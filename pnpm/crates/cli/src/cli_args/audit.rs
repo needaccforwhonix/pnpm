@@ -9,31 +9,34 @@ pub(crate) use render::{
 };
 pub(crate) use report::{
     AuditAdvisory, AuditError, AuditReport, AuditVulnerabilityCounts, RawBulkAdvisory,
-    bulk_response_to_audit_report, empty_audit_report, normalize_ghsa_id, normalize_registry,
-    redact_url_userinfo, sanitize_response_body,
+    bulk_response_to_audit_report, empty_audit_report, normalize_ghsa_id, sanitize_response_body,
 };
 pub(crate) use request::{
-    AuditGraph, AuditIndexRequest, DepClass, DepKind, Edge, GraphImporter, Include,
-    append_snapshot_edges, classify_graph, empty_snapshots, env_roots, importer_roots,
-    lockfile_to_audit_request, root_included,
+    AuditGraph, AuditIndexRequest, DepClass, DepKind, Edge, GraphImporter, Include, classify_graph,
+    empty_packages, empty_snapshots, env_roots, importer_roots, lockfile_to_audit_request,
+    root_included,
 };
 pub(crate) use version_ranges::{
-    caret_range_for_patched, infer_patched_versions, patched_range_for_style,
+    infer_patched_versions, is_range_subset, min_version_from_range, patched_range_for_style,
     satisfies_including_prerelease, satisfies_safe,
 };
 
+#[cfg(target_family = "wasm")]
+use crate::dialoguer_wasm::MultiSelect;
 use crate::{
     State,
     cli_args::{install::resolve_bool_override, sanitize::sanitize_inline},
 };
 use advisories::{
     audit, correct_inferred_patched_versions, filter_ignored_advisories, parse_audit_level,
-    retry_opts_from_config, severity_name, severity_number,
+    remove_advisories_by_ghsa, severity_name, severity_number,
 };
 use chrono::{DateTime, Utc};
 use clap::{Args, ValueEnum};
 use derive_more::{Display, Error};
+#[cfg(not(target_family = "wasm"))]
 use dialoguer::MultiSelect;
+use importers::{select_audited_importers, signature_packages};
 
 use miette::{Diagnostic, IntoDiagnostic};
 use node_semver::{Range, Version};
@@ -41,10 +44,11 @@ use owo_colors::{OwoColorize, Stream};
 
 use pnpm_config::{AuditLevel as ConfigAuditLevel, Config};
 use pnpm_lockfile::{
-    EnvLockfile, ImporterDepVersion, Lockfile, PackageKey, PkgName, ResolvedDependencyMap,
-    SnapshotDepRef, SnapshotEntry, SpecifierAndResolution, pick_registry_for_package,
+    EnvLockfile, ImporterDepVersion, Lockfile, PackageKey, PackageMetadata, PeerEdgeGraph,
+    PeerEdgeOptions, PeerSatisfactionEdges, PkgName, ResolvedDependencyMap, SnapshotEntry,
+    SpecifierAndResolution, pick_registry_for_package,
 };
-use pnpm_network::{RetryOpts, encode_package_name, send_with_retry};
+use pnpm_network::{encode_package_name, send_with_retry};
 use pnpm_package_manager::{ResolutionObserver, ResolvedPackageHint, Update};
 use pnpm_package_manifest::DependencyGroup;
 use pnpm_registry::RangeSpecStyle;
@@ -61,10 +65,10 @@ use std::{
     path::Path,
     rc::Rc,
     sync::Arc,
-    time::Duration,
 };
 
 mod fix;
+mod importers;
 mod paths;
 mod render;
 mod report;
@@ -172,18 +176,23 @@ pub struct AuditDependencyOptions {
 }
 
 impl AuditDependencyOptions {
-    fn include(&self, include_optional: bool) -> Include {
+    fn include(&self, config: &Config) -> Include {
         let mut dependencies = true;
         let mut dev_dependencies = true;
         let mut optional_dependencies =
-            resolve_bool_override(self.optional, self.no_optional, include_optional);
+            resolve_bool_override(self.optional, self.no_optional, config.optional);
         if self.prod {
             dev_dependencies = false;
         } else if self.dev {
             dependencies = false;
             optional_dependencies = false;
         }
-        Include { dependencies, dev_dependencies, optional_dependencies }
+        Include {
+            dependencies,
+            dev_dependencies,
+            optional_dependencies,
+            peer_edges: config.peer_edge_options(),
+        }
     }
 }
 
@@ -202,9 +211,12 @@ impl AuditArgs {
             return self.run_subcommand(subcommand, state).await;
         }
 
-        let include = self.dependency_options.include(state.config.optional);
+        let include = self.dependency_options.include(state.config);
         let audit_level = self.advisories.effective_level(state.config.audit_level);
         let fix_method = self.resolve_fix_method()?;
+        if fix_method.is_some() {
+            self.reject_ignore_flags()?;
+        }
 
         let lockfile_dir = state.lockfile_dir().to_path_buf();
         // pnpm writes settings to `workspaceDir ?? rootProjectManifestDir`.
@@ -253,15 +265,16 @@ impl AuditArgs {
         audit_level: ConfigAuditLevel,
     ) -> miette::Result<AuditOutcome> {
         if !self.advisories.ignore.is_empty() || self.advisories.ignore_unfixable {
-            let output = ignore_vulnerabilities(
+            let ignored = ignore_vulnerabilities(
                 &report,
                 config,
                 settings_dir,
                 &self.advisories.ignore,
                 self.advisories.ignore_unfixable,
             )?;
-            print_command_output(&output);
-            return Ok(AuditOutcome::Clean);
+            print_command_output(&ignored.summary);
+            remove_advisories_by_ghsa(&mut report, &ignored.ignore_ghsas);
+            return Ok(audit_outcome(&report, audit_level));
         }
 
         let ignored = filter_ignored_advisories(&mut report, config);
@@ -295,10 +308,10 @@ impl AuditArgs {
         self.run_signatures(state).await
     }
 
-    /// Fetch the audit report. `None` when a registry error was swallowed
-    /// per `--ignore-registry-errors`, matching pnpm's catch around the
-    /// `audit()` call; under `--json` the empty report has already been
-    /// printed by then.
+    /// Fetch the audit report. `None` when the selectors matched no project,
+    /// or when a registry error was swallowed per `--ignore-registry-errors`,
+    /// matching pnpm's catch around the `audit()` call; under `--json` the
+    /// empty report has already been printed by then.
     ///
     /// Takes `state` by shared reference so the `--fix update` path can
     /// re-borrow it mutably once the report is in hand.
@@ -315,6 +328,10 @@ impl AuditArgs {
         let Some(lockfile) = lockfile else {
             return Err(AuditError::NoLockfile.into());
         };
+        let Some(lockfile) = select_audited_importers(state, lockfile)? else {
+            return Ok(None);
+        };
+        let lockfile = lockfile.as_ref();
         let env_lockfile = EnvLockfile::read(lockfile_dir)
             .map_err(|err| miette::Report::new(err).wrap_err("load the env lockfile"))?;
         match audit(
@@ -328,7 +345,7 @@ impl AuditArgs {
         {
             Ok(report) => Ok(Some(report)),
             Err(err) if self.ignore_registry_errors => {
-                eprintln!("{err}");
+                pnpm_diagnostics::eprintln!("{err}");
                 let _ = std::io::stderr().flush();
                 if self.json {
                     let report = empty_audit_report(lockfile, env_lockfile.as_ref(), include);
@@ -345,10 +362,12 @@ impl AuditArgs {
     /// [`AuditOutcome::Vulnerable`]) when any signature is missing or invalid.
     /// Ports pnpm's `auditSignatures`.
     async fn run_signatures(&self, state: State) -> miette::Result<AuditOutcome> {
-        let include = self.dependency_options.include(state.config.optional);
+        let include = self.dependency_options.include(state.config);
         let lockfile_dir = state.lockfile_dir().to_path_buf();
 
-        let packages = signature_packages(&state, include, &lockfile_dir)?;
+        let Some(packages) = signature_packages(&state, include, &lockfile_dir)? else {
+            return Ok(AuditOutcome::Clean);
+        };
         if packages.is_empty() {
             return Err(AuditError::NoPackages.into());
         }
@@ -385,41 +404,6 @@ fn audit_outcome(report: &AuditReport, audit_level: ConfigAuditLevel) -> AuditOu
     }
 }
 
-/// Every installed package version the lockfile and env lockfile record,
-/// with the registry that serves it.
-fn signature_packages(
-    state: &State,
-    include: Include,
-    lockfile_dir: &std::path::Path,
-) -> miette::Result<Vec<signatures::SignaturePackage>> {
-    let lockfile = state.lockfile
-        .get()
-        .map_err(|err| miette::Report::new(err).wrap_err("load the lockfile"))?;
-    let Some(lockfile) = lockfile else {
-        return Err(AuditError::NoLockfile.into());
-    };
-    let env_lockfile = EnvLockfile::read(lockfile_dir)
-        .map_err(|err| miette::Report::new(err).wrap_err("load the env lockfile"))?;
-    let audit_request = lockfile_to_audit_request(lockfile, env_lockfile.as_ref(), include);
-    let registries: HashMap<String, String> = state.config
-        .resolved_registries()
-        .into_iter()
-        .collect();
-    Ok(audit_request.request
-        .iter()
-        .flat_map(|(name, versions)| {
-            let registry = pick_registry_for_package(&registries, name, None);
-            versions
-                .iter()
-                .map(move |version| signatures::SignaturePackage {
-                    name: name.clone(),
-                    registry: registry.clone(),
-                    version: version.clone(),
-                })
-        })
-        .collect())
-}
-
 /// Write one command result to stdout, appending the newline it lacks. Mirrors
 /// pnpm's CLI, which terminates every command's output the same way and writes
 /// nothing when a command produced none.
@@ -428,11 +412,11 @@ fn print_command_output(output: &str) {
         return;
     }
     if output.ends_with('\n') {
-        print!("{output}");
+        pnpm_diagnostics::print!("{output}");
     } else {
-        println!("{output}");
+        pnpm_diagnostics::println!("{output}");
     }
-    let _ = std::io::stdout().flush();
+    pnpm_diagnostics::stdout::check(std::io::stdout().flush());
 }
 
 #[cfg(test)]

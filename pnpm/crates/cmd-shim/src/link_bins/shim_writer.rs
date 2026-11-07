@@ -1,22 +1,28 @@
+#[cfg(not(target_family = "wasm"))]
+use crate::shim::generate_sh_shim;
+#[cfg(target_family = "wasm")]
+use crate::shim::generate_wasm_shim as generate_sh_shim;
+
 use super::{
     DirCreation, FsEnsureExecutableBits, FsReadHead, FsReadToString, FsSetExecutable, FsWrite,
-    LinkBinsError, Path, PathBuf, ScriptRuntime, ShimTargetCache, chmod_tolerating_removal,
-    generate_cmd_shim, generate_pwsh_shim, generate_sh_shim, io, is_node_bin_name,
-    is_sh_shim_hardened, is_shim_pointing_at, link_node_bin, link_symlinked_executable,
-    symlink_already_points_at,
+    LinkBinsError, LinkBinsOptions, Path, PathBuf, ScriptRuntime, ShimTargetCache,
+    chmod_tolerating_removal, generate_cmd_shim, generate_pwsh_shim, io, is_node_bin_name,
+    is_sh_shim_basedir_anchor_current, is_sh_shim_hardened, is_sh_shim_msys_cmd_switch_doubled,
+    is_shim_pointing_at, link_node_bin, link_symlinked_executable, linking_paths::LinkingPaths,
+    symlink_already_points_at, target_requires_shim, windows_shim_policy::WindowsShimPolicy,
 };
+use crate::shim::{CmdShimBatch, end_replaced_cmd_shim_batch};
 
 /// Write the canonical bin shim for `target_path` at `shim_path`,
 /// plus the `.cmd` and `.ps1` Windows-style siblings *when the host
 /// is Windows*. Idempotent on warm reinstalls via
 /// [`is_shim_pointing_at`].
 ///
-/// `make_powershell_shim` (see [`wants_powershell_shim`](super::wants_powershell_shim)) drops the
-/// `.ps1` sibling, and deletes any that an earlier install left
-/// behind.
+/// Without [`WindowsShimPolicy::powershell`] there is no `.ps1` sibling, and
+/// one an earlier install left is deleted.
 ///
-/// The chmod step (`set_executable` for the canonical shim and
-/// `ensure_executable_bits` for the target binary) is wired through the
+/// The chmod step (for the canonical shim and the target binary) is wired
+/// through the
 /// [`FsSetExecutable`] / [`FsEnsureExecutableBits`] capability traits.
 /// On Unix the production impls run the actual `chmod`; on Windows
 /// they are no-ops (Windows has no equivalent permission concept), so
@@ -25,8 +31,8 @@ use super::{
 /// The per-bin inputs one [`write_shim`] call consumes.
 #[derive(Clone, Copy)]
 pub(super) struct ShimSpec<'a> {
-    /// The bin file the shim executes, reached through the package's
-    /// `node_modules` location — the path the shim body embeds.
+    /// The bin file the shim executes. Relocatable linking resolves its
+    /// parent directory while retaining the final dirent.
     pub(super) target_path: &'a Path,
     /// [`target_path`](Self::target_path) with the package symlink
     /// resolved, used for the per-target probes (script runtime,
@@ -34,13 +40,58 @@ pub(super) struct ShimSpec<'a> {
     pub(super) probe_path: &'a Path,
     pub(super) shim_path: &'a Path,
     pub(super) node_path: &'a [String],
-    pub(super) prefer_symlinked_executables: bool,
-    pub(super) make_powershell_shim: bool,
-    /// Whether this run created the bin directory. Read by
-    /// [`read_or_create_shim`], which documents what it is worth.
-    pub(super) bin_dir: DirCreation,
+    pub(super) options: &'a LinkBinsOptions,
+    pub(super) windows: WindowsShimPolicy,
+    pub(super) paths: &'a LinkingPaths<'a>,
+    /// Precalculated script runtime from archive inspection or
+    /// `dist.pnpr.bins`, skipping the on-disk shebang probe when `Some`.
+    pub(super) precalculated_runtime: Option<&'a Option<ScriptRuntime>>,
 }
 
+impl ShimSpec<'_> {
+    fn installed_modules_dir(&self) -> Option<&Path> {
+        self.options.installed_modules_dir.as_deref()
+    }
+
+    fn relocatable_root(&self) -> Option<&Path> {
+        self.paths.relocatable_root.as_deref()
+    }
+
+    fn resolve_runtime<Sys: FsReadHead>(
+        &self,
+        cache: &ShimTargetCache,
+    ) -> Result<Option<ScriptRuntime>, LinkBinsError> {
+        match self.precalculated_runtime {
+            Some(runtime) => Ok(runtime.clone()),
+            None => cache
+                .runtime_for::<Sys>(self.probe_path)
+                .map_err(|error| LinkBinsError::ProbeShimSource {
+                    path: self.probe_path.to_path_buf(),
+                    error,
+                }),
+        }
+    }
+
+    fn sh_body(&self, runtime: Option<&ScriptRuntime>) -> Result<String, LinkBinsError> {
+        Ok(generate_sh_shim(
+            self.target_path,
+            &self.paths.sh_shim_path(self.target_path, self.shim_path)?,
+            runtime,
+            self.node_path,
+            self.relocatable_root(),
+        ))
+    }
+}
+
+/// Write the canonical bin shim for `target_path` at `shim_path`,
+/// plus the `.cmd` and `.ps1` Windows-style siblings *when the host
+/// is Windows*. Idempotent on warm reinstalls via
+/// [`is_shim_pointing_at`].
+///
+/// `make_powershell_shim` (see
+/// [`wants_powershell_shim`](super::windows_shim_policy::wants_powershell_shim)) drops the
+/// `.ps1` sibling, and deletes any that an earlier install left
+/// behind.
 pub(super) fn write_shim<Sys>(
     spec: ShimSpec<'_>,
     cache: &ShimTargetCache,
@@ -53,7 +104,7 @@ where
     // PowerShell keeps preferring it over the `.cmd` sibling. Delete
     // it up front, above the short-circuits below — they all return
     // without touching the Windows siblings.
-    if !spec.make_powershell_shim {
+    if !spec.windows.powershell {
         remove_stale_bin(&with_extension_appended(spec.shim_path, "ps1"))?;
     }
 
@@ -64,13 +115,15 @@ where
     };
 
     // pnpm's warm-install short-circuit: an existing symlink that
-    // already resolves to the target is correct as-is — regardless of
-    // `preferSymlinkedExecutables` — so a relink pass that doesn't
+    // already resolves to a directly executable target can
+    // stay regardless of `preferSymlinkedExecutables`, so a relink pass that doesn't
     // carry the setting (the injected-deps syncer's workspace-wide
     // relink, for one) leaves symlinked bins alone instead of
     // rewriting them into shims.
-    if symlink_already_points_at(spec.shim_path, spec.target_path) {
-        return cache.ensure_target_executable_once::<Sys>(spec.probe_path);
+    if symlink_already_points_at(spec.shim_path, spec.target_path, spec.relocatable_root())
+        && prepare_direct_target::<Sys>(&spec, cache)?
+    {
+        return Ok(());
     }
 
     // The node runtime binary is special: never wrap it in a shell
@@ -92,7 +145,9 @@ where
     //    (`$basedir/../node/bin/../node/bin/node` — the `node` segment
     //    appears twice). A direct symlink / hardlink bypasses the
     //    parser entirely.
-    if is_node_bin_name(spec.shim_path) && link_node_bin(spec.target_path, spec.shim_path)? {
+    if is_node_bin_name(spec.shim_path)
+        && link_node_bin(spec.target_path, spec.shim_path, spec.relocatable_root())?
+    {
         return Ok(());
     }
 
@@ -101,33 +156,37 @@ where
     // half returns `false` so bins keep their shims there, like pnpm.
     // Stays below the node-runtime special case, which links `node`
     // regardless of the setting.
-    if spec.prefer_symlinked_executables
+    if spec.options.prefer_symlinked_executables
+        && cfg!(any(unix, target_os = "wasi"))
+        && prepare_direct_target::<Sys>(&spec, cache)?
         && link_symlinked_executable::<Sys>(spec.target_path, spec.shim_path)?
     {
         return Ok(());
     }
 
-    let runtime = cache
-        .runtime_for::<Sys>(spec.probe_path)
-        .map_err(|error| LinkBinsError::ProbeShimSource {
-            path: spec.probe_path.to_path_buf(),
-            error,
-        })?;
+    let runtime = spec.resolve_runtime::<Sys>(cache)?;
+    let sh_body = spec.sh_body(runtime.as_ref())?;
+    let windows_shims = windows_shim_bodies::<Sys>(&spec, runtime.as_ref());
 
-    let sh_body =
-        generate_sh_shim(spec.target_path, spec.shim_path, runtime.as_ref(), spec.node_path);
-    let windows_shims = windows_shim_bodies(&spec, runtime.as_ref());
-
-    let current = shim_body_matches(existing_shim.as_deref(), &sh_body, &spec)
+    let current = existing_shim_is_current(existing_shim.as_deref(), &sh_body, &spec)
         && windows_shims_match::<Sys>(windows_shims.as_ref());
     if !current {
         replace_shims::<Sys>(spec.shim_path, &sh_body, windows_shims.as_ref())?;
     }
 
-    chmod_tolerating_removal(spec.shim_path, Sys::set_executable)?;
-    cache.ensure_target_executable_once::<Sys>(spec.probe_path)?;
+    chmod_tolerating_removal(spec.shim_path, Sys::ensure_executable)?;
+    cache.ensure_target_executable_once::<Sys>(spec.probe_path, spec.installed_modules_dir())
+}
 
-    Ok(())
+fn prepare_direct_target<Sys>(
+    spec: &ShimSpec<'_>,
+    cache: &ShimTargetCache,
+) -> Result<bool, LinkBinsError>
+where
+    Sys: FsReadHead + FsEnsureExecutableBits,
+{
+    cache.ensure_target_executable_once::<Sys>(spec.probe_path, spec.installed_modules_dir())?;
+    Ok(!target_requires_shim::<Sys>(spec.probe_path))
 }
 
 /// What occupies the shim path.
@@ -160,7 +219,7 @@ fn read_or_create_shim<Sys>(
 where
     Sys: FsReadToString + FsReadHead + FsWrite + FsSetExecutable + FsEnsureExecutableBits,
 {
-    if spec.bin_dir == DirCreation::Created
+    if spec.paths.bin_dir == DirCreation::Created
         && fresh_write_applies(spec)
         && write_shim_fresh::<Sys>(spec, cache)?
     {
@@ -180,33 +239,62 @@ where
 /// runtime is linked rather than shimmed, and
 /// `preferSymlinkedExecutables` links every bin on Unix.
 fn fresh_write_applies(spec: &ShimSpec<'_>) -> bool {
-    !(is_node_bin_name(spec.shim_path) || (spec.prefer_symlinked_executables && cfg!(unix)))
+    !(is_node_bin_name(spec.shim_path)
+        || (spec.options.prefer_symlinked_executables && cfg!(any(unix, target_os = "wasi"))))
 }
 
 /// The Windows sibling shims a write produces.
 struct WindowsShims {
-    cmd_path: PathBuf,
-    cmd_body: String,
+    cmd: CmdShim,
     powershell: Option<(PathBuf, String)>,
+}
+
+/// The `.cmd` sibling, together with the read of its path that laid its body
+/// out, so that the byte comparison deciding on a rewrite needs no second read.
+struct CmdShim {
+    path: PathBuf,
+    body: String,
+    /// What `path` held when `body` was laid out, read for a shim that ends
+    /// its batch before its target (see [`end_replaced_cmd_shim_batch`]).
+    replaced: Option<String>,
 }
 
 /// Generate the Windows siblings. They are off on Unix to match pnpm, and the
 /// bodies are computed only under `cfg!(windows)` so Unix builds stay off the
 /// `relative_target_windows` allocation path entirely.
-fn windows_shim_bodies(
+fn windows_shim_bodies<Sys: FsReadToString>(
     spec: &ShimSpec<'_>,
     runtime: Option<&ScriptRuntime>,
 ) -> Option<WindowsShims> {
     cfg!(windows).then(|| {
-        let cmd_path = with_extension_appended(spec.shim_path, "cmd");
-        let cmd_body = generate_cmd_shim(spec.target_path, &cmd_path, runtime, spec.node_path);
-        let powershell = spec.make_powershell_shim.then(|| {
+        let cmd = cmd_shim::<Sys>(spec, runtime);
+        let powershell = spec.windows.powershell.then(|| {
             let ps1_path = with_extension_appended(spec.shim_path, "ps1");
             let ps1_body = generate_pwsh_shim(spec.target_path, &ps1_path, runtime, spec.node_path);
             (ps1_path, ps1_body)
         });
-        WindowsShims { cmd_path, cmd_body, powershell }
+        WindowsShims { cmd, powershell }
     })
+}
+
+/// The `.cmd` sibling of `spec`. A shim that ends its batch before its target
+/// is laid out over what its path holds, so that cmd.exe, when it is still
+/// running what was there, does not read on into the new shim. A `.cmd` that
+/// cannot be read is replaced like a missing one.
+fn cmd_shim<Sys: FsReadToString>(spec: &ShimSpec<'_>, runtime: Option<&ScriptRuntime>) -> CmdShim {
+    let path = with_extension_appended(spec.shim_path, "cmd");
+    let body =
+        generate_cmd_shim(spec.target_path, &path, runtime, spec.node_path, spec.windows.cmd_batch);
+    if spec.windows.cmd_batch == CmdShimBatch::Kept {
+        return CmdShim { path, body, replaced: None };
+    }
+    match Sys::read_to_string(&path) {
+        Ok(replaced) => {
+            let body = end_replaced_cmd_shim_batch(&body, &replaced);
+            CmdShim { path, body, replaced: Some(replaced) }
+        }
+        Err(_) => CmdShim { path, body, replaced: None },
+    }
 }
 
 /// Whether the shim already on disk points at the right target.
@@ -214,24 +302,33 @@ fn windows_shim_bodies(
 /// The `.sh` flavor carries a `# cmd-shim-target=<path>` trailer that
 /// [`is_shim_pointing_at`] reads. When a `NODE_PATH` block is expected the
 /// marker alone cannot prove the shim carries the right (or any) block, so
-/// byte equality is required; the marker-only branch additionally rejects a
+/// byte equality is required. Relocatable shims also require equality so their
+/// physical directory anchor is upgraded. The marker-only branch rejects a
 /// stale `NODE_PATH` block when none is expected. The probe looks for the
 /// exact export the block opens with, so a target path that merely mentions
 /// `NODE_PATH` cannot force a rewrite.
 ///
 /// The marker says nothing about the header, so the marker-only branch also
 /// requires [`is_sh_shim_hardened`]. A shim an older version wrote still points
-/// at the right target, and without that check an upgrade would leave it in
-/// place resolving its shell helpers off the caller's `PATH`.
-fn shim_body_matches(existing: Option<&str>, sh_body: &str, spec: &ShimSpec<'_>) -> bool {
+/// at the right target, and without that check an upgrade would leave a stale
+/// header in place. [`is_sh_shim_basedir_anchor_current`] does the same for
+/// the physical directory anchor, and [`is_sh_shim_msys_cmd_switch_doubled`]
+/// for the `cmd` switch.
+fn existing_shim_is_current(existing: Option<&str>, sh_body: &str, spec: &ShimSpec<'_>) -> bool {
     let Some(existing) = existing else {
         return false;
     };
-    if !spec.node_path.is_empty() {
+    if spec.options.force
+        || cfg!(target_family = "wasm")
+        || !spec.node_path.is_empty()
+        || spec.relocatable_root().is_some()
+    {
         return existing == sh_body;
     }
-    is_shim_pointing_at(existing, spec.target_path)
+    is_shim_pointing_at(existing, spec.shim_path, spec.target_path)
         && is_sh_shim_hardened(existing)
+        && is_sh_shim_basedir_anchor_current(existing, sh_body)
+        && !is_sh_shim_msys_cmd_switch_doubled(existing)
         && !existing.contains("export NODE_PATH=")
 }
 
@@ -251,10 +348,13 @@ where
     let Some(shims) = windows_shims else {
         return true;
     };
-    let cmd_ok = matches!(
-        Sys::read_to_string(&shims.cmd_path),
-        Ok(existing) if existing == shims.cmd_body,
-    );
+    let cmd_ok = match &shims.cmd.replaced {
+        Some(replaced) => *replaced == shims.cmd.body,
+        None => matches!(
+            Sys::read_to_string(&shims.cmd.path),
+            Ok(existing) if existing == shims.cmd.body,
+        ),
+    };
     // A suppressed `.ps1` is already gone, so there is nothing left to compare.
     let ps1_ok = shims.powershell.as_ref().is_none_or(|(ps1_path, ps1_body)| {
         matches!(Sys::read_to_string(ps1_path), Ok(existing) if &existing == ps1_body)
@@ -275,14 +375,14 @@ where
     let Some(shims) = windows_shims else {
         return Ok(());
     };
-    replace_shim::<Sys>(&shims.cmd_path, shims.cmd_body.as_bytes())?;
+    replace_shim::<Sys>(&shims.cmd.path, shims.cmd.body.as_bytes())?;
     if let Some((ps1_path, ps1_body)) = &shims.powershell {
         replace_shim::<Sys>(ps1_path, ps1_body.as_bytes())?;
     }
     Ok(())
 }
 
-/// Create the shim(s) at a path nothing occupies. The exclusive create
+/// Create the shims at a path nothing occupies. The exclusive create
 /// refuses any pre-existing dirent — a dangling symlink included — so no
 /// removal or content probe is needed first. `Ok(false)` sends the
 /// caller to the general path: the create lost a race, found a dirent
@@ -294,21 +394,9 @@ fn write_shim_fresh<Sys>(
 where
     Sys: FsReadToString + FsReadHead + FsWrite + FsSetExecutable + FsEnsureExecutableBits,
 {
-    let &ShimSpec {
-        target_path,
-        probe_path,
-        shim_path,
-        node_path,
-        make_powershell_shim,
-        ..
-    } = spec;
-    let runtime = cache
-        .runtime_for::<Sys>(probe_path)
-        .map_err(|error| LinkBinsError::ProbeShimSource {
-            path: probe_path.to_path_buf(),
-            error,
-        })?;
-    let sh_body = generate_sh_shim(target_path, shim_path, runtime.as_ref(), node_path);
+    let &ShimSpec { probe_path, shim_path, .. } = spec;
+    let runtime = spec.resolve_runtime::<Sys>(cache)?;
+    let sh_body = spec.sh_body(runtime.as_ref())?;
     // Any failure — a lost race, a dangling symlink squatting on the
     // path, a `Sys` without exclusive creation — goes to the general
     // path, whose replacement is atomic. No content is ever read back
@@ -316,20 +404,16 @@ where
     if Sys::write_new(shim_path, sh_body.as_bytes()).is_err() {
         return Ok(false);
     }
-    if cfg!(windows) {
-        // The Windows siblings keep the replace shape: a missing
-        // canonical shim proves nothing about `.cmd`/`.ps1` leftovers.
-        let cmd_path = with_extension_appended(shim_path, "cmd");
-        let cmd_body = generate_cmd_shim(target_path, &cmd_path, runtime.as_ref(), node_path);
-        replace_shim::<Sys>(&cmd_path, cmd_body.as_bytes())?;
-        if make_powershell_shim {
-            let ps1_path = with_extension_appended(shim_path, "ps1");
-            let ps1_body = generate_pwsh_shim(target_path, &ps1_path, runtime.as_ref(), node_path);
-            replace_shim::<Sys>(&ps1_path, ps1_body.as_bytes())?;
+    // The Windows siblings keep the replace shape: a missing
+    // canonical shim proves nothing about `.cmd`/`.ps1` leftovers.
+    if let Some(shims) = windows_shim_bodies::<Sys>(spec, runtime.as_ref()) {
+        replace_shim::<Sys>(&shims.cmd.path, shims.cmd.body.as_bytes())?;
+        if let Some((ps1_path, ps1_body)) = &shims.powershell {
+            replace_shim::<Sys>(ps1_path, ps1_body.as_bytes())?;
         }
     }
     chmod_tolerating_removal(shim_path, Sys::set_executable)?;
-    cache.ensure_target_executable_once::<Sys>(probe_path)?;
+    cache.ensure_target_executable_once::<Sys>(probe_path, spec.installed_modules_dir())?;
     Ok(true)
 }
 
@@ -393,7 +477,7 @@ pub fn remove_bin(bin_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn remove_if_exists(path: &Path) -> io::Result<()> {
+pub(super) fn remove_if_exists(path: &Path) -> io::Result<()> {
     match pnpm_fs::remove_file_with_retry(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),

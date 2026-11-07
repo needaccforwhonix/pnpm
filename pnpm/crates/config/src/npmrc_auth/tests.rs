@@ -1,10 +1,10 @@
 use std::path::Path;
 
-use pnpm_network::{DEFAULT_REGISTRY_SCOPE, NoProxySetting};
+use pnpm_network::{DEFAULT_REGISTRY_SCOPE, NoProxySetting, base64_encode};
 use pretty_assertions::assert_eq;
 
 use super::{
-    BasicAuth, DeclaredRegistries, EnvVar, NpmrcAuth, RawCreds, RegistryCreds, base64_encode,
+    BasicAuth, DeclaredRegistries, EnvVar, NpmrcAuth, RawCreds, RegistryCreds, base64_encode_bytes,
     credentials::base64_decode,
 };
 use crate::{Config, workspace_yaml::LoadWorkspaceYamlError};
@@ -29,11 +29,7 @@ macro_rules! static_env {
     };
 }
 
-/// Test fake: the process environment is empty. Per the DI
-/// pattern from
-/// [pnpm/pacquet#339](https://github.com/pnpm/pacquet/issues/339),
-/// the fake is a unit struct scoped to the test module; tests
-/// turbofish it through the generic slot.
+/// Test fake: the process environment is empty.
 struct NoEnv;
 impl EnvVar for NoEnv {
     fn var(_: &str) -> Option<String> {
@@ -88,6 +84,7 @@ macro_rules! static_env_with_vars {
 }
 
 mod behavior;
+mod registry_alias;
 
 mod configuration;
 
@@ -100,3 +97,5 @@ mod reporting;
 mod security;
 
 mod streaming;
+
+mod json_env_expansion;

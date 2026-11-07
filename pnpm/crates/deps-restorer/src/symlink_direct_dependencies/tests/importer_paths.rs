@@ -60,7 +60,7 @@ fn unsafe_importer_keys_error_before_filesystem_writes() {
         let mut config = Config::new();
         config.store_dir = dir.path().join("pacquet-store").into();
         config.modules_dir = workspace_root.join("node_modules");
-        config.virtual_store_dir = workspace_root.join("node_modules/.pacquet");
+        config.install_state_dir = workspace_root.join("node_modules/.pacquet");
         let config = config.leak();
 
         let mut importers = HashMap::new();
@@ -70,7 +70,7 @@ fn unsafe_importer_keys_error_before_filesystem_writes() {
             context: crate::ImporterLinkContext {
                 config,
                 layout: &crate::VirtualStoreLayout::legacy(
-                    config.virtual_store_dir.clone(),
+                    config.install_state_dir.clone(),
                     config.virtual_store_dir_max_length as usize,
                 ),
                 workspace_root: &workspace_root,
@@ -90,7 +90,9 @@ fn unsafe_importer_keys_error_before_filesystem_writes() {
             dependency_groups: [DependencyGroup::Prod],
 
             package_manifests: None,
+            package_bins: None,
             requires_build_by_snapshot: None,
+            scheduled_builds: None,
         }
         .run::<SilentReporter>();
 
@@ -132,7 +134,7 @@ fn trusted_importer_id_outside_workspace_root_is_linked() {
     let mut config = Config::new();
     config.store_dir = dir.path().join("pacquet-store").into();
     config.modules_dir = workspace_root.join("node_modules");
-    config.virtual_store_dir = workspace_root.join("node_modules/.pacquet");
+    config.install_state_dir = workspace_root.join("node_modules/.pacquet");
     let config = config.leak();
 
     let mut importers = HashMap::new();
@@ -143,7 +145,7 @@ fn trusted_importer_id_outside_workspace_root_is_linked() {
         context: crate::ImporterLinkContext {
             config,
             layout: &crate::VirtualStoreLayout::legacy(
-                config.virtual_store_dir.clone(),
+                config.install_state_dir.clone(),
                 config.virtual_store_dir_max_length as usize,
             ),
             workspace_root: &workspace_root,
@@ -163,7 +165,9 @@ fn trusted_importer_id_outside_workspace_root_is_linked() {
         dependency_groups: [DependencyGroup::Prod],
 
         package_manifests: None,
+        package_bins: None,
         requires_build_by_snapshot: None,
+        scheduled_builds: None,
     }
     .run::<SilentReporter>()
     .expect("a declared project at `..` must be allowed");
@@ -173,7 +177,7 @@ fn trusted_importer_id_outside_workspace_root_is_linked() {
         context: crate::ImporterLinkContext {
             config,
             layout: &crate::VirtualStoreLayout::legacy(
-                config.virtual_store_dir.clone(),
+                config.install_state_dir.clone(),
                 config.virtual_store_dir_max_length as usize,
             ),
             workspace_root: &workspace_root,
@@ -193,7 +197,9 @@ fn trusted_importer_id_outside_workspace_root_is_linked() {
         dependency_groups: [DependencyGroup::Prod],
 
         package_manifests: None,
+        package_bins: None,
         requires_build_by_snapshot: None,
+        scheduled_builds: None,
     }
     .run::<SilentReporter>();
     assert!(

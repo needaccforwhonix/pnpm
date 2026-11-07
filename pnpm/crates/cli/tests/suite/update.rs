@@ -2,12 +2,16 @@ use crate::_utils;
 
 use _utils::{
     append_workspace_yaml_key, bravo_dep_mature_up_to_1_0_1_minimum_release_age,
-    lockfile_package_keys, set_ignore_dependencies, set_minimum_release_age,
+    importer_specifier, importer_version, lockfile_package_keys, read_lockfile,
+    set_ignore_dependencies, set_minimum_release_age,
 };
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
 use pnpm_package_manifest::{DependencyGroup, PackageManifest};
-use pnpm_testing_utils::bin::{AddMockedRegistry, CommandTempCwd};
+use pnpm_testing_utils::{
+    bin::{AddMockedRegistry, CommandTempCwd},
+    command_env::CommandTestExt,
+};
 use pretty_assertions::assert_eq;
 use std::{ffi::OsStr, fmt::Write as _, fs, path::Path, process::Command};
 use tempfile::TempDir;
@@ -48,6 +52,7 @@ fn pacquet(workspace: &Path, args: impl IntoIterator<Item = impl AsRef<OsStr>>) 
     Command::cargo_bin("pnpm")
         .expect("find the pnpm binary")
         .with_current_dir(workspace)
+        .without_ambient_pnpm_config()
         .with_args(args)
 }
 
@@ -359,6 +364,58 @@ fn update_rewrites_the_range_with_dedicated_lockfiles() {
     drop((root, anchor));
 }
 
+/// An override-applied importer specifier must survive an unrelated
+/// recursive no-save update, so the next frozen install still agrees with
+/// the manifest's effective declaration.
+#[test]
+fn update_no_save_preserves_an_override_specifier_for_an_unrelated_update() {
+    for override_key in [format!("{DEP}@>=100.0.0 <100.1.0"), DEP.to_string()] {
+        let (root, workspace, anchor) = setup();
+
+        write_manifest(
+            &workspace,
+            &format!(r#"{{ "{DEP}": "^100.0.0", "{BRAVO_DEP}": "1.0.0" }}"#),
+        );
+        set_overrides(&workspace, &[(override_key.as_str(), "100.1.0")]);
+        pacquet(&workspace, ["install", "--lockfile-only"]).assert().success();
+
+        // Widen the unrelated dependency after its initial exact install so
+        // update has a newer published fixture version to select.
+        write_manifest(
+            &workspace,
+            &format!(r#"{{ "{DEP}": "^100.0.0", "{BRAVO_DEP}": "^1.0.0" }}"#),
+        );
+        let before_packages = lockfile_package_keys(&workspace);
+        let before = fs::read_to_string(workspace.join("package.json")).expect("read package.json");
+        pacquet(&workspace, ["update", "--no-save", "--lockfile-only", "--recursive", BRAVO_DEP])
+            .assert()
+            .success();
+
+        assert_eq!(
+            fs::read_to_string(workspace.join("package.json")).expect("read package.json"),
+            before,
+            "--no-save must not rewrite package.json",
+        );
+        let lockfile = read_lockfile(&workspace.join("pnpm-lock.yaml"));
+        assert_eq!(importer_specifier(&lockfile, ".", DEP), "100.1.0");
+        assert_eq!(importer_version(&lockfile, ".", DEP), "100.1.0");
+
+        let after_packages = lockfile_package_keys(&workspace);
+        assert!(
+            after_packages.contains(&format!("{BRAVO_DEP}@1.1.0")),
+            "the requested unrelated update must resolve {BRAVO_DEP}@1.1.0: {after_packages:?}",
+        );
+        assert!(
+            !before_packages.contains(&format!("{BRAVO_DEP}@1.1.0")),
+            "{BRAVO_DEP}@1.1.0 must not already be installed: {before_packages:?}",
+        );
+        pacquet(&workspace, ["install", "--frozen-lockfile"]).assert().success();
+        assert!(virtual_store_has(&workspace, "@pnpm.e2e+bravo-dep@1.1.0"));
+
+        drop((root, anchor));
+    }
+}
+
 /// `--no-save` keeps `package.json` authoritative, so the lockfile moves
 /// within the declared range while the range itself stands.
 #[test]
@@ -452,6 +509,23 @@ fn update_latest_preserves_tilde() {
     drop((root, anchor));
 }
 
+/// A range with no operator of its own that excludes the latest version is
+/// rewritten with the `savePrefix` setting.
+#[test]
+fn update_latest_applies_save_prefix_to_a_range_without_an_operator() {
+    let (root, workspace, anchor) = setup();
+
+    write_manifest(&workspace, &format!(r#"{{ "{DEP}": "<100.1.0" }}"#));
+    append_workspace_yaml_key(&workspace, "savePrefix", "'~'");
+    pacquet(&workspace, ["install"]).assert().success();
+
+    pacquet(&workspace, ["update", "--latest"]).assert().success();
+
+    assert_eq!(dep_spec(&workspace, DEP).as_deref(), Some("~101.0.0"));
+
+    drop((root, anchor));
+}
+
 /// A dist-tag already reaches the latest version, so `--latest` has nothing
 /// to rewrite either.
 #[test]
@@ -480,6 +554,30 @@ fn update_latest_preserves_exact() {
     pacquet(&workspace, ["update", "--latest"]).assert().success();
 
     assert_eq!(dep_spec(&workspace, DEP).as_deref(), Some("101.0.0"));
+
+    drop((root, anchor));
+}
+
+/// Regression test for <https://github.com/pnpm/pnpm/issues/6714>.
+#[test]
+fn update_keeps_a_range_whose_shape_no_save_prefix_describes() {
+    let (root, workspace, anchor) = setup();
+
+    write_manifest(&workspace, &format!(r#"{{ "{FOO}": "<= 1.2.5" }}"#));
+    pacquet(&workspace, ["install"]).assert().success();
+    assert!(virtual_store_has(&workspace, "@pnpm.e2e+foo@1.2.0"));
+
+    pacquet(&workspace, ["update"]).assert().success();
+
+    assert_eq!(dep_spec(&workspace, FOO).as_deref(), Some("<= 1.2.5"));
+    let lockfile = read_lockfile(&workspace.join("pnpm-lock.yaml"));
+    assert_eq!(importer_specifier(&lockfile, ".", FOO), "<= 1.2.5");
+    assert_eq!(importer_version(&lockfile, ".", FOO), "1.2.0");
+    pacquet(&workspace, ["install", "--frozen-lockfile"]).assert().success();
+
+    pacquet(&workspace, ["update", "--latest"]).assert().success();
+
+    assert_eq!(dep_spec(&workspace, FOO).as_deref(), Some("^100.1.0"));
 
     drop((root, anchor));
 }
@@ -750,6 +848,136 @@ fn update_no_save_is_refused_when_a_pick_is_immature() {
     drop((root, anchor));
 }
 
+const UNSERVED_DEP_VERSION: &str = "100.9.9";
+
+/// Rewrite the lockfile to pin [`DEP`] at a version the registry does not
+/// serve, the state an unpublished version leaves behind.
+fn lock_unserved_version_of_dep(workspace: &Path) {
+    let locked_key = lockfile_package_keys(workspace)
+        .into_iter()
+        .find(|key| key.starts_with(&format!("{DEP}@")))
+        .expect("the lockfile pins the dependency");
+    let unserved_key = format!("{DEP}@{UNSERVED_DEP_VERSION}");
+    let lockfile_path = workspace.join("pnpm-lock.yaml");
+    let mut lockfile: serde_json::Value =
+        serde_saphyr::from_str(&fs::read_to_string(&lockfile_path).expect("read pnpm-lock.yaml"))
+            .expect("parse pnpm-lock.yaml");
+    for section in ["packages", "snapshots"] {
+        let entries = lockfile[section].as_object_mut().expect("the lockfile has the section");
+        let mut entry = entries.remove(&locked_key).expect("the section has the locked entry");
+        if let Some(resolution) =
+            entry.get_mut("resolution").and_then(serde_json::Value::as_object_mut)
+        {
+            resolution.remove("tarball");
+        }
+        entries.insert(unserved_key.clone(), entry);
+    }
+    for snapshot in lockfile["snapshots"]
+        .as_object_mut()
+        .expect("the lockfile has snapshots")
+        .values_mut()
+    {
+        if let Some(pin) = snapshot
+            .get_mut("dependencies")
+            .and_then(|deps| deps.get_mut(DEP))
+        {
+            *pin = UNSERVED_DEP_VERSION.into();
+        }
+    }
+    for importer in lockfile["importers"]
+        .as_object_mut()
+        .expect("the lockfile has importers")
+        .values_mut()
+    {
+        if let Some(dep) = importer
+            .get_mut("dependencies")
+            .and_then(|deps| deps.get_mut(DEP))
+        {
+            dep["version"] = UNSERVED_DEP_VERSION.into();
+        }
+    }
+    fs::write(
+        &lockfile_path,
+        serde_saphyr::to_string(&lockfile).expect("serialize pnpm-lock.yaml"),
+    )
+    .expect("write pnpm-lock.yaml");
+}
+
+/// Covers <https://github.com/pnpm/pnpm/issues/9953>. The lockfile
+/// verification gate skips the version the update replaces.
+#[test]
+fn update_moves_a_dependency_off_a_locked_version_the_registry_no_longer_serves() {
+    let (root, workspace, anchor) = setup();
+
+    write_manifest(&workspace, &format!(r#"{{ "{PARENT}": "100.0.0" }}"#));
+    pacquet(&workspace, ["install"]).assert().success();
+    lock_unserved_version_of_dep(&workspace);
+    set_minimum_release_age(&workspace, 1);
+
+    pacquet(&workspace, ["update", DEP]).assert().success();
+
+    let packages = lockfile_package_keys(&workspace);
+    assert!(!packages.contains(&format!("{DEP}@{UNSERVED_DEP_VERSION}")), "{packages:?}");
+    assert!(
+        packages
+            .iter()
+            .any(|key| key.starts_with(&format!("{DEP}@"))),
+        "{packages:?}",
+    );
+
+    drop((root, anchor));
+}
+
+/// `update --depth 0` does not replace every locked version of its target,
+/// so the lockfile verification gate still checks them.
+#[test]
+fn update_with_depth_limit_verifies_the_locked_versions_of_its_targets() {
+    let (root, workspace, anchor) = setup();
+
+    write_manifest(&workspace, &format!(r#"{{ "{DEP}": "^100.0.0" }}"#));
+    pacquet(&workspace, ["install"]).assert().success();
+    lock_unserved_version_of_dep(&workspace);
+    set_minimum_release_age(&workspace, 1);
+
+    assert_unserved_dep_is_rejected(pacquet(&workspace, ["update", "--depth", "0", DEP]));
+
+    drop((root, anchor));
+}
+
+fn assert_unserved_dep_is_rejected(mut command: Command) {
+    let output = command.assert().failure();
+    let stderr = String::from_utf8_lossy(&output.get_output().stderr).into_owned();
+
+    assert!(stderr.contains("ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION"), "{stderr}");
+    assert!(stderr.contains(&format!("{DEP}@{UNSERVED_DEP_VERSION}")), "{stderr}");
+}
+
+/// A filtered update leaves the other importers' pins in place, so the
+/// lockfile verification gate still checks them.
+#[test]
+fn update_verifies_the_locked_versions_of_importers_it_does_not_update() {
+    let (root, workspace, anchor) = setup();
+
+    write_manifest(&workspace, &format!(r#"{{ "{PARENT}": "100.0.0" }}"#));
+    add_workspace_package(&workspace, "project-b", "1.0.0");
+    fs::write(
+        workspace.join("project-b/package.json"),
+        format!(r#"{{ "name": "project-b", "version": "1.0.0", "dependencies": {{ "{PARENT}": "100.0.0" }} }}"#),
+    )
+    .expect("write project-b/package.json");
+    pacquet(&workspace, ["install"]).assert().success();
+    lock_unserved_version_of_dep(&workspace);
+    set_minimum_release_age(&workspace, 1);
+
+    assert_unserved_dep_is_rejected(pacquet(&workspace, ["--filter", "project-b", "update", DEP]));
+
+    pacquet(&workspace, ["update", "--recursive", DEP]).assert().success();
+    let packages = lockfile_package_keys(&workspace);
+    assert!(!packages.contains(&format!("{DEP}@{UNSERVED_DEP_VERSION}")), "{packages:?}");
+
+    drop((root, anchor));
+}
+
 /// An invalid `minimumReleaseAgeExclude` must not preempt command
 /// validation: `update <name>@<spec> --latest` still fails with the
 /// versioned-selector rejection, matching the TypeScript CLI, which
@@ -857,8 +1085,6 @@ fn update_latest_preserves_local_protocol_dependencies() {
     .expect("write packages/b/package.json");
 
     pacquet(&workspace, ["-r", "install"]).assert().success();
-    // Before the fix this failed with ERR_PNPM_PACKAGE_MANAGER_UPDATE_RESOLVE_LATEST
-    // trying to fetch the unpublished @test/b, @test/c, and @test/d from the registry.
     pacquet(&workspace, ["-r", "update", "--latest"]).assert().success();
 
     let a_manifest = fs::read_to_string(workspace.join("packages/a/package.json"))
@@ -1080,6 +1306,44 @@ fn update_latest_leaves_auto_installed_peers_alone() {
 }
 
 #[test]
+fn update_peer_resolves_and_saves_with_auto_install_peers_disabled() {
+    let (root, workspace, anchor) = setup_with_own_registry();
+    anchor.set_dist_tag(PEER_A, "1.0.1", "latest");
+    append_workspace_yaml_key(&workspace, "autoInstallPeers", false);
+    fs::write(
+        workspace.join("package.json"),
+        format!(
+            r#"{{ "name": "test-update", "version": "1.0.0", "peerDependencies": {{ "{PEER_A}": "^1.0.0" }} }}"#,
+        ),
+    )
+    .expect("write package.json");
+
+    pacquet(&workspace, ["update", "--peer", "--lockfile-only"]).assert().success();
+
+    let manifest = PackageManifest::from_path(workspace.join("package.json")).unwrap();
+    assert_eq!(
+        manifest
+            .dependencies([DependencyGroup::Peer])
+            .find(|(name, _)| *name == PEER_A)
+            .map(|(_, specifier)| specifier),
+        Some("^1.0.1"),
+    );
+    let lockfile = read_lockfile(&workspace.join("pnpm-lock.yaml"));
+    assert!(
+        lockfile
+            .root_project()
+            .and_then(|importer| importer.dependencies.as_ref())
+            .is_none_or(|dependencies| !dependencies
+                .keys()
+                .any(|name| name.to_string() == PEER_A)),
+        "an explicitly resolved peer must stay unmaterialized when autoInstallPeers is false",
+    );
+    pacquet(&workspace, ["install", "--frozen-lockfile"]).assert().success();
+
+    drop((root, anchor));
+}
+
+#[test]
 fn update_withholds_the_old_pin_of_an_auto_installed_peer() {
     let (root, workspace, anchor) = setup();
     let consumer = "@pnpm.e2e/wants-peer-c-1";
@@ -1090,6 +1354,29 @@ fn update_withholds_the_old_pin_of_an_auto_installed_peer() {
     pacquet(&workspace, ["update", "--lockfile-only"]).assert().success();
     let lockfile = _utils::read_lockfile(&workspace.join("pnpm-lock.yaml"));
     assert_eq!(_utils::importer_version(&lockfile, ".", consumer), "1.0.0(@pnpm.e2e/peer-c@1.0.1)");
+    drop((root, anchor));
+}
+
+/// Mirrors pnpm/pnpm#14895.
+#[test]
+fn update_re_keys_an_optional_peer_whose_locked_provider_left_in_one_pass() {
+    let (root, workspace, anchor) = setup();
+    let consumer = "@pnpm.e2e/depends-on-optional-peer-c-host";
+    let provider = "@pnpm.e2e/abc-regular-deps";
+    write_manifest(&workspace, &format!(r#"{{ "{consumer}": "1.0.0", "{PEER_C}": "1.0.1" }}"#));
+    pacquet(&workspace, ["install", "--lockfile-only"]).assert().success();
+    let lockfile = _utils::read_lockfile(&workspace.join("pnpm-lock.yaml"));
+    assert_eq!(_utils::importer_version(&lockfile, ".", consumer), "1.0.0(@pnpm.e2e/peer-c@1.0.1)");
+
+    write_manifest(&workspace, &format!(r#"{{ "{consumer}": "1.0.0", "{provider}": "1.0.0" }}"#));
+    pacquet(&workspace, ["update", "--lockfile-only"]).assert().success();
+    let first_pass = fs::read_to_string(workspace.join("pnpm-lock.yaml")).expect("read lockfile");
+    let lockfile = _utils::read_lockfile(&workspace.join("pnpm-lock.yaml"));
+    assert_eq!(_utils::importer_version(&lockfile, ".", consumer), "1.0.0(@pnpm.e2e/peer-c@1.0.0)");
+
+    pacquet(&workspace, ["update", "--lockfile-only"]).assert().success();
+    let second_pass = fs::read_to_string(workspace.join("pnpm-lock.yaml")).expect("read lockfile");
+    assert_eq!(second_pass, first_pass, "a second update must change nothing");
     drop((root, anchor));
 }
 
@@ -1119,3 +1406,361 @@ fn update_keeps_every_dist_tag_specifier_without_latest() {
 mod workspace;
 
 mod selectors;
+
+mod latest_transitive;
+
+mod overrides;
+
+mod compatibility_db;
+
+mod cargo_features;
+
+mod cargo_pinned_lines;
+
+/// A changed specifier re-resolves its dependency, and that dependency's
+/// own dependencies keep the versions the lockfile pins while nothing else
+/// in the graph prefers another (pnpm/pnpm#2191).
+#[test]
+fn a_changed_specifier_keeps_the_locked_versions_of_its_dependencies() {
+    const FOOBARQAR: &str = "@pnpm.e2e/foobarqar";
+    let (root, workspace, anchor) = setup_with_own_registry();
+    anchor.set_dist_tag(FOO, "100.0.0", "latest");
+    anchor.set_dist_tag(BAR, "100.0.0", "latest");
+    anchor.set_dist_tag(FOOBARQAR, "1.0.0", "latest");
+    write_manifest(&workspace, &format!(r#"{{ "{FOOBARQAR}": "^1.0.0" }}"#));
+    pacquet(&workspace, ["install", "--lockfile-only"]).assert().success();
+
+    anchor.set_dist_tag(FOO, "100.1.0", "latest");
+    anchor.set_dist_tag(BAR, "100.1.0", "latest");
+    anchor.set_dist_tag(FOOBARQAR, "1.0.1", "latest");
+    write_manifest(&workspace, &format!(r#"{{ "{FOOBARQAR}": "^1.0.1" }}"#));
+    pacquet(&workspace, ["install", "--lockfile-only"]).assert().success();
+
+    let packages = lockfile_package_keys(&workspace);
+    assert!(packages.contains(&format!("{FOOBARQAR}@1.0.1")), "{packages:?}");
+    assert!(packages.contains(&format!("{FOO}@100.0.0")), "{packages:?}");
+    assert!(!packages.contains(&format!("{FOO}@100.1.0")), "{packages:?}");
+
+    drop((root, anchor));
+}
+
+#[test]
+fn update_bumps_package_manager_and_non_downloaded_runtime_in_dev_engines() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    let mut server = mockito::Server::new();
+    let pnpm_tarball = {
+        let mut tar = tar::Builder::new(Vec::new());
+        let pkg_json = br#"{"name":"pnpm","version":"10.5.0","bin":{"pnpm":"bin/pnpm.cjs"}}"#;
+        let mut header = tar::Header::new_gnu();
+        header.set_size(pkg_json.len() as u64);
+        header.set_mode(0o644);
+        tar.append_data(&mut header, "package/package.json", &pkg_json[..])
+            .unwrap();
+        let tar = tar.into_inner().unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut gz, &tar).unwrap();
+        gz.finish().unwrap()
+    };
+    let pnpm_integrity = ssri::IntegrityOpts::new()
+        .algorithm(ssri::Algorithm::Sha512)
+        .chain(&pnpm_tarball)
+        .result()
+        .to_string();
+    let server_url = server.url();
+    let _pnpm_mock = server
+        .mock("GET", "/npm/pnpm")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            serde_json::json!({
+                "name": "pnpm",
+                "dist-tags": { "latest": "11.0.0" },
+                "versions": {
+                    "10.0.0": {
+                        "name": "pnpm",
+                        "version": "10.0.0",
+                        "dist": {
+                            "tarball": format!("{server_url}/npm/pnpm/-/pnpm-10.0.0.tgz"),
+                            "integrity": pnpm_integrity,
+                        },
+                    },
+                    "10.5.0": {
+                        "name": "pnpm",
+                        "version": "10.5.0",
+                        "dist": {
+                            "tarball": format!("{server_url}/npm/pnpm/-/pnpm-10.5.0.tgz"),
+                            "integrity": pnpm_integrity,
+                        },
+                    },
+                    "11.0.0": {
+                        "name": "pnpm",
+                        "version": "11.0.0",
+                        "dist": {
+                            "tarball": format!("{server_url}/npm/pnpm/-/pnpm-11.0.0.tgz"),
+                            "integrity": pnpm_integrity,
+                        },
+                    },
+                },
+            })
+            .to_string(),
+        )
+        .expect_at_least(1)
+        .create();
+    let _exe_mock = server
+        .mock("GET", "/npm/@pnpm%2Fexe")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            serde_json::json!({
+                "name": "@pnpm/exe",
+                "dist-tags": { "latest": "11.0.0" },
+                "versions": {
+                    "10.0.0": {
+                        "name": "@pnpm/exe",
+                        "version": "10.0.0",
+                        "dist": {
+                            "tarball": format!("{server_url}/npm/@pnpm/exe/-/exe-10.0.0.tgz"),
+                            "integrity": pnpm_integrity,
+                        },
+                    },
+                    "10.5.0": {
+                        "name": "@pnpm/exe",
+                        "version": "10.5.0",
+                        "dist": {
+                            "tarball": format!("{server_url}/npm/@pnpm/exe/-/exe-10.5.0.tgz"),
+                            "integrity": pnpm_integrity,
+                        },
+                    },
+                    "11.0.0": {
+                        "name": "@pnpm/exe",
+                        "version": "11.0.0",
+                        "dist": {
+                            "tarball": format!("{server_url}/npm/@pnpm/exe/-/exe-11.0.0.tgz"),
+                            "integrity": pnpm_integrity,
+                        },
+                    },
+                },
+            })
+            .to_string(),
+        )
+        .create();
+    let _node_mock = server
+        .mock("GET", "/node/index.json")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"[{"version":"v24.0.0","lts":false},{"version":"v22.5.0","lts":false},{"version":"v22.0.0","lts":false}]"#,
+        )
+        .expect_at_least(1)
+        .create();
+
+    fs::write(
+        workspace.join("pnpm-workspace.yaml"),
+        format!(
+            "storeDir: ../store\ncacheDir: ../cache\nfetchRetries: 0\nnodeDownloadMirrors:\n  release: '{server_url}/node/'\n",
+        ),
+    )
+    .unwrap();
+    fs::write(workspace.join(".npmrc"), format!("registry={server_url}/npm/\n")).unwrap();
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({
+            "name": "test-update-engines",
+            "version": "1.0.0",
+            "packageManager": "pnpm@10.0.0+sha256.deadbeef",
+            "devEngines": {
+                "packageManager": {
+                    "name": "pnpm",
+                    "version": "^10.0.0",
+                    "onFail": "warn",
+                },
+                "runtime": {
+                    "name": "node",
+                    "version": "^22.0.0",
+                    "onFail": "warn",
+                },
+            },
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let registry_flag = format!("--registry={server_url}/npm/");
+    let auth_file_flag = format!("--npmrc-auth-file={}", workspace.join(".npmrc").display());
+
+    // In-range `pnpm update` bumps within `^10.0.0` and `^22.0.0`, and syncs `packageManager`.
+    pacquet(&workspace, ["update", &registry_flag, &auth_file_flag]).assert().success();
+    let manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(workspace.join("package.json")).unwrap()).unwrap();
+    assert_eq!(manifest["devEngines"]["packageManager"]["version"], "^10.5.0");
+    assert_eq!(manifest["packageManager"], "pnpm@10.5.0");
+    assert_eq!(manifest["devEngines"]["runtime"]["version"], "^22.5.0");
+    let lockfile = fs::read_to_string(workspace.join("pnpm-lock.yaml")).unwrap();
+    assert!(
+        lockfile.contains("packageManagerDependencies:") && lockfile.contains("pnpm@10.5.0:"),
+        "lockfile should record updated pnpm pin in packageManagerDependencies:\n{lockfile}",
+    );
+
+    // `pnpm update --latest` bumps across majors to 11.0.0 and 24.0.0.
+    pacquet(&workspace, ["update", "--latest", &registry_flag, &auth_file_flag]).assert().success();
+    let manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(workspace.join("package.json")).unwrap()).unwrap();
+    assert_eq!(manifest["devEngines"]["packageManager"]["version"], "^11.0.0");
+    assert_eq!(manifest["packageManager"], "pnpm@11.0.0");
+    assert_eq!(manifest["devEngines"]["runtime"]["version"], "^24.0.0");
+    let lockfile = fs::read_to_string(workspace.join("pnpm-lock.yaml")).unwrap();
+    assert!(
+        lockfile.contains("pnpm@11.0.0:"),
+        "lockfile should record latest pnpm pin in packageManagerDependencies:\n{lockfile}",
+    );
+
+    // Explicit `pnpm update pnpm` selector skips pre-command PM enforcement and updates `packageManager`.
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({
+            "name": "test-update-engines",
+            "version": "1.0.0",
+            "packageManager": "pnpm@10.0.0+sha256.deadbeef",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    pacquet(&workspace, ["update", "--latest", "pnpm", &registry_flag, &auth_file_flag])
+        .assert()
+        .success();
+    let manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(workspace.join("package.json")).unwrap()).unwrap();
+    assert_eq!(manifest["packageManager"], "pnpm@11.0.0");
+}
+
+#[test]
+fn update_bumps_cargo_dependencies() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let cache_dir = root.path().join("cache");
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::write(workspace.join("src/lib.rs"), "").unwrap();
+
+    let cargo_index_dir = cache_dir.join("v11/cargo-index/crates-io/3/f");
+    fs::create_dir_all(&cargo_index_dir).unwrap();
+    let cargo_index_entry = ["1.0.0", "1.2.0", "2.0.0"]
+        .iter()
+        .map(|version| {
+            format!(
+                r#"{{"name":"foo","vers":"{version}","deps":[],"cksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","features":{{}},"yanked":false}}"#,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(cargo_index_dir.join("foo"), cargo_index_entry).unwrap();
+
+    fs::write(
+        workspace.join("pnpm-workspace.yaml"),
+        format!(
+            "cargo:\n  enabled: true\nstoreDir: '{}'\ncacheDir: '{}'\n",
+            root.path().join("store").display(),
+            cache_dir.display(),
+        ),
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nfoo = \"^1.0.0\"\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"foo\"]\n\n[[package]]\nname = \"foo\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n",
+    )
+    .unwrap();
+
+    // Default `pnpm update` updates within `^1.0.0` to `^1.2.0` and locks `1.2.0` without creating package.json.
+    pacquet(&workspace, ["update", "--offline", "--lockfile-only"]).assert().success();
+    let cargo_toml = fs::read_to_string(workspace.join("Cargo.toml")).unwrap();
+    assert!(cargo_toml.contains(r#"foo = "^1.2.0""#), "{cargo_toml}");
+    let cargo_lock = fs::read_to_string(workspace.join("Cargo.lock")).unwrap();
+    assert!(cargo_lock.contains("name = \"foo\"\nversion = \"1.2.0\""), "{cargo_lock}");
+    assert!(!workspace.join("package.json").exists());
+
+    // `pnpm update --latest crate:foo` updates across major to `^2.0.0` and locks `2.0.0`.
+    pacquet(&workspace, ["update", "--latest", "crate:foo", "--offline", "--lockfile-only"])
+        .assert()
+        .success();
+    let cargo_toml = fs::read_to_string(workspace.join("Cargo.toml")).unwrap();
+    assert!(cargo_toml.contains(r#"foo = "^2.0.0""#), "{cargo_toml}");
+    let cargo_lock = fs::read_to_string(workspace.join("Cargo.lock")).unwrap();
+    assert!(cargo_lock.contains("name = \"foo\"\nversion = \"2.0.0\""), "{cargo_lock}");
+}
+
+#[test]
+fn recursive_update_bumps_selected_cargo_dependency_across_workspace_members() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let cache_dir = root.path().join("cache");
+    let crate_a = workspace.join("crates/a");
+    let crate_b = workspace.join("crates/b");
+    fs::create_dir_all(crate_a.join("src")).unwrap();
+    fs::create_dir_all(crate_b.join("src")).unwrap();
+    fs::write(crate_a.join("src/lib.rs"), "").unwrap();
+    fs::write(crate_b.join("src/lib.rs"), "").unwrap();
+
+    for (prefix, name) in [("3/f", "foo"), ("3/b", "bar")] {
+        let index_dir = cache_dir.join(format!("v11/cargo-index/crates-io/{prefix}"));
+        fs::create_dir_all(&index_dir).unwrap();
+        let entry = ["1.0.0", "1.2.0"]
+            .iter()
+            .map(|ver| {
+                format!(
+                    r#"{{"name":"{name}","vers":"{ver}","deps":[],"cksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","features":{{}},"yanked":false}}"#,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(index_dir.join(name), entry).unwrap();
+    }
+
+    fs::write(
+        workspace.join("pnpm-workspace.yaml"),
+        format!(
+            "packages:\n  - crates/*\ncargo:\n  enabled: true\nstoreDir: '{}'\ncacheDir: '{}'\n",
+            root.path().join("store").display(),
+            cache_dir.display(),
+        ),
+    )
+    .unwrap();
+    fs::write(workspace.join("package.json"), r#"{"name":"root","private":true}"#).unwrap();
+    fs::write(crate_a.join("package.json"), r#"{"name":"crate-a","version":"0.1.0"}"#).unwrap();
+    fs::write(crate_b.join("package.json"), r#"{"name":"crate-b","version":"0.1.0"}"#).unwrap();
+    fs::write(
+        crate_a.join("Cargo.toml"),
+        "[package]\nname = \"crate-a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nfoo = \"^1.0.0\"\nbar = \"^1.0.0\"\n",
+    )
+    .unwrap();
+    fs::write(
+        crate_a.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"bar\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n\n[[package]]\nname = \"crate-a\"\nversion = \"0.1.0\"\ndependencies = [\"bar\", \"foo\"]\n\n[[package]]\nname = \"foo\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n",
+    )
+    .unwrap();
+    fs::write(
+        crate_b.join("Cargo.toml"),
+        "[package]\nname = \"crate-b\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nbar = \"^1.0.0\"\n",
+    )
+    .unwrap();
+    fs::write(
+        crate_b.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"bar\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n\n[[package]]\nname = \"crate-b\"\nversion = \"0.1.0\"\ndependencies = [\"bar\"]\n",
+    )
+    .unwrap();
+
+    pacquet(&workspace, ["-r", "update", "crate:foo", "--offline", "--lockfile-only"])
+        .assert()
+        .success();
+
+    let cargo_a = fs::read_to_string(crate_a.join("Cargo.toml")).unwrap();
+    assert!(cargo_a.contains(r#"foo = "^1.2.0""#), "{cargo_a}");
+    assert!(cargo_a.contains(r#"bar = "^1.0.0""#), "{cargo_a}");
+    let cargo_b = fs::read_to_string(crate_b.join("Cargo.toml")).unwrap();
+    assert!(cargo_b.contains(r#"bar = "^1.0.0""#), "{cargo_b}");
+}

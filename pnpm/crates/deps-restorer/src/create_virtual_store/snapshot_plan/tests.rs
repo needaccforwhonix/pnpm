@@ -159,6 +159,7 @@ impl PlanFixture {
             Some(&packages),
             None,
             None,
+            &crate::platform_selection::VariantPlatforms::host(),
         );
         PlanFixture { snapshots, packages, layout }
     }
@@ -211,6 +212,7 @@ impl PlanFixture {
             .collect();
         plan_snapshots::<SilentReporter>(SnapshotPlanInputs {
             policy: crate::create_virtual_store::snapshot_plan::SnapshotReusePolicy {
+                supported_architectures: None,
                 skipped: &SkippedSnapshots::default(),
                 link_dependencies: true,
                 force,
@@ -267,6 +269,29 @@ fn gvs_partial_slot_without_completion_marker_survives() {
         1,
         "a slot directory without its completion marker is a partial import and must be repaired",
     );
+    assert_eq!(
+        fixture.plan_with_matching_current(false).survivors.len(),
+        1,
+        "this project's current lockfile cannot vouch for a shared slot another install re-created",
+    );
+}
+
+#[test]
+fn current_lockfile_vouches_for_a_project_local_slot() {
+    let temp_dir = tempfile::tempdir().expect("create temp directory");
+    let gvs_fixture = PlanFixture::gvs(temp_dir.path(), registry_metadata());
+    let fixture = PlanFixture {
+        layout: VirtualStoreLayout::legacy(temp_dir.path().join("virtual-store"), 120),
+        ..gvs_fixture
+    };
+    fs::create_dir_all(fixture.slot_package_dir()).expect("materialize the slot's package dir");
+
+    let plan = fixture.plan_with_matching_current(false);
+
+    assert!(
+        plan.survivors.is_empty(),
+        "only this project writes its local slots, so its completed install's record vouches for them",
+    );
 }
 
 #[test]
@@ -297,6 +322,7 @@ fn gvs_slot_missing_a_regular_child_link_survives() {
         Some(&packages),
         None,
         None,
+        &crate::platform_selection::VariantPlatforms::host(),
     );
     let fixture = PlanFixture { snapshots, packages, layout };
     let parent_dir = fixture.layout
@@ -314,6 +340,16 @@ fn gvs_slot_missing_a_regular_child_link_survives() {
     assert!(
         survivor_keys.contains("foo@1.0.0"),
         "a marker-complete slot missing a child link is a partial import and must be repaired",
+    );
+    let survivor_keys: HashSet<String> = fixture
+        .plan_with_matching_current(false)
+        .survivors
+        .iter()
+        .map(|(key, _, _)| key.to_string())
+        .collect();
+    assert!(
+        survivor_keys.contains("foo@1.0.0"),
+        "this project's current lockfile cannot vouch for the links of a shared slot",
     );
 
     let child_link = parent_dir

@@ -1,8 +1,9 @@
 use super::{
-    super::{Decision, current_pnpmfiles, settings::current_settings},
-    check, isolated_included, setup_fresh_install, write_state_with_pnpmfiles,
+    super::{Decision, current_pnpmfiles},
+    backdate_validated_files, check, isolated_included, setup_fresh_install,
+    write_state_with_pnpmfiles,
 };
-use pnpm_testing_utils::fs::backdate_existing_files;
+use crate::install_state::settings::current_settings;
 use pnpm_workspace_state::ProjectEntry;
 use std::{collections::BTreeMap, fs};
 
@@ -17,11 +18,15 @@ fn returns_skipped_when_a_pnpmfile_is_modified() {
         dir.path()
             .to_string_lossy()
             .into_owned(),
-        ProjectEntry { name: Some("root".into()), version: Some("1.0.0".into()) },
+        ProjectEntry {
+            name: Some("root".into()),
+            version: Some("1.0.0".into()),
+            has_modules_dir: false,
+        },
     );
     write_state_with_pnpmfiles(
         dir.path(),
-        backdate_existing_files(dir.path()),
+        backdate_validated_files(dir.path()),
         current_settings(config, pnpm_config::NodeLinker::Isolated, isolated_included(), None),
         projects,
         current_pnpmfiles(dir.path(), config),

@@ -1,8 +1,9 @@
 use super::{
     BenchId, PNPR_SERVER_REGISTRY_ENV, PNPR_TARBALL_REWRITE_FROM_ENV, PnprServer, PnprServerPaths,
-    RevisionMockRegistry, WorkEnv, append_pnpr_auth_to_npmrc, cold_mock_config_yaml,
-    distinct_public_route_registries, mint_pnpr_token, seed_pnpr_auth, wait_for_pnpr_ready,
-    write_pnpr_benchmark_config,
+    RevisionMockRegistry, WorkEnv, append_pnpr_auth_to_npmrc, cold_revision_mock_command,
+    distinct_public_route_registries, mint_pnpr_token,
+    mock_home::{COLD_ORIGIN, REVISION_MOCK, revision_mock_home},
+    seed_pnpr_auth, serves_npm_under_base_path, wait_for_pnpr_ready, write_pnpr_benchmark_config,
 };
 use crate::{
     cli_args::{BenchmarkScenario, RegistryMode, TargetKind},
@@ -71,18 +72,9 @@ impl WorkEnv {
         let stderr = File::create(bench_dir.join("revision-mock.stderr.log"))
             .expect("create revision mock stderr log");
 
-        // The mock advertises its tarball URLs at the client-facing proxy
-        // URL (`registry.url`), not its own loopback port, so downloads cross
-        // the emulated registry link instead of bypassing it.
         let cold = self.options.selection.scenario.is_some_and(BenchmarkScenario::cold_pnpr_cache);
-        let mut command = if cold {
-            self.cold_revision_mock_command(revision, &binary, &bench_dir, mock_port, &registry.url)
-        } else {
-            eprintln!(
-                "Serving {revision}'s tarballs from a mock built from pnpr@{revision} on 127.0.0.1:{mock_port}...",
-            );
-            pnpm_registry_mock::pnpr_command_with_binary(&binary, mock_port, Some(&registry.url))
-        };
+        let (mut command, origin) =
+            self.revision_mock_command(revision, &binary, &bench_dir, mock_port, &registry.origin);
         self.apply_serve_timing(&mut command);
         let process = command
             .stdin(Stdio::null())
@@ -91,42 +83,97 @@ impl WorkEnv {
             .spawn()
             .expect(if cold { "spawn cold revision mock" } else { "spawn revision mock" });
 
-        let mut server = PnprServer { process, latency_proxy: None };
+        let mut server = PnprServer { process, latency_proxy: None, origin };
         wait_for_pnpr_ready(mock_port);
+        self.follow_revision_npm_base_path(revision, &registry.origin, mock_port);
+        if !cold {
+            self.publish_scenario_packages(mock_port);
+        }
         server.latency_proxy =
             Some(self.front_revision_mock(revision, registry.listener, mock_port));
         server
     }
-    /// Use isolated storage, wiped between iterations, with the warm mock as origin.
-    fn cold_revision_mock_command(
+    fn revision_mock_command(
         &self,
         revision: &str,
         binary: &Path,
         bench_dir: &Path,
         mock_port: u16,
         public_url: &str,
-    ) -> Command {
-        let cold_storage = bench_dir.join("cold-mock-storage");
-        let config_path = bench_dir.join("cold-mock-config.yaml");
-        fs::write(&config_path, cold_mock_config_yaml(&cold_storage, &self.registry.client))
-            .expect("write cold mock config");
-        eprintln!(
-            "Serving {revision}'s tarballs from a COLD mock built from pnpr@{revision} on 127.0.0.1:{mock_port} (origin {})...",
-            self.registry.client,
+    ) -> (Command, Option<Box<PnprServer>>) {
+        if self.options.selection.scenario.is_some_and(BenchmarkScenario::cold_pnpr_cache) {
+            let (origin_url, origin) = self.start_cold_revision_mock_origin(binary, bench_dir);
+            let cmd = cold_revision_mock_command(
+                revision,
+                binary,
+                bench_dir,
+                mock_port,
+                public_url,
+                &origin_url,
+            );
+            (cmd, Some(Box::new(origin)))
+        } else {
+            eprintln!(
+                "Serving {revision}'s tarballs from a mock built from pnpr@{revision} on 127.0.0.1:{mock_port}...",
+            );
+            let home = revision_mock_home(bench_dir, REVISION_MOCK);
+            self.allow_scenario_publisher();
+            let command = pnpm_registry_mock::pnpr_command_with_home(
+                binary,
+                mock_port,
+                Some(public_url),
+                Some(home.as_path()),
+            );
+            (command, None)
+        }
+    }
+    /// Spawn a warm origin from the same revision's `pnpr` binary over the
+    /// shared runtime storage, fronted by the client↔registry latency and
+    /// bandwidth profile so the cold mock fetches packuments and tarballs from
+    /// an origin that speaks its own revision's URL format.
+    fn start_cold_revision_mock_origin(
+        &self,
+        binary: &Path,
+        bench_dir: &Path,
+    ) -> (String, PnprServer) {
+        let origin_port = pick_unused_port().expect("pick a port for the cold mock warm origin");
+        let rate_limit = mbps_to_bytes_per_sec(self.options.network.registry_bandwidth_mbps);
+        let latency_proxy = (self.options.network.registry_latency_ms > 0 || rate_limit.is_some())
+            .then(|| {
+                let upstream = SocketAddr::from((Ipv4Addr::LOCALHOST, origin_port));
+                let profile = LinkProfile {
+                    one_way: Duration::from_millis(self.options.network.registry_latency_ms) / 2,
+                    rate_limit,
+                    slow_start: self.options.network.registry_slow_start,
+                };
+                LatencyProxy::spawn(upstream, profile)
+                    .expect("spawn cold mock warm origin latency proxy")
+            });
+        let public_origin = latency_proxy
+            .as_ref()
+            .map(|proxy| format!("http://{}", proxy.addr));
+        let mut command = pnpm_registry_mock::pnpr_command_with_home(
+            binary,
+            origin_port,
+            public_origin.as_deref(),
+            Some(revision_mock_home(bench_dir, COLD_ORIGIN).as_path()),
         );
-        let mut command = Command::new(binary);
-        command
-            .arg("--config")
-            .arg(&config_path)
-            .arg("--storage")
-            .arg(&cold_storage)
-            .arg("--listen")
-            .arg(format!("127.0.0.1:{mock_port}"))
-            .arg("--public-url")
-            .arg(public_url)
-            .arg("--packument-ttl-secs")
-            .arg("31536000");
-        command
+        self.apply_serve_timing(&mut command);
+        let process = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn cold mock warm origin");
+        let origin = PnprServer { process, latency_proxy, origin: None };
+        wait_for_pnpr_ready(origin_port);
+        let base = public_origin.unwrap_or_else(|| format!("http://127.0.0.1:{origin_port}"));
+        let origin_url = if serves_npm_under_base_path(origin_port) {
+            pnpm_registry_mock::npm_registry_url(&base)
+        } else {
+            format!("{base}/")
+        };
+        (origin_url, origin)
     }
     /// Start a pnpr resolver server for every `pnpr@<rev>`
     /// target and write the `.pnpr-env` its `install.bash` sources. Each
@@ -140,9 +187,7 @@ impl WorkEnv {
             .collect()
     }
     /// Front the mock with the same latency + bandwidth profile the shared
-    /// registry proxy uses, serving the socket reserved at planning time
-    /// (and baked into this revision's `.npmrc`) so the port can't have
-    /// been stolen during the build.
+    /// registry proxy uses.
     fn front_revision_mock(
         &self,
         revision: &str,
@@ -204,6 +249,7 @@ impl WorkEnv {
                 port,
             }),
             latency_proxy: None,
+            origin: None,
         };
 
         wait_for_pnpr_ready(port);
@@ -215,11 +261,6 @@ impl WorkEnv {
         // single login bcrypt stays out of the measured install loop.
         let pnpr_token = mint_pnpr_token(port);
 
-        // With `--pnpr-latency-ms`, the client reaches the server through
-        // a latency-injecting proxy instead of directly, so the benchmark
-        // measures pnpr as the remote service it is in production. The
-        // proxy guard rides along in `PnprServer` so it's torn down with
-        // the server.
         let client_url = self.pnpr_client_url(id, port, &mut server);
 
         self.write_pnpr_client_env(&bench_dir, &client_url, &pnpr_token, pnpr_server_registry);
@@ -269,7 +310,7 @@ impl WorkEnv {
             // sends, caching packuments in its own store. A long TTL keeps
             // those cached packuments authoritative across the run, the
             // same value the registry-mock pins for the same reason.
-            .arg("--packument-ttl-secs")
+            .arg("--packument-ttl")
             .arg("31536000");
         self.apply_serve_timing(&mut command);
         command
@@ -357,6 +398,28 @@ impl WorkEnv {
         );
         Some(proxy)
     }
+    /// The npm registry URL behind a latency proxy fronting the local registry.
+    pub(super) fn proxied_registry_url(&self, proxy: &LatencyProxy) -> String {
+        self.options.network.registry.local_registry_url(&format!("http://{}", proxy.addr))
+    }
+    /// `init()` pointed this revision's targets at the npm base path before its
+    /// mock existed. A revision from before pnpr always served npm under that
+    /// path serves it at the root.
+    fn follow_revision_npm_base_path(&self, revision: &str, origin: &str, mock_port: u16) {
+        if !serves_npm_under_base_path(mock_port) {
+            self.write_revision_registry_config(revision, &format!("{origin}/"));
+        }
+    }
+    /// Point every target of `revision` at `registry`.
+    fn write_revision_registry_config(&self, revision: &str, registry: &str) {
+        for id in self
+            .benchmarked_ids()
+            .filter(|id| id.revision() == Some(revision))
+        {
+            eprintln!("Pointing {id} at {registry}...");
+            self.write_registry_config(&self.bench_dir(id), registry);
+        }
+    }
     /// The registry a given bench id resolves against from the client's
     /// point of view. Direct targets use this for every registry request;
     /// pnpr targets keep it as the materialization registry while their
@@ -366,11 +429,7 @@ impl WorkEnv {
     ///
     /// When a revision has its own tarball-serving mock (see
     /// [`Self::plan_revision_mocks`]), its `pacquet@<rev>` and `pnpr@<rev>`
-    /// targets fetch from that mock instead of the shared one. In the cold-pnpr
-    /// scenario both arms therefore exercise the cold mock's serve path — the
-    /// direct arm hitting it as a cold pnpr *registry*, the pnpr arm through its
-    /// accelerator — and the frozen lockfile keeps that about tarball serving
-    /// rather than (noisy) cold resolution.
+    /// targets fetch from that mock instead of the shared one.
     pub(super) fn registry_for<'a>(
         &'a self,
         id: BenchId,
@@ -396,10 +455,7 @@ impl WorkEnv {
     /// revision and serves every arm, so a serve-path delta there cancels out;
     /// giving each revision a mock built from its own `pnpr` exposes the delta.
     ///
-    /// Binds the client-facing latency-proxy socket now — reserving the port
-    /// for the whole init + build window before `init()` bakes its URL into
-    /// `.npmrc` — and hands the live socket to the proxy when `benchmark()`
-    /// spawns it. Empty for non-Verdaccio modes, which front no local mock.
+    /// Empty for non-Verdaccio modes, which front no local mock.
     pub(super) fn plan_revision_mocks(&self) -> HashMap<String, RevisionMockRegistry> {
         let mut mocks = HashMap::new();
         if !matches!(self.options.network.registry, RegistryMode::Verdaccio) {
@@ -418,10 +474,9 @@ impl WorkEnv {
                         .local_addr()
                         .expect("revision mock proxy local addr")
                         .port();
-                    RevisionMockRegistry {
-                        listener,
-                        url: format!("http://127.0.0.1:{listen_port}/"),
-                    }
+                    let origin = format!("http://127.0.0.1:{listen_port}");
+                    let url = pnpm_registry_mock::npm_registry_url(&origin);
+                    RevisionMockRegistry { listener, origin, url }
                 });
         }
         mocks

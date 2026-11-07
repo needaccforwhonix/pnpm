@@ -1,6 +1,7 @@
 use super::{
-    AncestorIds, Arc, BTreeMap, DependenciesTreeNode, HashMap, HashSet, NodeId, PeerDep,
-    PkgNameVerPeer, TreeCtx, UpdateReuseScope, lock_recoverable,
+    AncestorPkgIds, Arc, BTreeMap, DependenciesTreeNode, HashMap, HashSet, NodeId,
+    ParentPkgAliases, PeerDep, PkgNameVerPeer, TreeChildren, TreeCtx, UpdateReuseScope,
+    lock_recoverable,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8,7 +9,7 @@ pub(in super::super) struct ChildrenOwner {
     pub(super) update_active: bool,
     pub(super) depth: i32,
     pub(in super::super) importer_order: usize,
-    pub(super) parent_path: Vec<String>,
+    pub(super) parent_path: AncestorPkgIds,
     pub(in super::super) importer_id: String,
 }
 
@@ -35,7 +36,7 @@ pub(super) struct ChildrenOwnerEntry {
     /// arrival-ordered. The deterministic children owner decides here
     /// instead, so the same graph always yields the same lockfile.
     ///
-    /// [`peer_shadowed_dependencies`]: crate::parent_pkg_aliases::peer_shadowed_dependencies
+    /// [`peer_shadowed_dependencies`]: crate::peer_provider::peer_shadowed_dependencies
     pub(in super::super) peer_shadowed: Arc<HashSet<String>>,
 }
 
@@ -58,11 +59,19 @@ pub(in super::super) struct RecordedChildrenContext {
     /// the walk drops from its children.
     pub(in super::super) peer_shadowed: Arc<HashSet<String>>,
     /// The prior-lockfile key whose snapshot pinned the children, if the
-    /// walk reused one.
+    /// walk reused one. `None` under an update that unpins every edge,
+    /// where the key pins nothing and an occurrence reached without one
+    /// produces the same children.
     pub(in super::super) prior_key: Option<PkgNameVerPeer>,
+    /// Whether the children were recorded from the prior lockfile's
+    /// snapshot (`true`) rather than resolved from the package's manifest.
+    pub(in super::super) reused: bool,
     /// Whether the resolving importer had an active update policy, which
     /// re-resolves what a keep-all importer reuses.
     pub(in super::super) update_active: bool,
+    /// The scope the children resolved in. It decides which of each
+    /// descendant's dependencies that descendant's own peers shadow.
+    pub(in super::super) children_scope: Arc<ParentPkgAliases>,
 }
 
 impl RecordedChildrenContext {
@@ -71,28 +80,13 @@ impl RecordedChildrenContext {
     /// avoid, and which leaves the occurrences that realized the
     /// pinned subtree pointing at children the record no longer holds.
     ///
-    /// An update policy is the one thing that re-resolves a pin on
-    /// purpose, so a walk under one is never held to the pins.
+    /// An update policy re-resolves a pin on purpose, so a walk under one
+    /// is never held to the pins.
     pub(in super::super) fn pins_children_over(&self, other: &Self) -> bool {
         self.peer_shadowed == other.peer_shadowed
             && self.prior_key.is_some()
             && other.prior_key.is_none()
             && !other.update_active
-    }
-
-    /// Two contexts produce the same children.
-    ///
-    /// The preferred-versions overlay is deliberately not part of the
-    /// test. `children_by_id` records one child list per package id,
-    /// and every occurrence that does not own the children already
-    /// expands from it whatever its own overlay says — the overlay
-    /// only ever decides which occurrence's versions get *recorded*.
-    /// Requiring identical overlays here would mean requiring identical
-    /// parents, which the occurrences that race never have.
-    pub(in super::super) fn produces_same_children_as(&self, other: &Self) -> bool {
-        self.peer_shadowed == other.peer_shadowed
-            && self.prior_key == other.prior_key
-            && self.update_active == other.update_active
     }
 }
 
@@ -103,20 +97,6 @@ pub(in super::super) struct ChildrenOwnerClaim {
     /// occurrence's when it won the claim, the standing owner's when it
     /// lost. See [`ChildrenOwnerEntry::peer_shadowed`].
     pub(in super::super) peer_shadowed: Arc<HashSet<String>>,
-    /// A winning claim displaced an owner whose shadowed-dependency set
-    /// equals this occurrence's, so the other occurrences' realized
-    /// children — including a subtree reused from the prior lockfile —
-    /// stay valid *as far as the claim can tell*, and the winner skips
-    /// the lazy-flip (and the engine-invalidating rewrite signal) it
-    /// would otherwise broadcast. The walk it then runs can still land
-    /// on different edges, which
-    /// [`ChildrenRecording::PublishedOverStale`] reports instead.
-    ///
-    /// This is a narrower question than whether the *recorded* children
-    /// can be reused instead of walked; that one is
-    /// [`fn@recorded_children_match`], which compares the full
-    /// resolution context.
-    pub(in super::super) children_context_unchanged: bool,
 }
 
 /// `peer_shadowed` is this occurrence's own set; it is installed as the
@@ -124,46 +104,54 @@ pub(in super::super) struct ChildrenOwnerClaim {
 /// losing occurrences of a concurrent claim all read back the winner's.
 pub(in super::super) fn claim_children_owner(
     ctx: &TreeCtx,
-    pkg_id: &str,
+    pkg_id: &Arc<str>,
     depth: i32,
-    ancestor_ids: &[String],
+    ancestor_ids: &AncestorPkgIds,
     peer_shadowed: HashSet<String>,
 ) -> ChildrenOwnerClaim {
     let owner = ChildrenOwner {
         update_active: !matches!(ctx.update_reuse_scope(), UpdateReuseScope::All),
         depth,
         importer_order: ctx.importer.order,
-        parent_path: ancestor_ids.to_vec(),
+        parent_path: Arc::clone(ancestor_ids),
         importer_id: ctx.importer.id.clone(),
     };
-    let (owns_children, peer_shadowed, children_context_unchanged) = {
+    let (owns_children, peer_shadowed) = {
         let mut owners = lock_recoverable(&ctx.workspace.children.owner_by_id);
         match owners.get(pkg_id) {
             Some(existing) if !owner.wins_over(&existing.owner) => {
-                (false, Arc::clone(&existing.peer_shadowed), false)
+                (false, Arc::clone(&existing.peer_shadowed))
             }
-            existing => {
-                let children_context_unchanged =
-                    existing.is_some_and(|entry| *entry.peer_shadowed == peer_shadowed);
+            _ => {
                 let peer_shadowed = Arc::new(peer_shadowed);
                 owners.insert(
-                    Arc::from(pkg_id),
+                    Arc::clone(pkg_id),
                     ChildrenOwnerEntry {
                         owner: owner.clone(),
                         peer_shadowed: Arc::clone(&peer_shadowed),
                     },
                 );
-                (true, peer_shadowed, children_context_unchanged)
+                (true, peer_shadowed)
             }
         }
     };
     if owns_children {
-        let mut first_importer = lock_recoverable(&ctx.workspace.children.first_importer_by_pkg);
-        if first_importer.map().get(pkg_id) != Some(&owner.importer_id) {
-            first_importer.map_mut().insert(pkg_id.to_string(), owner.importer_id.clone());
-        }
+        record_first_importer(ctx, pkg_id, &owner);
     }
-    ChildrenOwnerClaim { owner, owns_children, peer_shadowed, children_context_unchanged }
+    ChildrenOwnerClaim { owner, owns_children, peer_shadowed }
+}
+
+pub(super) fn record_first_importer(ctx: &TreeCtx, pkg_id: &str, owner: &ChildrenOwner) {
+    let mut first_importer = lock_recoverable(&ctx.workspace.children.first_importer_by_pkg);
+    if first_importer.map().get(pkg_id) != Some(&owner.importer_id) {
+        first_importer.map_mut().insert(pkg_id.to_string(), owner.importer_id.clone());
+    }
+}
+
+/// Whether a warm-up already took this package's children. See
+/// [`claim_children_warmup`].
+pub(in super::super) fn children_warmup_claimed(ctx: &TreeCtx, pkg_id: &str) -> bool {
+    lock_recoverable(&ctx.workspace.children.warmed_by_id).contains(pkg_id)
 }
 
 /// Whether this occurrence is the first to offer to warm its package's
@@ -175,24 +163,6 @@ pub(in super::super) fn claim_children_warmup(ctx: &TreeCtx, pkg_id: &str) -> bo
     // turned away, so the owned key is built only for the one that
     // takes the warmup.
     !warmed.contains(pkg_id) && warmed.insert(Arc::from(pkg_id.to_string()))
-}
-
-/// Whether this package's recorded children were resolved under
-/// `context`, and can therefore be expanded from instead of walked
-/// again. The walk that recorded them need not be the one owning the
-/// children now, which is why the comparison is against the recorded
-/// context rather than against the standing claim.
-pub(in super::super) fn recorded_children_match(
-    ctx: &TreeCtx,
-    pkg_id: &str,
-    context: &RecordedChildrenContext,
-) -> bool {
-    lock_recoverable(&ctx.workspace.children.by_id)
-        .get(pkg_id)
-        .is_some_and(|recorded| {
-            recorded.context.produces_same_children_as(context)
-                || recorded.context.pins_children_over(context)
-        })
 }
 
 /// What [`fn@record_children`] did with a walk's child edges.
@@ -211,34 +181,14 @@ pub(in super::super) enum ChildrenRecording {
 }
 
 impl ChildrenRecording {
-    /// The children to hang on the recording walk's own node, plus
-    /// whether the recording staled the children the package's other
-    /// occurrence nodes realized — the flag that gates
-    /// [`fn@make_non_owner_nodes_lazy`].
-    pub(in super::super) fn into_children(
-        self,
-        realized: BTreeMap<String, NodeId>,
-        parent_ids: &Arc<Vec<String>>,
-    ) -> (crate::resolved_tree::TreeChildren, bool) {
+    /// The children to hang on the recording walk's own node.
+    pub(in super::super) fn children(self, realized: BTreeMap<String, NodeId>) -> TreeChildren {
         match self {
-            ChildrenRecording::Declined => (lazy_children(parent_ids), false),
-            ChildrenRecording::Published => {
-                (crate::resolved_tree::TreeChildren::Realized(std::sync::Arc::new(realized)), false)
-            }
-            ChildrenRecording::PublishedOverStale => {
-                (crate::resolved_tree::TreeChildren::Realized(std::sync::Arc::new(realized)), true)
+            ChildrenRecording::Declined => TreeChildren::Lazy,
+            ChildrenRecording::Published | ChildrenRecording::PublishedOverStale => {
+                TreeChildren::Realized(Arc::new(realized))
             }
         }
-    }
-}
-
-/// Children a node expands from the standing owner's recording, under
-/// its own `parent_ids` cycle break.
-pub(in super::super) fn lazy_children(
-    parent_ids: &Arc<Vec<String>>,
-) -> crate::resolved_tree::TreeChildren {
-    crate::resolved_tree::TreeChildren::Lazy {
-        parent_ids: AncestorIds::from(Arc::clone(parent_ids)),
     }
 }
 
@@ -251,7 +201,7 @@ pub(in super::super) fn lazy_children(
 /// older walk finishing afterwards would otherwise overwrite them.
 pub(in super::super) fn record_children(
     ctx: &TreeCtx,
-    pkg_id: &str,
+    pkg_id: &Arc<str>,
     owner: &ChildrenOwner,
     edges: Vec<crate::resolved_tree::ChildEdge>,
     context: RecordedChildrenContext,
@@ -269,17 +219,13 @@ pub(in super::super) fn record_children(
             // Nothing recorded yet, so no occurrence node can hold
             // realized children of this package to stale.
             None => ChildrenRecording::Published,
-            // A recording the prior lockfile pinned outlives a fresh
-            // walk's answer, so this walk publishes nothing and reads
-            // the pinned children like every occurrence that reused the
-            // subtree. Publishing over them would re-resolve the open
-            // ranges reuse exists to hold still, and would leave those
-            // occurrences realizing children the record no longer
-            // holds. This comes before the equal-edge arm because
-            // republishing even the same edges would carry this walk's
-            // unpinned context onto the record, leaving the next fresh
-            // walk to land on different edges nothing to hold it back.
-            Some(recorded) if recorded.context.pins_children_over(&context) => {
+            // A fresh walk that resolved against a prior key outlives a
+            // later fresh walk without one unless the new walk was sent
+            // through by `recorded_children_match` because a descendant's
+            // peer-shadowed dependency split changed.
+            Some(recorded)
+                if !recorded.context.reused && recorded.context.pins_children_over(&context) =>
+            {
                 return ChildrenRecording::Declined;
             }
             Some(recorded) if *recorded.edges == edges => ChildrenRecording::Published,
@@ -294,7 +240,7 @@ pub(in super::super) fn record_children(
                 &edges,
             );
         }
-        children.insert(Arc::from(pkg_id.to_string()), RecordedChildren { edges, context });
+        children.insert(Arc::clone(pkg_id), RecordedChildren { edges, context });
         recording
     };
     ctx.workspace.tree.record_children_by_id_write(pkg_id);
@@ -308,7 +254,7 @@ pub(in super::super) fn record_children(
 /// from the record no longer lists `pkg_id` as a parent.
 pub(super) fn update_parent_index(
     parents_by_id: &mut HashMap<Arc<str>, HashSet<Arc<str>>>,
-    pkg_id: &str,
+    pkg_id: &Arc<str>,
     previous: Option<&[crate::resolved_tree::ChildEdge]>,
     next: &[crate::resolved_tree::ChildEdge],
 ) {
@@ -334,7 +280,7 @@ pub(super) fn update_parent_index(
         parents_by_id
             .entry(Arc::clone(&edge.pkg_id))
             .or_default()
-            .insert(Arc::from(pkg_id));
+            .insert(Arc::clone(pkg_id));
     }
 }
 
@@ -352,6 +298,22 @@ pub(in super::super) fn register_peer_dep_names(
     }
 }
 
+pub(in super::super) fn register_shadowable_dep_names<'name>(
+    ctx: &TreeCtx,
+    names: impl IntoIterator<Item = &'name String>,
+) {
+    let mut names = names.into_iter().peekable();
+    if names.peek().is_none() {
+        return;
+    }
+    let mut shadowable = lock_recoverable(&ctx.workspace.children.shadowable_dep_names);
+    for name in names {
+        if !shadowable.contains(name) {
+            shadowable.insert(name.clone());
+        }
+    }
+}
+
 pub(in super::super) fn is_current_children_owner(
     ctx: &TreeCtx,
     pkg_id: &str,
@@ -362,22 +324,14 @@ pub(in super::super) fn is_current_children_owner(
         .is_some_and(|current| current.owner == *owner)
 }
 
-pub(in super::super) fn remember_node_parent_ids(
-    ctx: &TreeCtx,
-    node_id: &NodeId,
-    parent_ids: Arc<Vec<String>>,
-) {
-    lock_recoverable(&ctx.workspace.tree.node_parent_ids_by_id).insert(node_id.clone(), parent_ids);
-}
-
 /// Record an occurrence node in the shared tree (lowering the depth of
 /// a revisited leaf) and, on first insertion, in the per-package
 /// reverse index [`fn@make_non_owner_nodes_lazy`] flips through.
 pub(in super::super) fn insert_tree_node(
     ctx: &TreeCtx,
     node_id: NodeId,
-    pkg_id: &str,
-    children: crate::resolved_tree::TreeChildren,
+    pkg_id: &Arc<str>,
+    children: TreeChildren,
     depth: i32,
 ) {
     let mut written = true;
@@ -391,12 +345,7 @@ pub(in super::super) fn insert_tree_node(
                 false
             }
             std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(DependenciesTreeNode::new(
-                    Arc::from(pkg_id.to_string()),
-                    children,
-                    depth,
-                    true,
-                ));
+                entry.insert(DependenciesTreeNode::new(Arc::clone(pkg_id), children, depth));
                 true
             }
         };
@@ -405,7 +354,7 @@ pub(in super::super) fn insert_tree_node(
     }
     if inserted {
         lock_recoverable(&ctx.workspace.tree.nodes_by_pkg_id)
-            .entry(Arc::from(pkg_id.to_string()))
+            .entry(Arc::clone(pkg_id))
             .or_default()
             .push(node_id);
     }
@@ -420,32 +369,20 @@ pub(in super::super) fn make_non_owner_nodes_lazy(
         Some(nodes) => nodes.clone(),
         None => return,
     };
-    // Collect the parent chains first so the two locks are never held
-    // together.
-    let parent_ids_by_node: Vec<(NodeId, Arc<Vec<String>>)> = {
-        let parent_ids = lock_recoverable(&ctx.workspace.tree.node_parent_ids_by_id);
-        pkg_nodes
-            .into_iter()
-            .filter(|node_id| node_id != owner_node_id)
-            .filter_map(|node_id| {
-                let ids = Arc::clone(parent_ids.get(&node_id)?);
-                Some((node_id, ids))
-            })
-            .collect()
-    };
     let mut tree = lock_recoverable(&ctx.workspace.tree.dependencies_tree);
     let mut rewritten = Vec::new();
-    for (node_id, parent_ids) in parent_ids_by_node {
+    for node_id in pkg_nodes {
+        if &node_id == owner_node_id {
+            continue;
+        }
         // An occurrence already reading the owner's children needs no
         // rewrite — and must not report one, since the signal makes the
         // discovery engine rebuild from scratch. In a peer-heavy graph
         // most occurrences of a package are already lazy.
         if let Some(node) = tree.get_mut(&node_id)
-            && !matches!(node.children, crate::resolved_tree::TreeChildren::Lazy { .. })
+            && !matches!(node.children, TreeChildren::Lazy)
         {
-            node.children = crate::resolved_tree::TreeChildren::Lazy {
-                parent_ids: AncestorIds::from(parent_ids),
-            };
+            node.children = TreeChildren::Lazy;
             rewritten.push(node_id);
         }
     }

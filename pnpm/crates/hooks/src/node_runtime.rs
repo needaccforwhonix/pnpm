@@ -2,27 +2,18 @@ use crate::{HookError, worker::NodeWorker};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::{path::PathBuf, sync::Arc};
-use tokio::{
-    io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader},
-    process::Command,
-    sync::OnceCell,
-    time::{Duration, timeout},
-};
+use tokio::sync::OnceCell;
 
-/// Runs `.pnpmfile.{cjs,mjs}` hooks via Node.js.
+/// Runs `.pnpmfile.{cjs,js,mjs}` hooks via Node.js.
 ///
-/// `readPackage`, `afterAllResolved`, and `filterLog` are served by a
-/// long-lived [`NodeWorker`] (spawned lazily, once per pnpmfile) so the
-/// per-package `readPackage` calls on the resolution hot path don't each pay a
-/// `node` startup. `preResolution` keeps a one-shot `node -e` invocation: it
-/// runs once per install and needs an `info`/`warn` logger rather than the
-/// worker's `context.log`.
+/// Every hook is served by a long-lived [`NodeWorker`] (spawned lazily, once
+/// per pnpmfile), so the pnpmfile is evaluated once and the per-package
+/// `readPackage` calls on the resolution hot path don't each pay a `node`
+/// startup.
 pub struct NodeJsHooks {
     pub file: PathBuf,
     worker: OnceCell<Result<Arc<NodeWorker>, HookError>>,
 }
-
-const HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl NodeJsHooks {
     #[must_use]
@@ -35,125 +26,6 @@ impl NodeJsHooks {
     async fn worker(&self) -> Result<Arc<NodeWorker>, HookError> {
         self.worker.get_or_init(|| NodeWorker::spawn(&self.file)).await.clone()
     }
-
-    /// Runs a side-effecting hook (`preResolution`) in a one-shot `node`
-    /// process, piping the JSON context on stdin and exposing an
-    /// `info`/`warn` logger. Failures are reported through `logger.warn`
-    /// rather than aborting, matching the hook's advisory role.
-    async fn call_node_void(
-        &self,
-        func: &str,
-        args: Value,
-        logger: &crate::PreResolutionHookLogger,
-    ) {
-        let Ok(ctx_payload) = serde_json::to_string(&args) else { return };
-        let Some((input_type, wrapper)) = hook_wrapper(&self.file.to_string_lossy(), func) else {
-            return;
-        };
-
-        let Ok(mut child) = Command::new("node")
-            .arg("--input-type")
-            .arg(input_type)
-            .arg("-e")
-            .arg(&wrapper)
-            .kill_on_drop(true)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-        else {
-            (logger.warn)("pnpmfile hook failed to start".to_string());
-            return;
-        };
-
-        let hook_result = drive_hook(&mut child, &ctx_payload, logger).await;
-
-        let Ok((stderr_tail, Ok(status))) = hook_result else {
-            (logger.warn)("pnpmfile hook timed out or failed to execute".to_string());
-            return;
-        };
-
-        if !status.success() {
-            let stderr = String::from_utf8_lossy(&stderr_tail);
-            (logger.warn)(format!("pnpmfile hook failed: {stderr}"));
-        }
-    }
-}
-
-/// The Node wrapper that loads the pnpmfile and calls `func` with the
-/// context read from stdin, keyed by the module type Node must parse it as.
-fn hook_wrapper(file_path: &str, func: &str) -> Option<(&'static str, String)> {
-    let file_path_escaped = serde_json::to_string(file_path).ok()?;
-    let (input_type, wrapper) = if file_path.ends_with(".mjs") {
-        (
-            "module",
-            format!(
-                r#"import {{ readFileSync }} from 'node:fs';
-import {{ pathToFileURL }} from 'node:url';
-const hooks = await import(pathToFileURL({file_path_escaped}).href);
-const ctx = JSON.parse(readFileSync(0, 'utf8'));
-const logger = {{
-  info: (m) => {{ console.log(JSON.stringify({{"level":"info","message":String(m)}})); }},
-  warn: (m) => {{ console.log(JSON.stringify({{"level":"warn","message":String(m)}})); }}
-}};
-await (hooks.hooks && hooks.hooks['{func}'])?.(ctx, logger);
-"#,
-            ),
-        )
-    } else {
-        (
-            "commonjs",
-            format!(
-                r#"(async () => {{
-  const hooks = require({file_path_escaped});
-  const ctx = JSON.parse(require('fs').readFileSync(0, 'utf8'));
-  const logger = {{
-info: (m) => {{ console.log(JSON.stringify({{"level":"info","message":String(m)}})); }},
-warn: (m) => {{ console.log(JSON.stringify({{"level":"warn","message":String(m)}})); }}
-  }};
-  await (hooks.hooks && hooks.hooks['{func}'])?.(ctx, logger);
-}})();
-"#,
-            ),
-        )
-    };
-    Some((input_type, wrapper))
-}
-
-/// Feed the hook its context and collect its stderr tail and exit status.
-async fn drive_hook(
-    child: &mut tokio::process::Child,
-    ctx_payload: &str,
-    logger: &crate::PreResolutionHookLogger,
-) -> Result<(Vec<u8>, std::io::Result<std::process::ExitStatus>), tokio::time::error::Elapsed> {
-    let stdin = child.stdin.take();
-    let stdout = child.stdout.take().expect("stdout is piped");
-    let stderr = child.stderr.take().expect("stderr is piped");
-
-    // Stream all three pipes concurrently instead of buffering:
-    // stdout/stderr are hook-controlled, so buffering would let a noisy
-    // pnpmfile grow memory without bound, and log messages should surface
-    // while the hook is still running (pnpm runs the hook in-process, so
-    // its logger calls render immediately). The context write runs in the
-    // same join because a pnpmfile that logs heavily at import time could
-    // otherwise fill the stdout pipe and deadlock against the stdin
-    // write. A write error is left for `child.wait()` to surface as a
-    // non-zero exit.
-    let write_context = async {
-        if let Some(mut stdin) = stdin {
-            let _ = stdin.write_all(ctx_payload.as_bytes()).await;
-        }
-        // Dropping stdin closes the pipe so `readFileSync(0)` sees EOF.
-    };
-    let forward_stdout = forward_hook_stdout(stdout, logger);
-    let collect_stderr = read_tail(stderr, STDERR_TAIL_LIMIT);
-    let wait_child = child.wait();
-    timeout(HOOK_TIMEOUT, async {
-        let ((), (), stderr_tail, status) =
-            tokio::join!(write_context, forward_stdout, collect_stderr, wait_child);
-        (stderr_tail, status)
-    })
-    .await
 }
 
 #[async_trait]
@@ -204,8 +76,8 @@ impl crate::PnpmfileHooks for NodeJsHooks {
         &self,
         ctx: crate::PreResolutionHookContext,
         logger: crate::PreResolutionHookLogger,
-    ) {
-        let ctx_json = serde_json::json!({
+    ) -> Result<crate::PreResolutionHookContext, HookError> {
+        let payload = serde_json::json!({
             "wantedLockfile": ctx.wanted_lockfile,
             "currentLockfile": ctx.current_lockfile,
             "existsCurrentLockfile": ctx.exists_current_lockfile,
@@ -214,8 +86,18 @@ impl crate::PnpmfileHooks for NodeJsHooks {
             "storeDir": ctx.store_dir,
             "registries": ctx.registries,
         });
-
-        self.call_node_void("preResolution", ctx_json, &logger).await;
+        let mut lockfiles = self.worker().await?.call_pre_resolution(payload, logger).await?;
+        let mut take = |field: &str| {
+            lockfiles
+                .get_mut(field)
+                .map(Value::take)
+                .unwrap_or_default()
+        };
+        Ok(crate::PreResolutionHookContext {
+            wanted_lockfile: take("wantedLockfile"),
+            current_lockfile: take("currentLockfile"),
+            ..ctx
+        })
     }
 
     async fn filter_log(&self, log: Value, ctx: crate::HookContext) -> bool {
@@ -226,11 +108,23 @@ impl crate::PnpmfileHooks for NodeJsHooks {
         }
     }
 
-    async fn has_filter_log(&self) -> bool {
+    async fn ignored_hooks(&self) -> Vec<crate::IgnoredHook> {
         match self.worker().await {
-            Ok(worker) => worker.has_filter_log().await,
-            Err(_) => false,
+            Ok(worker) => worker.ignored_hooks().await,
+            Err(_) => Vec::new(),
         }
+    }
+
+    async fn has_read_package(&self) -> Result<bool, HookError> {
+        self.worker().await?.has_read_package().await
+    }
+
+    async fn has_after_all_resolved(&self) -> Result<bool, HookError> {
+        self.worker().await?.has_after_all_resolved().await
+    }
+
+    async fn has_pre_resolution(&self) -> Result<bool, HookError> {
+        self.worker().await?.has_pre_resolution().await
     }
 
     async fn calculate_pnpmfile_checksum(&self) -> Option<String> {
@@ -440,9 +334,3 @@ fn is_js_truthy(value: &Value) -> bool {
         _ => true,
     }
 }
-
-#[cfg(test)]
-mod tests;
-
-mod output;
-use output::{STDERR_TAIL_LIMIT, forward_hook_stdout, read_tail};

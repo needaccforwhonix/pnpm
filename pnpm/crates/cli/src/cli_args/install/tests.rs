@@ -1,6 +1,6 @@
 use super::{InstallArgs, InstallDependencyOptions, NodeLinkerArg, PnprBenchmarkRegistryOverride};
 use crate::cli_args::install::pnpr_request::{
-    BenchmarkRegistryRewrite, rewrite_resolution_registry,
+    BenchmarkRegistryRewrite, check_pnpr_applied_settings, rewrite_resolution_registry,
 };
 use clap::Parser;
 use pnpm_config::NodeLinker;
@@ -43,7 +43,7 @@ fn dependency_options_to_dependency_groups() {
             optional: false,
             no_optional: false,
         }),
-        [Dev],
+        [Dev, Optional],
     );
 
     assert_eq!(
@@ -319,5 +319,74 @@ fn pnpr_benchmark_override_keeps_resolve_registry_separate_from_tarball_rewrite(
     assert_eq!(
         override_.client_tarball_url("http://server-registry.test/foo/-/foo-1.0.0.tgz"),
         "http://client-registry.test/foo/-/foo-1.0.0.tgz",
+    );
+}
+
+#[test]
+fn pnpr_lockfile_resolved_without_add_missing_peer_types_is_rejected() {
+    let enabled =
+        pnpm_config::Config { add_missing_peer_types: true, ..pnpm_config::Config::default() };
+    let applied = pnpm_lockfile::LockfileSettings {
+        add_missing_peer_types: Some(true),
+        ..pnpm_lockfile::LockfileSettings::default()
+    };
+
+    assert!(check_pnpr_applied_settings(&enabled, None).is_err());
+    assert!(
+        check_pnpr_applied_settings(&enabled, Some(&pnpm_lockfile::LockfileSettings::default()))
+            .is_err(),
+    );
+    assert!(check_pnpr_applied_settings(&enabled, Some(&applied)).is_ok());
+    assert!(check_pnpr_applied_settings(&pnpm_config::Config::default(), None).is_ok());
+}
+
+#[test]
+fn pnpr_lockfile_resolved_without_project_scoped_optional_peers_is_rejected() {
+    let enabled = pnpm_config::Config {
+        project_scoped_optional_peers: true,
+        ..pnpm_config::Config::default()
+    };
+    let applied = pnpm_lockfile::LockfileSettings {
+        project_scoped_optional_peers: Some(true),
+        ..pnpm_lockfile::LockfileSettings::default()
+    };
+    let without_dedupe = pnpm_config::Config { dedupe_peer_dependents: false, ..enabled.clone() };
+
+    assert!(check_pnpr_applied_settings(&enabled, None).is_err());
+    assert!(check_pnpr_applied_settings(&enabled, Some(&applied)).is_ok());
+    assert!(check_pnpr_applied_settings(&without_dedupe, None).is_ok());
+}
+
+#[test]
+fn allow_build_flag_parses_single_and_multiple() {
+    let parsed = InstallArgsHarness::try_parse_from(["pacquet-test"]).expect("parses default");
+    assert!(parsed.args.allow_build().is_empty(), "default is empty");
+
+    let parsed = InstallArgsHarness::try_parse_from(["pacquet-test", "--allow-build", "esbuild"])
+        .expect("parses --allow-build");
+    assert_eq!(parsed.args.allow_build(), ["esbuild"]);
+
+    let parsed = InstallArgsHarness::try_parse_from([
+        "pacquet-test",
+        "--allow-build=esbuild",
+        "--allow-build",
+        "sharp",
+        "--allow-build=!core-js",
+    ])
+    .expect("parses multiple --allow-build flags");
+    assert_eq!(parsed.args.allow_build(), ["esbuild", "sharp", "!core-js"]);
+}
+
+#[test]
+fn allow_build_disqualifies_fast_path() {
+    let config = pnpm_config::Config::default();
+    let mut args = InstallArgs::default();
+    assert_eq!(args.fast_path_ineligibility(&config), None, "default args eligible for fast path");
+
+    args.materialization.allow_build.push("esbuild".to_string());
+    assert_eq!(
+        args.fast_path_ineligibility(&config),
+        Some("--allow-build"),
+        "--allow-build must disqualify fast path so build policy applies",
     );
 }

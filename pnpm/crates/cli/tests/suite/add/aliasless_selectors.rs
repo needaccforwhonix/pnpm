@@ -1,7 +1,8 @@
 use super::{Path, prod_spec, write_json};
-use crate::_utils::append_workspace_yaml_key;
+use crate::_utils::{append_workspace_yaml_key, pacquet_in, read_lockfile};
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
+use pnpm_lockfile::PkgName;
 use pnpm_testing_utils::{
     bin::{AddMockedRegistry, CommandTempCwd},
     fixtures::tarball_with_manifest,
@@ -68,6 +69,73 @@ fn the_file_protocol_on_a_directory_is_kept() {
     assert_eq!(prod_spec(&workspace, "localpkg"), "file:localpkg");
 
     drop((root, npmrc_info));
+}
+
+/// A `link:` dependency is a symlink, so its peers never resolve from the
+/// project that adds it. `pnpm add <dir>` warns the way `pnpm link` does.
+#[test]
+fn adding_a_directory_with_peer_dependencies_as_a_link_warns() {
+    let warnings = add_local_package_with_a_peer("./localpkg");
+
+    assert_eq!(warnings.len(), 1, "expected exactly one warning, got: {warnings:?}");
+    assert!(
+        warnings[0].contains("has the following peerDependencies specified in its package.json:\n\n  - is-positive@1.0.0"),
+        "the warning must list the peer dependencies: {}",
+        warnings[0],
+    );
+    assert!(
+        warnings[0].contains(r#"To resolve this, you may use the "file:" protocol to reference the local dependency."#),
+        "the warning must suggest the file: protocol: {}",
+        warnings[0],
+    );
+}
+
+/// A `file:` directory is injected, so its peers resolve from the project
+/// and there is nothing to warn about.
+#[test]
+fn adding_a_directory_with_peer_dependencies_through_file_does_not_warn() {
+    let warnings = add_local_package_with_a_peer("file:./localpkg");
+
+    assert_eq!(warnings, Vec::<String>::new());
+}
+
+/// Add `selector`, pointing at a `localpkg` that declares a peer, and return
+/// the messages of the warnings the command reported.
+fn add_local_package_with_a_peer(selector: &str) -> Vec<String> {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let package_dir = workspace.join("localpkg");
+    fs::create_dir_all(&package_dir).expect("create local package dir");
+    write_json(
+        &package_dir.join("package.json"),
+        &serde_json::json!({
+            "name": "localpkg",
+            "version": "1.0.0",
+            "peerDependencies": { "is-positive": "1.0.0" },
+        }),
+    );
+
+    let output = pacquet
+        .with_args(["--reporter=ndjson", "add", selector])
+        .output()
+        .expect("spawn pacquet add");
+    assert!(output.status.success(), "add should succeed: {output:?}");
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr is utf-8");
+    let warnings = stderr
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| event["name"] == "pnpm" && event["level"] == "warn")
+        .filter_map(|event| event["message"].as_str().map(str::to_string))
+        .collect();
+
+    drop((root, npmrc_info));
+    warnings
 }
 
 /// A local tarball's name lives in the `package.json` it bundles, so
@@ -140,11 +208,83 @@ fn a_remote_tarball_url_is_saved_verbatim() {
     drop((root, mock_instance));
 }
 
-/// A catalog entry is read by every project referencing it, so it
-/// cannot hold a path that resolves against the project declaring it.
-/// `catalogMode` has to leave such a specifier direct — cataloging it
-/// writes an entry the next install refuses with
-/// `ERR_PNPM_CATALOG_ENTRY_INVALID_SPEC`.
+#[test]
+fn adding_a_new_unnamed_tarball_url_replaces_the_existing_dependency() {
+    assert_unnamed_tarball_replacement("3.1.0");
+}
+
+#[test]
+fn adding_a_new_unnamed_tarball_url_replaces_the_existing_dependency_at_the_same_version() {
+    assert_unnamed_tarball_replacement("1.0.0");
+}
+
+fn assert_unnamed_tarball_replacement(new_version: &str) {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    let registry = mock_instance.url().replace("127.0.0.1", "localhost");
+    let old_tarball = format!("{registry}is-positive/-/is-positive-1.0.0.tgz");
+    let new_tarball = format!("{registry}is-positive/-/is-positive-{new_version}.tgz?revision=2");
+    let installed_version = || {
+        let manifest: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(workspace.join("node_modules/is-positive/package.json"))
+                .expect("read installed package.json"),
+        )
+        .expect("parse installed package.json");
+        manifest["version"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+
+    pacquet_in(&workspace)
+        .with_args(["add", &old_tarball])
+        .assert()
+        .success();
+    assert_eq!(installed_version(), "1.0.0");
+    let old_package_dir = fs::canonicalize(workspace.join("node_modules/is-positive"))
+        .expect("resolve installed package directory");
+    pacquet_in(&workspace)
+        .with_args(["add", &new_tarball])
+        .assert()
+        .success();
+
+    assert_eq!(prod_spec(&workspace, "is-positive"), new_tarball);
+    assert_eq!(installed_version(), new_version);
+    let new_package_dir = fs::canonicalize(workspace.join("node_modules/is-positive"))
+        .expect("resolve updated package directory");
+    dbg!(&old_package_dir, &new_package_dir);
+    assert_ne!(new_package_dir, old_package_dir);
+    let lockfile_path = workspace.join("pnpm-lock.yaml");
+    let lockfile = read_lockfile(&lockfile_path);
+    dbg!(&lockfile);
+    let dependency = &lockfile.importers["."].dependencies.as_ref().unwrap()
+        [&"is-positive".parse::<PkgName>().unwrap()];
+    assert_eq!(dependency.specifier, new_tarball);
+    assert_eq!(dependency.version.to_string(), new_tarball);
+    let package_keys: Vec<_> = lockfile.packages
+        .as_ref()
+        .unwrap()
+        .keys()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(dbg!(package_keys), [format!("is-positive@{new_tarball}")]);
+
+    fs::remove_dir_all(workspace.join("node_modules")).expect("remove node_modules");
+    pacquet_in(&workspace)
+        .with_args(["install", "--frozen-lockfile"])
+        .assert()
+        .success();
+    assert_eq!(installed_version(), new_version);
+    assert_eq!(dbg!(read_lockfile(&lockfile_path)), lockfile);
+
+    drop((root, mock_instance));
+}
+
+/// A catalog measures a relative path from `pnpm-workspace.yaml`'s own
+/// directory, not from the project that declares the dependency, so
+/// `catalogMode` has to leave a local specifier direct — cataloging it
+/// would point it somewhere else than where `pnpm add` was run.
 #[test]
 fn a_local_directory_is_not_auto_cataloged() {
     let CommandTempCwd {

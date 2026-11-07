@@ -1,14 +1,5 @@
 //! Global-virtual-store directory naming — the GVS hash computation
 //! and path formatting.
-//!
-//! The engine string contribution is gated by a precomputed
-//! `build_required_dep_paths` set: only snapshots that themselves run
-//! a build script — or that transitively depend on one — keep the
-//! engine in the GVS hash payload.
-//! Pure-JS leaves and their pure-JS ancestors hash with
-//! `engine = null`, so their GVS directories survive Node.js
-//! upgrades and architecture moves. Passing `None` for
-//! `build_required_dep_paths` reproduces the always-include behaviour.
 
 use crate::{
     HashEncoding,
@@ -68,7 +59,7 @@ where
     } else {
         Value::Null
     };
-    let deps_hash = calc_dep_graph_hash(graph, cache, &mut HashSet::new(), dep_path);
+    let deps_hash = calc_dep_graph_hash(graph, cache, dep_path);
     // The object-hash serialization of
     // `{ engine, deps }`, plus `project` when the caller has one, with
     // `sort = false`: keys stay in the order written here, which is the
@@ -155,23 +146,16 @@ pub fn format_global_virtual_store_path(name: &str, version: &str, hex_digest: &
 }
 
 /// Join `base` with a [`format_global_virtual_store_path`]-shaped
-/// relative path, expanding each `/`-separated segment into a native
-/// path component.
+/// relative path.
 ///
-/// The GVS relative path is always formatted with `/` because it
-/// doubles as a cross-platform canonical id (it feeds hashing and
-/// lockfile comparison). Passing that string straight to
-/// [`Path::join`] keeps the `/` bytes on Windows, and the directory
-/// symlink/junction syscall that later consumes the slot path then
-/// rejects the forward-slash path with `ERROR_DIRECTORY`
-/// (`os error 267`). Splitting on `/` and pushing each segment yields
-/// a path built from the platform-native separator on every OS (and
-/// is a no-op transformation on Unix, where `/` is already native).
+/// A GVS relative path is always formatted with `/` because it doubles
+/// as a cross-platform canonical id: it feeds hashing and lockfile
+/// comparison. Turning it back into a native path is therefore
+/// [`pnpm_fs::push_slash_separated_path`]'s job, whose documentation
+/// covers what a `/` left in a Windows path string costs.
 #[must_use]
 pub fn join_global_virtual_store_path(base: &Path, rel: &str) -> PathBuf {
-    let mut path = base.to_path_buf();
-    path.extend(rel.split('/'));
-    path
+    pnpm_fs::join_slash_separated_path(base, rel)
 }
 
 #[cfg(test)]

@@ -1,12 +1,14 @@
+pub(super) mod selection;
+use selection::should_reject_unmatched_selection;
+
 use super::{
     UpdateError, UpdateOptions, UpdateResources, UpdateSeed,
     catalogs::{
-        CatalogCtx, merge_catalogs, read_catalog_ctx_with_catalogs, reconcile_catalog_rewrites,
+        CatalogCtx, ensure_catalog_ctx, merge_catalogs, read_catalog_ctx_with_catalogs,
+        reconcile_catalog_rewrites,
     },
     latest::{LatestResolverChain, LatestRewriteCtx},
-    seed_policy::{
-        UpdatePlan, UpdateScope, importer_seed_policy, select_seed_policy, selected_seed_policy,
-    },
+    seed_policy::{LockedImporter, OverriddenDirect, UpdatePlan, UpdateScope, select_seed_policy},
     selectors::{
         ParsedSelector, parse_selectors, reject_versioned_latest_selectors,
         reject_versions_of_indirect_update_specs,
@@ -14,7 +16,7 @@ use super::{
     workspace::workspace_targets,
 };
 use crate::{
-    DIRECT_GROUPS, ImporterUpdateSeedPolicy, InstallError, UpdateSeedPolicy,
+    DIRECT_GROUPS, ImporterUpdateSeedPolicy, InstallError, UpdateSeedPolicy, VersionsOverrider,
     emit_initial_package_manifest,
 };
 use pnpm_catalogs_types::Catalogs;
@@ -23,7 +25,7 @@ use pnpm_package_manifest::{DependencyGroup, PackageManifest};
 use pnpm_reporter::Reporter;
 use pnpm_resolving_resolver_base::PreferredVersions;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -35,7 +37,7 @@ pub(super) struct UpdatePreparation {
     /// Direct dependencies whose declared range the install may move onto
     /// the version it resolves, each mapped to the group and specifier the
     /// manifest declares for it. See [`crate::ManifestSpecBumps`].
-    pub(super) bump_targets: HashMap<String, (DependencyGroup, String)>,
+    pub(super) bump_targets: Vec<(String, DependencyGroup, String)>,
     pub(super) updated_catalogs: Catalogs,
     catalogs_override: Option<Catalogs>,
     pub(super) workspace_dir_for_catalogs: Option<PathBuf>,
@@ -59,52 +61,18 @@ pub(super) struct SelectedUpdatePreparation {
     preferred_versions_override: PreferredVersions,
     pub(super) persist_indices: Vec<usize>,
     /// [`UpdatePreparation::bump_targets`] per importer id.
-    pub(super) bump_targets: BTreeMap<String, HashMap<String, (DependencyGroup, String)>>,
+    pub(super) bump_targets: BTreeMap<String, Vec<(String, DependencyGroup, String)>>,
     pub(super) updated_catalogs: Catalogs,
     pub(super) catalogs_override: Option<Catalogs>,
     pub(super) workspace_dir_for_catalogs: Option<PathBuf>,
-    pub(super) any_work: bool,
+    work: SelectedUpdateWork,
 }
-impl SelectedUpdatePreparation {
-    pub(super) fn take_seed(&mut self, update: UpdateOptions<'_>) -> UpdateSeed {
-        UpdateSeed {
-            policy: selected_seed_policy(
-                update.version.patches,
-                std::mem::take(&mut self.seed_policies),
-                update.selection.depth,
-            ),
-            preferred_versions_override: std::mem::take(&mut self.preferred_versions_override),
-            catalogs_override: self.catalogs_override.take(),
-        }
-    }
-
-    /// Fold one project's preparation in, under the importer id it was
-    /// prepared for.
-    fn merge(&mut self, index: usize, importer_id: String, prepared: UpdatePreparation) {
-        self.any_work = true;
-        for (name, selectors) in prepared.preferred_versions_override {
-            self.preferred_versions_override
-                .entry(name)
-                .or_default()
-                .extend(selectors);
-        }
-        if !prepared.bump_targets.is_empty() {
-            self.bump_targets.insert(importer_id.clone(), prepared.bump_targets);
-        }
-        if let Some(policy) = importer_seed_policy(prepared.seed_policy) {
-            self.seed_policies.insert(importer_id, policy);
-        }
-        if prepared.persist_manifest {
-            self.persist_indices.push(index);
-        }
-        merge_catalogs(&mut self.updated_catalogs, &prepared.updated_catalogs);
-        if let Some(complete_catalogs) = prepared.catalogs_override {
-            self.catalogs_override = Some(complete_catalogs);
-        }
-        if self.workspace_dir_for_catalogs.is_none() {
-            self.workspace_dir_for_catalogs = prepared.workspace_dir_for_catalogs;
-        }
-    }
+#[derive(Default, PartialEq, Eq)]
+enum SelectedUpdateWork {
+    #[default]
+    None,
+    IgnoredDirectMatch,
+    Prepared,
 }
 /// A loaded `readPackage` hook paired with the log sink its `context.log`
 /// calls are forwarded to.
@@ -113,24 +81,19 @@ pub(super) fn update_read_package_hook<Reporter: self::Reporter>(
     workspace_root: &Path,
     config: &Config,
 ) -> Result<Option<ReadPackageHook>, UpdateError> {
-    let Some(hook) =
-        pnpm_hooks::finder::load_pnpmfiles(workspace_root, crate::pnpmfile_selection(config))
-            .map_err(UpdateError::MissingPnpmfile)?
+    let Some(hook) = crate::load_install_pnpmfiles(config, workspace_root)
+        .map_err(UpdateError::MissingPnpmfile)?
     else {
         return Ok(None);
     };
-    let log = hook
-        .source_path()
-        .map_or_else(
-            || Arc::new(|_| {}) as pnpm_hooks::LogFn,
-            |from| {
-                crate::install_with_fresh_lockfile::hook_log_fn::<Reporter>(
-                    workspace_root,
-                    from,
-                    "readPackage",
-                )
-            },
-        );
+    let log = match hook.source_path() {
+        Some(from) => crate::install_with_fresh_lockfile::hook_log_fn::<Reporter>(
+            workspace_root,
+            from,
+            "readPackage",
+        ),
+        None => Arc::new(|_| {}) as pnpm_hooks::LogFn,
+    };
     Ok(Some((hook, log)))
 }
 pub(super) async fn apply_read_package_hook_to_update_manifest(
@@ -142,20 +105,28 @@ pub(super) async fn apply_read_package_hook_to_update_manifest(
     let value = hook
         .read_package(manifest.value().clone(), ctx)
         .await
-        .map_err(InstallError::ReadPackageHook)
+        .map_err(InstallError::from)
         .map_err(UpdateError::Install)?;
     *manifest.value_mut() = (*value).clone();
     Ok(())
 }
 pub(super) async fn prepare_manifest<Reporter: self::Reporter>(
     manifest: &mut PackageManifest,
+    importer_id: &str,
     update: UpdateOptions<'_>,
     owned: &UpdateResources,
     catalogs_seed: Option<&Catalogs>,
     latest_chain: &mut Option<LatestResolverChain>,
 ) -> Result<Option<UpdatePreparation>, UpdateError> {
-    let Some(decision) =
-        decide_update::<Reporter>(manifest, update, owned, catalogs_seed, latest_chain).await?
+    let Some(decision) = decide_update::<Reporter>(
+        manifest,
+        importer_id,
+        update,
+        owned,
+        catalogs_seed,
+        latest_chain,
+    )
+    .await?
     else {
         return Ok(None);
     };
@@ -171,6 +142,7 @@ pub(super) struct UpdateDecision {
 }
 pub(super) async fn decide_update<Reporter: self::Reporter>(
     manifest: &PackageManifest,
+    importer_id: &str,
     update: UpdateOptions<'_>,
     owned: &UpdateResources,
     catalogs_seed: Option<&Catalogs>,
@@ -186,9 +158,11 @@ pub(super) async fn decide_update<Reporter: self::Reporter>(
     // Catalogs stay lazy unless an earlier selected project already produced
     // the complete in-memory catalog set for this batch.
     let mut catalog_ctx = catalogs_seed
-        .map(|catalogs| read_catalog_ctx_with_catalogs(manifest, catalogs.clone()))
+        .map(|catalogs| read_catalog_ctx_with_catalogs(manifest, update.config, catalogs.clone()))
         .transpose()?;
-    let scope = update_scope(update, owned, &selectors, &direct);
+    let overridden_direct =
+        overridden_direct(manifest, update, &selectors, &direct, &mut catalog_ctx)?;
+    let scope = update_scope(update, owned, importer_id, &selectors, &direct, &overridden_direct);
     let mut plan = UpdatePlan::default();
     let Some(seed_policy) = select_seed_policy::<Reporter>(
         &scope,
@@ -214,18 +188,74 @@ pub(super) async fn decide_update<Reporter: self::Reporter>(
 pub(super) fn update_scope<'a>(
     update: UpdateOptions<'a>,
     owned: &UpdateResources,
+    importer_id: &'a str,
     selectors: &'a [ParsedSelector],
     direct: &'a [(String, DependencyGroup, String)],
+    overridden_direct: &'a [OverriddenDirect],
 ) -> UpdateScope<'a> {
     UpdateScope {
         selectors,
         direct,
-        lockfile: update.lockfile,
+        overridden_direct,
+        lockfile: LockedImporter { document: update.lockfile.document, id: importer_id },
         config: update.config,
         version: update.version,
-        depth: update.selection.depth,
+        selection: update.selection,
         updates_all_groups: updates_all_groups(&owned.include_direct),
     }
+}
+
+fn overridden_direct(
+    manifest: &PackageManifest,
+    update: UpdateOptions<'_>,
+    selectors: &[ParsedSelector],
+    direct: &[(String, DependencyGroup, String)],
+    catalog_ctx: &mut Option<CatalogCtx>,
+) -> Result<Vec<OverriddenDirect>, UpdateError> {
+    if update.version.save
+        || !selectors.iter().any(|selector| selector.version.is_some())
+        || update.config.overrides.as_ref().is_none_or(indexmap::IndexMap::is_empty)
+    {
+        return Ok(Vec::new());
+    }
+    let catalogs = &ensure_catalog_ctx(catalog_ctx, manifest, update.config)?.catalogs;
+    let parsed = crate::install::parse_config_overrides(update.config, catalogs)
+        .map_err(|error| UpdateError::Install(error.into()))?
+        .unwrap_or_default();
+    let project_dir = super::manifest_dir(manifest);
+    let lockfile_root = crate::install::lockfile_root_dir(update.config, project_dir)
+        .map_err(UpdateError::FindWorkspaceDir)?;
+    let overrider =
+        VersionsOverrider::new(&parsed, update.config.root_project_manifest_dir(&lockfile_root));
+    Ok(collect_overridden_direct(manifest, direct, &overrider))
+}
+
+fn collect_overridden_direct(
+    manifest: &PackageManifest,
+    direct: &[(String, DependencyGroup, String)],
+    overrider: &VersionsOverrider,
+) -> Vec<OverriddenDirect> {
+    let matcher = overrider.dependency_matcher(manifest.value());
+    let matched = direct
+        .iter()
+        .filter(|(name, group, previous)| matcher.matches(*group, name, previous))
+        .map(|(name, group, _)| (name.clone(), *group))
+        .collect::<Vec<_>>();
+    if matched.is_empty() {
+        return Vec::new();
+    }
+    let mut effective = manifest.clone();
+    overrider.apply(&mut effective, Some(super::manifest_dir(manifest)));
+    matched
+        .into_iter()
+        .map(|(name, group)| OverriddenDirect {
+            effective_specifier: effective
+                .dependencies([group])
+                .find_map(|(alias, specifier)| (alias == name).then(|| specifier.to_string())),
+            name,
+            group,
+        })
+        .collect()
 }
 /// The direct dependencies of the groups the update covers, as
 /// `(name, group, specifier)`.
@@ -340,8 +370,11 @@ pub(super) async fn prepare_selected_manifests<Reporter: self::Reporter>(
     }
 
     for &index in selected_indices {
+        let importer_id =
+            pnpm_workspace::importer_id_from_root_dir(workspace_root, &projects[index].root_dir);
         let Some(prepared) = prepare_manifest::<Reporter>(
             &mut projects[index].manifest,
+            &importer_id,
             update,
             owned,
             prepared_all.catalogs_override.as_ref(),
@@ -349,20 +382,16 @@ pub(super) async fn prepare_selected_manifests<Reporter: self::Reporter>(
         )
         .await?
         else {
+            prepared_all.record_ignored_match(&projects[index].manifest, update, owned);
             continue;
         };
-        let importer_id =
-            pnpm_workspace::importer_id_from_root_dir(workspace_root, &projects[index].root_dir);
         prepared_all.merge(index, importer_id, prepared);
     }
 
     // A recursive `--latest` that matches nothing is an error, unlike the
     // single-project one that quietly returns: with no project left to
     // mutate there is nothing for the run to have meant.
-    if update.selection.depth == 0
-        && !update.selection.packages.is_empty()
-        && !prepared_all.any_work
-    {
+    if should_reject_unmatched_selection(update, &prepared_all) {
         return Err(UpdateError::NoPackageInDependencies);
     }
 

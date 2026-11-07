@@ -26,7 +26,7 @@ pub fn gvs_default_is_off_and_paths_derive_cleanly() {
     let config =
         Config::new().current::<HostNoHome>(tmp.path()).expect("workspace yaml absent => no error");
     assert!(!config.enable_global_virtual_store, "GVS is off by default");
-    assert_eq!(config.virtual_store_dir, tmp.path().join("node_modules/.pnpm"));
+    assert_eq!(config.install_state_dir, tmp.path().join("node_modules/.pnpm"));
     assert_eq!(config.global_virtual_store_dir, config.store_dir.links());
 }
 
@@ -36,12 +36,15 @@ pub fn yaml_global_virtual_store_dir_wins_over_derivation() {
     let yaml_gvs = tmp.path().join("my-shared-store");
     fs::write(
         tmp.path().join("pnpm-workspace.yaml"),
-        format!("enableGlobalVirtualStore: true\nglobalVirtualStoreDir: {}\n", yaml_gvs.display()),
+        format!(
+            "enableGlobalVirtualStore: true\nvirtualStoreDir: other-store\nglobalVirtualStoreDir: {}\n",
+            yaml_gvs.display(),
+        ),
     )
     .expect("write to pnpm-workspace.yaml");
     let config = Config::new().current::<HostNoHome>(tmp.path()).expect("yaml is valid");
     assert!(config.enable_global_virtual_store);
-    assert_eq!(config.virtual_store_dir, tmp.path().join("node_modules/.pnpm"));
+    assert_eq!(config.install_state_dir, tmp.path().join("node_modules/.pnpm"));
     assert_eq!(config.global_virtual_store_dir, yaml_gvs);
 }
 
@@ -62,4 +65,26 @@ pub fn max_sockets_takes_the_canonical_spelling_when_a_file_has_both() {
         .expect("write to pnpm-workspace.yaml");
     let config = Config::new().current::<HostNoHome>(tmp.path()).expect("yaml is valid");
     assert_eq!(config.max_sockets, Some(5));
+}
+
+#[test]
+pub fn virtual_store_dir_follows_a_configured_modules_dir() {
+    let tmp = tempdir().unwrap();
+    fs::write(tmp.path().join("pnpm-workspace.yaml"), "packages:\n  - .\nmodulesDir: vendor\n")
+        .expect("write to pnpm-workspace.yaml");
+    let config = Config::new().current::<HostNoHome>(tmp.path()).expect("yaml is valid");
+    assert_eq!(config.modules_dir, tmp.path().join("vendor"));
+    assert_eq!(config.virtual_store_dir(), tmp.path().join("vendor/.pnpm"));
+}
+
+#[test]
+pub fn a_configured_virtual_store_dir_does_not_follow_modules_dir() {
+    let tmp = tempdir().unwrap();
+    fs::write(
+        tmp.path().join("pnpm-workspace.yaml"),
+        "packages:\n  - .\nmodulesDir: vendor\nvirtualStoreDir: store\n",
+    )
+    .expect("write to pnpm-workspace.yaml");
+    let config = Config::new().current::<HostNoHome>(tmp.path()).expect("yaml is valid");
+    assert_eq!(config.virtual_store_dir(), tmp.path().join("store"));
 }

@@ -1,5 +1,32 @@
 pub mod package_manager_spec;
+pub use bins::{
+    MAX_PRECALCULATED_BINS, MAX_PRECALCULATED_BINS_BYTES, PackageBin, ScriptRuntime,
+    declared_bin_entries, extension_program, infer_script_runtime_from_head,
+    infer_script_runtime_from_shebang, is_safe_bin_name, is_within_precalculated_bins_budget,
+    manifest_declares_bins, normalize_bin_path, normalize_package_relative_path, parse_shebang,
+    parse_shebang_from_bytes, resolve_package_bins, resolve_package_bins_from_cas_paths,
+    resolve_package_bins_with, serialize_precalculated_bins, unscoped_bin_name,
+    verify_package_bins,
+};
+pub use build_triggers::{
+    BINDING_GYP, BuildTriggers, files_build_triggers, files_include_install_scripts,
+    manifest_opts_out_of_gyp_build, manifest_requires_build, pkg_build_triggers,
+    pkg_requires_build, read_package_json_from_cas_paths, requires_build_from_cas_paths,
+    requires_build_from_files, stored_requires_build_needs_manifest_check,
+};
+pub use bundled_manifest::normalize_bundled_manifest;
+pub use error::PackageManifestError;
 pub use initialization::{InitAuthor, InitOptions};
+pub use install_manifest::{
+    ArchiveFacts, INSTALL_MANIFEST_FIELDS, INSTALL_MANIFEST_PROFILE, InstallManifest,
+    ManifestComparison, NODE_GYP_REBUILD,
+};
+pub use metadata::{extract_author, extract_homepage, extract_license};
+pub use project::{
+    PROJECT_MANIFEST_BASENAMES, find_parent_publish_manifest, project_manifest_path,
+    publishes_from_directory, safe_read_project_manifest_from_dir,
+};
+pub use readme::{ReadmeKind, decode_readme, is_preferred_readme, readme_kind};
 pub use runtime::{
     apply_runtime_on_fail_override, convert_dependencies_to_engines_runtime,
     convert_engines_runtime_to_dependencies, engines_runtime_dependencies, is_runtime_alias,
@@ -14,64 +41,27 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use derive_more::{Display, Error, From};
-use miette::Diagnostic;
-use node_semver::Range;
+use blank_lines::BlankLines;
+use node_semver::{Range, Version};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use serialization::{empty_dependency_fields, normalize_dependency_fields, serialize_with_indent};
 use strum::IntoStaticStr;
-use tempfile::NamedTempFile;
+mod bins;
+mod blank_lines;
+mod build_triggers;
+mod bundled_manifest;
+mod error;
+mod initialization;
+mod install_manifest;
+mod json5;
+mod metadata;
+mod project;
+mod readme;
+mod runtime;
+mod serialization;
 mod truthiness;
-
-#[derive(Debug, Display, Error, Diagnostic, From)]
-#[non_exhaustive]
-pub enum PackageManifestError {
-    #[diagnostic(code(ERR_PNPM_PACKAGE_MANIFEST_SERIALIZATION_ERROR))]
-    Serialization(serde_json::Error), // TODO: remove derive(From), split this variant
-
-    #[from(ignore)] // TODO: remove this after derive(From) has been removed
-    #[display("Failed to parse {}: {source}", path.display())]
-    #[diagnostic(code(ERR_PNPM_PACKAGE_MANIFEST_SERIALIZATION_ERROR))]
-    Parse {
-        path: PathBuf,
-        #[error(source)]
-        source: serde_json::Error,
-    },
-
-    #[diagnostic(code(ERR_PNPM_PACKAGE_MANIFEST_IO_ERROR))]
-    Io(std::io::Error), // TODO: remove derive(From), split this variant
-
-    #[from(ignore)] // TODO: remove this after derive(From) has been removed
-    #[display("Failed to read {}: {source}", path.display())]
-    #[diagnostic(code(ERR_PNPM_PACKAGE_MANIFEST_IO_ERROR))]
-    Read {
-        path: PathBuf,
-        #[error(source)]
-        source: io::Error,
-    },
-
-    #[display("package.json file already exists")]
-    #[diagnostic(
-        code(ERR_PNPM_PACKAGE_JSON_EXISTS),
-        help("Your current working directory already has a package.json file.")
-    )]
-    AlreadyExist,
-
-    #[from(ignore)] // TODO: remove this after derive(From) has been removed
-    #[display("invalid attribute: {_0}")]
-    #[diagnostic(code(ERR_PNPM_PACKAGE_MANIFEST_INVALID_ATTRIBUTE))]
-    InvalidAttribute(#[error(not(source))] String),
-
-    #[from(ignore)] // TODO: remove this after derive(From) has been removed
-    #[display("No package.json was found in {_0}")]
-    #[diagnostic(code(ERR_PNPM_NO_IMPORTER_MANIFEST_FOUND))]
-    NoImporterManifestFound(#[error(not(source))] String),
-
-    #[from(ignore)] // TODO: remove this after derive(From) has been removed
-    #[display("Missing script: {_0:?}")]
-    #[diagnostic(code(ERR_PNPM_NO_SCRIPT))]
-    NoScript(#[error(not(source))] String),
-}
+mod validation;
 
 #[derive(Debug, Clone, Copy, PartialEq, IntoStaticStr)]
 pub enum DependencyGroup {
@@ -96,10 +86,11 @@ pub enum BundleDependencies {
 /// (freshly scaffolded or in-memory).
 const DEFAULT_INDENT: &str = "  ";
 
-/// Content of the `package.json` files and its path.
+/// Content of a `package.json`, `package.json5`, or `package.yaml` manifest and its path.
+/// JSON5 numbers must be finite and values may be nested at most 128 levels.
 ///
 /// Carries the source file's formatting (indentation unit, final-newline
-/// state) and its parsed value across the read/save round-trip, so
+/// state, blank lines between JSON object members) and its parsed value across the read/save round-trip, so
 /// [`Self::save`] preserves the file's style and skips the write entirely
 /// when nothing changed — the same contract as pnpm's project-manifest
 /// reader/writer pair.
@@ -110,14 +101,20 @@ pub struct PackageManifest {
     /// Whether a save ends the file with a newline. New and in-memory
     /// manifests get one.
     insert_final_newline: bool,
+    crlf: bool,
     /// One indentation level. Empty for a single-line source document,
     /// which then round-trips back to its compact form.
     indent: String,
+    /// The blank lines of a JSON source file, restored on save.
+    blank_lines: BlankLines,
     /// The manifest as the file currently encodes it (`devEngines` folded,
     /// dependency fields normalized), used to skip a save that wouldn't
     /// change the file. `None` when there is no file baseline (in-memory
     /// manifests), so the first save always writes.
     on_disk: Option<Value>,
+    /// The dependency fields the file declares as empty objects, kept on
+    /// save so a write only drops a field pnpm itself emptied.
+    empty_dependency_fields: Vec<&'static str>,
 }
 
 impl InitAuthor<'_> {
@@ -168,8 +165,11 @@ impl PackageManifest {
             path,
             value,
             insert_final_newline: true,
+            crlf: false,
             indent: DEFAULT_INDENT.to_string(),
+            blank_lines: BlankLines::default(),
             on_disk: None,
+            empty_dependency_fields: Vec::new(),
         }
     }
 
@@ -200,41 +200,76 @@ impl PackageManifest {
         let mut value = self.value.clone();
         convert_dependencies_to_engines_runtime(&mut value, "devDependencies", "devEngines")?;
         convert_dependencies_to_engines_runtime(&mut value, "dependencies", "engines")?;
-        normalize_dependency_fields(&mut value);
+        normalize_dependency_fields(&mut value, &self.empty_dependency_fields);
         Ok(value)
+    }
+
+    /// Persist the manifest in its on-disk shape (`devEngines` folded back,
+    /// dependency fields normalized) and return a reference to that shape.
+    ///
+    /// Preserves JSON indentation, final-newline state, and blank lines
+    /// between object members, JSON5 comments,
+    /// or YAML comments and existing key order. A save that changes nothing leaves the file
+    /// and its modification time untouched.
+    fn save_internal(&mut self) -> Result<&Value, PackageManifestError> {
+        let value = self.written_value()?;
+        if self.on_disk.as_ref() == Some(&value) {
+            return Ok(self.on_disk.as_ref().unwrap());
+        }
+        let contents = self.serialize(&value)?;
+        Self::write_atomic(&self.path, &contents)?;
+        if !self.is_yaml() && !self.is_json5() {
+            self.blank_lines = BlankLines::detect(&contents);
+        }
+        self.empty_dependency_fields = empty_dependency_fields(&value);
+        self.on_disk = Some(value);
+        Ok(self.on_disk.as_ref().unwrap())
     }
 
     /// Persist the manifest in its on-disk shape (`devEngines` folded back,
     /// dependency fields normalized) and return that shape.
     ///
-    /// The write preserves the source file's indentation and final-newline
-    /// state, and is skipped entirely when the file already encodes the
-    /// same manifest — so a no-op save never churns formatting or mtime.
+    /// Preserves JSON indentation, final-newline state, and blank lines
+    /// between object members, JSON5 comments,
+    /// or YAML comments and existing key order. A save that changes nothing leaves the file
+    /// and its modification time untouched.
     pub fn save_and_get_written_value(&mut self) -> Result<Value, PackageManifestError> {
-        let value = self.written_value()?;
-        if self.on_disk.as_ref() == Some(&value) {
-            return Ok(value);
+        self.save_internal().cloned()
+    }
+
+    /// The file contents a save writes for `value`, in the source file's
+    /// format and style.
+    fn serialize(&self, value: &Value) -> Result<String, PackageManifestError> {
+        let mut contents = if self.is_yaml() {
+            self.serialize_yaml(value)?
+        } else {
+            let mut contents = if self.is_json5() {
+                self.serialize_json5(value)?
+            } else {
+                self.blank_lines.restore(&serialize_with_indent(value, &self.indent)?)
+            };
+            if self.insert_final_newline {
+                contents.push('\n');
+            }
+            contents
+        };
+        if self.crlf {
+            contents = serialization::normalize_crlf(&contents);
         }
-        let mut contents = serialize_with_indent(&value, &self.indent)?;
-        if self.insert_final_newline {
-            contents.push('\n');
-        }
-        Self::write_atomic(&self.path, &contents)?;
-        self.on_disk = Some(value.clone());
-        Ok(value)
+        Ok(contents)
     }
 
     pub fn save(&mut self) -> Result<(), PackageManifestError> {
-        self.save_and_get_written_value()?;
+        self.save_internal()?;
         Ok(())
     }
 
+    /// Skips groups that are not objects and specifiers that are not strings.
+    /// Installs reject the latter through [`Self::validate_dependency_types`].
     pub fn dependencies<'a>(
         &'a self,
         groups: impl IntoIterator<Item = DependencyGroup> + 'a,
     ) -> impl Iterator<Item = (&'a str, &'a str)> + 'a {
-        // TODO: add error when `dependencies` is found to not be an object
-        // TODO: add error when `version` is found to not be a string
         groups
             .into_iter()
             .filter_map(|group| self.value.get::<&str>(group.into()))
@@ -294,7 +329,7 @@ impl PackageManifest {
     /// generates under `node_modules/.bit_roots/<id>`; the isolated
     /// linker keys root-component member reachability off that value.
     /// Returned verbatim so callers can match whichever mode they care
-    /// about (today only `"workspaces"` is acted on).
+    /// about.
     #[must_use]
     pub fn install_config_hoisting_limits(&self) -> Option<&str> {
         self.value
@@ -418,147 +453,5 @@ impl PackageManifest {
     }
 }
 
-/// Decide whether a package directory needs a build pass.
-///
-/// True when the package's manifest declares any of `preinstall`, `install`,
-/// or `postinstall`, or when the package contains `binding.gyp` or a `.hooks/`
-/// directory. Missing manifests, IO errors, and parse errors all collapse to
-/// `false` — pacquet cannot meaningfully build a package whose extracted
-/// content cannot be inspected.
-#[must_use]
-pub fn pkg_requires_build(pkg_root: &Path) -> bool {
-    if pkg_root.join("binding.gyp").exists() || pkg_root.join(".hooks").is_dir() {
-        return true;
-    }
-    let Ok(Some(manifest)) = safe_read_package_json_from_dir(pkg_root) else { return false };
-    manifest_requires_build(&manifest)
-}
-
-/// Decide whether a parsed manifest declares lifecycle scripts that
-/// make its package a build candidate.
-///
-/// A script has to carry a value to count. An empty `postinstall` runs
-/// nothing, and pnpm v11's `pkgRequiresBuild` reads the same manifest as
-/// build-free, so treating the key's presence as build work would ask the
-/// user to approve a build that does not exist.
-#[must_use]
-pub fn manifest_requires_build(manifest: &Value) -> bool {
-    manifest
-        .get("scripts")
-        .and_then(Value::as_object)
-        .is_some_and(|scripts| {
-            ["preinstall", "install", "postinstall"]
-                .iter()
-                .any(|name| scripts.get(*name).is_some_and(script_is_set))
-        })
-}
-
-/// Whether a `scripts` entry holds something to run.
-///
-/// Mirrors `Boolean(manifest.scripts.postinstall)` in pnpm v11's
-/// `pkgRequiresBuild`: `null`, `false`, `0`, and `""` are the falsy values
-/// a manifest can carry there.
-fn script_is_set(script: &Value) -> bool {
-    match script {
-        Value::String(script) => !script.is_empty(),
-        Value::Null | Value::Bool(false) => false,
-        Value::Number(number) => number.as_f64() != Some(0.0),
-        _ => true,
-    }
-}
-
-/// Decide whether a store-index file key implies build hooks.
-#[must_use]
-pub fn file_path_requires_build(filename: &str) -> bool {
-    filename == "binding.gyp"
-        || filename
-            .strip_prefix(".hooks")
-            .is_some_and(|suffix| suffix.starts_with('/') || suffix.starts_with('\\'))
-}
-
-#[must_use]
-pub fn files_include_install_scripts<Filenames, Filename>(filenames: Filenames) -> bool
-where
-    Filenames: IntoIterator<Item = Filename>,
-    Filename: AsRef<str>,
-{
-    filenames.into_iter().any(|filename| file_path_requires_build(filename.as_ref()))
-}
-
 #[cfg(test)]
 mod tests;
-
-/// Extracts the author field from a manifest (either string or object with name).
-///
-/// A blank name is no name: an SBOM would otherwise carry it as the nameless
-/// SPDX actor `Person: `, which strict consumers reject.
-#[must_use]
-pub fn extract_author(manifest: &serde_json::Value) -> Option<String> {
-    let author = manifest.get("author")?;
-    let name = author
-        .as_str()
-        .or_else(|| author.get("name")?.as_str())?;
-    (!name.trim().is_empty()).then(|| name.to_string())
-}
-
-/// Extracts the homepage field from a manifest.
-pub fn extract_homepage(manifest: &serde_json::Value) -> Option<String> {
-    manifest
-        .get("homepage")
-        .and_then(|v| v.as_str())
-        .map(ToString::to_string)
-}
-
-/// Extracts the license from either the modern `license` field or the legacy
-/// `licenses` field.
-pub fn extract_license(manifest: &serde_json::Value) -> Option<String> {
-    manifest
-        .get("license")
-        .and_then(extract_license_field)
-        .or_else(|| manifest.get("licenses").and_then(extract_license_field))
-}
-
-fn extract_license_field(field: &serde_json::Value) -> Option<String> {
-    if let Some(license) = field.as_str() {
-        return (!license.is_empty()).then(|| license.to_string());
-    }
-    if let Some(entries) = field.as_array() {
-        let licenses: Vec<&str> = entries
-            .iter()
-            .filter_map(extract_license_type)
-            .collect();
-        return match licenses.as_slice() {
-            [] => None,
-            [license] => Some((*license).to_string()),
-            licenses => Some(format!("({})", licenses.join(" OR "))),
-        };
-    }
-    extract_license_type(field).map(ToString::to_string)
-}
-
-fn extract_license_type(entry: &serde_json::Value) -> Option<&str> {
-    if let Some(license) = entry
-        .as_str()
-        .filter(|license| !license.is_empty())
-    {
-        return Some(license);
-    }
-    let entry = entry.as_object()?;
-    for key in ["type", "name"] {
-        if let Some(license) = entry
-            .get(key)
-            .and_then(serde_json::Value::as_str)
-            .filter(|license| !license.is_empty())
-        {
-            return Some(license);
-        }
-    }
-    None
-}
-
-mod runtime;
-
-mod initialization;
-
-mod serialization;
-use serialization::{normalize_dependency_fields, serialize_with_indent};

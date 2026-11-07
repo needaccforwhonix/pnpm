@@ -15,8 +15,8 @@ use pnpm_testing_utils::{fs::is_symlink_or_junction, registry::TestRegistry};
 use tempfile::tempdir;
 use text_block_macros::text_block;
 
-/// End-to-end wiring smoke for the lockfile-verification gate
-/// (Phase 7). An invalid `minimumReleaseAgeExclude` pattern (the
+/// End-to-end wiring smoke for the lockfile-verification gate.
+/// An invalid `minimumReleaseAgeExclude` pattern (the
 /// glob form is rejected when paired with a version part, surfacing
 /// `ERR_PNPM_NAME_PATTERN_IN_VERSION_UNION`) trips
 /// `build_resolution_verifiers` before the frozen-lockfile dispatch
@@ -41,7 +41,7 @@ async fn install_rejects_invalid_minimum_release_age_exclude_pattern() {
     let mut config = Config::new();
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
     // Activate the verifier with an invalid exclude entry — the
     // version-part-with-wildcard combination is rejected by
     // `create_package_version_policy`.
@@ -106,6 +106,8 @@ async fn install_rejects_invalid_minimum_release_age_exclude_pattern() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -149,8 +151,8 @@ async fn fresh_install_writes_pnpm_lock_yaml_with_expected_shape() {
     let mut config = Config::new();
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
-    config.registry = mock_instance.url();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
+    config.registry = mock_instance.url().to_string();
     let config = config.leak();
 
     Install {
@@ -202,6 +204,8 @@ async fn fresh_install_writes_pnpm_lock_yaml_with_expected_shape() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -257,8 +261,8 @@ async fn fresh_install_splits_dev_and_prod_dependency_sections() {
     let mut config = Config::new();
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
-    config.registry = mock_instance.url();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
+    config.registry = mock_instance.url().to_string();
     let config = config.leak();
 
     Install {
@@ -310,6 +314,8 @@ async fn fresh_install_splits_dev_and_prod_dependency_sections() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -354,8 +360,8 @@ async fn fresh_install_marks_optional_snapshots_in_pnpm_lock_yaml() {
     let mut config = Config::new();
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
-    config.registry = mock_instance.url();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
+    config.registry = mock_instance.url().to_string();
     let config = config.leak();
 
     Install {
@@ -407,6 +413,8 @@ async fn fresh_install_marks_optional_snapshots_in_pnpm_lock_yaml() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -421,7 +429,7 @@ async fn fresh_install_marks_optional_snapshots_in_pnpm_lock_yaml() {
     // Look snapshots up by package name + version rather than by an
     // exact key parse: `@pnpm/xyz` declares peer deps, so the resolver
     // emits a peer-suffixed depPath that won't parse cleanly out of a
-    // literal here. Membership-by-name keeps the test robust to the
+    // literal here. Membership-by-name keeps the test independent of the
     // fixture's exact peer-suffix shape.
     let find_optional = |scope: &str, bare: &str| -> Option<bool> {
         snapshots
@@ -473,8 +481,8 @@ async fn fresh_install_skips_platform_incompatible_optional_dependency() {
     config.enable_global_virtual_store = false;
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
-    config.registry = mock_instance.url();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
+    config.registry = mock_instance.url().to_string();
     let config = config.leak();
 
     Install {
@@ -526,6 +534,8 @@ async fn fresh_install_skips_platform_incompatible_optional_dependency() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -617,7 +627,7 @@ fn is_modules_yaml_consistent_returns_true_when_settings_match() {
     let mut config = Config::new();
     config.store_dir = dir.path().join("pacquet-store").into();
     config.modules_dir = modules_dir.clone();
-    config.virtual_store_dir = modules_dir.join(".pacquet");
+    config.install_state_dir = modules_dir.join(".pacquet");
     let config = config.leak();
 
     let included = pnpm_modules_yaml::IncludedDependencies {
@@ -634,7 +644,7 @@ fn is_modules_yaml_consistent_returns_true_when_settings_match() {
         public_hoist_pattern: config.public_hoist_pattern.clone(),
         store_dir: config.store_dir.display().to_string(),
         virtual_store_dir: config
-            .effective_virtual_store_dir()
+            .virtual_store_dir()
             .to_string_lossy()
             .into_owned(),
         virtual_store_dir_max_length: config.virtual_store_dir_max_length,
@@ -661,7 +671,7 @@ fn is_modules_yaml_consistent_returns_false_when_included_drifts() {
     let mut config = Config::new();
     config.store_dir = dir.path().join("pacquet-store").into();
     config.modules_dir = modules_dir.clone();
-    config.virtual_store_dir = modules_dir.join(".pacquet");
+    config.install_state_dir = modules_dir.join(".pacquet");
     let config = config.leak();
 
     let prod_only = pnpm_modules_yaml::IncludedDependencies {
@@ -683,7 +693,7 @@ fn is_modules_yaml_consistent_returns_false_when_included_drifts() {
         public_hoist_pattern: config.public_hoist_pattern.clone(),
         store_dir: config.store_dir.display().to_string(),
         virtual_store_dir: config
-            .effective_virtual_store_dir()
+            .virtual_store_dir()
             .to_string_lossy()
             .into_owned(),
         virtual_store_dir_max_length: config.virtual_store_dir_max_length,
@@ -714,7 +724,7 @@ fn included_drift_alone_does_not_make_the_layout_inconsistent() {
     let mut config = Config::new();
     config.store_dir = dir.path().join("pacquet-store").into();
     config.modules_dir = modules_dir.clone();
-    config.virtual_store_dir = modules_dir.join(".pacquet");
+    config.install_state_dir = modules_dir.join(".pacquet");
     let config = config.leak();
 
     let prod_only = pnpm_modules_yaml::IncludedDependencies {
@@ -736,7 +746,7 @@ fn included_drift_alone_does_not_make_the_layout_inconsistent() {
         public_hoist_pattern: config.public_hoist_pattern.clone(),
         store_dir: config.store_dir.display().to_string(),
         virtual_store_dir: config
-            .effective_virtual_store_dir()
+            .virtual_store_dir()
             .to_string_lossy()
             .into_owned(),
         virtual_store_dir_max_length: config.virtual_store_dir_max_length,
@@ -770,7 +780,7 @@ fn layout_drift_still_makes_the_layout_inconsistent() {
     let mut config = Config::new();
     config.store_dir = dir.path().join("pacquet-store").into();
     config.modules_dir = modules_dir.clone();
-    config.virtual_store_dir = modules_dir.join(".pacquet");
+    config.install_state_dir = modules_dir.join(".pacquet");
     let config = config.leak();
 
     let seed = Modules {
@@ -780,7 +790,7 @@ fn layout_drift_still_makes_the_layout_inconsistent() {
         public_hoist_pattern: config.public_hoist_pattern.clone(),
         store_dir: config.store_dir.display().to_string(),
         virtual_store_dir: config
-            .effective_virtual_store_dir()
+            .virtual_store_dir()
             .to_string_lossy()
             .into_owned(),
         virtual_store_dir_max_length: config.virtual_store_dir_max_length,

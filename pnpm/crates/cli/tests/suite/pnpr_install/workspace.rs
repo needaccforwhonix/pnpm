@@ -25,7 +25,7 @@ fn workspace_install_via_pnpr_resolves_catalog_references() {
     writeln!(yaml, "catalog:\n  '{WORKSPACE_HELLO}': 1.0.0").expect("append the catalog");
     fs::write(&path, yaml).expect("write pnpm-workspace.yaml");
     write_workspace_project(&workspace, "app", "app", (WORKSPACE_HELLO, "catalog:"));
-    let (pnpr_url, token) = start_pnpr(&mock_instance.url());
+    let (pnpr_url, token) = start_pnpr(mock_instance.url());
     configure_pnpr_auth(&npmrc_path, &pnpr_url, &token);
 
     pacquet_at(&workspace)
@@ -53,7 +53,7 @@ fn workspace_install_via_pnpr_names_importers_relative_to_a_pinned_lockfile_dir(
     configure_workspace(&workspace);
     crate::_utils::append_workspace_yaml_key(&workspace, "lockfileDir", "..");
     write_workspace_project(&workspace, "app", "app", (WORKSPACE_HELLO, "1.0.0"));
-    let (pnpr_url, token) = start_pnpr(&mock_instance.url());
+    let (pnpr_url, token) = start_pnpr(mock_instance.url());
     configure_pnpr_auth(&npmrc_path, &pnpr_url, &token);
 
     pacquet_at(&workspace)
@@ -73,6 +73,50 @@ fn workspace_install_via_pnpr_names_importers_relative_to_a_pinned_lockfile_dir(
     assert!(workspace_has_link(&workspace, "app", WORKSPACE_HELLO));
 
     drop(mock_instance);
+}
+
+#[test]
+fn workspace_install_via_pnpr_links_publish_directory() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { npmrc_path, mock_instance, .. } = npmrc_info;
+    configure_workspace(&workspace);
+    let app = workspace.join("packages/app");
+    let lib = workspace.join("packages/lib");
+    fs::create_dir_all(&app).expect("create app");
+    fs::create_dir_all(lib.join("dist")).expect("create publish directory");
+    fs::write(
+        app.join("package.json"),
+        r#"{"name":"app","version":"1.0.0","dependencies":{"lib":"workspace:*"}}"#,
+    )
+    .expect("write app manifest");
+    fs::write(
+        lib.join("package.json"),
+        r#"{"name":"lib","version":"1.0.0","publishConfig":{"directory":"dist"}}"#,
+    )
+    .expect("write lib manifest");
+    fs::write(lib.join("dist/package.json"), r#"{"name":"lib","version":"1.0.0"}"#)
+        .expect("write published manifest");
+    let (pnpr_url, token) = start_pnpr(mock_instance.url());
+    configure_pnpr_auth(&npmrc_path, &pnpr_url, &token);
+
+    pacquet_at(&workspace)
+        .with_env("PNPM_CONFIG_REGISTRY", mock_instance.url())
+        .with_args(["install", "--pnpr-server", &pnpr_url])
+        .assert()
+        .success();
+
+    let lockfile = read_workspace_lockfile(&workspace);
+    assert_eq!(workspace_importer_version(&lockfile, "packages/app", "lib"), "link:../lib/dist");
+    assert_eq!(
+        workspace_importer(&lockfile, "packages/lib").publish_directory.as_deref(),
+        Some("dist"),
+    );
+    assert_eq!(
+        fs::canonicalize(app.join("node_modules/lib")).expect("resolve linked lib"),
+        fs::canonicalize(lib.join("dist")).expect("resolve publish directory"),
+    );
+    drop((root, mock_instance));
 }
 
 #[test]
@@ -108,7 +152,7 @@ fn workspace_pnpr_install_uses_current_resolver_settings_and_frozen_replays_them
     let stale = read_workspace_lockfile(&workspace);
     assert_eq!(resolver_settings(&stale), (true, None, true));
     replace_workspace_dependency(&workspace, "app", (MISSING_PEERS_PARENT, "1.0.0"));
-    let (pnpr_url, token) = start_pnpr(&mock_instance.url());
+    let (pnpr_url, token) = start_pnpr(mock_instance.url());
     configure_pnpr_auth(&npmrc_path, &pnpr_url, &token);
 
     pacquet_at(&workspace)
@@ -169,7 +213,7 @@ fn filtered_pnpr_repair_preserves_unselected_metadata() {
     let CommandTempCwd { root, workspace, npmrc_info, .. } =
         CommandTempCwd::init().add_mocked_registry();
     let AddMockedRegistry { mock_instance, .. } = npmrc_info;
-    seed_filtered_repair_workspace(&workspace, &mock_instance.url());
+    seed_filtered_repair_workspace(&workspace, mock_instance.url());
     let lockfile_path = workspace.join("pnpm-lock.yaml");
     let mut previous = read_workspace_lockfile(&workspace);
     let previous_unselected = workspace_importer(&previous, "packages/unselected").clone();
@@ -258,7 +302,7 @@ fn filtered_pnpr_repair_verifies_the_merged_lockfile_before_writing() {
     let CommandTempCwd { root, workspace, npmrc_info, .. } =
         CommandTempCwd::init().add_mocked_registry();
     let AddMockedRegistry { mock_instance, .. } = npmrc_info;
-    seed_filtered_repair_workspace(&workspace, &mock_instance.url());
+    seed_filtered_repair_workspace(&workspace, mock_instance.url());
     let lockfile_path = workspace.join("pnpm-lock.yaml");
     let previous = read_workspace_lockfile(&workspace);
     let fresh = selected_only_pnpr_lockfile(previous.clone());
@@ -352,7 +396,7 @@ fn filtered_workspace_pnpr_resolves_workspace_protocol_from_project_identity() {
     configure_workspace(&workspace);
     write_workspace_project(&workspace, "app", "app", ("lib", "workspace:*"));
     write_workspace_project(&workspace, "lib", "lib", (WORKSPACE_HELLO, "1.0.0"));
-    let (pnpr_url, token) = start_pnpr(&mock_instance.url());
+    let (pnpr_url, token) = start_pnpr(mock_instance.url());
     configure_pnpr_auth(&npmrc_path, &pnpr_url, &token);
 
     pacquet_at(&workspace)

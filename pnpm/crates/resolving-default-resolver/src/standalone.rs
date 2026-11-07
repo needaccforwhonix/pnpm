@@ -7,9 +7,9 @@
 //! tarball resolver read a fetched `package.json`. A caller that wants a
 //! single answer for a single specifier — `pnpm store add`, the NAPI
 //! `resolveDependency` — has none of that, and would otherwise each grow
-//! its own copy of the ten-resolver chain.
+//! its own copy of the resolver chain.
 //!
-//! Two deliberate deviations from the install chain follow from having no
+//! Deliberate deviations from the install chain follow from having no
 //! install to hang off:
 //!
 //! - The tarball resolver runs without a fetch context, so an `http(s)`
@@ -20,7 +20,7 @@
 //!   install-time concern.
 
 use crate::DefaultResolver;
-use pnpm_config::Config;
+use pnpm_config::{Config, Tool};
 use pnpm_engine_pm_yarn_resolver::YarnResolver;
 use pnpm_engine_runtime_bun_resolver::BunResolver;
 use pnpm_engine_runtime_deno_resolver::DenoResolver;
@@ -30,8 +30,8 @@ use pnpm_resolving_git_resolver::{GitResolver, RealGitProbe, RealGitRunner};
 use pnpm_resolving_local_resolver::{LocalPathResolver, LocalResolverContext, LocalSchemeResolver};
 use pnpm_resolving_npm_resolver::{
     InMemoryPackageMetaCache, MergeNamedRegistriesError, NamedRegistryResolver, NpmResolver,
-    merge_named_registries, shared_in_memory_cache, shared_packument_fetch_locker,
-    shared_picked_manifest_cache,
+    OfflineStoreView, merge_named_registries, shared_in_memory_cache,
+    shared_packument_fetch_locker, shared_picked_manifest_cache,
 };
 use pnpm_resolving_resolver_base::Resolver;
 use pnpm_resolving_tarball_resolver::TarballResolver;
@@ -54,8 +54,7 @@ pub struct StandaloneChainOptions<'a> {
 
 /// Build the chain a single resolve dispatches through.
 ///
-/// Order mirrors the install path: npm → git → tarball → localScheme →
-/// node → deno → bun → yarn → namedRegistry → localPath. The local-resolver
+/// Order mirrors the install path. The local-resolver
 /// split (scheme before the runtimes, path last) lets a
 /// `<alias>:@scope/pkg` named-registry specifier reach the named-registry
 /// resolver instead of being claimed by the path-shape detector on the
@@ -64,7 +63,7 @@ pub fn build_standalone_chain(
     opts: &StandaloneChainOptions<'_>,
 ) -> Result<DefaultResolver, MergeNamedRegistriesError> {
     let &StandaloneChainOptions { config, http_client, .. } = opts;
-    let retry_opts = chain_retry_opts(config);
+    let retry_opts = config.retry_opts();
     // Shared behind an `Arc` so the deno / bun runtime resolvers (which
     // reuse the npm resolver for their own version picking) and the chain
     // slot below all point at the same instance and its metadata cache.
@@ -72,7 +71,7 @@ pub fn build_standalone_chain(
     // `preserveAbsolutePaths` isn't exposed by pacquet's `Config` yet, so
     // the local-resolver context defaults to `false` here — same as the
     // install path.
-    let local_ctx = LocalResolverContext { preserve_absolute_paths: false };
+    let local_ctx = LocalResolverContext { preserve_absolute_paths: false, ..Default::default() };
 
     Ok(DefaultResolver::new(vec![
         Box::new(Arc::clone(&npm_resolver)),
@@ -84,32 +83,21 @@ pub fn build_standalone_chain(
         Box::new(LocalSchemeResolver::new(local_ctx)),
         Box::new(build_node_resolver(config, http_client)),
         Box::new(DenoResolver::new(Arc::clone(http_client), Arc::clone(&npm_resolver))),
-        Box::new(BunResolver::new(Arc::clone(http_client), Arc::clone(&npm_resolver))),
+        Box::new(
+            BunResolver::new(Arc::clone(http_client), Arc::clone(&npm_resolver))
+                .with_mirror(config.tool_mirror(Tool::Bun)),
+        ),
         Box::new(YarnResolver::new(Arc::clone(http_client), config.tls.strict_ssl.unwrap_or(true))),
         Box::new(build_named_registry_resolver(opts, retry_opts)?),
         Box::new(LocalPathResolver::new(local_ctx)),
     ]))
 }
 
-fn chain_retry_opts(config: &Config) -> RetryOpts {
-    RetryOpts {
-        retries: config.fetch_retries,
-        factor: config.fetch_retry_factor,
-        min_timeout: std::time::Duration::from_millis(config.fetch_retry_mintimeout),
-        max_timeout: std::time::Duration::from_millis(config.fetch_retry_maxtimeout),
-    }
-}
-
 fn build_npm_resolver(
     opts: &StandaloneChainOptions<'_>,
     retry_opts: RetryOpts,
 ) -> NpmResolver<InMemoryPackageMetaCache> {
-    let &StandaloneChainOptions {
-        config,
-        http_client,
-        full_metadata,
-        filter_metadata,
-    } = opts;
+    let &StandaloneChainOptions { config, http_client, .. } = opts;
     NpmResolver {
         // `resolved_registries` inserts the `default` route from
         // `config.registry`; `config.registries` alone omits it, which
@@ -118,10 +106,7 @@ fn build_npm_resolver(
             .resolved_registries()
             .into_iter()
             .collect(),
-        registries_by_prefix: config.registries_by_prefix
-            .clone()
-            .into_iter()
-            .collect(),
+        declared_prefixes: config.declared_registry_prefixes(),
         metadata: pnpm_resolving_npm_resolver::RegistryMetadataClient {
             http_client: Arc::clone(http_client),
             auth_headers: Arc::clone(&config.auth_headers),
@@ -131,23 +116,38 @@ fn build_npm_resolver(
             cache_dir: Some(config.cache_dir.clone()),
             retry_opts,
         },
-        format: pnpm_resolving_npm_resolver::RegistryMetadataFormat {
-            full_metadata,
-            needs_full_metadata_for: None,
-            filter_metadata,
-        },
+        format: metadata_format(opts),
         cache_policy: pnpm_resolving_npm_resolver::MetadataCachePolicy {
-            offline: config.offline,
-            prefer_offline: config.prefer_offline,
+            network: config.network_policy(),
             ignore_missing_time_field: config.minimum_release_age_ignore_missing_time,
         },
+        store_view: offline_store_view(config),
     }
+}
+
+fn metadata_format(
+    opts: &StandaloneChainOptions<'_>,
+) -> pnpm_resolving_npm_resolver::RegistryMetadataFormat {
+    let config = opts.config;
+    pnpm_resolving_npm_resolver::RegistryMetadataFormat {
+        full_metadata: opts.full_metadata,
+        needs_full_metadata_for: None,
+        filter_metadata: opts.filter_metadata,
+        registry_options_by_url: Arc::new(config.registry_options_by_url.clone()),
+        minimum_release_age: config.resolved_minimum_release_age(),
+    }
+}
+
+fn offline_store_view(config: &Config) -> Option<OfflineStoreView> {
+    OfflineStoreView::open_for_offline(config.offline, &config.store_dir, config.frozen_store)
 }
 
 fn build_node_resolver(config: &Config, http_client: &Arc<ThrottledClient>) -> NodeResolver {
     let mut node_resolver =
         NodeResolver::new_with_auth(Arc::clone(http_client), Arc::clone(&config.auth_headers));
     node_resolver.node_download_mirrors.clone_from(&config.node_download_mirrors);
+    node_resolver.mirror = config.tool_mirror(Tool::Node).map(ToString::to_string);
+    node_resolver.channel_mirrors = config.tool_channel_mirrors(Tool::Node);
     node_resolver.offline = config.offline;
     node_resolver.cache_dir = Some(config.cache_dir.clone());
     node_resolver
@@ -161,12 +161,7 @@ fn build_named_registry_resolver(
     opts: &StandaloneChainOptions<'_>,
     retry_opts: RetryOpts,
 ) -> Result<NamedRegistryResolver<InMemoryPackageMetaCache>, MergeNamedRegistriesError> {
-    let &StandaloneChainOptions {
-        config,
-        http_client,
-        full_metadata,
-        filter_metadata,
-    } = opts;
+    let &StandaloneChainOptions { config, http_client, .. } = opts;
     let user_registries_by_prefix: HashMap<String, String> = config
         .registries_by_prefix
         .iter()
@@ -179,6 +174,11 @@ fn build_named_registry_resolver(
             .cloned()
             .collect(),
         registries_by_prefix: merged_registries_by_prefix,
+        registries: config
+            .resolved_registries()
+            .into_iter()
+            .collect(),
+        declared_prefixes: config.declared_registry_prefixes(),
         metadata: pnpm_resolving_npm_resolver::RegistryMetadataClient {
             http_client: Arc::clone(http_client),
             auth_headers: Arc::clone(&config.auth_headers),
@@ -188,15 +188,11 @@ fn build_named_registry_resolver(
             cache_dir: Some(config.cache_dir.clone()),
             retry_opts,
         },
-        format: pnpm_resolving_npm_resolver::RegistryMetadataFormat {
-            full_metadata,
-            needs_full_metadata_for: None,
-            filter_metadata,
-        },
+        format: metadata_format(opts),
         cache_policy: pnpm_resolving_npm_resolver::MetadataCachePolicy {
-            offline: config.offline,
-            prefer_offline: config.prefer_offline,
+            network: config.network_policy(),
             ignore_missing_time_field: config.minimum_release_age_ignore_missing_time,
         },
+        store_view: offline_store_view(config),
     })
 }

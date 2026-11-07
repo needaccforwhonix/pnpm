@@ -18,14 +18,20 @@
 //! demands it.
 
 use pnpm_network::{
-    AuthHeaders, RetryOpts, ThrottledClient, ThrottledClientGuard, redact_url_credentials,
-    redact_url_for_display, retry_async, send_with_retry_at_priority,
+    AuthHeaders, RetryOpts, ThrottledClient, ThrottledClientGuard, read_self_delimiting_body,
+    redact_url_credentials, redact_url_for_display, retry_async, send_with_retry_at_priority,
 };
 use pnpm_registry::Package;
 use reqwest::{Response, StatusCode, header};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use crate::{FetchMetadataError, mirror::clear_meta, registry_url::to_registry_url};
+use crate::{
+    FetchMetadataError,
+    decode_pool::run_decode,
+    metadata_cache_policy::{DocumentKind, normalizes_to_abbreviated},
+    mirror::clear_meta,
+    registry_url::to_registry_url,
+};
 
 /// Accept header for the full packument.
 pub(crate) const ACCEPT_FULL_DOC: &str = "application/json; q=1.0, */*";
@@ -34,12 +40,57 @@ pub(crate) const ACCEPT_FULL_DOC: &str = "application/json; q=1.0, */*";
 pub(crate) const ACCEPT_ABBREVIATED_DOC: &str =
     "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*";
 
+/// Accept header for pnpr's own package document, sent only to a registry
+/// declared `serverType: pnpr`.
+pub(crate) const ACCEPT_PNPR_DOC: &str = "application/vnd.pnpr.install-v2+json; q=1.0, \
+     application/vnd.npm.install-v1+json; q=0.9, application/json; q=0.8, */*";
+
+/// Content type of pnpr's own package document, which may leave a version's
+/// manifest in its release record.
+const INSTALL_V2_CONTENT_TYPE: &str = "application/vnd.pnpr.install-v2+json";
+
+/// The response header with which pnpr identifies its package documents.
+const PNPR_REGISTRY_HEADER: &str = "pnpr-registry";
+
 /// Content type of an abbreviated (install-oriented) packument. A
 /// spec-compliant registry echoes this in the response `Content-Type` when it
 /// honors the abbreviated `Accept` header. Its absence signals that the
 /// registry ignored the header and served the full document instead.
 /// <https://github.com/npm/registry/blob/ae49abf1ba/docs/responses/package-metadata.md>
 const ABBREVIATED_META_CONTENT_TYPE: &str = "application/vnd.npm.install-v1+json";
+
+/// `true` when `Cache-Control` says the metadata document is already stale.
+///
+/// `max-age=0`, `no-cache`, and `no-store` are the signals a registry uses
+/// when a later publish must not be hidden behind the previous document.
+/// A positive `max-age` stays cacheable and keeps conditional requests.
+pub(crate) fn metadata_response_is_uncacheable(headers: &header::HeaderMap) -> bool {
+    // `get` returns only the first field. A registry can send
+    // `Cache-Control: public` and `Cache-Control: no-cache` as two
+    // fields; any one of them forbidding reuse wins.
+    headers
+        .get_all(header::CACHE_CONTROL)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(cache_control_value_is_uncacheable)
+}
+
+fn cache_control_value_is_uncacheable(value: &str) -> bool {
+    value
+        .split(',')
+        .any(|directive| {
+            let directive = directive.trim();
+            if directive.eq_ignore_ascii_case("no-cache")
+                || directive.eq_ignore_ascii_case("no-store")
+            {
+                return true;
+            }
+            let Some((name, age)) = directive.split_once('=') else {
+                return false;
+            };
+            name.trim().eq_ignore_ascii_case("max-age") && age.trim().parse::<u64>().ok() == Some(0)
+        })
+}
 
 /// Whether the response `Content-Type` declares the abbreviated packument
 /// media type. Parameters (`; charset=utf-8`) are dropped and the comparison
@@ -50,8 +101,39 @@ pub(crate) fn is_abbreviated_content_type(headers: &header::HeaderMap) -> bool {
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| {
             let media_type = value.split_once(';').map_or(value, |(media_type, _)| media_type);
-            media_type.trim().eq_ignore_ascii_case(ABBREVIATED_META_CONTENT_TYPE)
+            let media_type = media_type.trim();
+            media_type.eq_ignore_ascii_case(ABBREVIATED_META_CONTENT_TYPE)
+                || media_type.eq_ignore_ascii_case(INSTALL_V2_CONTENT_TYPE)
         })
+}
+
+/// A metadata body, in npm's format or, when `install_v2`, in pnpr's own.
+fn parse_metadata(body: &str, install_v2: bool) -> serde_json::Result<Package> {
+    if install_v2 { pnpm_registry::parse_install_v2(body) } else { serde_json::from_str(body) }
+}
+
+/// Whether the response is pnpr's own package document.
+fn is_install_v2_content_type(headers: &header::HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case(INSTALL_V2_CONTENT_TYPE))
+}
+
+/// Warn, once per registry, that `registry` sent a package document with
+/// [`PNPR_REGISTRY_HEADER`] although it is not declared `serverType: pnpr`:
+/// the install works from npm's documents, without what only pnpr's carry.
+fn warn_about_undeclared_pnpr(http_client: &ThrottledClient, registry: &str) {
+    static WARNED: std::sync::LazyLock<std::sync::Mutex<indexmap::IndexSet<String>>> =
+        std::sync::LazyLock::new(Default::default);
+    if !crate::warn_once::first_warning(&WARNED, registry.to_string(), 64) {
+        return;
+    }
+    http_client.warn(&format!(
+        r#"The registry {} is a pnpr registry. Declare it with "serverType: pnpr" under "registries" in pnpm-workspace.yaml to install its revisions and the facts it records about each package's archives."#,
+        redact_url_for_display(registry),
+    ));
 }
 
 /// Options bundle for [`fetch_full_metadata`]. The cached variant
@@ -76,13 +158,10 @@ pub struct FetchFullMetadataOptions<'a> {
     pub http: crate::MetadataHttpClient<'a>,
 }
 
-/// Outcome of a [`fetch_full_metadata`] call. The caller (today: only
-/// `maybe_upgrade_abbreviated_meta_for_release_age` inside
-/// [`crate::pick_package()`]) reacts differently to a 304 than to
-/// a 200. [`Package`] is boxed so the size of the enum stays small
-/// even though a full packument can be many KB — the same boxing
-/// pattern used elsewhere in the crate when a large struct sits next
-/// to a unit variant.
+/// Outcome of a [`fetch_full_metadata`] call. The caller reacts
+/// differently to a 304 than to a 200. [`Package`] is boxed so the
+/// size of the enum stays small even though a full packument can be
+/// many KB.
 #[derive(Debug, Clone)]
 pub enum FetchFullMetadataOutcome {
     /// Registry returned a 2xx with a parsed body.
@@ -103,11 +182,10 @@ pub(crate) struct MetadataRequestOptions<'a> {
     pub priority: u64,
     pub etag: Option<&'a str>,
     pub modified: Option<&'a str>,
-    /// Ask for the packument as a cold cache would: [`Self::etag`] and
-    /// [`Self::modified`] are dropped rather than sent, and `Cache-Control:
-    /// no-cache` keeps an intermediary from validating them on our behalf.
-    /// Set when the mirror those validators describe is known to be gone, so
-    /// only a body — never a `304` — can satisfy the request.
+    /// Send `Cache-Control: no-cache`, so an intermediary cannot answer from
+    /// its own copy without asking the origin. With [`Self::etag`] or
+    /// [`Self::modified`] the origin still answers a current mirror with a
+    /// `304`. Without them only a body can satisfy the request.
     pub bypass_cache: bool,
     pub http: crate::MetadataHttpClient<'a>,
 }
@@ -119,13 +197,29 @@ pub struct MetadataHttpClient<'a> {
     pub retry_opts: RetryOpts,
 }
 
+impl MetadataHttpClient<'_> {
+    /// One HTTP attempt. [`crate::FetchMetadataError::is_transient`]
+    /// owns the caller's retry budget around the whole fetch, so the
+    /// inner send must not spend it again.
+    pub(crate) fn one_attempt(self) -> Self {
+        Self { retry_opts: RetryOpts { retries: 0, ..self.retry_opts }, ..self }
+    }
+}
+
 /// Send a metadata GET, retrying an unsolicited 304 once with intermediary
 /// cache reuse disabled. A repeated 304 cannot validate any local body and is
 /// reported with the same error in both pnpm implementations.
 ///
-/// A [`MetadataRequestOptions::bypass_cache`] request has already given up its
-/// validators, so that retry would only repeat itself: its 304 fails straight
-/// away instead.
+/// A validator-free [`MetadataRequestOptions::bypass_cache`] request already
+/// disabled intermediary reuse, so that retry would only repeat itself: its
+/// 304 fails straight away instead.
+///
+/// A 304 to a revalidation sent without `bypass_cache` whose `Cache-Control`
+/// forbids reuse (see [`metadata_response_is_uncacheable`]) is asked once
+/// more without validators. Only a mirror without the uncacheable flag sends
+/// such a revalidation, and a stale intermediary can answer it with a 304. If
+/// the validator-free request is answered with a 304 too, it is returned as
+/// is and the caller serves its mirror.
 pub(crate) async fn send_metadata_request<'a>(
     opts: &MetadataRequestOptions<'a>,
 ) -> Result<(ThrottledClientGuard<'a>, Response), FetchMetadataError> {
@@ -137,8 +231,15 @@ pub(crate) async fn send_metadata_request<'a>(
     }
     let validators = Validators::for_request(opts);
     let (client, response) = send_once(opts, &validators, opts.bypass_cache).await?;
-    if response.status() != StatusCode::NOT_MODIFIED || validators.any() {
+    if response.status() != StatusCode::NOT_MODIFIED {
         return Ok((client, response));
+    }
+    if validators.any() {
+        if opts.bypass_cache || !metadata_response_is_uncacheable(response.headers()) {
+            return Ok((client, response));
+        }
+        drop(client);
+        return send_once(opts, &Validators::NONE, true).await;
     }
     drop(client);
     if opts.bypass_cache {
@@ -157,18 +258,16 @@ pub(crate) async fn send_metadata_request<'a>(
     Ok((client, response))
 }
 
-/// The conditional-request headers this call may send. A cache-bypassing
-/// request gives them up.
+/// The conditional-request headers this call may send.
 struct Validators<'a> {
     etag: Option<&'a str>,
     modified: Option<String>,
 }
 
 impl<'a> Validators<'a> {
+    const NONE: Validators<'static> = Validators { etag: None, modified: None };
+
     fn for_request(opts: &MetadataRequestOptions<'a>) -> Self {
-        if opts.bypass_cache {
-            return Validators { etag: None, modified: None };
-        }
         Validators {
             etag: opts.etag.filter(|value| !value.is_empty()),
             modified: opts.modified
@@ -212,20 +311,32 @@ async fn send_once<'a>(
         },
     )
     .await
-    .map_err(|error| FetchMetadataError::Network { url: redact_url_credentials(opts.url), error })
+    .map_err(|error| FetchMetadataError::Network {
+        url: redact_url_credentials(opts.url),
+        error: error.without_url(),
+    })
 }
 
 /// Convert a stored `modified` value — the packument's ISO-8601
 /// `time.modified` — to the HTTP-date form `If-Modified-Since` requires
 /// (RFC 9110 §8.8.3), the same conversion the TypeScript CLI applies with
-/// `toUTCString()`. A value already in HTTP-date form is kept. `None` when
-/// the value parses as neither, so it is dropped instead of sent — a
-/// recipient must ignore a malformed `If-Modified-Since` anyway.
+/// `toUTCString()`. A date without a time is midnight UTC, as JavaScript's
+/// `Date` reads it. A value already in HTTP-date form is kept. `None` when
+/// the value parses as none of these, or names a time outside the years
+/// 1970 to 9999 that an HTTP date can carry, so it is dropped instead of
+/// sent — a recipient must ignore a malformed `If-Modified-Since` anyway.
 fn to_http_date(value: &str) -> Option<String> {
-    if let Ok(datetime) = chrono::DateTime::parse_from_rfc3339(value) {
-        return Some(httpdate::fmt_http_date(datetime.into()));
-    }
-    httpdate::parse_http_date(value).ok().map(httpdate::fmt_http_date)
+    let time: chrono::DateTime<chrono::Utc> =
+        if let Ok(datetime) = chrono::DateTime::parse_from_rfc3339(value) {
+            datetime.into()
+        } else if let Ok(date) = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d") {
+            date.and_time(chrono::NaiveTime::MIN).and_utc()
+        } else {
+            return httpdate::parse_http_date(value).ok().map(httpdate::fmt_http_date);
+        };
+    // `fmt_http_date` panics outside that range.
+    let in_range = time.timestamp() >= 0 && chrono::Datelike::year(&time) <= 9999;
+    in_range.then(|| httpdate::fmt_http_date(time.into()))
 }
 
 /// Fetch the registry metadata document for `pkg_name`. The
@@ -236,50 +347,134 @@ pub async fn fetch_full_metadata(
     opts: &FetchFullMetadataOptions<'_>,
 ) -> Result<FetchFullMetadataOutcome, FetchMetadataError> {
     let url = to_registry_url(opts.registry, pkg_name);
-    let accept = if opts.full_metadata { ACCEPT_FULL_DOC } else { ACCEPT_ABBREVIATED_DOC };
-    retry_async(&url, opts.http.retry_opts, FetchMetadataError::is_body_retryable, || async {
-        let started_at = Instant::now();
-        let (client, response) = send_metadata_request(&MetadataRequestOptions {
-            pkg_name,
-            url: &url,
-            accept,
-            priority: pnpm_network::UNPRIORITIZED,
-            etag: opts.etag,
-            modified: opts.modified,
-            bypass_cache: false,
-            http: opts.http,
-        })
-        .await?;
-        if response.status() == StatusCode::NOT_MODIFIED {
-            return Ok(FetchFullMetadataOutcome::NotModified);
-        }
-        let response = response
-            .error_for_status()
-            .map_err(|error| FetchMetadataError::Network {
-                url: redact_url_credentials(&url),
-                error,
-            })?;
-        let normalize_to_abbreviated =
-            !opts.full_metadata && !is_abbreviated_content_type(response.headers());
-        let raw_body = response
-            .text()
-            .await
-            .map_err(|error| FetchMetadataError::BodyRead {
-                url: redact_url_credentials(&url),
-                error,
-            })?;
-        // Body fully buffered — release the connection and its
-        // network-concurrency permit, then parse off the reactor: a
-        // multi-MB packument parse would otherwise pin a tokio worker
-        // and stall every socket it pumps (see
-        // `fetch_full_metadata_cached` for the cold-install numbers).
-        drop(client);
-        let (meta, elapsed) =
-            decode_full_metadata(&url, raw_body, normalize_to_abbreviated, started_at).await?;
-        warn_if_request_is_slow(opts.http.http_client, elapsed, &url);
-        Ok(FetchFullMetadataOutcome::Modified(Box::new(meta)))
+    let kind = DocumentKind::requested(opts.full_metadata);
+    retry_async(&url, opts.http.retry_opts, FetchMetadataError::is_transient, || {
+        one_metadata_attempt(pkg_name, opts, &url, kind)
     })
     .await
+}
+
+async fn one_metadata_attempt(
+    pkg_name: &str,
+    opts: &FetchFullMetadataOptions<'_>,
+    url: &str,
+    kind: DocumentKind,
+) -> Result<FetchFullMetadataOutcome, FetchMetadataError> {
+    let (client, response) = send_metadata_request(&MetadataRequestOptions {
+        pkg_name,
+        url,
+        accept: kind.accept(false),
+        priority: pnpm_network::UNPRIORITIZED,
+        etag: opts.etag,
+        modified: opts.modified,
+        bypass_cache: false,
+        http: opts.http.one_attempt(),
+    })
+    .await?;
+    if response.status() == StatusCode::NOT_MODIFIED {
+        return Ok(FetchFullMetadataOutcome::NotModified);
+    }
+    let normalize = normalizes_to_abbreviated(kind, response.headers());
+    let meta = decode_metadata_response(
+        MetadataResponse {
+            client,
+            response,
+            url,
+            registry: opts.registry,
+            asked_install_v2: false,
+            http_client: opts.http.http_client,
+        },
+        normalize,
+        Ok,
+    )
+    .await?;
+    Ok(FetchFullMetadataOutcome::Modified(Box::new(meta)))
+}
+
+/// A metadata response together with the network permit it holds.
+pub(crate) struct MetadataResponse<'a> {
+    pub client: ThrottledClientGuard<'a>,
+    pub response: Response,
+    pub url: &'a str,
+    pub registry: &'a str,
+    /// Whether the request offered pnpr's own format, so a response in it is
+    /// read as one. An unsolicited one is not.
+    pub asked_install_v2: bool,
+    pub http_client: &'a ThrottledClient,
+}
+
+impl MetadataResponse<'_> {
+    /// Whether the body is pnpr's own package document: a response in that
+    /// format is read as one only when it was asked for. A registry that
+    /// identifies itself as pnpr without having been asked gets a warning.
+    fn is_install_v2(&self) -> bool {
+        let headers = self.response.headers();
+        if !self.asked_install_v2 && headers.contains_key(PNPR_REGISTRY_HEADER) {
+            warn_about_undeclared_pnpr(self.http_client, self.registry);
+        }
+        self.asked_install_v2 && is_install_v2_content_type(headers)
+    }
+}
+
+/// Read a metadata response's body, then parse it and hand it to `finish`
+/// off the reactor.
+///
+/// - A non-`2xx` status fails with [`FetchMetadataError::Network`].
+/// - The connection and its network-concurrency permit are released once
+///   the body is buffered, before the parse, so the permit bounds sockets,
+///   not parses.
+/// - `finish` runs on the decode pool too, so it may write the mirror.
+/// - The slow-request warning counts from the permit's acquisition to the
+///   end of the parse.
+pub(crate) async fn decode_metadata_response<Output: Send + 'static>(
+    response: MetadataResponse<'_>,
+    normalize_to_abbreviated: bool,
+    finish: impl FnOnce(Package) -> Result<Output, FetchMetadataError> + Send + 'static,
+) -> Result<Output, FetchMetadataError> {
+    let install_v2 = response.is_install_v2();
+    let MetadataResponse {
+        client, response, url, http_client, ..
+    } = response;
+    let started_at = client.acquired_at();
+    let response = response
+        .error_for_status()
+        .map_err(|error| FetchMetadataError::Network {
+            url: redact_url_credentials(url),
+            error: error.without_url(),
+        })?;
+    let raw_body = read_self_delimiting_body(response).await
+        .inspect_err(|error| http_client.downscale_on_timeout(url, error))
+        .map_err(|error| FetchMetadataError::BodyRead {
+            url: redact_url_credentials(url),
+            error: error.without_url(),
+        })?;
+    drop(client);
+    // Packuments run to several megabytes for high-release-cadence packages
+    // (`@fluentui/*`, `@types/node`, ...); parsing one inline pins a tokio
+    // worker for hundreds of milliseconds and stalls every socket that
+    // worker pumps.
+    let task_url = url.to_string();
+    let (output, elapsed) = run_decode(move || {
+        let raw_body = raw_body.into_text();
+        let mut meta = parse_metadata(&raw_body, install_v2)
+            .map_err(|error| FetchMetadataError::Decode {
+                url: redact_url_credentials(&task_url),
+                error,
+            })?;
+        // Each version's fragment is copied out of the body, so it can go
+        // before `finish` writes the mirror.
+        drop(raw_body);
+        meta.drop_incomplete_publish_times();
+        let elapsed = started_at.elapsed();
+        if normalize_to_abbreviated {
+            meta = normalize_abbreviated_meta(meta);
+        }
+        Ok::<_, FetchMetadataError>((finish(meta)?, elapsed))
+    })
+    .await
+    .map_err(|error| FetchMetadataError::ParseTask { url: redact_url_credentials(url), error })??;
+    warn_if_request_is_slow(http_client, elapsed, url);
+    Ok(output)
 }
 
 pub(crate) fn warn_if_request_is_slow(http_client: &ThrottledClient, elapsed: Duration, url: &str) {
@@ -317,32 +512,3 @@ pub(crate) fn normalize_abbreviated_meta(meta: Package) -> Package {
 
 #[cfg(test)]
 mod tests;
-
-/// Parse a buffered packument off the reactor after releasing the network permit.
-async fn decode_full_metadata(
-    url: &str,
-    raw_body: String,
-    normalize_to_abbreviated: bool,
-    started_at: Instant,
-) -> Result<(Package, Duration), FetchMetadataError> {
-    let task_url = url.to_string();
-    let (meta, elapsed) =
-        tokio::task::spawn_blocking(move || -> Result<(Package, Duration), FetchMetadataError> {
-            let mut meta = serde_json::from_str::<Package>(&raw_body)
-                .map_err(|error| FetchMetadataError::Decode {
-                    url: redact_url_credentials(&task_url),
-                    error,
-                })?;
-            meta.drop_incomplete_publish_times();
-            let elapsed = started_at.elapsed();
-            let meta =
-                if normalize_to_abbreviated { normalize_abbreviated_meta(meta) } else { meta };
-            Ok((meta, elapsed))
-        })
-        .await
-        .map_err(|error| FetchMetadataError::ParseTask {
-            url: redact_url_credentials(url),
-            error,
-        })??;
-    Ok((meta, elapsed))
-}

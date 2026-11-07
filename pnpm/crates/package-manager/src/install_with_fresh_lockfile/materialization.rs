@@ -3,8 +3,8 @@ use super::{
     InstallWithFreshLockfileResult, LockfileOnlyOptions, LockfileViews, MaterializationScope,
     OnDiskInputs, OnDiskOutput, OwnedInputs, PlanLockfiles, PlanScope, Resolved, ResolverSetup,
     build_lockfile_phase, errors::InstallWithFreshLockfileError, finish_early_materialization,
-    finish_lockfile_only, persist_fresh_lockfile, plan_fresh_materialization, resolver_setup,
-    run_on_disk_phases, warn_stale_convergence_overrides_if_any,
+    finish_lockfile_only, manifest_transforms, persist_fresh_lockfile, plan_fresh_materialization,
+    resolver_setup, run_on_disk_phases, warn_stale_convergence_overrides_if_any,
 };
 use crate::{AllowBuildPolicy, VirtualStoreLayout};
 use pnpm_catalogs_types::Catalogs;
@@ -21,7 +21,8 @@ pub(super) struct MaterializationResources {
     node_version: Option<String>,
     early_host_detection: Option<pnpm_deps_restorer::materialization_plan::HostDetection>,
     deps_requiring_build_sink: Option<crate::DepsRequiringBuildSink>,
-    lockfile_verification_gate: Option<crate::LockfileVerificationGate>,
+    lockfile: super::WantedLockfileHandles,
+    resolution_observer: Option<Arc<dyn crate::ResolutionObserver>>,
 }
 pub(super) struct MaterializationStores {
     index: Option<pnpm_store_dir::SharedReadonlyStoreIndex>,
@@ -78,23 +79,30 @@ pub(super) fn finish_resolved_install<'a, Reporter: self::Reporter + 'static>(
             prefix: install.projects.lockfile_dir.display().to_string(),
             stage: Stage::ResolutionDone,
         }));
-        FreshMaterialization {
-            install,
-            resources: MaterializationResources {
-                tarball_mem_cache: owned.fetching.tarball_mem_cache,
-                lockfile_specifier_manifests: owned.projects.lockfile_specifier_manifests,
-                catalogs: owned.projects.catalogs,
-                node_version: owned.node_version,
-                early_host_detection: owned.early_host_detection,
-                deps_requiring_build_sink: owned.resolution.deps_requiring_build_sink,
-                lockfile_verification_gate: owned.lockfile_verification_gate,
-            },
-            shape: setup.shape,
-            stores: setup.stores.into(),
-            custom_fetcher_session: setup.chain.custom_fetcher_session,
-            resolved,
-        }
-        .run()
+        Box::pin(
+            FreshMaterialization {
+                install,
+                resources: MaterializationResources {
+                    tarball_mem_cache: owned.fetching.tarball_mem_cache,
+                    lockfile_specifier_manifests:
+                        manifest_transforms::apply_overrides_to_specifier_manifests(
+                            owned.projects.lockfile_specifier_manifests,
+                            resolved.overrides.versions_overrider.as_deref(),
+                        ),
+                    catalogs: owned.projects.catalogs,
+                    node_version: owned.node_version,
+                    early_host_detection: owned.early_host_detection,
+                    deps_requiring_build_sink: owned.resolution.deps_requiring_build_sink,
+                    lockfile: owned.lockfile,
+                    resolution_observer: setup.completion_observer,
+                },
+                shape: setup.shape,
+                stores: setup.stores.into(),
+                custom_fetcher_session: setup.chain.custom_fetcher_session,
+                resolved,
+            }
+            .run(),
+        )
         .await
     })
 }
@@ -114,17 +122,37 @@ pub(super) async fn warn_stale_overrides<Reporter: self::Reporter + 'static>(
         .await;
     }
 }
+
+fn on_disk_store<'a>(
+    store_index_writer: Arc<pnpm_store_dir::StoreIndexWriter>,
+    tarball_mem_cache: &'a Arc<MemCache>,
+    resolution_observer: Option<&'a dyn crate::ResolutionObserver>,
+    stores: &'a MaterializationStores,
+    dir_clone_cache: Option<&'a pnpm_deps_restorer::DirCloneCache<'a>>,
+    custom_fetcher_session: Option<&'a Arc<pnpm_deps_restorer::CustomFetcherSession>>,
+) -> crate::install_with_fresh_lockfile::on_disk::OnDiskStore<'a> {
+    crate::install_with_fresh_lockfile::on_disk::OnDiskStore {
+        tarball_mem_cache,
+        dir_clone_cache,
+        custom_fetcher_session,
+        store_index_ref: stores.index.as_ref(),
+        store_index_writer,
+        caches: &stores.caches,
+        resolution_observer,
+    }
+}
+
 impl<Reporter: self::Reporter + 'static> FreshMaterialization<'_, Reporter> {
     async fn run(
         mut self,
     ) -> Result<InstallWithFreshLockfileResult, InstallWithFreshLockfileError> {
-        let allow_build_policy = (!self.install.execution.lockfile_only)
+        let allow_build_policy = (!self.install.execution.lockfile_only())
             .then(|| AllowBuildPolicy::from_config(self.install.drivers.config))
             .transpose()
             .map_err(InstallWithFreshLockfileError::AllowBuildsPolicy)?;
         let built_lockfile = build_lockfile_phase::<Reporter>(
             self.install,
-            &mut self.resources.lockfile_verification_gate,
+            &mut self.resources.lockfile.verification_gate,
             std::mem::take(&mut self.resolved.graph.time),
             &self.resolved,
             LockfileViews {
@@ -150,6 +178,9 @@ impl<Reporter: self::Reporter + 'static> FreshMaterialization<'_, Reporter> {
         self,
         built_lockfile: Lockfile,
     ) -> Result<InstallWithFreshLockfileResult, InstallWithFreshLockfileError> {
+        if let Some(observer) = &self.resources.resolution_observer {
+            observer.flush_progress();
+        }
         finish_lockfile_only::<Reporter>(LockfileOnlyOptions {
             write:
                 crate::install_with_fresh_lockfile::resolution_inputs::LockfilePersistenceOptions {
@@ -157,6 +188,7 @@ impl<Reporter: self::Reporter + 'static> FreshMaterialization<'_, Reporter> {
                     dir: self.install.projects.lockfile_dir,
                     dry_run: self.install.execution.dry_run,
                     save: self.install.execution.save_lockfile,
+                    check_sink: self.resources.lockfile.check_sink.as_ref(),
                     hook: self.resolved.hooks.after_all_resolved_hook.as_ref(),
                     log: self.resolved.hooks.after_all_resolved_log,
                 },
@@ -178,6 +210,8 @@ impl<Reporter: self::Reporter + 'static> FreshMaterialization<'_, Reporter> {
         built_lockfile: Lockfile,
         allow_build_policy: AllowBuildPolicy,
     ) -> Result<InstallWithFreshLockfileResult, InstallWithFreshLockfileError> {
+        let known_requires_build = collect_known_requires_build(&self.resolved.graph.merged_graph);
+        let known_bins = collect_known_bins(&self.resolved.graph.merged_graph);
         let initial =
             MaterializationScope::initial(self.install, self.shape.is_hoisted, &built_lockfile);
         let mut plan = plan_fresh_materialization::<Reporter>(
@@ -189,9 +223,10 @@ impl<Reporter: self::Reporter + 'static> FreshMaterialization<'_, Reporter> {
             PlanLockfiles { initial: initial.lockfile(&built_lockfile), built: &built_lockfile },
             &allow_build_policy,
             PlanScope {
-                included: self.install.included(),
+                groups: &initial.groups,
                 include_transitive_optional_dependencies: self.shape
                     .include_transitive_optional_dependencies,
+                known_requires_build: known_requires_build.as_ref(),
             },
         )
         .await?;
@@ -204,8 +239,15 @@ impl<Reporter: self::Reporter + 'static> FreshMaterialization<'_, Reporter> {
             self.install.drivers.logged_methods,
         )
         .await;
-        let on_disk =
-            self.run_on_disk(&built_lockfile, &scope, &mut plan, &allow_build_policy).await?;
+        let on_disk = self.run_on_disk(
+            &built_lockfile,
+            &scope,
+            &mut plan,
+            &allow_build_policy,
+            known_requires_build.as_ref(),
+            known_bins.as_ref(),
+        )
+        .await?;
         self.persist_result(built_lockfile, on_disk).await
     }
 
@@ -244,15 +286,26 @@ impl<Reporter: self::Reporter + 'static> FreshMaterialization<'_, Reporter> {
         scope: &FinalScope,
         plan: &mut FreshPlan<'_>,
         allow_build_policy: &AllowBuildPolicy,
+        known_requires_build: Option<&pnpm_deps_restorer::RequiresBuildBySnapshot>,
+        known_bins: Option<&pnpm_deps_restorer::PackageBins>,
     ) -> Result<OnDiskOutput, InstallWithFreshLockfileError> {
-        let store_index_writer = self.stores.take_writer();
+        let store = on_disk_store(
+            self.stores.take_writer(),
+            &self.resources.tarball_mem_cache,
+            self.resources.resolution_observer.as_deref(),
+            &self.stores,
+            plan.dir_clone_cache.as_ref(),
+            self.custom_fetcher_session.as_ref(),
+        );
+        let swap_lock =
+            pnpm_deps_restorer::ModulesSwapLock::new(&self.install.drivers.config.modules_dir);
         run_on_disk_phases::<Reporter>(
             OnDiskInputs {
                 install: self.install,
                 ctx: &fresh_install_context(
                     self.install,
                     &self.shape,
-                    &self.stores.caches,
+                    (&self.stores.caches, plan.dir_clone_cache.as_ref(), &swap_lock),
                     &plan.layout,
                     allow_build_policy,
                 ),
@@ -262,39 +315,79 @@ impl<Reporter: self::Reporter + 'static> FreshMaterialization<'_, Reporter> {
                     .deps_requiring_build_sink
                     .take(),
                 patched_dependencies: self.resolved.patches.record.as_deref(),
-                store: crate::install_with_fresh_lockfile::on_disk::OnDiskStore {
-                    tarball_mem_cache: &self.resources.tarball_mem_cache,
-                    dir_clone_cache: plan.dir_clone_cache.as_ref(),
-                    custom_fetcher_session: self.custom_fetcher_session.as_ref(),
-                    store_index_ref: self.stores.index.as_ref(),
-                    store_index_writer,
-                    caches: &self.stores.caches,
-                },
+                store,
                 runtime: crate::install_with_fresh_lockfile::on_disk::OnDiskRuntime {
                     host_node: plan.host_node.as_ref(),
                     engine_name: plan.engine_name.take(),
                     deferred_engine_name: plan.deferred_engine_name.take(),
+                    known_requires_build,
+                    known_bins,
                 },
-                projects: crate::install_with_fresh_lockfile::on_disk::OnDiskProjects {
-                    materialization_lockfile: scope.lockfile(built_lockfile),
-                    importer_manifests: &self.resolved.importer_manifests,
-                    project_anchor_importer_ids: &scope.project_anchor_importer_ids,
-                },
+                projects: scope.on_disk_projects(built_lockfile, &self.resolved.importer_manifests),
             },
             &mut plan.skipped,
-            &mut self.resources.lockfile_verification_gate,
+            &mut self.resources.lockfile.verification_gate,
         )
         .await
     }
 }
+
+fn collect_known_requires_build(
+    graph: &pnpm_resolving_deps_resolver::DependenciesGraph,
+) -> Option<pnpm_deps_restorer::RequiresBuildBySnapshot> {
+    let mut known = pnpm_deps_restorer::RequiresBuildBySnapshot::new();
+    for node in graph.values() {
+        let Some(requires_build) = pnpm_deps_restorer::manifest_requires_build(
+            node.resolve_result.package.manifest.as_deref(),
+        ) else {
+            continue;
+        };
+        if let Ok(key) = node.dep_path.as_str().parse::<pnpm_lockfile::PackageKey>() {
+            known.insert(key.without_peer(), requires_build);
+        }
+    }
+    (!known.is_empty()).then_some(known)
+}
+
+fn collect_known_bins(
+    graph: &pnpm_resolving_deps_resolver::DependenciesGraph,
+) -> Option<pnpm_deps_restorer::PackageBins> {
+    let mut known = pnpm_deps_restorer::PackageBins::new();
+    for node in graph.values() {
+        let manifest = node.resolve_result.package.manifest.as_deref();
+        if pnpm_deps_restorer::manifest_requires_build(manifest) != Some(false) {
+            continue;
+        }
+        let Some(bins) = pnpm_deps_restorer::manifest_bins(manifest) else {
+            continue;
+        };
+        if let Ok(key) = node.dep_path.as_str().parse::<pnpm_lockfile::PackageKey>() {
+            known.insert(key.without_peer(), bins);
+        }
+    }
+    (!known.is_empty()).then_some(known)
+}
 pub(super) fn fresh_install_context<'b>(
     install: FreshInputs<'b>,
     shape: &'b InstallShape,
-    caches: &'b resolver_setup::StoreCaches,
+    (caches, dir_clone_cache, swap_lock): (
+        &'b resolver_setup::StoreCaches,
+        Option<&'b pnpm_deps_restorer::DirCloneCache<'b>>,
+        &'b pnpm_deps_restorer::ModulesSwapLock,
+    ),
     layout: &'b VirtualStoreLayout,
     allow_build_policy: &'b AllowBuildPolicy,
 ) -> pnpm_deps_restorer::InstallContext<'b> {
     pnpm_deps_restorer::InstallContext {
+        caches: pnpm_deps_restorer::InstallCaches {
+            materialized_graph: std::sync::Arc::default(),
+
+            logged_methods: install.drivers.logged_methods,
+            swap_lock: Some(swap_lock),
+            git_source_cache: &caches.git_source_cache,
+            dir_clone_cache,
+        },
+
         linker: pnpm_deps_restorer::ModuleLinkerContext {
             layout,
             kind: install.execution.node_linker,
@@ -305,8 +398,5 @@ pub(super) fn fresh_install_context<'b>(
         requester: install.projects.requester,
 
         allow_build_policy,
-
-        logged_methods: install.drivers.logged_methods,
-        git_source_cache: &caches.git_source_cache,
     }
 }

@@ -2,7 +2,7 @@ use std::future::Future;
 
 use derive_more::{Display, Error};
 use miette::Diagnostic;
-use pnpm_network::{ThrottledClient, encode_uri_component, redact_and_sanitize};
+use pnpm_network::{ThrottledClient, UNPRIORITIZED, encode_uri_component, redact_and_sanitize};
 use pnpm_network_web_auth::{
     Clock, EnterKeyListener, OpenUrl, OtpChallenge, OtpError, PromptError, PromptOtp, Sleep,
     StdinIsTty, StdoutIsTty, SyntheticOtpError, WebAuthFetch, WebAuthFetchOptions,
@@ -100,7 +100,9 @@ struct Credentials<'a> {
 }
 
 /// Register a user via `PUT -/user/org.couchdb.user:<name>`, returning the
-/// granted token. `otp` populates the `npm-otp` header on the retry pass.
+/// granted token. The credentials also go in a `Basic` `Authorization` header,
+/// which registries such as verdaccio require to log in an existing user.
+/// `otp` populates the `npm-otp` header on the retry pass.
 async fn add_user(
     http_client: &ThrottledClient,
     registry: &str,
@@ -113,12 +115,14 @@ async fn add_user(
     )
     .map_err(|error| AddUserError::Transport { reason: error.to_string() })?;
 
-    let guard = http_client.acquire_for_url(&url).await;
+    let guard =
+        http_client.acquire_for_url_without_redirects_with_priority(&url, UNPRIORITIZED).await;
     let mut request = guard
         .put(&url)
         .header("content-type", "application/json")
         .header("accept", "application/json")
         .header("npm-auth-type", "web")
+        .basic_auth(credentials.username, Some(credentials.password))
         .body(add_user_document(&credentials));
     if let Some(otp) = otp {
         request = request.header("npm-otp", otp);

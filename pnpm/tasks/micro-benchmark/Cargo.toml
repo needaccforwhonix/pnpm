@@ -19,6 +19,7 @@ pnpm-catalogs-types = { workspace = true }
 pnpm-package-manifest = { workspace = true }
 pnpm-registry = { workspace = true }
 pnpm-resolving-deps-resolver = { workspace = true }
+pnpm-resolving-npm-resolver = { workspace = true }
 pnpm-resolving-resolver-base = { workspace = true }
 pnpm-network = { workspace = true }
 pnpm-reporter = { workspace = true }
@@ -41,6 +42,9 @@ ssri = { workspace = true }
 tar = { workspace = true }
 node-semver = { workspace = true }
 serde_json = { workspace = true }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tokio = { workspace = true, features = ["net", "signal"] }
 
 [lints]
 workspace = true

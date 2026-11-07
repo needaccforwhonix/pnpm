@@ -1,11 +1,13 @@
 use super::{
     Candidate, Channel, Config, Display, GlobalShims, GlobalShimsSetting, Host,
-    LoadWorkspaceYamlError, PACKAGE_MANAGER_ENVS_DIR_NAME, PackageManager, Path, PathBuf,
-    ShimPolicy, Value, WorkspaceSettings, create_hex_hash, create_hex_hash_bytes,
-    default_config_dir, default_pnpm_home_dir, default_state_dir, local_bin_identity,
-    parse_node_specifier, resolve_configured_state_dir, trusted_runtime_config,
+    LoadWorkspaceYamlError, MachineSettings, PACKAGE_MANAGER_ENVS_DIR_NAME, PackageManager, Path,
+    PathBuf, SettingsRead, ShimPolicy, TrustedSettings, Value, create_hex_hash,
+    create_hex_hash_bytes, default_config_dir, default_pnpm_home_dir, default_state_dir,
+    local_bin_identity, parse_node_specifier, resolve_configured_state_dir, trusted_runtime_config,
     wanted_package_manager,
 };
+use node_semver::Range;
+use std::collections::HashSet;
 
 /// The `globalShims` setting at dispatch time, so config edits take
 /// effect immediately instead of waiting for the next global install to
@@ -26,7 +28,7 @@ pub(super) fn trusted_shim_settings() -> TrustedShimSettings {
     match load_trusted_shim_settings() {
         Ok(settings) => settings,
         Err(error) => {
-            eprintln!(
+            pnpm_diagnostics::eprintln!(
                 "pnpm: project-aware global shims are disabled because trusted configuration could not be loaded: {error}",
             );
             let mut shims = GlobalShims::default();
@@ -46,6 +48,7 @@ pub(crate) fn global_shims_setting() -> GlobalShims {
 #[derive(Debug, Display)]
 pub(crate) enum LoadGlobalShimsSettingError {
     Workspace(LoadWorkspaceYamlError),
+    DirEnv(pnpm_config::UnexpandedWindowsEnvVar),
     #[display("malformed {env_name} value {value:?}: {source}")]
     Environment {
         env_name: &'static str,
@@ -55,27 +58,28 @@ pub(crate) enum LoadGlobalShimsSettingError {
 }
 
 fn load_trusted_shim_settings() -> Result<TrustedShimSettings, LoadGlobalShimsSettingError> {
+    pnpm_config::ensure_windows_dir_envs::<Host>().map_err(LoadGlobalShimsSettingError::DirEnv)?;
     let mut shims = GlobalShims::default();
     let default_state_dir = default_state_dir::<Host>().unwrap_or_default();
     let mut state_dir = default_state_dir.clone();
     if let Some(config_dir) = default_config_dir::<Host>() {
-        let mut settings = WorkspaceSettings::load_global(&config_dir)
+        let mut settings = TrustedSettings::load_global(&config_dir)
             .map_err(LoadGlobalShimsSettingError::Workspace)?;
         if let Some(settings) = settings.as_mut() {
             settings.substitute_env_trusted::<Host>();
             apply_state_dir_setting(
                 &mut state_dir,
-                settings.state_dir.as_deref(),
+                settings.machine.state_dir.as_deref(),
                 &default_state_dir,
             );
-            if let Some(layer) = settings.global_shims.as_ref() {
+            if let Some(layer) = settings.machine.global_shims.as_ref() {
                 shims.apply(layer);
             }
         }
     }
     apply_settings_above_global_config(&mut shims)?;
-    let mut env_settings = WorkspaceSettings::from_pnpm_config_env::<Host>();
-    env_settings.substitute_env_trusted::<Host>();
+    let mut env_settings = TrustedSettings::from_pnpm_config_env::<Host>().machine;
+    env_settings.substitute_env::<Host>();
     apply_state_dir_setting(&mut state_dir, env_settings.state_dir.as_deref(), &default_state_dir);
     Ok(TrustedShimSettings { shims, state_dir })
 }
@@ -98,12 +102,12 @@ pub(super) fn apply_state_dir_setting(
 pub(crate) fn apply_settings_above_global_config(
     shims: &mut GlobalShims,
 ) -> Result<(), LoadGlobalShimsSettingError> {
-    if let Some(home) = default_pnpm_home_dir::<Host>() {
-        let settings =
-            WorkspaceSettings::load_at(&home).map_err(LoadGlobalShimsSettingError::Workspace)?;
-        if let Some(layer) = settings.and_then(|settings| settings.global_shims) {
-            shims.apply(&layer);
-        }
+    if let Some(home) = default_pnpm_home_dir::<Host>()
+        && let Some(layer) =
+            MachineSettings::load_pnpm_home_global_shims::<Host>(&home, SettingsRead::All)
+                .map_err(LoadGlobalShimsSettingError::Workspace)?
+    {
+        shims.apply(&layer);
     }
     for env_name in ["PNPM_CONFIG_GLOBAL_SHIMS", "pnpm_config_global_shims"] {
         if let Ok(value) = std::env::var(env_name)
@@ -145,13 +149,13 @@ pub(super) fn validate_candidate(
         Candidate::RuntimePin {
             project_dir,
             version_spec,
-            manifest_hash,
+            source_hash,
             ..
         } => (package == name).then(|| Candidate::RuntimePin {
             project_dir,
-            identity: create_hex_hash(&format!("runtime\0{name}\0{version_spec}\0{manifest_hash}")),
+            identity: create_hex_hash(&format!("runtime\0{name}\0{version_spec}\0{source_hash}")),
             version_spec,
-            manifest_hash,
+            source_hash,
         }),
         Candidate::PackageManagerPin {
             project_dir,
@@ -169,6 +173,9 @@ pub(super) fn validate_candidate(
             version_spec,
             manifest_hash,
         }),
+        candidate @ Candidate::RustToolchain { .. } => {
+            (package == super::RUST_SHIM_PACKAGE).then_some(candidate)
+        }
     }
 }
 
@@ -222,12 +229,19 @@ pub(super) fn is_automatic_runtime(name: &str, version_spec: &str) -> bool {
         && pnpm_detect_libc::detect() != Some(pnpm_detect_libc::Implementation::Musl)
 }
 
-/// The version a project's `package.json` pins for the runtime `name`,
-/// `devEngines.runtime` first, then `engines.runtime` — the same
-/// precedence as the pre-command runtime check. The pin counts whatever
-/// its `onFail` policy says: the dispatcher only chooses which version to
-/// run, it does not modify the project.
-pub(super) fn manifest_runtime_pin(dir: &Path, name: &str) -> Option<(String, String)> {
+/// The version one directory pins for the runtime `name`. The version
+/// files are read in the order fnm and n use.
+pub(super) fn runtime_pin(dir: &Path, name: &str) -> Option<(String, String)> {
+    manifest_runtime_pin(dir, name)
+        .or_else(|| version_file_runtime_pin(dir, name, ".node-version"))
+        .or_else(|| version_file_runtime_pin(dir, name, ".nvmrc"))
+}
+
+/// The runtime pin in `package.json`, with `devEngines.runtime` before
+/// `engines.runtime` — the same precedence as the pre-command runtime
+/// check. The pin counts whatever its `onFail` policy says: the dispatcher
+/// only chooses which version to run, it does not modify the project.
+fn manifest_runtime_pin(dir: &Path, name: &str) -> Option<(String, String)> {
     let bytes = std::fs::read(dir.join("package.json")).ok()?;
     let manifest_hash = create_hex_hash_bytes(&bytes);
     let manifest: Value = serde_json::from_slice(&bytes).ok()?;
@@ -239,6 +253,87 @@ pub(super) fn manifest_runtime_pin(dir: &Path, name: &str) -> Option<(String, St
         }
     }
     None
+}
+
+/// The pin in a version-manager file. Both files are read with the
+/// `.nvmrc` grammar, as fnm and n do: `.node-version` conventionally
+/// holds one version, optionally `v`-prefixed, but a comment or an nvm
+/// alias in it means the same as it would in `.nvmrc`.
+fn version_file_runtime_pin(dir: &Path, name: &str, file_name: &str) -> Option<(String, String)> {
+    if name != "node" {
+        return None;
+    }
+    let bytes = std::fs::read(dir.join(file_name)).ok()?;
+    let contents = std::str::from_utf8(&bytes).ok()?;
+    Some((parse_version_file(contents)?, create_hex_hash_bytes(&bytes)))
+}
+
+fn parse_version_file(contents: &str) -> Option<String> {
+    let mut version = None;
+    let mut keys = HashSet::new();
+    for line in contents.lines() {
+        match classify_version_file_line(line) {
+            VersionFileLine::Empty => {}
+            VersionFileLine::Setting(key) if key == "node" || !keys.insert(key) => return None,
+            VersionFileLine::Setting(_) => {}
+            // Runtime materialization builds a package selector from this
+            // value. It must remain one selector rather than extra packages.
+            VersionFileLine::Version(value)
+                if value.contains(',') || version.replace(value).is_some() =>
+            {
+                return None;
+            }
+            VersionFileLine::Version(_) => {}
+        }
+    }
+    version.and_then(normalize_nvm_version)
+}
+
+enum VersionFileLine<'a> {
+    Empty,
+    Setting(&'a str),
+    Version(&'a str),
+}
+
+fn classify_version_file_line(line: &str) -> VersionFileLine<'_> {
+    let line = line
+        .split_once('#')
+        .map_or(line, |(before_comment, _)| before_comment)
+        .trim();
+    if line.is_empty() {
+        return VersionFileLine::Empty;
+    }
+    if !line.starts_with('=')
+        && let Some((key, _)) = line.split_once('=')
+    {
+        return VersionFileLine::Setting(key.trim());
+    }
+    VersionFileLine::Version(line)
+}
+
+/// Translate an nvm selector into one pnpm's runtime resolver serves.
+/// Values only nvm can act on, such as `system`, `default`, `iojs`,
+/// `lts/-1`, and user-defined aliases, and malformed versions yield no
+/// pin, so the directory counts as unpinned. A pin the resolver cannot
+/// satisfy would fail the invocation instead.
+fn normalize_nvm_version(version: &str) -> Option<String> {
+    let version = version
+        .strip_prefix('v')
+        .filter(|rest| rest.starts_with(|character: char| character.is_ascii_digit()))
+        .unwrap_or(version);
+    match version {
+        "node" | "stable" => Some("latest".to_string()),
+        "lts/*" => Some("lts".to_string()),
+        _ if version.starts_with(|character: char| character.is_ascii_digit()) => {
+            Range::parse(version).is_ok().then(|| version.to_string())
+        }
+        _ => {
+            let codename = version.strip_prefix("lts/")?;
+            (!codename.is_empty() && codename.bytes().all(|byte| byte.is_ascii_alphabetic())).then(
+                || codename.to_string(),
+            )
+        }
+    }
 }
 
 /// The runtime entries one `engines`-style field declares. The field takes

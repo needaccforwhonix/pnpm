@@ -1,5 +1,3 @@
-#![cfg(unix)]
-
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
 use pnpm_testing_utils::{
@@ -101,6 +99,86 @@ fn assert_side_effects_materialized(hoisted: bool) {
     drop((root, mock_instance));
 }
 
+/// The symlinks a build creates are restored as symlinks from the
+/// side-effects cache, not as copies of their targets.
+///
+/// Regression for <https://github.com/pnpm/pnpm/issues/12859>.
+#[cfg(unix)]
+#[test]
+fn symlinks_created_by_a_build_are_restored_from_the_side_effects_cache() {
+    assert_symlinks_restored(false);
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinks_created_by_a_build_are_restored_from_the_side_effects_cache_with_hoisted_linker() {
+    assert_symlinks_restored(true);
+}
+
+#[cfg(unix)]
+fn assert_symlinks_restored(hoisted: bool) {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+
+    let yaml_path = workspace.join("pnpm-workspace.yaml");
+    let mut yaml = fs::read_to_string(&yaml_path).expect("read pnpm-workspace.yaml");
+    if !yaml.ends_with('\n') {
+        yaml.push('\n');
+    }
+    yaml.push_str("allowBuilds:\n  '@pnpm.e2e/postinstall-creates-symlinks': true\n");
+    if hoisted {
+        yaml.push_str("nodeLinker: hoisted\n");
+    }
+    fs::write(&yaml_path, yaml).expect("write pnpm-workspace.yaml");
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({
+            "dependencies": { "@pnpm.e2e/postinstall-creates-symlinks": "1.0.0" },
+        })
+        .to_string(),
+    )
+    .expect("write package.json");
+    let pkg_dir = workspace.join("node_modules/@pnpm.e2e/postinstall-creates-symlinks");
+
+    pacquet
+        .with_arg("install")
+        .assert()
+        .success();
+    fs::remove_dir_all(workspace.join("node_modules")).expect("remove node_modules");
+    run_frozen_install(&workspace);
+    fs::remove_dir_all(workspace.join("node_modules")).expect("remove node_modules");
+
+    // The fixture's postinstall fails when this is set, so the install only
+    // succeeds if the build comes from the side-effects cache.
+    let output = frozen_install_command(&workspace)
+        .with_env("PNPM_E2E_FAIL_POSTINSTALL", "1")
+        .output()
+        .expect("run the install");
+    assert!(output.status.success(), "the build must come from the cache: {output:?}");
+
+    for (link, target) in
+        [("bin/tool-alias", "tool"), ("lib-link", "lib"), ("replaced.js", "lib/index.js")]
+    {
+        assert_eq!(
+            fs::read_link(pkg_dir.join(link)).ok(),
+            Some(Path::new(target).to_path_buf()),
+            "{link} must be restored as a symlink to {target}",
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(pkg_dir.join("lib-link/index.js")).expect("read through the link"),
+        "module.exports = true\n",
+    );
+
+    drop((root, mock_instance));
+}
+
 /// A build whose whole effect lands outside the package directory, such as
 /// a git-hook installer, leaves the side-effects cache nothing to restore.
 /// Such a row must not count as a cache hit: skipping the scripts would
@@ -109,6 +187,19 @@ fn assert_side_effects_materialized(hoisted: bool) {
 /// Regression for <https://github.com/pnpm/pnpm/issues/14717>.
 #[test]
 fn a_build_with_nothing_to_restore_runs_on_every_install() {
+    assert_build_runs_on_every_install("1.0.0");
+}
+
+/// The 1.1.0 fixture ships an executable file. Off Unix the rehash cannot
+/// record that bit, which must not count as build output.
+///
+/// Regression for <https://github.com/pnpm/pnpm/issues/15667>.
+#[test]
+fn a_build_with_nothing_to_restore_runs_on_every_install_when_the_package_ships_an_executable() {
+    assert_build_runs_on_every_install("1.1.0");
+}
+
+fn assert_build_runs_on_every_install(version: &str) {
     let CommandTempCwd {
         pacquet,
         root,
@@ -129,7 +220,7 @@ fn a_build_with_nothing_to_restore_runs_on_every_install() {
     fs::write(
         workspace.join("package.json"),
         serde_json::json!({
-            "dependencies": { "@pnpm.e2e/postinstall-writes-outside-package": "1.0.0" },
+            "dependencies": { "@pnpm.e2e/postinstall-writes-outside-package": version },
         })
         .to_string(),
     )
@@ -184,4 +275,137 @@ fn frozen_install_command(workspace: &Path) -> Command {
         .without_ambient_pnpm_config()
         .with_current_dir(workspace)
         .with_args(["install", "--frozen-lockfile"])
+}
+
+/// A workspace whose only dependency is approved to build under the global
+/// virtual store.
+///
+/// `@pnpm/postinstall-modifies-source` appends to a file that *is* in its
+/// tarball, so a slot reverted to its pristine files is visible in the file's
+/// contents. A package whose build only adds files would look correct, because
+/// `slot_carries_overlay` tests only that each overlay path exists.
+fn write_gvs_build_workspace(workspace: &Path) {
+    crate::_utils::enable_gvs_in_workspace_yaml(
+        workspace,
+        "allowBuilds:\n  '@pnpm/postinstall-modifies-source': true\n",
+    );
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({
+            "dependencies": { "@pnpm/postinstall-modifies-source": "1.0.0" },
+        })
+        .to_string(),
+    )
+    .expect("write package.json");
+}
+
+const BUILT_PACKAGE_DIR: &str = "node_modules/@pnpm/postinstall-modifies-source";
+
+/// A forced re-import must not revert a built package to its pristine
+/// files and then skip the rebuild.
+///
+/// Under the global virtual store a forced import heals the shared slot
+/// in place from the pristine base file map, because the side-effects
+/// overlay is applied later by the build phase. The build phase then has
+/// to be told the slot needs rebuilding — which is what
+/// `.pnpm-needs-build` is for, per `slot_carries_overlay`. Without the
+/// marker the cache hit reports the build as already on disk and the
+/// package keeps whatever the re-import left.
+#[test]
+fn a_forced_install_does_not_revert_a_built_package_under_the_global_virtual_store() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+
+    write_gvs_build_workspace(&workspace);
+
+    let built_file = workspace.join(BUILT_PACKAGE_DIR).join("empty-file.txt");
+
+    pacquet
+        .with_arg("install")
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(&built_file).expect("read the built file"),
+        "hello",
+        "the postinstall must run on the first install",
+    );
+
+    crate::_utils::pacquet_in(&workspace)
+        .with_args(["install", "--force"])
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(&built_file).expect("read the built file after the forced install"),
+        "hello",
+        "the forced install must not leave the package reverted to its pristine files",
+    );
+
+    drop((root, mock_instance));
+}
+
+/// The marker a forced re-import writes must not outlive the install that
+/// wrote it, or every later install would read it as an interrupted build:
+/// re-importing the slot to its pristine files each time and keeping it out
+/// of the warm skip set, repaired only for as long as the cache row lives.
+///
+/// Nothing clears it explicitly on this path — `build_one_snapshot` removes it
+/// only from `build_candidate`, which the cache hit returns before reaching.
+/// What settles it is that a cache overlay is the whole post-build file set,
+/// imported with `force`, so materializing it replaces the directory's
+/// contents and takes the marker with them. The third install is here to hold
+/// that: it is a plain warm install, and it would re-import the slot if the
+/// marker had survived.
+#[test]
+fn a_forced_install_leaves_no_build_marker_behind_under_the_global_virtual_store() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+
+    write_gvs_build_workspace(&workspace);
+
+    let package_dir = workspace.join(BUILT_PACKAGE_DIR);
+    let marker = package_dir.join(".pnpm-needs-build");
+
+    pacquet
+        .with_arg("install")
+        .assert()
+        .success();
+    assert!(!marker.exists(), "a completed build must not leave the marker behind");
+
+    crate::_utils::pacquet_in(&workspace)
+        .with_args(["install", "--force"])
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(package_dir.join("empty-file.txt"))
+            .expect("read the built file after the forced install"),
+        "hello",
+        "the forced install must restore the build",
+    );
+    assert!(!marker.exists(), "the restored build must not leave the forced import's marker");
+
+    crate::_utils::pacquet_in(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(package_dir.join("empty-file.txt"))
+            .expect("read the built file after the following install"),
+        "hello",
+        "the install after a forced one must leave the build in place",
+    );
+    assert!(!marker.exists(), "no later install may reintroduce the marker");
+
+    drop((root, mock_instance));
 }

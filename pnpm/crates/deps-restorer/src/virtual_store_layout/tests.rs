@@ -19,12 +19,12 @@ use std::{collections::HashMap, path::PathBuf};
 
 /// Build a `Config` test-double with the GVS-relevant fields
 /// wired explicitly. `gvs_dir` populates `global_virtual_store_dir`
-/// for the GVS-on path; `virtual_store_dir` stays at the
-/// project-local default for the GVS-off path.
+/// for the GVS-on path; `install_state_dir` holds the project-local
+/// virtual store for the GVS-off path.
 fn make_config(gvs: bool, virtual_store_dir: PathBuf, gvs_dir: PathBuf) -> Config {
     let mut config = Config::new();
     config.enable_global_virtual_store = gvs;
-    config.virtual_store_dir = virtual_store_dir;
+    config.install_state_dir = virtual_store_dir;
     config.global_virtual_store_dir = gvs_dir;
     config
 }
@@ -121,15 +121,9 @@ fn cyclic_slot_suffixes() -> Vec<(String, String)> {
     suffixes
 }
 
-/// Two cyclic subgraphs whose digests only come out right when the
-/// hasher visits a snapshot's children the way pnpm's
-/// `{...dependencies, ...optionalDependencies}` object does.
-///
-/// `a` reaches the `p` ↔ `x` cycle through two regular dependencies —
-/// aliased `c` and `p` — so it pins the order *within* a section.
-/// `b` reaches the `n` ↔ `y` cycle through a regular `n` and an
-/// optional `c`, whose alias sorts first, so it pins that
-/// `optionalDependencies` still come last.
+/// Two cyclic subgraphs: `a` reaches the `p` ↔ `x` cycle through two
+/// regular dependencies, and `b` reaches the `n` ↔ `y` cycle through a
+/// regular and an optional dependency.
 fn cyclic_snapshots() -> (HashMap<PackageKey, SnapshotEntry>, HashMap<PackageKey, PackageMetadata>)
 {
     let snapshots = HashMap::from([

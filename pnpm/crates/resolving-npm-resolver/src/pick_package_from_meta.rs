@@ -11,9 +11,9 @@
 //!   [`pick_lowest_version_by_version_range`] — choose the
 //!   highest/lowest version in `meta.versions` satisfying a range
 //!   string, biased by an optional [`VersionSelectors`] preference
-//!   table. The high-side variant also runs the deprecated-version
-//!   fallback (if the max pick is deprecated and other versions
-//!   exist, retry against the non-deprecated subset).
+//!   table. The high-side variant skips deprecated versions wherever it
+//!   is free to choose one, retrying within the winning dist-tag target
+//!   or preference group.
 //! - [`filter_pkg_metadata_by_publish_date`] — derive a packument
 //!   that contains only versions published at or before a cutoff,
 //!   plus rewritten `dist-tags` pointing to the highest within-cutoff
@@ -23,14 +23,19 @@
 //! in [`crate::pick_package()`]; both depend on this module but this
 //! module pulls in no I/O.
 
-pub(crate) use preferred_versions::dominant_lockfile_version;
+pub(crate) mod semver_range;
+
+pub(crate) use preferred_versions::{
+    cached_meta_misses_preferred_version, dominant_lockfile_version,
+};
 
 pub(crate) use release_age::{PublishedByView, apply_published_by_policy};
 
 pub use release_age::{filter_pkg_metadata_by_publish_date, filter_pkg_metadata_versions};
 
-mod semver_range;
-use semver_range::{max_satisfying, min_satisfying, semver_satisfies_loose};
+use semver_range::{
+    max_satisfying, max_version, min_satisfying, min_version, semver_satisfies_loose,
+};
 
 mod preferred_versions;
 use preferred_versions::prioritize_preferred_versions;
@@ -47,12 +52,11 @@ use dashmap::DashMap;
 use derive_more::{Display, Error};
 use miette::Diagnostic;
 use node_semver::{Range, Version};
-use pnpm_config::version_policy::{PackageVersionPolicy, PolicyMatch};
 use pnpm_registry::{DerivedPackuments, Package, PackageVersion, PackageVersions};
 use pnpm_resolving_resolver_base::{
-    EXISTING_VERSION_SELECTOR_WEIGHT, VersionSelectorEntry, VersionSelectorType, VersionSelectors,
-    parse_packument_timestamp,
+    VersionSelectorEntry, VersionSelectorType, VersionSelectors, parse_packument_timestamp,
 };
+use pnpm_version_policy::{PackageVersionPolicy, PolicyMatch};
 
 /// Discriminator for [`RegistryPackageSpec::spec_type`]: the
 /// `tag` / `version` / `range` triple.
@@ -151,6 +155,13 @@ pub enum PickPackageFromMetaError {
         #[error(not(source))]
         pkg_name: String,
     },
+    /// `ERR_PNPM_REGISTRY_NAME_MISMATCH`: the packument names a package
+    /// other than the requested one.
+    #[display(
+        r#"The registry returned metadata for "{returned_name}" when "{pkg_name}" was requested"#
+    )]
+    #[diagnostic(code(ERR_PNPM_REGISTRY_NAME_MISMATCH))]
+    NameMismatch { pkg_name: String, returned_name: String },
 }
 
 /// Pure picker entry point.
@@ -165,7 +176,6 @@ pub enum PickPackageFromMetaError {
 /// - `Ok(None)` — no version satisfies the spec. The orchestrator
 ///   layer above propagates this as "resolver returned nothing,"
 ///   not as an error.
-/// - `Err(_)` — one of the four `PnpmError` variants above.
 pub fn pick_package_from_meta<PickFn>(
     pick_version_by_range: PickFn,
     opts: &PickPackageFromMetaOptions<'_>,
@@ -175,6 +185,7 @@ pub fn pick_package_from_meta<PickFn>(
 where
     PickFn: Fn(&PickVersionByVersionRangeOptions<'_>) -> Option<String>,
 {
+    assert_meta_names_requested_package(meta, spec)?;
     // "Owned-after-filter" shape: when publishedBy is active and a
     // maturity filter applies, swap `meta` for the filtered view —
     // otherwise borrow the input through.
@@ -212,7 +223,7 @@ where
             undecodable_excluded = Some(without_version(meta_now, &version));
             continue;
         };
-        return Ok(Some(pinned_manifest(manifest, meta_now)));
+        return Ok(Some(manifest_under_requested_name(manifest, spec)));
     }
 }
 
@@ -225,15 +236,33 @@ fn no_versions_error(meta: &Package, spec: &RegistryPackageSpec) -> PickPackageF
     PickPackageFromMetaError::NoVersions { pkg_name: spec.name.clone() }
 }
 
+/// The registry may confirm the identity of the requested package but
+/// never change it: build policy, trust policy, and the lockfile all key
+/// on the resolved name.
+fn assert_meta_names_requested_package(
+    meta: &Package,
+    spec: &RegistryPackageSpec,
+) -> Result<(), PickPackageFromMetaError> {
+    if meta.name.is_empty() || meta.name == spec.name {
+        return Ok(());
+    }
+    Err(PickPackageFromMetaError::NameMismatch {
+        pkg_name: spec.name.clone(),
+        returned_name: meta.name.clone(),
+    })
+}
+
 /// GitHub registry quirk: a scoped package can be published as `@owner/foo`
-/// while the per-version `name` is just `foo`. The manifest name is pinned
-/// to the packument-level name.
-fn pinned_manifest(manifest: Arc<PackageVersion>, meta: &Package) -> Arc<PackageVersion> {
-    if meta.name.is_empty() || manifest.name == meta.name {
+/// while the per-version `name` is just `foo`.
+fn manifest_under_requested_name(
+    manifest: Arc<PackageVersion>,
+    spec: &RegistryPackageSpec,
+) -> Arc<PackageVersion> {
+    if manifest.name == spec.name {
         return manifest;
     }
     let mut pinned = (*manifest).clone();
-    pinned.name.clone_from(&meta.name);
+    pinned.name.clone_from(&spec.name);
     Arc::new(pinned)
 }
 
@@ -335,25 +364,28 @@ pub fn pick_version_by_version_range(
         return Some(pick);
     }
 
-    // `*` is special-cased because `semver.satisfies` rejects prereleases
-    // for `*`: a package whose only version is `1.0.0-beta.1` would
-    // otherwise return nothing for `*`. See pnpm/pnpm#865.
     if let Some(latest) = latest
         && (opts.version_range == "*" || semver_satisfies_loose(latest, opts.version_range))
     {
-        return Some(latest.to_string());
+        if !opts.meta.versions.is_deprecated(latest) {
+            return Some(latest.to_string());
+        }
+        return Some(
+            non_deprecated_pick(opts, opts.meta.versions.keys().map(String::as_str), latest)
+                .unwrap_or_else(|| latest.to_string()),
+        );
     }
 
-    let all_versions: Vec<&str> = opts.meta.versions
-        .keys()
-        .map(String::as_str)
-        .collect();
-    let max_pick = max_satisfying(&all_versions, opts.version_range)?;
-    non_deprecated_pick(opts, &all_versions, &max_pick).or(Some(max_pick))
+    let max_pick =
+        max_satisfying(opts.meta.versions.keys().map(String::as_str), opts.version_range)?;
+    non_deprecated_pick(opts, opts.meta.versions.keys().map(String::as_str), &max_pick)
+        .or(Some(max_pick))
 }
 
 /// The highest satisfying version of the first preference group that has
-/// one, with `latest` winning inside its own group.
+/// one, with `latest` winning inside its own group. A deprecated winner
+/// falls back within its own group, so a group that is a single pinned
+/// version keeps that version.
 fn preferred_max_pick(
     opts: &PickVersionByVersionRangeOptions<'_>,
     latest: Option<&str>,
@@ -361,37 +393,70 @@ fn preferred_max_pick(
     let selectors = opts.preferred_version_selectors.filter(|selectors| !selectors.is_empty())?;
     let groups = prioritize_preferred_versions(opts.meta, opts.version_range, Some(selectors));
     for group in groups {
-        if let Some(latest) = latest
+        let pick = if let Some(latest) = latest
             && group
                 .iter()
                 .any(|version| version == latest)
             && semver_satisfies_loose(latest, opts.version_range)
         {
-            return Some(latest.to_string());
-        }
-        if let Some(pick) = max_satisfying(&group, opts.version_range) {
-            return Some(pick);
+            Some(latest.to_string())
+        } else {
+            max_satisfying(group.iter().map(String::as_str), opts.version_range)
+        };
+        if let Some(pick) = pick {
+            return Some(
+                non_deprecated_pick(opts, group.iter().map(String::as_str), &pick).unwrap_or(pick),
+            );
         }
     }
     None
 }
 
-/// A deprecated top pick falls back to the highest non-deprecated version,
-/// when the packument carries another one at all.
-fn non_deprecated_pick(
-    opts: &PickVersionByVersionRangeOptions<'_>,
-    all_versions: &[&str],
-    picked: &str,
-) -> Option<String> {
-    if !opts.meta.versions.is_deprecated(picked) || all_versions.len() <= 1 {
-        return None;
-    }
-    let non_deprecated: Vec<&str> = all_versions
+fn same_release_line(version: &str, target: &node_semver::Version) -> bool {
+    node_semver::Version::parse(version)
+        .is_ok_and(|parsed| {
+            parsed.major == target.major
+                && parsed.minor == target.minor
+                && parsed.patch == target.patch
+        })
+}
+
+fn same_release_non_deprecated_pick(non_deprecated: &[&str], picked: &str) -> Option<String> {
+    let picked_semver = node_semver::Version::parse(picked).ok()?;
+    let same_release_prereleases: Vec<&str> = non_deprecated
         .iter()
         .copied()
-        .filter(|version| !opts.meta.versions.is_deprecated(version))
+        .filter(|version| same_release_line(version, &picked_semver))
         .collect();
-    max_satisfying(&non_deprecated, opts.version_range)
+    max_version(&same_release_prereleases)
+}
+
+/// A deprecated pick falls back to the highest non-deprecated version
+/// among `candidates`, when the packument carries another one at all.
+/// Scoping the retry to the candidates keeps a preference group that is
+/// one explicitly pinned version from being overridden.
+fn non_deprecated_pick<'a>(
+    opts: &PickVersionByVersionRangeOptions<'_>,
+    candidates: impl IntoIterator<Item = &'a str>,
+    picked: &str,
+) -> Option<String> {
+    if !opts.meta.versions.is_deprecated(picked) {
+        return None;
+    }
+    if opts.version_range == "*" && !semver_satisfies_loose(picked, opts.version_range) {
+        let non_deprecated: Vec<&str> = candidates
+            .into_iter()
+            .filter(|version| !opts.meta.versions.is_deprecated(version))
+            .collect();
+        return same_release_non_deprecated_pick(&non_deprecated, picked)
+            .or_else(|| max_satisfying(non_deprecated.iter().copied(), opts.version_range));
+    }
+    max_satisfying(
+        candidates
+            .into_iter()
+            .filter(|version| !opts.meta.versions.is_deprecated(version)),
+        opts.version_range,
+    )
 }
 
 /// Pick the **lowest** version in `meta.versions` satisfying
@@ -405,29 +470,17 @@ pub fn pick_lowest_version_by_version_range(
     {
         let groups = prioritize_preferred_versions(opts.meta, opts.version_range, Some(selectors));
         for group in groups {
-            if let Some(pick) = min_satisfying(&group, opts.version_range) {
+            if let Some(pick) = min_satisfying(group.iter().map(String::as_str), opts.version_range)
+            {
                 return Some(pick);
             }
         }
     }
 
-    let all_versions: Vec<&str> = opts.meta.versions
-        .keys()
-        .map(String::as_str)
-        .collect();
     if opts.version_range == "*" {
-        let mut parsed: Vec<(Version, &str)> = all_versions
-            .iter()
-            .filter_map(|raw| {
-                Version::parse(raw)
-                    .ok()
-                    .map(|version| (version, *raw))
-            })
-            .collect();
-        parsed.sort_by(|left, right| left.0.cmp(&right.0));
-        return parsed.first().map(|(_, raw)| (*raw).to_string());
+        return min_version(opts.meta.versions.keys().map(String::as_str));
     }
-    min_satisfying(&all_versions, opts.version_range)
+    min_satisfying(opts.meta.versions.keys().map(String::as_str), opts.version_range)
 }
 
 /// Returns the cached version only when lockfile preferences prove

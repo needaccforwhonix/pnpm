@@ -2,6 +2,7 @@ pub use arguments::{
     InstallFetchArgs, InstallLockfileArgs, InstallMaterializationArgs, LockfileUpdateArgs,
 };
 
+pub(crate) use pnpr_pnpmfile::{PnprTarget, pnpr_target};
 pub(crate) use pnpr_resolution::{install_selected_via_pnpr, install_via_pnpr};
 
 mod arguments;
@@ -14,7 +15,6 @@ use crate::{
         package_manager::read_root_manifest_json, pipelines::InstallFamilySelection,
         recursive::discover_workspace_projects,
         supported_architectures::SupportedArchitecturesArgs,
-        yarn_workspaces_field::warn_unsupported_workspaces_field,
     },
 };
 use clap::{Args, ValueEnum};
@@ -34,25 +34,27 @@ use pnpm_package_manager::{
     InstallFrozenLockfileError, LockfileVerificationOverride, PolicyExcludes, SkippedSnapshots,
     TarballPrefetcher, UpToDateFastPathCheck, UpdateSeedPolicy, WantedLockfileSatisfactionCheck,
     WorkspaceInstallSelection, build_resolution_verifiers, install_already_up_to_date,
-    materialization_closure, merge_filtered_wanted_lockfile, wanted_lockfile_satisfies_workspace,
+    install_already_up_to_date_from_records, install_already_up_to_date_per_project,
+    materialization_closure, merge_filtered_wanted_lockfile, report_merged_lockfile_conflicts,
+    wanted_lockfile_satisfies_workspace,
 };
 use pnpm_package_manifest::DependencyGroup;
 use pnpm_pnpr_client::{
-    PnprClient, PnprClientError, ResolveProject, ResolveProjectsOptions, VerifyLockfileOptions,
+    PnprClient, PnprClientError, PublishConfig, ResolveProject, ResolveProjectsOptions,
+    VerifyLockfileOptions,
 };
 use pnpm_reporter::Reporter;
+use pnpr_config_validation::DryRunIncompatibleWithPnpr;
 use pnpr_lockfile::{
     LocalLockfileInstall, full_workspace_importer_ids, install_from_local_lockfile,
     link_pnpr_lockfile, merge_and_save_pnpr_lockfile, pnpr_lockfile_dir, selection_importer_ids,
 };
+use pnpr_pnpmfile::{check_frozen_pnpmfile, record_pnpmfile};
 use pnpr_request::{
-    PnprBenchmarkRegistryOverride, PnprRequestInputs, pnpr_catalogs, pnpr_request_inputs,
-    resolve_projects_for_pnpr, resolve_projects_options,
+    PnprBenchmarkRegistryOverride, PnprRequestInputs, check_pnpr_applied_settings, pnpr_catalogs,
+    pnpr_request_inputs, resolve_projects_for_pnpr, resolve_projects_options,
 };
-use pnpr_resolution::{
-    DryRunIncompatibleWithPnpr, PnprSession, install_via_pnpr_inner, prefetch_allowed,
-    resolve_project,
-};
+use pnpr_resolution::{PnprSession, install_via_pnpr_inner, prefetch_allowed};
 
 use std::path::PathBuf;
 
@@ -105,21 +107,37 @@ impl InstallDependencyOptions {
         include_optional: bool,
     ) -> impl Iterator<Item = DependencyGroup> {
         let &InstallDependencyOptions { prod, dev, optional, no_optional } = self;
-        let include_optional = resolve_bool_override(optional, no_optional, include_optional);
-        // `--prod` wins over `--dev`, and a dev-only install drops optional
-        // dependencies along with the production ones.
-        let (has_prod, has_dev, has_optional) = if prod {
-            (true, false, include_optional)
-        } else if dev {
-            (false, true, false)
-        } else {
-            (true, true, include_optional)
-        };
-        std::iter::empty()
-            .chain(has_prod.then_some(DependencyGroup::Prod))
-            .chain(has_dev.then_some(DependencyGroup::Dev))
-            .chain(has_optional.then_some(DependencyGroup::Optional))
+        included_dependency_groups(
+            prod,
+            dev,
+            resolve_bool_override(optional, no_optional, include_optional),
+        )
     }
+}
+
+/// The dependency groups an install resolves and materializes, given the
+/// `--prod` / `--dev` filter and whether optional dependencies are
+/// included.
+///
+/// Shared with `add`, which takes the same two flags through `pnpm
+/// install <pkg>`.
+pub(crate) fn included_dependency_groups(
+    prod: bool,
+    dev: bool,
+    include_optional: bool,
+) -> impl Iterator<Item = DependencyGroup> {
+    // `--prod` wins over `--dev`.
+    let (has_prod, has_dev) = if prod {
+        (true, false)
+    } else if dev {
+        (false, true)
+    } else {
+        (true, true)
+    };
+    std::iter::empty()
+        .chain(has_prod.then_some(DependencyGroup::Prod))
+        .chain(has_dev.then_some(DependencyGroup::Dev))
+        .chain(include_optional.then_some(DependencyGroup::Optional))
 }
 
 #[derive(Debug, Default, Clone, Args)]
@@ -157,11 +175,7 @@ pub(crate) fn resolve_bool_override(force_on: bool, force_off: bool, config: boo
 
 impl InstallArgs {
     /// The install args for a reinstall triggered by an out-of-band change to
-    /// the install inputs: `patch-commit` / `patch-remove` (which rewrite the
-    /// manifest's `patchedDependencies`) and `unlink` (which removes `link:`
-    /// overrides from `pnpm-workspace.yaml`). Forces a fresh resolution
-    /// (`preferFrozenLockfile: false`, via `no_prefer_frozen_lockfile`, and
-    /// `frozenLockfile: false`, via `no_frozen_lockfile`) so the changed
+    /// the install inputs. Forces a fresh resolution so the changed
     /// inputs re-resolve rather than reusing — or failing against — the
     /// stale lockfile.
     pub(crate) fn for_reresolving_install() -> Self {
@@ -188,13 +202,12 @@ impl InstallArgs {
     /// `--frozen-lockfile` / `--no-frozen-lockfile` as typed on the command
     /// line, before the `frozenLockfile` setting is layered under it.
     pub(crate) fn frozen_lockfile_flag(&self) -> Option<bool> {
-        if self.lockfile.frozen {
-            Some(true)
-        } else if self.lockfile.no_frozen {
-            Some(false)
-        } else {
-            None
-        }
+        self.lockfile.frozen_flag()
+    }
+
+    /// Package names allowed to run lifecycle (build) scripts during this install.
+    pub fn allow_build(&self) -> &[String] {
+        &self.materialization.allow_build
     }
 
     pub async fn run<Reporter: self::Reporter + 'static>(self, state: State) -> miette::Result<()> {
@@ -218,19 +231,15 @@ impl InstallArgs {
         let frozen_lockfile = self.resolve_frozen_lockfile(&state)?;
         let lockfile_path = state.lockfile_path();
         let link = self.resolve_link_options(state.config, &lockfile_path, frozen_lockfile);
-        if let Some(pnpr_server) = state.config.pnpr_server.as_deref() {
-            if self.materialization.dry_run {
-                return Err(DryRunIncompatibleWithPnpr.into());
-            }
-            return Box::pin(install_via_pnpr_inner::<Reporter>(
-                &state,
-                pnpr_server,
-                selection.as_ref(),
-                link,
-            ))
-            .await;
+        if state.config.pnpr_server.is_some() && self.materialization.dry_run {
+            return Err(DryRunIncompatibleWithPnpr.into());
         }
-        self.run_local::<Reporter>(&state, link, selection.as_ref()).await?;
+        if let Some(target) = pnpr_target::<Reporter>(&state, &link).await? {
+            Box::pin(install_via_pnpr_inner::<Reporter>(&state, target, selection.as_ref(), link))
+                .await?;
+        } else {
+            self.run_local::<Reporter>(&state, link, selection.as_ref()).await?;
+        }
         // Resolution watch senders must close inline; only inert manifest and lockfile data
         // may outlive the command through background destruction.
         pnpm_fs::background_drop((state.lockfile, state.manifest, selection));
@@ -303,9 +312,12 @@ impl InstallArgs {
                 .lockfile_updates
                 .update_checksums;
             base_install.lockfile_policy.excludes = PolicyExcludes::Persist;
-            base_install.lockfile_policy.disable_optimistic_repeat = self
-                .materialization
-                .verify_deps_before_run_install;
+            // A trust flag reaches only these options, while the repeat check
+            // compares the configured `trustLockfile`, so it cannot vouch for
+            // an install whose flag overrides the setting.
+            base_install.lockfile_policy.disable_optimistic_repeat =
+                self.materialization.verify_deps_before_run_install
+                    || link.lockfile.trust != state.config.trust_lockfile;
             base_install.execution.skip_runtimes = link.skip_runtimes;
             base_install.execution.node_linker = link.node_linker;
             base_install.execution.lockfile_only = link.lockfile.only;
@@ -333,9 +345,8 @@ impl InstallArgs {
     ///
     /// `--fix-lockfile` rewrites the lockfile, so it is never frozen. On
     /// CI a project that already has a non-empty lockfile installs frozen
-    /// by default, unless the run said otherwise through
-    /// `--lockfile-only`, either `preferFrozenLockfile` flag, or the
-    /// setting itself.
+    /// by default, unless the run is `--lockfile-only` or the effective
+    /// `preferFrozenLockfile` is `false`.
     fn resolve_frozen_lockfile(&self, state: &State) -> miette::Result<bool> {
         if self.lockfile.fix {
             return Ok(false);
@@ -343,12 +354,10 @@ impl InstallArgs {
         if let Some(value) = self.configured_frozen_lockfile(state.config) {
             return Ok(value);
         }
-        let ci_default = state.config.ci
-            && !self.lockfile.only
-            && !self.lockfile.prefer_frozen
-            && !self.lockfile.no_prefer_frozen
-            && !state.config.explicit_settings.contains_key("preferFrozenLockfile");
-        if !ci_default {
+        let prefer_frozen =
+            self.prefer_frozen_override().unwrap_or(state.config.prefer_frozen_lockfile);
+        let ci_frozen = state.config.ci && !self.lockfile.only && prefer_frozen;
+        if !ci_frozen {
             return Ok(false);
         }
         Ok(state.lockfile
@@ -365,6 +374,7 @@ pub(crate) fn workspace_install_selection(
         project_dependencies: &selection.project_dependencies,
         ordered_dirs: &selection.ordered_dirs,
         selected_dirs: selection.selected_dirs.as_ref(),
+        edited_dirs: None,
         install_dirs: selection.install_dirs.as_ref(),
         active_manifest_is_standin: selection.active_manifest_is_standin,
         workspace_cycles: selection.workspace_cycles
@@ -448,6 +458,10 @@ fn prefer_frozen_lockfile_override(
 mod tests;
 
 mod fast_path;
+
+mod pnpr_config_validation;
+
+mod pnpr_pnpmfile;
 
 mod pnpr_request;
 

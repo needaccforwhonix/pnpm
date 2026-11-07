@@ -1,7 +1,10 @@
 use super::{
-    Config, EnvVar, EnvVarOs, ExplicitPaths, GetCurrentDir, GetHomeDir, LinkProbe,
-    LoadWorkspaceYamlError, Path, PathBuf, WORKSPACE_MANIFEST_FILENAME, WorkspaceSettings,
-    collect_explicit_settings, fs, note_declared_registries, resolve_configured_state_dir,
+    Arc, Config, EnvVar, EnvVarOs, ExplicitPaths, GetCurrentDir, GetHomeDir, LinkProbe,
+    LoadWorkspaceYamlError, MachineSettings, Path, PathBuf, TrustedSettings, WorkspaceSettings,
+    collect_explicit_settings, collect_explicit_trusted_settings, default_pnpm_home_dir,
+    naming_cases::to_camel_case,
+    note_declared_registries, resolve_configured_state_dir,
+    workspace_yaml::{parse_settings, read_workspace_document},
 };
 
 impl Config {
@@ -27,7 +30,7 @@ impl Config {
             // Re-anchor the path-valued defaults to the workspace root
             // before applying settings. Without this, a `pacquet install`
             // run from a workspace subdirectory leaves
-            // `modules_dir` / `virtual_store_dir` anchored at the CLI
+            // `modules_dir` / `install_state_dir` anchored at the CLI
             // `--dir` (the subdir), while the per-importer
             // [`SymlinkDirectDependencies`] writes are anchored at the
             // workspace root — producing two `node_modules` layouts
@@ -40,7 +43,7 @@ impl Config {
             // still wins.
             //
             // `virtual_store_dir_explicit` guards the re-anchor for
-            // `virtual_store_dir` — without it, a `virtualStoreDir`
+            // `install_state_dir` — without it, a `virtualStoreDir`
             // already set in the global `config.yaml` would be
             // clobbered by the workspace-root default whenever the
             // workspace yaml itself leaves the field unset. `modules_dir`
@@ -51,11 +54,11 @@ impl Config {
             // been applied yet at this point in the cascade.
             self.modules_dir = base_dir.join("node_modules");
             if !explicit.virtual_store_dir {
-                self.virtual_store_dir = base_dir.join("node_modules").join(".pnpm");
+                self.install_state_dir = base_dir.join("node_modules").join(".pnpm");
             }
             // The workspace root is structural context (env-lockfile reads/
             // writes, pin persistence), not a "setting" — set it whenever a
-            // workspace is discovered, even on the `NPM_CONFIG_WORKSPACE_DIR`
+            // workspace is discovered, even on the `PNPM_CONFIG_WORKSPACE_DIR`
             // path when the yaml file is missing and `apply_to` (which also
             // writes it) never runs.
             self.workspace_dir = Some(base_dir.clone());
@@ -78,8 +81,7 @@ impl Config {
         Ok(())
     }
 
-    /// The workspace manifest's own settings, minus the ones a
-    /// repository-controlled file must not carry.
+    /// The workspace manifest's own settings.
     pub(super) fn apply_workspace_settings<Sys>(
         &mut self,
         mut settings: WorkspaceSettings,
@@ -91,27 +93,30 @@ impl Config {
     where
         Sys: EnvVar + EnvVarOs + GetCurrentDir + GetHomeDir + LinkProbe,
     {
-        // CI detection is process state. A repository-controlled
-        // manifest must not be able to turn it off; trusted global
-        // config and PNPM_CONFIG_CI are applied in their own layers.
-        settings.ci = None;
-        settings.state_dir = None;
-        settings.scope = None;
-        settings.global_dir = None;
-        settings.global_bin_dir = None;
         // Noted rather than assigned, so an `enableGlobalVirtualStore` /
         // `virtualStoreDir` set in the global `config.yaml` still counts as
         // "explicitly set" when the workspace yaml leaves it unset.
         explicit.note(&settings);
-        settings.substitute_env_untrusted::<Sys>();
+        let ignored_settings = match settings.substitute_env_untrusted::<Sys>() {
+            Err(_) if self.settings_read.skips_unreadable() => {
+                settings.drop_unexpanded_registries();
+                settings.substitute_env_untrusted::<Sys>()?
+            }
+            result => result?,
+        };
+        self.npmrc_warnings.extend(ignored_settings);
         if for_self_update {
             settings.clear_self_update_policy();
         }
         self.workspace_key_issues = settings.key_issues.clone();
+        self.workspace_includes = settings.includes.take().map(Arc::new);
         note_declared_registries(declared_registries, &settings);
         collect_explicit_settings(&mut self.explicit_settings, &settings);
         settings.resolve_script_shell(base_dir);
         settings.apply_to(self, base_dir);
+        if default_pnpm_home_dir::<Sys>().as_deref() == Some(base_dir) {
+            self.apply_pnpm_home_global_shims::<Sys>(base_dir)?;
+        }
         // `overrides` reaches `Config` only from the workspace yaml (the
         // global config.yaml is stripped of the key, and no `PNPM_CONFIG_*`
         // var carries a map), so the `$dep-name` values it may hold are
@@ -122,13 +127,28 @@ impl Config {
         Ok(())
     }
 
+    /// A global command anchors its config at the pnpm home, whose
+    /// `pnpm-workspace.yaml` the user owns, so `globalShims` is read from it.
+    fn apply_pnpm_home_global_shims<Sys: EnvVar>(
+        &mut self,
+        pnpm_home: &Path,
+    ) -> Result<(), LoadWorkspaceYamlError> {
+        self.workspace_key_issues.refused.retain(|key| to_camel_case(key) != "globalShims");
+        if let Some(global_shims) =
+            MachineSettings::load_pnpm_home_global_shims::<Sys>(pnpm_home, self.settings_read)?
+        {
+            self.global_shims.apply(&global_shims);
+        }
+        Ok(())
+    }
+
     /// Apply the global layer without changing the discovered workspace directory.
     /// Relative paths use `start_dir`, except `stateDir`: its global-shim trust
     /// records must resolve outside the project being considered for execution.
-    /// Workspace-only keys are rejected by [`WorkspaceSettings::load_global`].
+    /// Workspace-only keys are rejected by [`TrustedSettings::load_global`].
     pub(super) fn apply_global_settings<Sys>(
         &mut self,
-        global_settings: Option<WorkspaceSettings>,
+        global_settings: Option<TrustedSettings>,
         explicit: &mut ExplicitPaths,
         declared_registries: &mut crate::npmrc_auth::DeclaredRegistries,
         default_state_dir: &std::path::Path,
@@ -143,12 +163,12 @@ impl Config {
         // resolution must fire only when the user has *not* pinned a
         // path. See [`crate::store_path::resolve_store_dir`].
         if let Some(mut global_settings) = global_settings {
-            note_declared_registries(declared_registries, &global_settings);
-            explicit.note(&global_settings);
-            collect_explicit_settings(&mut self.explicit_settings, &global_settings);
-            let configured_state_dir = global_settings.state_dir.take();
+            note_declared_registries(declared_registries, &global_settings.settings);
+            explicit.note(&global_settings.settings);
+            collect_explicit_trusted_settings(&mut self.explicit_settings, &global_settings);
+            let configured_state_dir = global_settings.machine.state_dir.take();
             let saved_workspace_dir = self.workspace_dir.take();
-            global_settings.expand_global_dir_home_prefixes::<Sys>();
+            global_settings.expand_home_prefixes::<Sys>();
             global_settings.apply_to(self, start_dir);
             self.workspace_dir = saved_workspace_dir;
             if let Some(configured_state_dir) = configured_state_dir
@@ -161,8 +181,21 @@ impl Config {
         }
     }
 
-    /// Find the workspace root and read its `pnpm-workspace.yaml`.
+    /// Find the workspace root and read its `pnpm-workspace.yaml`. One
+    /// that cannot be read at all keeps only the root when
+    /// [`Config::settings_read`] skips unreadable ones.
     pub(super) fn resolve_workspace_yaml<Sys>(
+        &self,
+        start_dir: &std::path::Path,
+    ) -> Result<Option<(PathBuf, Option<WorkspaceSettings>)>, LoadWorkspaceYamlError>
+    where
+        Sys: EnvVar + EnvVarOs + GetCurrentDir + GetHomeDir + LinkProbe,
+    {
+        let resolved = self.read_workspace_yaml::<Sys>(start_dir);
+        self.skip_if_unreadable(resolved, || self.locate_workspace::<Sys>(start_dir))
+    }
+
+    fn read_workspace_yaml<Sys>(
         &self,
         start_dir: &std::path::Path,
     ) -> Result<Option<(PathBuf, Option<WorkspaceSettings>)>, LoadWorkspaceYamlError>
@@ -178,36 +211,16 @@ impl Config {
         // there is no shared lockfile, no sibling projects, and no
         // `pnpm-workspace.yaml` settings layer. Only the flag reaches
         // this far — see [`Config::ignore_workspace`].
-        let env_workspace_dir = Sys::var_os("NPM_CONFIG_WORKSPACE_DIR")
-            .or_else(|| Sys::var_os("npm_config_workspace_dir"))
-            .filter(|value| !value.is_empty())
+        let env_workspace_dir = pnpm_workspace::WORKSPACE_DIR_ENV_VARS
+            .iter()
+            .find_map(|name| Sys::var_os(name).filter(|value| !value.is_empty()))
             .map(PathBuf::from);
         let workspace_yaml = if self.ignore_workspace {
             None
         } else if let Some(env_dir) = env_workspace_dir {
-            // Env-var path: load yaml directly from the env dir. A
-            // missing file is silent, but the re-anchor still fires
-            // because the user has explicitly told us where the
-            // workspace lives.
-            let yaml_path = env_dir.join(WORKSPACE_MANIFEST_FILENAME);
-            match fs::read_to_string(&yaml_path) {
-                Ok(text) => {
-                    let mut settings: WorkspaceSettings = serde_saphyr::from_str(&text)
-                        .map_err(Box::new)
-                        .map_err(|source| LoadWorkspaceYamlError::ParseYaml {
-                            path: yaml_path,
-                            source,
-                        })?;
-                    settings.collect_key_issues(&text);
-                    Some((env_dir, Some(settings)))
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some((env_dir, None)),
-                Err(source) => {
-                    return Err(LoadWorkspaceYamlError::ReadFile { path: yaml_path, source });
-                }
-            }
+            Some(read_env_workspace_yaml::<Sys>(env_dir, self.settings_read)?)
         } else {
-            WorkspaceSettings::find_and_load(start_dir)?
+            WorkspaceSettings::find_and_read(start_dir, self.settings_read)?
                 .map(|(path, settings)| {
                     let base_dir = path
                         .parent()
@@ -215,7 +228,46 @@ impl Config {
                         .to_path_buf();
                     (base_dir, Some(settings))
                 })
+                .filter(|(base_dir, settings)| {
+                    workspace_includes_start_dir(base_dir, start_dir, settings.as_ref())
+                })
         };
         Ok(workspace_yaml)
     }
+}
+
+/// Read the `pnpm-workspace.yaml` of the workspace dir an environment
+/// variable names. A missing file is silent, but the workspace dir still
+/// applies, because the user has said where the workspace lives.
+fn read_env_workspace_yaml<Sys: EnvVar>(
+    env_dir: PathBuf,
+    settings_read: crate::SettingsRead,
+) -> Result<(PathBuf, Option<WorkspaceSettings>), LoadWorkspaceYamlError> {
+    let Some(document) = read_workspace_document(&env_dir)? else {
+        return Ok((env_dir, None));
+    };
+    let settings = WorkspaceSettings::read_document(document, settings_read, |text, path| {
+        parse_settings::<Sys, WorkspaceSettings>(text)
+            .map_err(|source| LoadWorkspaceYamlError::ParseYaml {
+                path: path.to_path_buf(),
+                source,
+            })
+    })?;
+    Ok((env_dir, Some(settings)))
+}
+
+/// Does the workspace found above `start_dir` include a project there?
+///
+/// The rule and the reason for it are
+/// [`pnpm_workspace::belongs_to_workspace`]'s. A glob that cannot be
+/// compiled is left to the project enumeration that reports it, so a
+/// malformed `packages:` entry keeps the workspace here rather than
+/// silently turning the project standalone.
+fn workspace_includes_start_dir(
+    base_dir: &Path,
+    start_dir: &Path,
+    settings: Option<&WorkspaceSettings>,
+) -> bool {
+    let patterns = settings.and_then(|settings| settings.packages.as_deref());
+    pnpm_workspace::belongs_to_workspace(base_dir, start_dir, patterns).unwrap_or(true)
 }

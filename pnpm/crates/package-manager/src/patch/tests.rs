@@ -249,7 +249,7 @@ async fn patch_extract_records_download_in_store_index() {
     std::fs::create_dir_all(&store_dir).expect("create store dir");
 
     let mut config = pnpm_config::Config::new();
-    config.registry = registry.url();
+    config.registry = registry.url().to_string();
     config.store_dir = StoreDir::new(&store_dir);
     let config: &'static pnpm_config::Config = Box::leak(Box::new(config));
 
@@ -348,7 +348,7 @@ async fn patch_extract_git_hosted_tarball_runs_packlist() {
 
     assert_eq!(
         std::fs::read_to_string(dest.join("package.json")).expect("package.json"),
-        r#"{"name":"foo","version":"1.0.0","files":["index.js"]}"#,
+        r#"{"name":"foo","version":"1.0.0","files":["index.js"],"scripts":{"prepare":"exit 1"}}"#,
     );
     assert_eq!(std::fs::read_to_string(dest.join("index.js")).expect("index.js"), "ok\n");
     assert!(!dest.join("ignore.txt").exists(), "packlist should filter ignored files");
@@ -373,7 +373,7 @@ async fn patch_extract_url_inferred_git_hosted_tarball_runs_packlist() {
 
     assert_eq!(
         std::fs::read_to_string(dest.join("package.json")).expect("package.json"),
-        r#"{"name":"foo","version":"1.0.0","files":["index.js"]}"#,
+        r#"{"name":"foo","version":"1.0.0","files":["index.js"],"scripts":{"prepare":"exit 1"}}"#,
     );
     assert_eq!(std::fs::read_to_string(dest.join("index.js")).expect("index.js"), "ok\n");
     assert!(!dest.join("ignore.txt").exists(), "packlist should filter ignored files");
@@ -506,7 +506,10 @@ fn resolution_kind_names_non_patchable_resolution_shapes() {
     });
     assert_eq!(resolution_kind(&binary), "binary");
 
-    let variations = LockfileResolution::Variations(VariationsResolution { variants: Vec::new() });
+    let variations = LockfileResolution::Variations(VariationsResolution {
+        variants: Vec::new(),
+        revision: None,
+    });
     assert_eq!(resolution_kind(&variations), "variations");
 }
 
@@ -538,8 +541,8 @@ impl PatchExtractFixture {
         use_git_hosted_url: bool,
         git_hosted_flag: bool,
     ) -> Self {
-        use pnpm_tarball::CacheValue;
-        use std::{collections::HashMap, path::PathBuf, sync::Arc};
+        use pnpm_tarball::{CacheValue, CachedTarball};
+        use std::{collections::HashMap, sync::Arc};
 
         let tmp = tempfile::tempdir().expect("temp dir");
         let store_dir = tmp.path().join("store");
@@ -547,7 +550,9 @@ impl PatchExtractFixture {
         let pkg_json = store_dir.join("pkg-json");
         let index = store_dir.join("index");
         let manifest = if use_git_hosted_url {
-            format!(r#"{{"name":"{name}","version":"{version}","files":["index.js"]}}"#)
+            format!(
+                r#"{{"name":"{name}","version":"{version}","files":["index.js"],"scripts":{{"prepare":"exit 1"}}}}"#,
+            )
         } else {
             format!(r#"{{"name":"{name}","version":"{version}"}}"#)
         };
@@ -577,15 +582,21 @@ impl PatchExtractFixture {
         } else {
             format!("https://registry.test/{name}/-/{name}-{version}.tgz")
         };
-        let seeded: HashMap<String, PathBuf> = HashMap::from([
-            ("package.json".to_string(), pkg_json),
-            ("index.js".to_string(), index),
-            ("ignore.txt".to_string(), ignored),
+        let seeded: pnpm_fs::CasPaths = HashMap::from([
+            ("package.json".to_string(), pkg_json.into()),
+            ("index.js".to_string(), index.into()),
+            ("ignore.txt".to_string(), ignored.into()),
         ]);
         let mem_cache = pnpm_tarball::MemCache::default();
         mem_cache.insert(
-            tarball_url,
-            Arc::new(tokio::sync::RwLock::new(CacheValue::Available(Arc::new(seeded)))),
+            pnpm_tarball::package_mem_cache_key(
+                &tarball_url,
+                Some(&"sha512-aGVsbG8=".parse().expect("parse integrity")),
+                false,
+            ),
+            Arc::new(tokio::sync::RwLock::new(CacheValue::Available(CachedTarball::from_files(
+                seeded,
+            )))),
         );
 
         Self {
@@ -610,7 +621,7 @@ async fn resolve_registry_fixture(
     registries.insert("default".to_string(), registry.to_string());
     let resolver = NpmResolver {
         registries,
-        registries_by_prefix: HashMap::new(),
+        declared_prefixes: pnpm_lockfile::DeclaredRegistryPrefixes::default(),
         metadata: pnpm_resolving_npm_resolver::RegistryMetadataClient {
             http_client,
             auth_headers: Arc::default(),
@@ -624,12 +635,14 @@ async fn resolve_registry_fixture(
             full_metadata: false,
             needs_full_metadata_for: None,
             filter_metadata: false,
+            registry_options_by_url: std::sync::Arc::default(),
+            minimum_release_age: None,
         },
         cache_policy: pnpm_resolving_npm_resolver::MetadataCachePolicy {
-            offline: false,
-            prefer_offline: false,
+            network: pnpm_config::NetworkPolicy::Online,
             ignore_missing_time_field: true,
         },
+        store_view: None,
     };
     let wanted = WantedDependency {
         alias: Some(alias.to_string()),

@@ -12,141 +12,28 @@
 //! built-in pseudo-groups (`$all`, `$authenticated`, `$anonymous`), a
 //! bare *username*, or a `team:<name>` reference to a team the owning
 //! registry declares. Teams are registry-scoped — the registry is the
-//! tenant, so it owns its principal sets — and a `team:` token is
-//! resolved to the declared member set when the config is loaded, so
-//! evaluation needs only the caller's identity.
+//! tenant, so it owns its principal sets — and a `team:` token reads the
+//! registry's live [`TeamDirectory`], so evaluation needs only the caller's
+//! identity.
 
-use std::collections::{BTreeMap, BTreeSet};
+pub use access::{AccessList, AccessToken, Identity, Membership};
+pub use package_rules::{PackageRules, RuleOverride};
+pub use teams::{TeamDirectory, Teams};
+
+mod access;
+mod package_rules;
+mod teams;
+
+use std::collections::BTreeMap;
 
 use pnpr_registry::PackagePattern;
-
-/// A single token in an access list.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AccessToken {
-    /// `$all` — anyone, authenticated or not.
-    All,
-    /// `$authenticated` — any caller carrying valid Bearer or Basic
-    /// credentials.
-    Authenticated,
-    /// `$anonymous` — only callers *without* valid credentials.
-    Anonymous,
-    /// A bare token: a username. Matches an authenticated caller whose
-    /// username equals it — never a team name; teams are referenced with
-    /// the explicit `team:` form.
-    User(String),
-    /// A `team:<name>` reference, resolved to the owning registry's
-    /// declared member set at config load (an undeclared team is a config
-    /// error there). Matches an authenticated caller whose username is a
-    /// member. `name` is kept for diagnostics only.
-    Team { name: String, members: BTreeSet<String> },
-}
-
-/// Only the `$`-sigiled spellings are built-ins; any other token is a
-/// username, which can only *narrow* access, so this stays infallible.
-/// Near-miss spellings (verdaccio's `@all`/bare aliases, an unknown
-/// `$...`) and `team:` references are handled at YAML load (`AccessSpec`
-/// in the config module): the former are rejected, the latter resolved
-/// against the registry's declared teams. A programmatic caller passing
-/// one of those spellings just gets a username that matches nobody.
-impl From<&str> for AccessToken {
-    fn from(token: &str) -> Self {
-        match token {
-            "$all" => AccessToken::All,
-            "$authenticated" => AccessToken::Authenticated,
-            "$anonymous" => AccessToken::Anonymous,
-            name => AccessToken::User(name.to_string()),
-        }
-    }
-}
-
-/// One `access` / `publish` permission: the set of tokens that satisfy
-/// it. An empty list admits no one (an explicit `unpublish: []`).
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct AccessList(Vec<AccessToken>);
-
-impl AccessList {
-    /// Build from already-resolved tokens (the config loader's path,
-    /// where `team:` references have been resolved to member sets).
-    #[must_use]
-    pub fn new(tokens: Vec<AccessToken>) -> Self {
-        Self(tokens)
-    }
-
-    /// Build from individual built-in or username tokens (e.g. the
-    /// elements of a YAML sequence). Each string is one token, taken
-    /// verbatim; `team:` references cannot be built this way — they need
-    /// the owning registry's team declarations (the config loader
-    /// resolves them and builds the list with `Self::new`).
-    pub fn from_tokens<Tokens, Token>(tokens: Tokens) -> Self
-    where
-        Tokens: IntoIterator<Item = Token>,
-        Token: AsRef<str>,
-    {
-        Self(
-            tokens
-                .into_iter()
-                .map(|token| AccessToken::from(token.as_ref()))
-                .collect(),
-        )
-    }
-
-    /// Whether `identity` satisfies any token in the list.
-    #[must_use]
-    pub fn allows(&self, identity: &Identity) -> bool {
-        self.0
-            .iter()
-            .any(|token| identity.satisfies(token))
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-}
-
-/// The resolved caller identity an [`AccessList`] is evaluated against.
-/// Just the authenticated username (or its absence): team membership
-/// lives in the [`AccessToken::Team`] tokens, resolved at config load,
-/// so identity carries no memberships.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Identity {
-    /// No valid credentials were presented.
-    Anonymous,
-    /// Authenticated as `username`.
-    User { username: String },
-}
-
-impl Identity {
-    #[must_use]
-    pub fn user(username: impl Into<String>) -> Self {
-        Self::User { username: username.into() }
-    }
-
-    #[must_use]
-    pub fn is_authenticated(&self) -> bool {
-        matches!(self, Identity::User { .. })
-    }
-
-    fn satisfies(&self, token: &AccessToken) -> bool {
-        match (token, self) {
-            (AccessToken::All, _) => true,
-            (AccessToken::Authenticated, Identity::User { .. }) => true,
-            (AccessToken::Anonymous, Identity::Anonymous) => true,
-            (AccessToken::User(name), Identity::User { username }) => name == username,
-            (AccessToken::Team { members, .. }, Identity::User { username }) => {
-                members.contains(username)
-            }
-            _ => false,
-        }
-    }
-}
 
 /// One entry of a registry's `packages:` map: a namespace claim
 /// ([`PackagePattern`] key) plus optional per-package rules. `access`
 /// controls who can read the packument and tarballs; `publish` controls
 /// who can publish or change dist-tags; `unpublish` controls destructive
 /// writes. An omitted field falls back to the registry-level default
-/// carried by the owning [`PackageRules`].
+/// carried by the owning [`RuleTable`].
 #[derive(Debug, Clone)]
 pub struct PackageRule {
     pub pattern: PackagePattern,
@@ -155,9 +42,10 @@ pub struct PackageRule {
     pub unpublish: Option<AccessList>,
 }
 
-/// One concrete registry's `packages:` map: its namespace (the key set)
-/// and its per-package rules (the values), with the registry-level
-/// defaults an entry's omitted fields fall back to.
+/// One concrete registry's `packages:` map as it stands at one moment: its
+/// namespace (the key set) and its per-package rules (the values), with the
+/// registry-level defaults an entry's omitted fields fall back to.
+/// [`PackageRules`] holds the current table.
 ///
 /// Selection is by **specificity** — the most specific matching key wins,
 /// and key order carries no meaning (see the module docs). No entry can be
@@ -165,13 +53,12 @@ pub struct PackageRule {
 /// serves the rest, so there is no shadowed-entry validation inside a
 /// registry; a duplicate key is the only error (rejected at config load).
 #[derive(Debug, Clone)]
-pub struct PackageRules {
+pub struct RuleTable {
     rules: Vec<PackageRule>,
     /// Winner lookup by specificity tier, rebuilt whenever the rule set
     /// changes: at most one key per tier can match a given name, so the
     /// most specific match resolves with map lookups instead of a scan of
-    /// every rule — `for_package` runs on every read, write, search hit,
-    /// and route classification.
+    /// every rule.
     index: RuleIndex,
     /// Fallbacks for fields the winning entry omits (and for every name
     /// when the map itself is empty = the registry claims every name).
@@ -239,7 +126,7 @@ impl RuleIndex {
     }
 }
 
-impl Default for PackageRules {
+impl Default for RuleTable {
     /// The safe defaults with no rules: every name claimed, reads open,
     /// publishes require auth, destructive writes denied.
     fn default() -> Self {
@@ -263,7 +150,7 @@ pub struct Effective<'a> {
     pub access_is_explicit: bool,
 }
 
-impl PackageRules {
+impl RuleTable {
     /// Build a registry's rules. `default_access` is the registry-level
     /// `access:` (its omission = `$all`); publish defaults to
     /// `$authenticated` and unpublish to nobody, the safe defaults.
@@ -278,9 +165,14 @@ impl PackageRules {
         }
     }
 
-    /// Override the registry-level unpublish default (nobody). Used by the
-    /// programmatic registry-mock constructors, whose fixtures exercise
-    /// unpublish flows with any authenticated user.
+    /// Override the registry-level publish default (`$authenticated`).
+    #[must_use]
+    pub fn with_default_publish(mut self, publish: AccessList) -> Self {
+        self.default_publish = publish;
+        self
+    }
+
+    /// Override the registry-level unpublish default (nobody).
     #[must_use]
     pub fn with_default_unpublish(mut self, unpublish: AccessList) -> Self {
         self.default_unpublish = unpublish;
@@ -316,6 +208,21 @@ impl PackageRules {
             .any(|rule| rule.publish.is_some() || rule.unpublish.is_some())
     }
 
+    /// Whether any permission list, the registry defaults included, holds a
+    /// `team:<team>` token.
+    #[must_use]
+    pub fn references_team(&self, team: &str) -> bool {
+        let defaults = [&self.default_access, &self.default_publish, &self.default_unpublish];
+        defaults
+            .into_iter()
+            .any(|list| list.references_team(team))
+            || self.rules
+                .iter()
+                .flat_map(|rule| [&rule.access, &rule.publish, &rule.unpublish])
+                .flatten()
+                .any(|list| list.references_team(team))
+    }
+
     /// Whether any package carries an explicit access policy.
     #[must_use]
     pub fn refines_access(&self) -> bool {
@@ -324,10 +231,7 @@ impl PackageRules {
 
     /// The effective permissions for `package`: the **most specific**
     /// matching entry's fields, each falling back to the registry-level
-    /// default. Selection is order-free — the restricted pattern language
-    /// guarantees at most one matching key per specificity tier, so the
-    /// winner is unique regardless of where it appears in the map — and
-    /// indexed, so it costs tier lookups rather than a scan of every rule.
+    /// default.
     #[must_use]
     pub fn for_package(&self, package: &str) -> Effective<'_> {
         let winner = self.index

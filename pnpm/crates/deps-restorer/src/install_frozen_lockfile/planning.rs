@@ -3,9 +3,8 @@ use crate::{
     AllowBuildPolicy, CreateVirtualStore, CreateVirtualStoreOutput, SkippedSnapshots,
     VirtualStoreLayout, any_installability_constraint,
 };
-use pnpm_lockfile::{LockfileEntries, PackageKey, PackageMetadata, SnapshotEntry};
+use pnpm_lockfile::{Lockfile, LockfileEntries, PackageKey, PackageMetadata, SnapshotEntry};
 use pnpm_modules_yaml::{Host, IncludedDependencies, read_modules_manifest};
-use pnpm_package_manifest::DependencyGroup;
 use pnpm_store_dir::StoreIndexWriter;
 use pnpm_tarball::SharedReportedProgressKeys;
 use std::{
@@ -25,7 +24,7 @@ pub(super) struct MaterializationPlan<'p> {
     /// Borrows the allow-builds policy `run` owns.
     pub(super) dir_clone_cache: Option<crate::DirCloneCache<'p>>,
     pub(super) cas_prefetch: crate::create_virtual_store::CasPrefetch,
-    pub(super) git_source_cache: pnpm_git_fetcher::GitSourceCache,
+    pub(super) git_source_cache: Arc<pnpm_git_fetcher::GitSourceCache>,
 }
 /// The install's borrowed inputs, as one `Copy` value a phase's future
 /// can capture. Only the `Copy` fields of [`InstallFrozenLockfile`](crate::InstallFrozenLockfile) are
@@ -54,13 +53,11 @@ impl<'a> FrozenInputs<'a> {
     /// Which dependency groups this install includes, in the shape the
     /// skip set and the sidecars record.
     pub(super) fn included(&self) -> IncludedDependencies {
-        IncludedDependencies {
-            dependencies: self.projects.dependency_groups.contains(&DependencyGroup::Prod),
-            dev_dependencies: self.projects.dependency_groups.contains(&DependencyGroup::Dev),
-            optional_dependencies: self.projects.dependency_groups.contains(
-                &DependencyGroup::Optional,
-            ),
-        }
+        self.projects.groups.included
+    }
+
+    pub(super) fn groups(&self) -> &'a crate::GroupSelection {
+        self.projects.groups
     }
 
     // Declared projects may live outside the lockfile directory, unlike untrusted importer keys.
@@ -103,7 +100,10 @@ impl<'a> FrozenInputs<'a> {
             Option<&'p crate::DirCloneCache<'p>>,
         ),
         store_index_writer: &'p Arc<StoreIndexWriter>,
-        skipped: &'p SkippedSnapshots,
+        (skipped, known_requires_build): (
+            &'p SkippedSnapshots,
+            Option<&'p crate::RequiresBuildBySnapshot>,
+        ),
         progress_reported: &'p SharedReportedProgressKeys,
         custom_fetcher_session: Option<&'p Arc<crate::CustomFetcherSession>>,
     ) -> CreateVirtualStore<'p>
@@ -126,11 +126,18 @@ impl<'a> FrozenInputs<'a> {
                 skipped,
                 include_optional: install.included().optional_dependencies,
                 supported_architectures: install.platform.supported_architectures,
+                platform_lockfile: Some(crate::PlatformLockfile {
+                    lockfile: install.lockfiles.verified,
+                    groups: install.groups(),
+                }),
+                known_requires_build,
+                known_bins: None,
             },
             ctx,
 
             entries: install.entries(),
             current_entries: install.lockfiles.current_entries,
+            importers: install.importers(),
 
             dir_clone_cache,
 
@@ -180,8 +187,12 @@ impl<'a> FrozenInputs<'a> {
         // resolution-verification fan-out where the offline name check
         // would otherwise run. The slot-containment half needs the
         // install-time `layout`, so it can't live in the verifier crate.
-        pnpm_lockfile_verification::verify_lockfile_dependency_names(install.lockfiles.wanted)
+        pnpm_lockfile_verification::verify_lockfile_dependency_names(install.lockfiles.verified)
             .map_err(InstallFrozenLockfileError::LockfileVerification)?;
+        pnpm_lockfile_verification::verify_lockfile_importer_snapshot_links(
+            install.lockfiles.verified,
+        )
+        .map_err(InstallFrozenLockfileError::LockfileVerification)?;
         crate::validate_virtual_store_slot_containment(snapshots, &layout)
             .map_err(InstallFrozenLockfileError::LockfileVerification)?;
 
@@ -213,6 +224,10 @@ impl<'a> FrozenInputs<'a> {
     pub(super) fn entries(&self) -> LockfileEntries<'a> {
         LockfileEntries::from(self.lockfiles.wanted)
     }
+
+    pub(super) fn importers(&self) -> &'a HashMap<String, pnpm_lockfile::ProjectSnapshot> {
+        &self.lockfiles.wanted.importers
+    }
 }
 /// What [`InstallFrozenLockfile::build`](crate::InstallFrozenLockfile::build) reads from the phases before it.
 pub(super) struct BuildInputs<'p> {
@@ -229,6 +244,9 @@ pub(super) struct LinkInputs<'p> {
     /// Taken out of `fetched`: the hoisted linker consumes it.
     pub(super) cas_paths_by_pkg_id: Option<crate::CasPathsByPkgId>,
     pub(super) host_node: Option<&'p crate::materialization_plan::HostNode>,
+    /// The wanted lockfile narrowed to what this install keeps, shared
+    /// by the module-resolution sidecars and the `injectedDeps` record.
+    pub(super) current_lockfile: &'p Lockfile,
 }
 /// What [`InstallFrozenLockfile::fetch`](crate::InstallFrozenLockfile::fetch) needs beyond the install's own
 /// inputs: the plan's store-side half and the state the phases before
@@ -238,6 +256,7 @@ pub(super) struct FetchInputs<'p> {
     pub(super) dir_clone_cache: Option<&'p crate::DirCloneCache<'p>>,
     pub(super) store_index_writer: &'p Arc<StoreIndexWriter>,
     pub(super) skipped: &'p SkippedSnapshots,
+    pub(super) known_requires_build: Option<&'p crate::RequiresBuildBySnapshot>,
     pub(super) verification_override: Option<LockfileVerificationOverride<'p>>,
 }
 /// The engine name the build cache keys on, once the host is known:
@@ -286,8 +305,8 @@ pub(super) fn seed_skip_set(
     config: &pnpm_config::Config,
     seed_skipped: Option<Vec<String>>,
 ) -> SkippedSnapshots {
-    // `--force` installs previously-skipped snapshots too, so the
-    // recorded skip set must not survive into this install.
+    // `--force` re-evaluates every snapshot, so the recorded skip set
+    // must not survive into this install.
     if config.force {
         return SkippedSnapshots::new();
     }
@@ -321,7 +340,7 @@ pub(super) fn needs_installability_check(
     snapshots: Option<&HashMap<PackageKey, SnapshotEntry>>,
     packages: Option<&HashMap<PackageKey, PackageMetadata>>,
 ) -> bool {
-    !config.force
+    !config.installs_incompatible_packages()
         && match (snapshots, packages) {
             (Some(snaps), Some(pkgs)) if !snaps.is_empty() => {
                 any_installability_constraint(snaps, pkgs)
@@ -362,7 +381,7 @@ pub(super) async fn detect_host(
     if !config.enable_global_virtual_store {
         return early_host_detection.unwrap_or_else(|| {
             crate::materialization_plan::HostDetection::spawn(
-                config.engine_strict,
+                config.effective_engine_strict(),
                 node_version,
                 supported_architectures.cloned(),
             )
@@ -373,7 +392,7 @@ pub(super) async fn detect_host(
         None => {
             crate::materialization_plan::detect_installability_host(
                 true,
-                config.engine_strict,
+                config.effective_engine_strict(),
                 node_version,
                 supported_architectures,
             )
@@ -397,11 +416,15 @@ impl EngineNamePlan {
     /// slot a pending host probe will fill, the deferred probe's shared
     /// handle, or the name already known.
     pub(super) fn source(&self) -> crate::EngineNameSource {
-        match (&self.pending_slot, &self.deferred) {
-            (Some(slot), _) => crate::EngineNameSource::Pending(std::sync::Arc::clone(slot)),
-            (None, Some(deferred)) => crate::EngineNameSource::Pending(deferred.shared()),
-            (None, None) => crate::EngineNameSource::Ready(self.name.clone()),
+        if let Some(slot) = &self.pending_slot {
+            return crate::EngineNameSource::Pending(std::sync::Arc::clone(slot));
         }
+        if let Some(slot) =
+            self.deferred.as_ref().and_then(crate::materialization_plan::DeferredEngineName::shared)
+        {
+            return crate::EngineNameSource::Pending(slot);
+        }
+        crate::EngineNameSource::Ready(self.name.clone())
     }
 }
 /// `engine_name` feeds two sites:
@@ -414,9 +437,9 @@ impl EngineNamePlan {
 ///   by both the cache read-gate and the write-gate; when `None`, both
 ///   gates close and the cache is bypassed.
 ///
-/// An `engines.runtime` / `devEngines.runtime` pin that reached the
-/// lockfile wins: the runtime resolver writes the chosen Node as a
-/// `node@runtime:<version>` snapshot, and anchoring the GVS hash and the
+/// The root project's `engines.runtime` / `devEngines.runtime` pin wins:
+/// the runtime resolver writes the chosen Node as the root importer's
+/// `node: runtime:<version>` dependency, and anchoring the GVS hash and the
 /// side-effects-cache key prefix to that pinned Node is what keeps
 /// pinned and non-pinned installs on one host from splitting the shared
 /// store. Otherwise the name is derived from the host — synchronously
@@ -429,11 +452,12 @@ impl EngineNamePlan {
 pub(super) async fn plan_engine_name(
     config: &pnpm_config::Config,
     host_detection: &crate::materialization_plan::HostDetection,
-    snapshots: Option<&HashMap<PackageKey, SnapshotEntry>>,
+    importers: &HashMap<String, pnpm_lockfile::ProjectSnapshot>,
+    needs_deferred_probe: bool,
 ) -> EngineNamePlan {
     let host = match host_detection {
         crate::materialization_plan::HostDetection::Pending { .. } => {
-            let name = crate::materialization_plan::engine_name_from_runtime_pin(snapshots);
+            let name = crate::materialization_plan::engine_name_from_runtime_pin(importers);
             if name.is_some() {
                 return EngineNamePlan { name, deferred: None, pending_slot: None };
             }
@@ -448,8 +472,9 @@ pub(super) async fn plan_engine_name(
     let host_node = host.as_ref().map(crate::materialization_plan::HostNode::from);
     let (name, deferred) = crate::materialization_plan::resolve_engine_name(
         config.enable_global_virtual_store,
-        snapshots,
+        importers,
         host_node.as_ref(),
+        needs_deferred_probe,
     )
     .await;
     EngineNamePlan { name, deferred, pending_slot: None }

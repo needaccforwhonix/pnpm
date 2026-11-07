@@ -1,4 +1,3 @@
-use crate::ScriptsPrependNodePath;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -36,18 +35,17 @@ pub struct ScriptExecutionOptions<'a> {
     /// it. Supplied by [`crate::bundled_node_gyp_bin`]; `None` when
     /// nothing was shipped beside the executable.
     pub node_gyp_bin: Option<&'a Path>,
-    /// Tri-state from `scriptsPrependNodePath` config. `Never` is the
-    /// safe default; `Always` appends `dirname(node)` to `PATH`.
-    pub prepend_node_path: ScriptsPrependNodePath,
     /// Custom shell from `scriptShell` config (e.g. `bash`,
     /// `/usr/local/bin/bash`). `None` means use the platform default
     /// (`sh -c` on POSIX, `cmd /d /s /c` on Windows).
     pub shell: Option<&'a Path>,
     /// The `shellEmulator` config: run the script through pacquet's
-    /// built-in shell rather than the platform's. Callers that mirror a
-    /// pnpm call site which does not thread the setting — publishing,
-    /// packing, patching, git package preparation — pass `false`.
+    /// built-in shell rather than the platform's.
     pub shell_emulator: bool,
+    /// The `.bin` holding the script directory's own executables, when
+    /// `modulesDir` puts them somewhere other than
+    /// `<dir>/node_modules/.bin`. `None` keeps `<dir>/node_modules/.bin`.
+    pub wd_bin_dir: Option<&'a Path>,
 }
 
 pub struct ScriptInvocation<'a> {

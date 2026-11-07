@@ -104,7 +104,7 @@ fn global_install_preserves_virtual_shim_ownership_and_restores_it_on_remove() {
     prepare_global_home(&pnpm_home, &npmrc_info);
     let registry = npmrc_info.mock_instance.url();
 
-    global_shim_command(&workspace, &pnpm_home, root.path(), &registry)
+    global_shim_command(&workspace, &pnpm_home, root.path(), registry)
         .with_args(["shim", "add", "@foo/touch-file-one-bin"])
         .assert()
         .success();
@@ -126,7 +126,7 @@ fn global_install_preserves_virtual_shim_ownership_and_restores_it_on_remove() {
     .expect("write unrelated manifest");
     fs::write(unrelated.join("cli.js"), "#!/usr/bin/env node\n").expect("write unrelated bin");
     let unrelated_selector = format!("file:{}", unrelated.display());
-    let collision = global_shim_command(&workspace, &pnpm_home, root.path(), &registry)
+    let collision = global_shim_command(&workspace, &pnpm_home, root.path(), registry)
         .with_args(["add", "-g", &unrelated_selector])
         .assert()
         .failure();
@@ -135,7 +135,7 @@ fn global_install_preserves_virtual_shim_ownership_and_restores_it_on_remove() {
     assert!(stderr.contains("pnpm shim rm @foo/touch-file-one-bin"), "{stderr}");
     assert_eq!(fs::read(&target_file).unwrap(), virtual_target);
 
-    global_shim_command(&workspace, &pnpm_home, root.path(), &registry)
+    global_shim_command(&workspace, &pnpm_home, root.path(), registry)
         .with_args(["add", "-g", "@foo/touch-file-one-bin"])
         .assert()
         .success();
@@ -146,7 +146,7 @@ fn global_install_preserves_virtual_shim_ownership_and_restores_it_on_remove() {
         String::from_utf8_lossy(&backed_target),
     );
 
-    let collision = global_shim_command(&workspace, &pnpm_home, root.path(), &registry)
+    let collision = global_shim_command(&workspace, &pnpm_home, root.path(), registry)
         .with_args(["add", "-g", &unrelated_selector])
         .assert()
         .failure();
@@ -154,7 +154,7 @@ fn global_install_preserves_virtual_shim_ownership_and_restores_it_on_remove() {
     assert!(stderr.contains("pnpm shim rm @foo/touch-file-one-bin"), "{stderr}");
     assert_eq!(fs::read(&target_file).unwrap(), backed_target);
 
-    global_shim_command(&workspace, &pnpm_home, root.path(), &registry)
+    global_shim_command(&workspace, &pnpm_home, root.path(), registry)
         .with_args(["remove", "-g", "@foo/touch-file-one-bin"])
         .assert()
         .success();
@@ -165,15 +165,15 @@ fn global_install_preserves_virtual_shim_ownership_and_restores_it_on_remove() {
     );
     assert!(shim_path.is_file(), "the restored shim must be in place");
 
-    global_shim_command(&workspace, &pnpm_home, root.path(), &registry)
+    global_shim_command(&workspace, &pnpm_home, root.path(), registry)
         .with_args(["add", "-g", "@foo/touch-file-one-bin"])
         .assert()
         .success();
-    global_shim_command(&workspace, &pnpm_home, root.path(), &registry)
+    global_shim_command(&workspace, &pnpm_home, root.path(), registry)
         .with_args(["shim", "rm", "@foo/touch-file-one-bin"])
         .assert()
         .success();
-    global_shim_command(&workspace, &pnpm_home, root.path(), &registry)
+    global_shim_command(&workspace, &pnpm_home, root.path(), registry)
         .with_args(["remove", "-g", "@foo/touch-file-one-bin"])
         .assert()
         .success();
@@ -209,11 +209,11 @@ fn global_replacement_restores_a_virtual_shim_for_a_dropped_bin() {
     )
     .expect("write new package manifest");
 
-    global_shim_command(&workspace, &pnpm_home, root.path(), &registry)
+    global_shim_command(&workspace, &pnpm_home, root.path(), registry)
         .with_args(["shim", "add", "@foo/touch-file-one-bin"])
         .assert()
         .success();
-    global_shim_command(&workspace, &pnpm_home, root.path(), &registry)
+    global_shim_command(&workspace, &pnpm_home, root.path(), registry)
         .with_args(["add", "-g", "@foo/touch-file-one-bin"])
         .assert()
         .success();
@@ -223,7 +223,7 @@ fn global_replacement_restores_a_virtual_shim_for_a_dropped_bin() {
             .starts_with(b"pkg:"),
     );
 
-    global_shim_command(&workspace, &pnpm_home, root.path(), &registry)
+    global_shim_command(&workspace, &pnpm_home, root.path(), registry)
         .with_args(["add", "-g", &format!("file:{}", new_package.display())])
         .assert()
         .success();
@@ -252,18 +252,18 @@ fn failed_virtual_shim_restoration_leaves_global_removal_retryable() {
     prepare_global_home(&pnpm_home, &npmrc_info);
     let registry = npmrc_info.mock_instance.url();
 
-    global_shim_command(&workspace, &pnpm_home, root.path(), &registry)
+    global_shim_command(&workspace, &pnpm_home, root.path(), registry)
         .with_args(["shim", "add", "@foo/touch-file-one-bin"])
         .assert()
         .success();
-    global_shim_command(&workspace, &pnpm_home, root.path(), &registry)
+    global_shim_command(&workspace, &pnpm_home, root.path(), registry)
         .with_args(["add", "-g", "@foo/touch-file-one-bin"])
         .assert()
         .success();
 
     fs::remove_file(&shim_path).expect("remove the global shim");
     fs::create_dir(&shim_path).expect("occupy the shim path with a directory");
-    global_shim_command(&workspace, &pnpm_home, root.path(), &registry)
+    global_shim_command(&workspace, &pnpm_home, root.path(), registry)
         .with_args(["remove", "-g", "@foo/touch-file-one-bin"])
         .assert()
         .failure();
@@ -274,7 +274,7 @@ fn failed_virtual_shim_restoration_leaves_global_removal_retryable() {
     );
 
     fs::remove_dir(&shim_path).expect("release the shim path");
-    global_shim_command(&workspace, &pnpm_home, root.path(), &registry)
+    global_shim_command(&workspace, &pnpm_home, root.path(), registry)
         .with_args(["remove", "-g", "@foo/touch-file-one-bin"])
         .assert()
         .success();
@@ -358,6 +358,65 @@ fn global_shims_auto_writes_native_dispatcher_for_node_runtime() {
     let target = fs::read(global_bin.join(".pnpm-shim-v1-node-target")).unwrap();
     assert!(target.ends_with(b"/bin/node"), "target was: {}", String::from_utf8_lossy(&target));
     assert!(!global_bin.join(".pnpm-shim-v1").exists());
+
+    drop(npmrc_info);
+    drop(root);
+}
+
+/// A shim invocation forwards its arguments to the target untouched: pnpm
+/// must not interpret the target's `--env-file` — a missing file must not
+/// fail the launch, and a present file's variables must not be injected.
+#[cfg(unix)]
+#[test]
+fn shim_invocation_forwards_env_file_flag_untouched() {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::PermissionsExt;
+
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let pnpm_home = root.path().join("pnpm-home");
+    prepare_global_home(&pnpm_home, &npmrc_info);
+
+    let bin_dir = root.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    let target = bin_dir.join("target.sh");
+    fs::write(
+        &target,
+        "#!/bin/sh\necho \"ARGS:$@\"\necho \"VAR:${PACQUET_SHIM_ENV_TEST-unset}\"\n",
+    )
+    .expect("write target script");
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).expect("chmod target");
+    fs::copy(assert_cmd::cargo::cargo_bin("pnpm"), bin_dir.join("mybin"))
+        .expect("copy the shim binary");
+    fs::write(bin_dir.join(".pnpm-shim-v1-mybin-target"), target.as_os_str().as_bytes())
+        .expect("record the shim target");
+
+    let run_shim = |args: &[&str]| {
+        Command::new(bin_dir.join("mybin"))
+            .without_ambient_pnpm_config()
+            .with_current_dir(&workspace)
+            .with_env("PNPM_HOME", &pnpm_home)
+            .with_env("XDG_STATE_HOME", root.path().join("state"))
+            .with_env("XDG_CONFIG_HOME", root.path().join("config"))
+            .with_args(args)
+            .output()
+            .expect("run the shim")
+    };
+
+    let output = run_shim(&["--env-file", "does-not-exist.env"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "shim must dispatch, got: {output:?}");
+    assert!(stdout.contains("--env-file"), "flag must be forwarded: {stdout:?}");
+    assert!(stdout.contains("does-not-exist.env"), "value must be forwarded: {stdout:?}");
+    assert!(!stderr.contains("ERR_PNPM_ENV_FILE"), "pnpm must not load the file: {stderr:?}");
+
+    fs::write(workspace.join("real.env"), "PACQUET_SHIM_ENV_TEST=from-file\n")
+        .expect("write real.env");
+    let output = run_shim(&["--env-file", "real.env"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "shim must dispatch, got: {output:?}");
+    assert!(stdout.contains("VAR:unset"), "pnpm must not inject the file: {stdout:?}");
 
     drop(npmrc_info);
     drop(root);

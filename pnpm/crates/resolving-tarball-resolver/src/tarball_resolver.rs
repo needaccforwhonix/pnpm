@@ -1,9 +1,9 @@
 //! Resolves `http://` / `https://` tarball URLs and the latest-version
 //! companion path for them.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
-use pnpm_lockfile::{LockfileResolution, TarballResolution};
+use pnpm_lockfile::{IntegrityTarget, LockfileResolution, TarballResolution};
 use pnpm_network::{AuthHeaders, ThrottledClient};
 use pnpm_reporter::SilentReporter;
 use pnpm_resolving_resolver_base::{
@@ -12,23 +12,19 @@ use pnpm_resolving_resolver_base::{
 };
 use pnpm_tarball::{
     FetchTarballForResolution, MemCache, PrefetchIntegrityCheck, PrefetchResult, RetryOpts,
-    prefetch_cas_paths,
+    TarballError, prefetch_cas_paths,
 };
 use ssri::Integrity;
 
+mod cache;
+
 /// Store/network handles the [`TarballResolver`] needs to fetch a
-/// remote tarball during resolution — download it, compute its sha512
-/// integrity, extract it to the store, and read its bundled manifest.
-///
-/// The install orchestrator owns these and hands the resolver a clone;
-/// `mem_cache` (when present) is warmed keyed by URL so the install
-/// pass reuses the extraction without re-downloading. Absent only in
-/// unit tests that exercise the HEAD/normalize/redirect logic in
-/// isolation — see [`TarballResolver`].
+/// remote tarball during resolution.
 pub struct TarballFetchContext {
     pub mem_cache: Option<Arc<MemCache>>,
     pub auth_headers: Arc<AuthHeaders>,
     pub retry_opts: RetryOpts,
+    pub tar_limits: pnpm_tarball::TarLimits,
     /// What the prior lockfile recorded for each remote-tarball entry,
     /// keyed by `pkg_id`. Lets a re-resolve reuse the already-extracted
     /// store content instead of re-downloading. Empty on a first install.
@@ -38,6 +34,11 @@ pub struct TarballFetchContext {
     /// reveal a redirect.
     pub prior_tarball_entries: Arc<HashMap<String, PriorTarballEntry>>,
     pub store: pnpm_tarball::ArchiveStoreContext<'static>,
+    /// `<cacheDir>` for the URL → integrity record. `None` in unit tests
+    /// that only exercise the HEAD preflight.
+    pub cache_dir: Option<PathBuf>,
+    /// Which hash the resolution's integrity names.
+    pub integrity_target: IntegrityTarget,
 }
 
 /// One remote-tarball entry carried over from the prior lockfile.
@@ -96,39 +97,37 @@ impl TarballResolver {
         let Some(bare) = wanted_dependency.bare_specifier.as_deref() else {
             return Ok(None);
         };
-        if !is_http_url(bare) {
+        let Some(normalized_bare_specifier) = remote_tarball_id(bare) else {
             return Ok(None);
-        }
+        };
+        let normalized_bare_specifier = normalized_bare_specifier?;
 
-        // Round-trip through `Url::parse` to drop a redundant default
-        // port (`registry.npmjs.org:443` → `registry.npmjs.org`) before
-        // it reaches the lockfile.
-        let normalized_bare_specifier = reqwest::Url::parse(bare)
-            .map_err(|err| Box::new(err) as ResolveError)?
-            .to_string();
-
-        // Warm-store reuse: when the prior
-        // lockfile recorded this exact tarball URL with an integrity and
-        // the content is already extracted in the store, reuse the cached
-        // integrity + bundled manifest instead of re-downloading. The
-        // bundled manifest carries the same dependency fields a fresh
+        // The bundled manifest carries the same dependency fields a fresh
         // extraction would, so transitive resolution is unchanged. Done
         // before the HEAD request so a hit needs no network at all (this
-        // is what lets a re-resolve succeed under `--offline`). Any miss
-        // (cold store, key drift, a row without a bundled manifest) falls
-        // through to the HEAD + download below.
+        // is what lets a re-resolve succeed under `--offline`).
         if let Some(reused) =
             self.reuse_from_warm_store(wanted_dependency, &normalized_bare_specifier).await
         {
             return Ok(Some(reused));
         }
 
+        if let Some(reused) =
+            self.reuse_from_http_cache(wanted_dependency, &normalized_bare_specifier).await?
+        {
+            return Ok(Some(reused));
+        }
+
+        self.fetch_and_resolve(wanted_dependency, normalized_bare_specifier).await
+    }
+
+    async fn fetch_and_resolve(
+        &self,
+        wanted_dependency: &WantedDependency,
+        normalized_bare_specifier: String,
+    ) -> Result<Option<ResolveResult>, ResolveError> {
         let resolved_url = self.preflight_url(&normalized_bare_specifier).await?;
 
-        // No store context (unit tests): keep the HEAD-only shape. The
-        // download below is what fills `manifest` + `integrity`; without
-        // a store to extract into there's nothing to fetch, so leave
-        // them unset.
         let Some(ctx) = self.fetch_context.as_ref() else {
             return Ok(Some(Self::head_only_result(
                 wanted_dependency,
@@ -139,10 +138,7 @@ impl TarballResolver {
             )));
         };
 
-        // Download the tarball, compute its sha512 integrity, extract it
-        // to the store, and read its bundled manifest. Warms `mem_cache`
-        // (keyed by `resolved_url`) so the install pass reuses the
-        // extraction. Silent reporter: the install pass owns the
+        // Silent reporter: the install pass owns the
         // `resolved → found_in_store → imported` event ordering (see
         // `prefetching_resolver.rs`).
         let resolved = self
@@ -150,6 +146,7 @@ impl TarballResolver {
             .run::<SilentReporter>(ctx.mem_cache.as_deref())
             .await
             .map_err(|err| Box::new(err) as ResolveError)?;
+        self.remember_http_cache(&normalized_bare_specifier, &resolved_url, &resolved);
 
         Ok(Some(Self::head_only_result(
             wanted_dependency,
@@ -171,19 +168,34 @@ impl TarballResolver {
     ) -> FetchTarballForResolution<'a> {
         FetchTarballForResolution {
             http_client: &self.http_client,
-            store_dir: ctx.store.dir,
-            store_index_writer: ctx.store.index_writer.clone(),
-            package_url: resolved_url,
-            package_id: normalized_bare_specifier,
+            store: ctx.store.resolution_store(),
+            package: pnpm_tarball::TarballPackage {
+                integrity_kind: ctx.integrity_target.into(),
+                integrity: None,
+                unpacked_size: None,
+                file_count: None,
+                url: resolved_url,
+                id: normalized_bare_specifier,
+            },
             auth_headers: &ctx.auth_headers,
             retry_opts: ctx.retry_opts,
+            tar_limits: ctx.tar_limits,
             manifest_subdir: None,
+            // A direct URL tarball carries no registry revision.
+            revision_addressed: false,
         }
     }
 
-    /// Authenticate the HEAD preflight like the GET. Only immutable responses
+    /// Authorize and authenticate the HEAD preflight like the GET. Only immutable responses
     /// pin the post-redirect URL; mutable URLs must be revalidated on the next run.
     async fn preflight_url(&self, normalized_bare_specifier: &str) -> Result<String, ResolveError> {
+        if let Some(ctx) = self.fetch_context.as_ref()
+            && !ctx.auth_headers.allows_fetch(normalized_bare_specifier)
+        {
+            return Err(Box::new(TarballError::OffAllowlist {
+                url: pnpm_network::redact_url_credentials(normalized_bare_specifier),
+            }));
+        }
         let client = self.http_client.acquire_for_url(normalized_bare_specifier).await;
         let mut request = client.head(normalized_bare_specifier);
         if let Some(value) = self.fetch_context
@@ -243,7 +255,7 @@ impl TarballResolver {
         ))
     }
 
-    /// Build the `ResolveResult` for a claimed http(s) tarball.
+    /// Build the `ResolveResult` for a claimed HTTP or HTTPS tarball.
     /// `name_ver` stays `None` (URL-id semantics: the depPath is
     /// `name@<url>`, derived downstream from the manifest name);
     /// `integrity` and `manifest` are filled once the tarball is
@@ -273,13 +285,14 @@ impl TarballResolver {
                 latest: None,
                 published_at: None,
                 manifest,
+                non_deprecated_alternative: None,
             },
         }
     }
 }
 
 /// URL tarballs lock to the exact URL — no concept of "latest". When
-/// the wanted dep names an http(s) URL, claim it so the dispatcher
+/// the wanted dep names an HTTP or HTTPS URL, claim it so the dispatcher
 /// stops; the caller still surfaces a ref-mismatch report if the
 /// lockfile points at a different URL than before.
 fn resolve_latest(query: &LatestQuery) -> Option<LatestInfo> {
@@ -288,6 +301,20 @@ fn resolve_latest(query: &LatestQuery) -> Option<LatestInfo> {
         return None;
     }
     Some(LatestInfo { latest_manifest: None })
+}
+
+/// The id an `http(s)` tarball spec resolves to, which the lockfile keys the
+/// package by: the URL without a redundant default port
+/// (`registry.npmjs.org:443` → `registry.npmjs.org`). `None` for any other
+/// spec.
+#[must_use]
+pub fn remote_tarball_id(bare: &str) -> Option<Result<String, ResolveError>> {
+    is_http_url(bare)
+        .then(|| {
+            reqwest::Url::parse(bare)
+                .map(|url| url.to_string())
+                .map_err(|err| Box::new(err) as ResolveError)
+        })
 }
 
 fn is_http_url(bare: &str) -> bool {

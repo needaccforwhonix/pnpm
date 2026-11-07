@@ -46,6 +46,13 @@
 //! <value 0> … <value N-1>
 //! ```
 //!
+//! **`undefined`** — a field set to `undefined`, such as the `manifest` of
+//! a tarball without a `package.json`:
+//! ```text
+//! d4 00 00        fixext1, ext type 0x00, payload 0x00
+//! ```
+//! The read side turns it into `nil`.
+//!
 //! Everything else (maps, arrays, strings, ints, bools, nil, floats) is
 //! vanilla `MessagePack`. Despite `moreTypes: true`, pnpm's payloads encode
 //! JS `Map` objects as standard msgpack `fixmap`/`map16`/`map32` — no
@@ -63,15 +70,11 @@
 //!
 //! **Write side** ([`encode_package_files_index`]): a hand-written
 //! emitter that allocates slots lazily per distinct *record shape*
-//! for `PackageFilesIndex`, `CafsFileInfo`, and `SideEffectsDiff` —
-//! `0x40` is reserved for the top-level `PackageFilesIndex`, and
-//! inner slots in `0x41..=0x7f` are handed out in first-seen order,
-//! so a single Rust type can consume more than one slot when its
-//! optional-field presence varies within the same row. `HashMap`
-//! fields (`files`, `sideEffects`, `added`) stay as plain msgpack
-//! maps. That shape matches what msgpackr itself emits for a JS
-//! object containing `Map` fields, so pnpm's reader round-trips the
-//! bytes correctly.
+//! for `PackageFilesIndex`, `CafsFileInfo`, and `SideEffectsDiff`.
+//! `HashMap` fields (`files`, `sideEffects`, `added`) stay as plain
+//! msgpack maps. That shape matches what msgpackr itself emits for a
+//! JS object containing `Map` fields, so pnpm's reader round-trips
+//! the bytes correctly.
 
 pub use encoding::{EncodeError, encode_package_files_index};
 
@@ -90,6 +93,9 @@ use std::{collections::HashMap, rc::Rc};
 /// opener for pnpm-written rows because the top-level struct is always
 /// a record.
 pub const RECORD_DEF_EXT_TYPE: u8 = 0x72;
+
+/// msgpackr's encoding of JS `undefined`: fixext1, ext type 0, payload 0.
+const UNDEFINED: [u8; 3] = [0xd4, 0x00, 0x00];
 
 /// Byte range that encodes a record-slot reference.
 const SLOT_LO: u8 = 0x40;
@@ -312,6 +318,11 @@ fn transcode_scalar(
         0xcd | 0xd1 => copy_n(reader, writer, 3),
         0xce | 0xd2 => copy_n(reader, writer, 5),
         0xcf | 0xd3 => copy_n(reader, writer, 9),
+        0xd4 if reader.peek(1)? == UNDEFINED[1] && reader.peek(2)? == UNDEFINED[2] => {
+            reader.read_bytes(UNDEFINED.len())?;
+            writer.push(0xc0);
+            Ok(())
+        }
         0xd4 => copy_n(reader, writer, 3),
         0xd5 => copy_n(reader, writer, 4),
         0xd6 => copy_n(reader, writer, 6),

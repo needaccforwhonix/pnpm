@@ -60,8 +60,8 @@ enum PromptRow {
     /// A group heading or a group's column header: shown, never selected.
     Separator(String),
     /// Checking it selects `value`, which the confirmed answer names by
-    /// `short`.
-    Choice { label: String, short: String, value: String },
+    /// `short`. `notes_key` finds the release notes shown below it.
+    Choice { label: String, short: String, value: String, notes_key: Option<String> },
 }
 
 /// The look of the prompt: pnpm's own theme for the dependency list, the
@@ -70,6 +70,41 @@ enum PromptRow {
 enum PromptStyle {
     Dependencies,
     GlobalGroups,
+}
+
+impl PromptStyle {
+    /// The prompt for `rows`, whose answer names the checked rows by index.
+    fn checkbox_prompt(
+        self,
+        message: &str,
+        rows: &[PromptRow],
+        notes: &ChoiceNotes,
+    ) -> CheckboxPrompt<usize> {
+        let items = rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| match row {
+                PromptRow::Separator(text) => CheckboxItem::Separator(text.clone()),
+                PromptRow::Choice { label, short, notes_key, .. } => {
+                    CheckboxItem::Choice(CheckboxChoice {
+                        name: label.clone(),
+                        short: short.clone(),
+                        value: index,
+                        description: notes_key
+                            .as_ref()
+                            .and_then(|key| notes.get(key))
+                            .cloned(),
+                    })
+                }
+            })
+            .collect();
+        match self {
+            Self::Dependencies => CheckboxPrompt::new(message, items)
+                .required(true)
+                .theme(CheckboxTheme { checked: "●".to_string(), unchecked: "○".to_string() }),
+            Self::GlobalGroups => CheckboxPrompt::new(message, items),
+        }
+    }
 }
 
 /// How `update --interactive` asks which dependencies to update.
@@ -92,34 +127,11 @@ impl UpdatePrompt {
         self,
         message: &str,
         rows: &[PromptRow],
-        style: PromptStyle,
+        (style, notes): (PromptStyle, &ChoiceNotes),
     ) -> miette::Result<Option<Vec<usize>>> {
         match self {
             Self::Terminal => {
-                let items = rows
-                    .iter()
-                    .enumerate()
-                    .map(|(index, row)| match row {
-                        PromptRow::Separator(text) => CheckboxItem::Separator(text.clone()),
-                        PromptRow::Choice { label, short, .. } => {
-                            CheckboxItem::Choice(CheckboxChoice {
-                                name: label.clone(),
-                                short: short.clone(),
-                                value: index,
-                            })
-                        }
-                    })
-                    .collect();
-                let prompt = match style {
-                    PromptStyle::Dependencies => CheckboxPrompt::new(message, items)
-                        .required(true)
-                        .theme(CheckboxTheme {
-                            checked: "●".to_string(),
-                            unchecked: "○".to_string(),
-                            highlight_active: false,
-                        }),
-                    PromptStyle::GlobalGroups => CheckboxPrompt::new(message, items),
-                };
+                let prompt = style.checkbox_prompt(message, rows, notes);
                 match prompt
                     .interact()
                     .into_diagnostic()
@@ -168,19 +180,14 @@ pub(crate) async fn select_packages<Reporter: self::Reporter>(
     )
     .await?;
     if options.include_github_actions {
-        append_github_actions::<Reporter>(
-            &mut choices,
-            root,
-            options.latest,
-            config.update_config.github_actions_server.as_deref(),
-        )
-        .await?;
+        append_github_actions::<Reporter>(&mut choices, root, options.latest, config).await?;
     }
+    let notes = choice_notes(config, &choices).await;
     prompt_for_packages::<Reporter>(
         &choices,
         options.latest,
         config.workspace_dir.is_some(),
-        options.prompt,
+        (options.prompt, &notes),
     )
 }
 
@@ -213,28 +220,29 @@ pub(crate) async fn select_packages_for_projects<Reporter: self::Reporter>(
     )
     .await?;
     if options.include_github_actions {
-        append_github_actions::<Reporter>(
-            &mut choices,
-            root,
-            options.latest,
-            config.update_config.github_actions_server.as_deref(),
-        )
-        .await?;
+        append_github_actions::<Reporter>(&mut choices, root, options.latest, config).await?;
     }
-    prompt_for_packages::<Reporter>(&choices, options.latest, true, options.prompt)
+    let notes = choice_notes(config, &choices).await;
+    prompt_for_packages::<Reporter>(&choices, options.latest, true, (options.prompt, &notes))
 }
 
 async fn append_github_actions<Reporter: self::Reporter>(
     choices: &mut Vec<OutdatedPackage>,
     root: &Path,
     latest: bool,
-    server_url: Option<&str>,
+    config: &Config,
 ) -> miette::Result<()> {
     choices.extend(
-        github_actions::find_outdated::<Reporter>(root, !latest, None, server_url)
-            .await?
-            .into_iter()
-            .map(OutdatedPackage::from),
+        github_actions::find_outdated::<Reporter>(
+            root,
+            !latest,
+            None,
+            config.update_config.github_actions_server.as_deref(),
+            crate::github_actions::release_age(config)?.as_ref(),
+        )
+        .await?
+        .into_iter()
+        .map(OutdatedPackage::from),
     );
     Ok(())
 }
@@ -255,8 +263,9 @@ async fn collect_choices(
         match_names: None,
         ignore_names: ignored.as_ref(),
         include_deprecated: false,
+        full_metadata: false,
     };
-    let run = OutdatedRun::new(config, Arc::clone(http_client))?;
+    let run = OutdatedRun::new(config, Arc::clone(http_client), &query)?;
     let choices = futures_util::future::join_all(
         projects
             .iter()
@@ -305,14 +314,14 @@ fn print_up_to_date(latest: bool) {
     } else {
         "All of your dependencies are already up to date inside the specified ranges. Use the --latest option to update the ranges in package.json"
     };
-    println!("{message}");
+    pnpm_diagnostics::println!("{message}");
 }
 
 fn prompt_for_packages<Reporter: self::Reporter>(
     choices: &[OutdatedPackage],
     latest: bool,
     workspaces_enabled: bool,
-    prompt: UpdatePrompt,
+    (prompt, notes): (UpdatePrompt, &ChoiceNotes),
 ) -> miette::Result<Option<Vec<String>>> {
     if choices.is_empty() {
         print_up_to_date(latest);
@@ -323,7 +332,7 @@ fn prompt_for_packages<Reporter: self::Reporter>(
     let rows = flatten_groups(&groups);
 
     let Some(selected_indices) =
-        prompt.select(&dependencies_prompt_message(), &rows, PromptStyle::Dependencies)?
+        prompt.select(&dependencies_prompt_message(), &rows, (PromptStyle::Dependencies, notes))?
     else {
         report_cancelled::<Reporter>();
         return Ok(None);
@@ -361,6 +370,7 @@ fn flatten_groups(groups: &[choices::ChoiceGroup]) -> Vec<PromptRow> {
                         label: row.label.clone(),
                         short: sanitize_inline(value).into_owned(),
                         value: value.clone(),
+                        notes_key: row.notes_key.clone(),
                     },
                 }),
         );
@@ -391,6 +401,9 @@ fn cyan(text: &str) -> String {
 }
 
 mod choices;
+mod notes;
+
+use notes::{ChoiceNotes, choice_notes};
 
 #[cfg(test)]
 mod tests;

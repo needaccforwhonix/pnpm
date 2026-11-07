@@ -1,21 +1,27 @@
 use super::{
     AuthSources, Config, EnvVar, EnvVarOs, ExplicitPaths, GetCurrentDir, GetHomeDir, LinkProbe,
-    LoadWorkspaceYamlError, NpmrcAuth, Path, WorkspaceSettings, build_package_manager_bootstrap,
-    collect_explicit_settings, default_config_dir, default_state_dir, resolve_configured_state_dir,
+    LoadWorkspaceYamlError, NpmrcAuth, Path, TrustedSettings, WorkspaceSettings,
+    build_package_manager_bootstrap, collect_explicit_trusted_settings, default_config_dir,
+    default_state_dir, ensure_windows_dir_envs, resolve_configured_state_dir,
 };
+
+/// A failed [`Config::current_keeping_warnings`].
+#[derive(Debug)]
+pub struct ConfigLoadFailure {
+    pub error: LoadWorkspaceYamlError,
+    /// The `.npmrc` warnings collected before the load failed.
+    pub warnings: Vec<String>,
+}
 
 impl Config {
     /// Load the merged configuration for a CLI run.
     ///
     /// Config sources (low → high precedence): `SmartDefault`, the supported
     /// `.npmrc` subset (cwd, falling back to home), global `config.yaml`,
-    /// project `pnpm-workspace.yaml`, then `PNPM_CONFIG_*` env.
+    /// project `pnpm-workspace.yaml`, `PNPM_CONFIG_*` env, then
+    /// [`CliLayer::setting_values`](crate::CliLayer::setting_values), then
+    /// the [`CliLayer`](crate::CliLayer) registry routes.
     ///
-    /// Pacquet currently applies `registry`, scoped registry routes,
-    /// npm-auth credentials, the
-    /// proxy keys (`https-proxy`, `http-proxy`, `proxy`, `no-proxy` /
-    /// `noproxy`), and the TLS + local-address keys (`ca`, `cafile`,
-    /// `cert`, `key`, `strict-ssl`, `local-address`) from `.npmrc`.
     /// Other `.npmrc` entries — project-structural settings like
     /// `storeDir`, `lockfile` and `hoist-pattern` — are silently
     /// ignored here. Those must come from `pnpm-workspace.yaml` or CLI
@@ -25,6 +31,18 @@ impl Config {
     /// `pnpm-workspace.yaml` cannot be read or parsed. A missing file is not
     /// an error.
     pub fn current<Sys>(self, start_dir: &std::path::Path) -> Result<Self, LoadWorkspaceYamlError>
+    where
+        Sys: EnvVar + EnvVarOs + GetCurrentDir + GetHomeDir + LinkProbe,
+    {
+        self.current_inner::<Sys>(start_dir, false).map_err(|failure| failure.error)
+    }
+
+    /// Like [`Config::current`], but a failure keeps the `.npmrc` warnings
+    /// the load collected before it, so the caller can still print them.
+    pub fn current_keeping_warnings<Sys>(
+        self,
+        start_dir: &std::path::Path,
+    ) -> Result<Self, ConfigLoadFailure>
     where
         Sys: EnvVar + EnvVarOs + GetCurrentDir + GetHomeDir + LinkProbe,
     {
@@ -41,43 +59,126 @@ impl Config {
     where
         Sys: EnvVar + EnvVarOs + GetCurrentDir + GetHomeDir + LinkProbe,
     {
-        self.current_inner::<Sys>(start_dir, true)
+        self.current_inner::<Sys>(start_dir, true).map_err(|failure| failure.error)
+    }
+
+    /// [`Config::apply_workspace_yaml`], leaving out all of the workspace
+    /// file's settings when [`Config::settings_read`] skips unreadable ones and
+    /// they fail to apply. The workspace root still applies.
+    fn apply_workspace_yaml_unless_unreadable<Sys>(
+        &mut self,
+        workspace_yaml: Option<(std::path::PathBuf, Option<WorkspaceSettings>)>,
+        explicit: &mut ExplicitPaths,
+        declared_registries: &mut crate::npmrc_auth::DeclaredRegistries,
+        for_self_update: bool,
+    ) -> Result<(), LoadWorkspaceYamlError>
+    where
+        Sys: EnvVar + EnvVarOs + GetCurrentDir + GetHomeDir + LinkProbe,
+    {
+        if !self.settings_read.skips_unreadable() {
+            return self.apply_workspace_yaml::<Sys>(
+                workspace_yaml,
+                explicit,
+                declared_registries,
+                for_self_update,
+            );
+        }
+        // Whole or not at all: a failure partway through must not leave the
+        // settings applied before it in force.
+        let before = (self.clone(), *explicit, declared_registries.clone());
+        let workspace_dir = workspace_yaml.as_ref().map(|(dir, _)| dir.clone());
+        let applied = self.apply_workspace_yaml::<Sys>(
+            workspace_yaml,
+            explicit,
+            declared_registries,
+            for_self_update,
+        );
+        if applied.is_ok() {
+            return applied;
+        }
+        (*self, *explicit, *declared_registries) = before;
+        self.apply_workspace_yaml::<Sys>(
+            workspace_dir.map(|dir| (dir, None)),
+            explicit,
+            declared_registries,
+            for_self_update,
+        )
+    }
+
+    /// `result`, or `fallback`'s value in its place when
+    /// [`Config::settings_read`] leaves out the source that failed.
+    pub(super) fn skip_if_unreadable<Value>(
+        &self,
+        result: Result<Value, LoadWorkspaceYamlError>,
+        fallback: impl FnOnce() -> Value,
+    ) -> Result<Value, LoadWorkspaceYamlError> {
+        match result {
+            Err(_) if self.settings_read.skips_unreadable() => Ok(fallback()),
+            result => result,
+        }
+    }
+
+    /// The workspace root the directory tree places, without reading its
+    /// `pnpm-workspace.yaml`, for one this pnpm cannot read at all.
+    pub(super) fn locate_workspace<Sys: EnvVarOs>(
+        &self,
+        start_dir: &std::path::Path,
+    ) -> Option<(std::path::PathBuf, Option<WorkspaceSettings>)> {
+        if self.ignore_workspace {
+            return None;
+        }
+        pnpm_workspace::WORKSPACE_DIR_ENV_VARS
+            .iter()
+            .find_map(|name| Sys::var_os(name).filter(|value| !value.is_empty()))
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                crate::workspace_yaml::find_workspace_manifest(start_dir)
+                    .and_then(|manifest| manifest.parent().map(Path::to_path_buf))
+            })
+            .map(|dir| (dir, None))
     }
 
     pub(super) fn current_inner<Sys>(
         mut self,
         start_dir: &std::path::Path,
         for_self_update: bool,
-    ) -> Result<Self, LoadWorkspaceYamlError>
+    ) -> Result<Self, ConfigLoadFailure>
     where
         Sys: EnvVar + EnvVarOs + GetCurrentDir + GetHomeDir + LinkProbe,
     {
+        match self.load_sources::<Sys>(start_dir, for_self_update) {
+            Ok(()) => Ok(self),
+            Err(error) => Err(ConfigLoadFailure { error, warnings: self.npmrc_warnings }),
+        }
+    }
+
+    fn load_sources<Sys>(
+        &mut self,
+        start_dir: &std::path::Path,
+        for_self_update: bool,
+    ) -> Result<(), LoadWorkspaceYamlError>
+    where
+        Sys: EnvVar + EnvVarOs + GetCurrentDir + GetHomeDir + LinkProbe,
+    {
+        ensure_windows_dir_envs::<Sys>().map_err(LoadWorkspaceYamlError::UnexpandedEnvInPath)?;
         let default_state_dir = default_state_dir::<Sys>().unwrap_or_default();
         self.state_dir.clone_from(&default_state_dir);
 
         self.anchor_default_module_dirs(start_dir);
 
-        // Read the project/workspace .npmrc plus trusted user-level sources
-        // and apply only the auth/network subset. Everything else is
-        // intentionally ignored.
-        //
-        // pnpm reads several `.npmrc` sources and merges them
-        // (`user < auth.ini < workspace`), pinning each file's *unscoped*
-        // credentials to that file's own registry *before* the merge so
-        // a higher-priority file (or `pnpm-workspace.yaml`) can never
-        // pull them to a different host. See
-        // [`NpmrcAuth::rescope_unscoped`].
-        //
         // The global `config.yaml` is loaded up front: its `npmrcAuthFile`
         // participates in the user-level path resolution below, and its
         // directory is where `auth.ini` lives.
-        let global_config_dir = default_config_dir::<Sys>();
+        let global_config_dir = self.config_dir.clone().or_else(default_config_dir::<Sys>);
         self.config_dir.clone_from(&global_config_dir);
         let global_settings = self.load_global_settings::<Sys>()?;
 
+        // Captured here, before any later layer can flip the boolean:
+        // only the CLI-seeded value suppresses the search.
+        self.workspace_search_skipped = self.ignore_workspace;
         let workspace_yaml = self.resolve_workspace_yaml::<Sys>(start_dir)?;
 
-        let AuthSources { mut npmrc_auth, trusted_auth } = self.collect_auth_sources::<Sys>(
+        let AuthSources { mut npmrc_auth, trusted_auth } = self.read_auth_sources::<Sys>(
             start_dir,
             workspace_yaml.as_ref(),
             global_settings.as_ref(),
@@ -103,7 +204,8 @@ impl Config {
             start_dir,
         );
 
-        self.apply_workspace_yaml::<Sys>(
+        *self.boot_inherited = crate::BootConfig::capture(self);
+        self.apply_workspace_yaml_unless_unreadable::<Sys>(
             workspace_yaml,
             &mut explicit,
             &mut declared_registries,
@@ -114,36 +216,41 @@ impl Config {
         // repo-controlled registries) but before `PNPM_CONFIG_*` (so an
         // explicit `pnpm_config_registry` / `--registry` still wins) —
         // pnpm's "CLI > _auth > yaml" precedence.
-        npmrc_auth.apply_json_env_registries(&mut self, &declared_registries);
+        npmrc_auth.apply_json_env_registries(self, &declared_registries);
 
         self.apply_env_settings::<Sys>(&mut explicit, &default_state_dir, start_dir);
-
-        if !self.explicit_settings.contains_key("lockfile") {
-            self.lockfile = self.package_lock;
-        }
+        self.apply_cli_setting_values(&mut explicit, &default_state_dir, start_dir);
+        self.apply_cli_registries();
 
         self.apply_store_derivations::<Sys>(explicit, &mut npmrc_auth, start_dir)?;
 
         self.apply_layout_derivations::<Sys>();
 
-        Ok(self)
+        Ok(())
     }
 
     /// Anchor module defaults to the requested directory, which may differ from the process cwd.
     pub(super) fn anchor_default_module_dirs(&mut self, start_dir: &std::path::Path) {
         self.modules_dir = start_dir.join("node_modules");
-        self.virtual_store_dir = self.modules_dir.join(".pnpm");
+        self.install_state_dir = self.modules_dir.join(".pnpm");
     }
 
     pub(super) fn apply_bootstrap_settings<Sys: EnvVar>(
         &mut self,
         trusted_auth: NpmrcAuth,
-        global_settings: Option<&WorkspaceSettings>,
+        global_settings: Option<&TrustedSettings>,
     ) -> Result<(), LoadWorkspaceYamlError> {
+        // Not left out when unreadable: an empty bootstrap would download the
+        // pinned pnpm from the public registry, past the machine's mirror and
+        // credentials.
         self.package_manager_bootstrap = build_package_manager_bootstrap::<Sys>(trusted_auth)?;
         if let Some(global_settings) = global_settings {
             let bootstrap = &mut self.package_manager_bootstrap;
-            global_settings.apply_proxy_to(&mut bootstrap.proxy, &mut bootstrap.proxy_keys);
+            global_settings.settings.apply_proxy_to(
+                &mut bootstrap.proxy,
+                &mut bootstrap.proxy_keys,
+            );
+            global_settings.settings.apply_tls_to(&mut bootstrap.tls);
         }
         Ok(())
     }
@@ -158,22 +265,26 @@ impl Config {
         // is found — because the env-var fallback is a normalization step
         // on the resolved config, not a function of `.npmrc` presence.
         npmrc_auth.proxy.apply_proxy_cascade::<Sys>(self);
-        // TLS + local-address are sourced from `.npmrc` only — pnpm
-        // does not honor env vars (`NODE_EXTRA_CA_CERTS`,
+        // pnpm does not honor Node's TLS env vars (`NODE_EXTRA_CA_CERTS`,
         // `NODE_TLS_REJECT_UNAUTHORIZED`, etc.) for these keys
-        // (Node's runtime does, but pnpm's reader does not). When
-        // there is no `.npmrc`, `npmrc_auth` is the default value and
-        // this is a no-op write of `TlsConfig::default()` onto the
-        // already-default `self.tls`.
+        // (Node's runtime does, but pnpm's reader does not).
         npmrc_auth.tls.apply_tls_and_local_address(self);
     }
 
+    /// The global `config.yaml`, or none in its place when it cannot be
+    /// read at all and [`Config::settings_read`] skips unreadable ones.
     pub(super) fn load_global_settings<Sys: EnvVar>(
         &self,
-    ) -> Result<Option<WorkspaceSettings>, LoadWorkspaceYamlError> {
+    ) -> Result<Option<TrustedSettings>, LoadWorkspaceYamlError> {
+        self.skip_if_unreadable(self.read_global_settings::<Sys>(), || None)
+    }
+
+    fn read_global_settings<Sys: EnvVar>(
+        &self,
+    ) -> Result<Option<TrustedSettings>, LoadWorkspaceYamlError> {
         let mut global_settings = self.config_dir
             .as_deref()
-            .map(WorkspaceSettings::load_global)
+            .map(|dir| TrustedSettings::load_global_reading(dir, self.settings_read))
             .transpose()?
             .flatten();
         if let Some(global_settings) = global_settings.as_mut() {
@@ -184,12 +295,7 @@ impl Config {
     }
 
     /// Apply `PNPM_CONFIG_*` env vars *after* `pnpm-workspace.yaml`:
-    /// env vars override yaml. The `WorkspaceSettings::apply_to`
-    /// call also runs the post-processing (Windows `unsafe_perm`
-    /// override, `hoist: false` short-circuit on `hoist_pattern`)
-    /// regardless of where the values came from, so env-var-set
-    /// values still go through the same hardening yaml-set values
-    /// do.
+    /// env vars override yaml.
     ///
     /// `workspace_dir` save/restore is the same trick used for the
     /// global config above — `apply_to` would otherwise clobber
@@ -204,21 +310,24 @@ impl Config {
     ) where
         Sys: EnvVar + EnvVarOs + GetCurrentDir + GetHomeDir + LinkProbe,
     {
-        let mut env_settings = WorkspaceSettings::from_pnpm_config_env::<Sys>();
-        explicit.note(&env_settings);
+        let mut env_settings = TrustedSettings::from_pnpm_config_env::<Sys>();
+        explicit.note(&env_settings.settings);
+        self.boot_overrides.overlay(&env_settings.settings);
         env_settings.substitute_env_trusted::<Sys>();
         // `PNPM_CONFIG_REGISTRY` comes from the environment, not the
         // repository, so it overrides the bootstrap default registry too.
-        let env_registry_override = env_settings.registry.clone();
-        collect_explicit_settings(&mut self.explicit_settings, &env_settings);
-        let configured_state_dir = env_settings.state_dir.take();
+        let env_registry_override = env_settings.settings.registry.clone();
+        collect_explicit_trusted_settings(&mut self.explicit_settings, &env_settings);
+        let configured_state_dir = env_settings.machine.state_dir.take();
         let bootstrap = &mut self.package_manager_bootstrap;
-        env_settings.apply_proxy_to(&mut bootstrap.proxy, &mut bootstrap.proxy_keys);
+        env_settings.settings.apply_proxy_to(&mut bootstrap.proxy, &mut bootstrap.proxy_keys);
+        env_settings.settings.apply_tls_to(&mut bootstrap.tls);
         let saved_workspace_dir = self.workspace_dir.clone();
-        env_settings.expand_global_dir_home_prefixes::<Sys>();
+        env_settings.expand_home_prefixes::<Sys>();
         env_settings.apply_to(self, start_dir);
         self.workspace_dir = saved_workspace_dir;
         self.apply_remote_side_effects_cache_env::<Sys>();
+        self.apply_remote_cache_env::<Sys>();
         if let Some(configured_state_dir) = configured_state_dir
             .as_deref()
             .filter(|value| !value.is_empty())
@@ -226,11 +335,37 @@ impl Config {
             self.state_dir = resolve_configured_state_dir(default_state_dir, configured_state_dir);
         }
         if let Some(registry) = env_registry_override {
-            let normalized =
-                if registry.ends_with('/') { registry } else { format!("{registry}/") };
+            let normalized = pnpm_network::normalize_registry_url(&registry).into_owned();
             self.registries_by_scope.insert("default".to_string(), normalized.clone());
             self.package_manager_bootstrap.registry.clone_from(&normalized);
             self.package_manager_bootstrap.registries.insert("default".to_string(), normalized);
         }
+    }
+
+    /// Layer [`CliLayer::setting_values`](crate::CliLayer::setting_values)
+    /// over every other source, before the derivations that read the final
+    /// settings run.
+    fn apply_cli_setting_values(
+        &mut self,
+        explicit: &mut ExplicitPaths,
+        default_state_dir: &Path,
+        start_dir: &Path,
+    ) {
+        if self.cli.setting_values.is_empty() {
+            return;
+        }
+        let mut settings = TrustedSettings::from_string_values(&self.cli.setting_values);
+        explicit.note(&settings.settings);
+        self.boot_overrides.overlay(&settings.settings);
+        collect_explicit_trusted_settings(&mut self.explicit_settings, &settings);
+        if let Some(configured_state_dir) = settings.machine.state_dir.take() {
+            self.state_dir = resolve_configured_state_dir(default_state_dir, &configured_state_dir);
+        }
+        let bootstrap = &mut self.package_manager_bootstrap;
+        settings.settings.apply_proxy_to(&mut bootstrap.proxy, &mut bootstrap.proxy_keys);
+        settings.settings.apply_tls_to(&mut bootstrap.tls);
+        let saved_workspace_dir = self.workspace_dir.clone();
+        settings.apply_to(self, start_dir);
+        self.workspace_dir = saved_workspace_dir;
     }
 }

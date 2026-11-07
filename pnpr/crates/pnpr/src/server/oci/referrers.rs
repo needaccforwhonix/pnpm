@@ -144,9 +144,16 @@ impl Request {
         }
         let _guard = self.state.inner.locks.packages.lock(key.as_str()).await;
         storage
-            .update_hosted_document_with_retry(key, DOCUMENT_WRITE_RETRIES, |existing| {
+            .update_hosted_document_with_retry(key, DOCUMENT_WRITE_RETRIES, None, |existing| {
                 let Some(bytes) = existing else { return Ok(None) };
                 let mut current = ImageDocument::parse(bytes)?;
+                if current.format_version > pnpr_oci::IMAGE_DOCUMENT_FORMAT_VERSION {
+                    return Err(RegistryError::DocumentFormatTooNew {
+                        document: key.as_str().to_string(),
+                        format_version: current.format_version,
+                        supported_version: pnpr_oci::IMAGE_DOCUMENT_FORMAT_VERSION,
+                    });
+                }
                 let mut changed = false;
                 for entry in additions {
                     if current

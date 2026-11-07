@@ -29,13 +29,12 @@ pub fn make_node_require_option(module_path: &Path, node_options: Option<&str>) 
     }
 }
 pub fn package_map_path_for_execution(config: &Config, dir: &Path) -> Option<PathBuf> {
-    if !config.node_experimental_package_map {
+    if !config.node_package_map_mode.loads() {
         return None;
     }
     // Installs write the map under the configured modules dir, so detect it
     // by that dir's basename rather than the hard-coded `node_modules`.
-    let modules_dir_name =
-        config.modules_dir.file_name().unwrap_or_else(|| std::ffi::OsStr::new("node_modules"));
+    let modules_dir_name = config.modules_dir_name();
     let workspace_path = config.workspace_dir
         .as_ref()
         .map(|dir| dir.join(modules_dir_name).join(PACKAGE_MAP_FILENAME));

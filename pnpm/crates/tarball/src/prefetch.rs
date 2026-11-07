@@ -4,17 +4,21 @@
 //! the install fans out, so the warm batch can skip per-package
 //! store-index lookups entirely.
 
+pub use cached_rows::CachedCasPaths;
 pub(crate) use cached_rows::{load_cached_cas_paths, load_legacy_synthesized_cas_paths};
 
 use super::{
     Arc, ArchiveStoreProjection, HashMap, IntoParallelIterator, PackageContentCheck,
-    ParallelIterator, PathBuf, TarballError,
+    ParallelIterator, TarballError,
 };
-use pnpm_package_manifest::{files_include_install_scripts, manifest_requires_build};
+use pnpm_package_manifest::{
+    requires_build_from_cas_paths, requires_build_from_files,
+    stored_requires_build_needs_manifest_check,
+};
 use pnpm_reporter::{GlobalLog, LogEvent, LogLevel};
 use pnpm_store_dir::{
     PackageFilesIndex, PendingFilesCheck, PkgContentMismatch, SharedReadonlyStoreIndex,
-    SharedVerifiedFilesCache, StoreDir,
+    SharedVerifiedFilesCache, StoreDir, files_maps,
 };
 
 /// Pre-fetched cas-paths map shared across all per-snapshot futures.
@@ -23,9 +27,9 @@ use pnpm_store_dir::{
 ///
 /// Values are `Arc`-wrapped so the cold-batch fallback can hand a hit
 /// back as a cheap pointer-clone rather than memcpy-ing the whole
-/// per-file map (each entry is a `HashMap<String, PathBuf>` with up
+/// per-file map (each entry is a `pnpm_fs::CasPaths` with up
 /// to ~hundred entries, so the deep clone is a hot-path cost).
-pub type PrefetchedCasPaths = HashMap<String, Arc<HashMap<String, PathBuf>>>;
+pub type PrefetchedCasPaths = HashMap<String, Arc<pnpm_fs::CasPaths>>;
 
 /// Bundled package manifests recovered from the `SQLite` store index,
 /// keyed by the same `<integrity>\t<pkg_id>` string [`PrefetchedCasPaths`]
@@ -57,7 +61,7 @@ pub type PrefetchedManifests = HashMap<String, Arc<serde_json::Value>>;
 /// Outer values are `Arc`-wrapped for the same cold-batch cheap-clone
 /// reason [`PrefetchedCasPaths`] is.
 pub type PrefetchedSideEffectsMaps =
-    HashMap<String, Arc<HashMap<String, HashMap<String, PathBuf>>>>;
+    HashMap<String, Arc<HashMap<String, pnpm_store_dir::SideEffectsOverlay>>>;
 
 pub type PrefetchedSideEffects =
     HashMap<String, Arc<HashMap<String, pnpm_store_dir::SideEffectsDiff>>>;
@@ -159,7 +163,12 @@ impl PrefetchResult {
         let failed: Vec<String> = checks
             .into_par_iter()
             .filter_map(|(cache_key, check)| {
-                (!check.verify(store_dir, verified_files_cache)).then_some(cache_key)
+                let no_files = pnpm_store_dir::FilesMap::new();
+                let files = self.cas_paths.get(&cache_key).map_or(&no_files, |files| &**files);
+                let overlays = self.side_effects_maps.get(&cache_key).map(|maps| &**maps);
+                let passed =
+                    check.verify(store_dir, verified_files_cache, &files_maps(files, overlays));
+                (!passed).then_some(cache_key)
             })
             .collect();
         for cache_key in &failed {
@@ -168,15 +177,32 @@ impl PrefetchResult {
                 ?cache_key,
                 "store-index entry failed integrity check; leaving it to the per-snapshot lookup",
             );
-            self.cas_paths.remove(cache_key);
-            self.manifests.remove(cache_key);
-            self.side_effects_maps.remove(cache_key);
-            self.side_effects.remove(cache_key);
-            self.remote_side_effects_quarantine.remove(cache_key);
-            self.requires_build.remove(cache_key);
-            self.requires_prepare.remove(cache_key);
+            self.remove_row(cache_key);
         }
         failed.len()
+    }
+
+    /// Drop every row whose key `keep` rejects, along with its pending
+    /// files check.
+    pub fn retain_rows(&mut self, keep: impl Fn(&str) -> bool) {
+        self.cas_paths.retain(|cache_key, _| keep(cache_key));
+        self.manifests.retain(|cache_key, _| keep(cache_key));
+        self.side_effects_maps.retain(|cache_key, _| keep(cache_key));
+        self.side_effects.retain(|cache_key, _| keep(cache_key));
+        self.remote_side_effects_quarantine.retain(|cache_key, _| keep(cache_key));
+        self.requires_build.retain(|cache_key, _| keep(cache_key));
+        self.requires_prepare.retain(|cache_key, _| keep(cache_key));
+        self.pending_checks.retain(|cache_key, _| keep(cache_key));
+    }
+
+    fn remove_row(&mut self, cache_key: &str) {
+        self.cas_paths.remove(cache_key);
+        self.manifests.remove(cache_key);
+        self.side_effects_maps.remove(cache_key);
+        self.side_effects.remove(cache_key);
+        self.remote_side_effects_quarantine.remove(cache_key);
+        self.requires_build.remove(cache_key);
+        self.requires_prepare.remove(cache_key);
     }
 }
 
@@ -256,10 +282,7 @@ fn prefetch_cas_paths_blocking(
 /// Phase 2: decode one row's msgpackr-records bytes into a
 /// [`PackageFilesIndex`], then run the integrity check. Both steps are
 /// per-row CPU work with no shared state, so the caller fans them out
-/// across rayon. With manifests included in the payload, decoding 1k+ rows
-/// serially had become the dominant chunk of the prefetch wall
-/// (single-threaded `spawn_blocking`); the par-iter recovers the per-row
-/// parallelism the warm-batch link phase already uses.
+/// across rayon.
 ///
 /// The bundled manifest is split off the decoded entry via `Option::take` so
 /// it travels back to the caller without an intermediate `Value::clone` of
@@ -329,6 +352,29 @@ fn decode_matching_prefetch_entry(cache_key: &str, bytes: &[u8]) -> Option<Packa
     Some(entry)
 }
 
+/// A git-hosted row (one that records `requiresPrepare`) with no bundled
+/// manifest derives `requiresBuild` from its files and ignores the stored
+/// value, which existing stores may hold wrong
+/// ([pnpm/pnpm#17224](https://github.com/pnpm/pnpm/issues/17224)).
+fn resolve_row_requires_build(
+    stored: Option<bool>,
+    stored_requires_prepare: Option<bool>,
+    manifest: Option<&serde_json::Value>,
+    cas_paths: &pnpm_fs::CasPaths,
+) -> bool {
+    if stored_requires_prepare.is_some() && manifest.is_none() {
+        return requires_build_from_cas_paths(cas_paths);
+    }
+    match stored {
+        Some(true) if stored_requires_build_needs_manifest_check(manifest, cas_paths.keys()) => {
+            requires_build_from_cas_paths(cas_paths)
+        }
+        Some(stored) => stored,
+        None if manifest.is_none() => requires_build_from_cas_paths(cas_paths),
+        None => requires_build_from_files(manifest, cas_paths.keys()),
+    }
+}
+
 /// Fold the verified rows into the per-key maps the install path reads.
 fn collect_prefetch_result(decoded: Vec<DecodedPrefetchRow>) -> PrefetchResult {
     let mut result = PrefetchResult {
@@ -351,10 +397,12 @@ fn collect_prefetch_result(decoded: Vec<DecodedPrefetchRow>) -> PrefetchResult {
         if let Some(pending_check) = pending_check {
             result.pending_checks.insert(cache_key.clone(), pending_check);
         }
-        let calculated_requires_build = stored_requires_build.unwrap_or_else(|| {
-            manifest.as_deref().is_some_and(manifest_requires_build)
-                || files_include_install_scripts(verify_result.files_map.keys())
-        });
+        let calculated_requires_build = resolve_row_requires_build(
+            stored_requires_build,
+            stored_requires_prepare,
+            manifest.as_deref(),
+            &verify_result.files_map,
+        );
         if let Some(manifest) = manifest {
             result.manifests.insert(cache_key.clone(), manifest);
         }

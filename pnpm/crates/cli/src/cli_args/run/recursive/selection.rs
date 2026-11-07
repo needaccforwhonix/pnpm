@@ -1,12 +1,19 @@
 use super::{
-    BuildTaskGraphOptions, Config, ExecutionStatus, GraphPkg, HashMap, IndexMap, IntoDiagnostic,
-    LogEvent, LogLevel, Path, PathBuf, PnpmLog, ProcessTracker, ProjectGraph, RecursiveRunError,
-    RunArgs, ScriptSelector, TaskGraph, TaskKey, TaskRunExecutionSettings, TaskRunStateContext,
-    build_task_graph, count_failures, env, filtered_projects_dependencies, find_resume_root,
-    render_project_commands, render_task_graph_dry_run, resume_task_graph_from, reverse_task_graph,
-    task_graph_to_json, task_run_execution_settings, throw_or_filter_hidden_scripts,
-    write_recursive_summary,
+    super::listing::split_regex_literal, BuildTaskGraphOptions, Config, ExecutionStatus, GraphPkg,
+    HashMap, HashSet, IndexMap, IntoDiagnostic, LogEvent, LogLevel, Path, PathBuf, PnpmLog,
+    ProcessTracker, ProjectGraph, RecursiveRunError, RunArgs, ScriptSelector, TaskGraph, TaskKey,
+    TaskRunExecutionSettings, TaskRunStateContext, TaskSettings, build_task_graph, count_failures,
+    env, filtered_projects_dependencies, find_resume_root, render_project_commands,
+    render_task_graph_dry_run, resume_task_graph_from, reverse_task_graph, task_graph_to_json,
+    task_run_execution_settings, throw_or_filter_hidden_scripts, write_recursive_summary,
 };
+use pnpm_workspace_projects_graph::BaseProject;
+
+/// Whether a task name addresses scripts by `RegExp` literal rather than by
+/// name.
+fn is_selector_task(task_name: &str) -> bool {
+    split_regex_literal(task_name).is_some()
+}
 
 /// Before anything is dispatched: when no selected project has the
 /// script, the run is a user error, and the tasks `dependsOn` pulled in
@@ -19,16 +26,50 @@ pub(super) fn check_a_project_has_the_script(
     script_name: &str,
     all_packages_selected: bool,
 ) -> miette::Result<()> {
-    if script_name == "test" || args.if_present {
-        return Ok(());
-    }
-    if task_graph
-        .values()
-        .any(|node| node.requested && !node.scripts.is_empty())
-    {
+    if script_name == "test" || args.if_present || a_project_has_the_script(task_graph) {
         return Ok(());
     }
     Err(no_requested_script_error(script_name, all_packages_selected).into())
+}
+
+/// A script listed in `requiredScripts` must exist in every requested
+/// project.
+pub(super) fn check_required_script(
+    task_graph: &TaskGraph,
+    graph: &ProjectGraph<GraphPkg<'_>>,
+    script_name: &str,
+    required_scripts: &[String],
+) -> Result<(), RecursiveRunError> {
+    if !required_scripts
+        .iter()
+        .any(|required| required == script_name)
+    {
+        return Ok(());
+    }
+    let missing: Vec<String> = task_graph
+        .values()
+        .filter(|node| node.requested && node.scripts.is_empty())
+        .map(|node| project_display_name(graph, &node.project))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(RecursiveRunError::MissingRequiredScript {
+        script_name: script_name.to_string(),
+        packages: missing.join(", "),
+    })
+}
+
+fn project_display_name(graph: &ProjectGraph<GraphPkg<'_>>, project: &Path) -> String {
+    graph[project].package
+        .manifest_name()
+        .map_or_else(|| project.display().to_string(), str::to_string)
+}
+
+pub(super) fn a_project_has_the_script(task_graph: &TaskGraph) -> bool {
+    task_graph
+        .values()
+        .any(|node| node.requested && !node.scripts.is_empty())
 }
 
 /// `--no-bail` runs every task whatever fails, so it needs no tracker at
@@ -49,23 +90,17 @@ pub(super) fn run_state_settings(
 ) -> Vec<String> {
     let mut sync_injected = config.sync_injected_deps_after_scripts.clone();
     sync_injected.sort();
-    let scripts_prepend_node_path = match config.scripts_prepend_node_path {
-        pnpm_config::ScriptsPrependNodePath::Always => "true",
-        pnpm_config::ScriptsPrependNodePath::Never => "false",
-        pnpm_config::ScriptsPrependNodePath::WarnOnly => "warn-only",
-    };
     let mut settings = task_run_execution_settings(&TaskRunExecutionSettings {
         extra_bin_paths: &config.extra_bin_paths,
         extra_env,
         modules_dir: &config.modules_dir,
-        node_experimental_package_map: config.node_experimental_package_map,
+        node_experimental_package_map: config.node_package_map_mode.loads(),
         node_options: config.node_options.as_deref(),
         user_agent: &config.user_agent,
     });
     settings.extend([
         format!("enable-pre-post-scripts={}", config.enable_pre_post_scripts),
         format!("script-shell={}", config.script_shell.as_deref().unwrap_or_default()),
-        format!("scripts-prepend-node-path={scripts_prepend_node_path}"),
         format!("shell-emulator={}", config.shell_emulator),
         format!(
             "sync-injected-deps-after-scripts={}",
@@ -119,7 +154,7 @@ pub(super) fn print_selected_project_commands(
                 && candidate.root_dir != project.package.project.root_dir
         })
         .map(|project| project.manifest.value());
-    println!(
+    pnpm_diagnostics::println!(
         "{}",
         render_project_commands(project.package.project.manifest.value(), root_manifest),
     );
@@ -135,30 +170,100 @@ pub(super) fn print_run_dry_run(
 ) -> miette::Result<()> {
     if args.json {
         let document = task_graph_to_json(task_graph, workspace_root);
-        println!("{}", serde_json::to_string_pretty(&document).into_diagnostic()?);
+        pnpm_diagnostics::println!(
+            "{}",
+            serde_json::to_string_pretty(&document).into_diagnostic()?,
+        );
     } else {
-        println!("{}", render_task_graph_dry_run(task_graph, sequenced_tasks, workspace_root));
+        pnpm_diagnostics::println!(
+            "{}",
+            render_task_graph_dry_run(task_graph, sequenced_tasks, workspace_root),
+        );
     }
     Ok(())
 }
 
-/// Hidden scripts (names starting with `.`) can only be invoked from
-/// within another script, detected by an inherited `npm_lifecycle_event`.
-/// Checked only for the tasks the invocation named: a `dependsOn`
-/// declaration naming a hidden script is a deliberate reference, like a
-/// call from another script.
+/// Removes hidden scripts (names starting with `.`) from the requested
+/// tasks, and fails when everything a project's requested tasks select is
+/// hidden. Hidden scripts can only be invoked from within another script,
+/// detected by an inherited `npm_lifecycle_event`. Checked only for the
+/// tasks the invocation named: a `dependsOn` declaration naming a hidden
+/// script is a deliberate reference, like a call from another script, so a
+/// requested task that a `dependsOn` of
+/// [`HiddenScriptCheck::full_task_graph`] targets is exempt too. Checked per
+/// project, over every requested task: a `RegExp` selector can seed one task
+/// per matched script.
 pub(super) fn filter_hidden_requested_scripts(
     task_graph: &mut TaskGraph,
-    script_name: &str,
+    check: &HiddenScriptCheck<'_>,
 ) -> miette::Result<()> {
     if env::var_os("npm_lifecycle_event").is_some() {
         return Ok(());
     }
-    for node in task_graph.values_mut().filter(|node| node.requested) {
-        node.scripts =
-            throw_or_filter_hidden_scripts(std::mem::take(&mut node.scripts), script_name)?;
+    let referenced = depends_on_targets(check);
+    let checked: Vec<TaskKey> = task_graph
+        .iter()
+        .filter(|(key, node)| node.requested && !referenced.contains(key))
+        .map(|(key, _)| key.clone())
+        .collect();
+    let mut requested_by_project: IndexMap<PathBuf, Vec<String>> = IndexMap::new();
+    for key in &checked {
+        let node = &task_graph[key];
+        requested_by_project
+            .entry(node.project.clone())
+            .or_default()
+            .extend(node.scripts.iter().cloned());
+    }
+    let mut visible_by_project: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+    for (project, scripts) in requested_by_project {
+        let visible = throw_or_filter_hidden_scripts(scripts, check.script_name)?;
+        visible_by_project.insert(project, visible.into_iter().collect());
+    }
+    for key in &checked {
+        let node = task_graph.get_mut(key).expect("checked task is in the graph");
+        let visible = &visible_by_project[&node.project];
+        node.scripts.retain(|script| visible.contains(script));
     }
     Ok(())
+}
+
+pub(super) struct HiddenScriptCheck<'a> {
+    pub(super) script_name: &'a str,
+    /// The graph as built, before `--resume-from` drops tasks and a
+    /// tolerated cycle loses edges.
+    pub(super) full_task_graph: &'a TaskGraph,
+    /// Whether `--reverse` inverted the graph's edges.
+    pub(super) reversed: bool,
+    pub(super) tasks: Option<&'a IndexMap<String, TaskSettings>>,
+}
+
+/// The tasks a `dependsOn` declaration targets: every dependency of a task
+/// that has a `tasks` entry. A task without one only has the default
+/// dependency on its own name in the dependency projects, which is no
+/// reference. Edges are read in declaration direction when `--reverse`
+/// inverted them.
+fn depends_on_targets<'a>(check: &HiddenScriptCheck<'a>) -> HashSet<&'a TaskKey> {
+    let declares =
+        |key: &TaskKey| check.tasks.is_some_and(|tasks| tasks.contains_key(&key.task_name));
+    check.full_task_graph
+        .iter()
+        .flat_map(|(key, node)| {
+            node.dependencies
+                .iter()
+                .map(move |dependency| (key, dependency))
+        })
+        .map(|(key, dependency)| if check.reversed { (dependency, key) } else { (key, dependency) })
+        .filter(|(dependent, _)| declares(dependent))
+        .map(|(_, dependency)| dependency)
+        .collect()
+}
+
+/// The `tasks` declarations the run's graph follows: none under `--no-sort`.
+pub(super) fn run_tasks<'a>(
+    args: &RunArgs,
+    config: &'a Config,
+) -> Option<&'a IndexMap<String, TaskSettings>> {
+    (args.workspace.sort && !config.tasks.is_empty()).then_some(&config.tasks)
 }
 
 /// How many tasks run at once. `--parallel` runs them all, `--sequential`
@@ -281,7 +386,8 @@ pub(super) fn build_run_task_graph(
         project_dependencies: &project_dependencies,
         select_scripts,
         task_name: script_name,
-        tasks: (args.workspace.sort && !config.tasks.is_empty()).then_some(&config.tasks),
+        tasks: run_tasks(args, config),
+        is_selector_task,
     });
     if args.workspace.reverse {
         task_graph = reverse_task_graph(&task_graph);

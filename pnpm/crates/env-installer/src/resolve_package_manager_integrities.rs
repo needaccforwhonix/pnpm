@@ -2,15 +2,18 @@ use crate::{
     ConfigDepError,
     manifest_lockfile::{package_metadata, read_dependency_map},
     options::ConfigDepsInstallOptions,
-    prune::prune_env_lockfile,
+    prune_env_lockfile,
     resolve_optional_subdeps::resolution_has_integrity,
     verify_env_lockfile::{verify_env_lockfile, write_verified_env_lockfile},
 };
+use pnpm_config::PNPM_VERSION;
 use pnpm_lockfile::{
     EnvLockfile, LockfileResolution, PackageKey, PkgName, PkgVerPeer, RegistryResolution,
     SnapshotDepRef, SnapshotEntry, SpecifierAndResolution, TarballResolution,
 };
-use pnpm_resolving_resolver_base::{ResolveOptions, ResolveResult, Resolver, WantedDependency};
+use pnpm_resolving_resolver_base::{
+    NoMatchingVersionError, ResolveOptions, ResolveResult, Resolver, WantedDependency,
+};
 use std::{
     collections::{BTreeMap, HashMap},
     path::PathBuf,
@@ -28,7 +31,7 @@ const PNPM_EXE_INTRODUCED: (u64, u64, u64) = (6, 17, 1);
 /// up to date but are invalid (e.g. resolutions carrying tarball URLs
 /// written by an earlier pnpm) are discarded and re-resolved. Such entries
 /// already record the version the manifest pins — only pnpm's own reading of
-/// them is at stake — so under `opts.frozen_lockfile` the re-resolution
+/// them is at stake — so under `opts.lockfile.frozen` the re-resolution
 /// happens in memory and the lockfile is left untouched, rather than failing
 /// a command the manifest and the lockfile agree on. Entries that do not
 /// record the pinned version are the case `--frozen-lockfile` exists for and
@@ -54,8 +57,8 @@ pub async fn resolve_package_manager_integrities(
     {
         return Ok(env_lockfile);
     }
-    let repair_in_memory = force_resync && opts.frozen_lockfile;
-    if opts.frozen_lockfile && !force_resync {
+    let repair_in_memory = force_resync && opts.lockfile.frozen;
+    if opts.lockfile.frozen && !force_resync {
         return frozen_lockfile_result(env_lockfile, version, package_manager_deps);
     }
 
@@ -78,7 +81,7 @@ pub async fn resolve_package_manager_integrities(
     if repair_in_memory {
         verify_env_lockfile(&env_lockfile)?;
     } else {
-        write_verified_env_lockfile(&env_lockfile, opts.root_dir)?;
+        write_verified_env_lockfile(&env_lockfile, opts.root_dir, opts.lockfile.symlinked)?;
     }
     Ok(env_lockfile)
 }
@@ -142,7 +145,7 @@ async fn record_package(
     resolver: &dyn Resolver,
     opts: &ConfigDepsInstallOptions<'_>,
 ) -> Result<Vec<EnvPackage>, ConfigDepError> {
-    let registry = opts.pick_registry(&package.name);
+    let registry = opts.verification.pick_registry(&package.name);
     let mut metadata =
         package_metadata(&package.name, &package.version, &package.result, registry, false)
             .map_err(ConfigDepError::LockfileForm)?;
@@ -204,6 +207,18 @@ fn strip_registry_tarball_url(resolution: LockfileResolution) -> LockfileResolut
     }
 }
 
+/// Whether `error` is the registry answering that `version`, the pnpm now
+/// running, is not among the versions it publishes.
+///
+/// Such a pin asks for no download, so this is no integrity left to record
+/// rather than a pin that cannot be satisfied: a mirror mid-sync, or a build
+/// that is never published.
+#[must_use]
+pub fn running_version_unpublished(error: &ConfigDepError, version: &str) -> bool {
+    version == PNPM_VERSION
+        && matches!(error, ConfigDepError::Resolve { error, .. } if error.is::<NoMatchingVersionError>())
+}
+
 #[must_use]
 pub fn is_package_manager_resolved(
     env_lockfile: &EnvLockfile,
@@ -218,9 +233,8 @@ pub fn is_package_manager_resolved(
     )
 }
 
-/// Whether the env lockfile already records what this pnpm would write for
-/// `pnpm_version`: the pinned packages under the specifier they were pinned
-/// from, and nothing besides them.
+/// Whether the env lockfile already pins `pnpm_version` under
+/// `wanted_specifier`, so there is nothing for this run to write.
 fn is_package_manager_resolved_with_deps(
     env_lockfile: &EnvLockfile,
     wanted_specifier: &str,
@@ -229,10 +243,9 @@ fn is_package_manager_resolved_with_deps(
 ) -> bool {
     recorded_package_manager_deps(env_lockfile)
         .is_some_and(|pm_deps| {
-            pm_deps.len() == package_manager_deps.len()
-                && pm_deps
-                    .values()
-                    .all(|dep| dep.specifier == wanted_specifier)
+            pm_deps
+                .values()
+                .all(|dep| dep.specifier == wanted_specifier)
         })
         && pins_wanted_package_manager(env_lockfile, pnpm_version, package_manager_deps)
 }
@@ -240,15 +253,9 @@ fn is_package_manager_resolved_with_deps(
 /// Whether the env lockfile pins the package manager the manifest asks for,
 /// even when it records more packages than this pnpm installs it from.
 ///
-/// A pnpm below 11.20.0 pins `@pnpm/exe` beside `pnpm` for a v12 version,
-/// because that is the set its own major is installed from. Such an entry
-/// pins the wanted version through the same integrity and cannot change
-/// which pnpm runs, so a frozen lockfile accepts it instead of failing a
-/// project whose lockfile a teammate's older pnpm last wrote. An entry
-/// pinning any other version, or one the lockfile carries no package to
-/// install from, is a lockfile that disagrees with the manifest, which is
-/// what the flag is for, and a writable install still rewrites the block to
-/// the packages this pnpm installs from.
+/// Every entry must pin the wanted version and have package and snapshot
+/// records. Compatible additional entries are retained to keep commands
+/// from repeatedly rewriting `pnpm-lock.yaml`.
 fn pins_wanted_package_manager(
     env_lockfile: &EnvLockfile,
     pnpm_version: &str,

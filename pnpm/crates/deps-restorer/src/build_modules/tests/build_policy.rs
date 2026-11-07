@@ -1,12 +1,14 @@
 use super::{
-    super::{BuildModules, allow_build_policy::AllowBuildPolicy, deferred_builds},
+    super::{
+        BuildModules, ScheduledBuilds, ScheduledBuildsInputs, allow_build_policy::AllowBuildPolicy,
+        deferred_builds,
+    },
     TEST_LOGGED_METHODS, create_buildable_pkg, key, policy_from_specs, root_importers,
 };
 #[cfg(unix)]
 use super::{create_failing_postinstall_fixture, create_postinstall_modifies_source_fixture};
 use crate::{RequiresBuildBySnapshot, SkippedSnapshots, VirtualStoreLayout};
 use pnpm_config::{Config, PackageImportMethod};
-use pnpm_executor::ScriptsPrependNodePath;
 use pnpm_lockfile::SnapshotEntry;
 use pnpm_reporter::SilentReporter;
 #[cfg(unix)]
@@ -16,6 +18,35 @@ use pretty_assertions::assert_eq;
 use std::sync::Mutex;
 use std::{collections::HashMap, fs};
 use tempfile::tempdir;
+
+/// Only a materialized snapshot whose build `allowBuilds` allows is scheduled,
+/// and nothing is once scripts are ignored.
+#[test]
+fn scheduled_builds_are_materialized_and_allowed() {
+    let allowed = key("allowed", "1.0.0");
+    let denied = key("denied", "1.0.0");
+    let unlisted = key("unlisted", "1.0.0");
+    let not_materialized = key("not-materialized", "1.0.0");
+    let materialized = [allowed.clone(), denied.clone(), unlisted.clone()];
+    let policy = policy_from_specs(
+        [("allowed", true), ("denied", false), ("not-materialized", true)],
+        false,
+    );
+    let inputs = |ignore_scripts| ScheduledBuildsInputs {
+        materialized_snapshots: Some(&materialized),
+        packages: None,
+        allow_build_policy: &policy,
+        ignore_scripts,
+    };
+
+    let scheduled = ScheduledBuilds::new(inputs(false)).expect("builds follow the link phase");
+    assert!(scheduled.includes(&allowed));
+    assert!(!scheduled.includes(&denied));
+    assert!(!scheduled.includes(&unlisted));
+    assert!(!scheduled.includes(&not_materialized));
+
+    assert!(ScheduledBuilds::new(inputs(true)).is_none(), "ignored scripts schedule nothing");
+}
 
 #[test]
 fn deferred_builds_uses_only_the_supplied_snapshots() {
@@ -38,6 +69,15 @@ pub(super) fn dangerously_allow_all_builds() {
     let policy = policy_from_specs([], true);
     assert_eq!(policy.check("any-package@1.0.0"), Some(true));
     assert_eq!(policy.check("other-package@2.0.0"), Some(true));
+}
+#[test]
+fn explicit_deny_outranks_dangerously_allow_all_builds() {
+    let policy = policy_from_specs([("denied", false), ("pinned@1.0.0", false)], true);
+    assert_eq!(policy.check("denied@1.0.0"), Some(false));
+    assert_eq!(policy.check("denied@1.0.0(peer@2.0.0)"), Some(false));
+    assert_eq!(policy.check("pinned@1.0.0"), Some(false));
+    assert_eq!(policy.check("pinned@2.0.0"), Some(true));
+    assert_eq!(policy.check("other-package@1.0.0"), Some(true));
 }
 /// Wildcards in `allowBuilds` keys are accepted by the parser
 /// (they land as literal strings in the expanded set) but the
@@ -83,7 +123,7 @@ fn build_modules_collects_ignored_builds() {
 
     let ignored = BuildModules {
         cache: crate::BuildCacheContext {
-            maps_by_snapshot: None,
+            side_effects: crate::CachedSideEffects { overlays: None, rows: None },
             engine_name: None,
             read: true,
             write: false,
@@ -93,6 +133,7 @@ fn build_modules_collects_ignored_builds() {
             frozen_store: false,
         },
         directories: crate::BuildLayout {
+            link_options: &pnpm_cmd_shim::LinkBinsOptions::default(),
             layout: &VirtualStoreLayout::legacy(
                 virtual_store_dir.path(),
                 pnpm_config::default_virtual_store_dir_max_length() as usize,
@@ -110,15 +151,23 @@ fn build_modules_collects_ignored_builds() {
             patches: None,
             requires_build_by_snapshot: None,
             importers: &importers,
+            dependency_groups: None,
+            build_scope: None,
+            variant_platforms: None,
         },
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),
             user_agent: "pnpm/test",
-            prepend_node_path: ScriptsPrependNodePath::Never,
+            path: crate::ScriptPath { extra_bin_paths: &[], private_hoisting: false },
             shell: None,
             shell_emulator: false,
             unsafe_perm: true,
             ignore: false,
+            patched_engines: crate::PatchedEngineCheck {
+                engine_strict: false,
+                node_version: None,
+                install_state_dir: None,
+            },
         },
 
         allow_build_policy: &policy,
@@ -156,7 +205,7 @@ fn mutated_slots_is_false_when_every_build_is_ignored() {
 
     let output = BuildModules {
         cache: crate::BuildCacheContext {
-            maps_by_snapshot: None,
+            side_effects: crate::CachedSideEffects { overlays: None, rows: None },
             engine_name: None,
             read: true,
             write: false,
@@ -166,6 +215,7 @@ fn mutated_slots_is_false_when_every_build_is_ignored() {
             frozen_store: false,
         },
         directories: crate::BuildLayout {
+            link_options: &pnpm_cmd_shim::LinkBinsOptions::default(),
             layout: &VirtualStoreLayout::legacy(
                 virtual_store_dir.path(),
                 pnpm_config::default_virtual_store_dir_max_length() as usize,
@@ -183,15 +233,23 @@ fn mutated_slots_is_false_when_every_build_is_ignored() {
             patches: None,
             requires_build_by_snapshot: None,
             importers: &importers,
+            dependency_groups: None,
+            build_scope: None,
+            variant_platforms: None,
         },
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),
             user_agent: "pnpm/test",
-            prepend_node_path: ScriptsPrependNodePath::Never,
+            path: crate::ScriptPath { extra_bin_paths: &[], private_hoisting: false },
             shell: None,
             shell_emulator: false,
             unsafe_perm: true,
             ignore: false,
+            patched_engines: crate::PatchedEngineCheck {
+                engine_strict: false,
+                node_version: None,
+                install_state_dir: None,
+            },
         },
 
         allow_build_policy: &policy,
@@ -229,7 +287,7 @@ fn mutated_slots_is_true_when_a_script_runs() {
 
     let output = BuildModules {
         cache: crate::BuildCacheContext {
-            maps_by_snapshot: None,
+            side_effects: crate::CachedSideEffects { overlays: None, rows: None },
             engine_name: None,
             read: true,
             write: false,
@@ -239,6 +297,7 @@ fn mutated_slots_is_true_when_a_script_runs() {
             frozen_store: false,
         },
         directories: crate::BuildLayout {
+            link_options: &pnpm_cmd_shim::LinkBinsOptions::default(),
             layout: &VirtualStoreLayout::legacy(
                 virtual_store_dir.path(),
                 pnpm_config::default_virtual_store_dir_max_length() as usize,
@@ -256,15 +315,23 @@ fn mutated_slots_is_true_when_a_script_runs() {
             patches: None,
             requires_build_by_snapshot: None,
             importers: &importers,
+            dependency_groups: None,
+            build_scope: None,
+            variant_platforms: None,
         },
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),
             user_agent: "pnpm/test",
-            prepend_node_path: ScriptsPrependNodePath::Never,
+            path: crate::ScriptPath { extra_bin_paths: &[], private_hoisting: false },
             shell: None,
             shell_emulator: false,
             unsafe_perm: true,
             ignore: false,
+            patched_engines: crate::PatchedEngineCheck {
+                engine_strict: false,
+                node_version: None,
+                install_state_dir: None,
+            },
         },
 
         allow_build_policy: &policy,
@@ -301,7 +368,7 @@ fn ignore_scripts_skips_build_without_collecting_ignored() {
 
     let ignored = BuildModules {
         cache: crate::BuildCacheContext {
-            maps_by_snapshot: None,
+            side_effects: crate::CachedSideEffects { overlays: None, rows: None },
             engine_name: None,
             read: true,
             write: false,
@@ -311,6 +378,7 @@ fn ignore_scripts_skips_build_without_collecting_ignored() {
             frozen_store: false,
         },
         directories: crate::BuildLayout {
+            link_options: &pnpm_cmd_shim::LinkBinsOptions::default(),
             layout: &VirtualStoreLayout::legacy(
                 virtual_store_dir.path(),
                 pnpm_config::default_virtual_store_dir_max_length() as usize,
@@ -328,15 +396,23 @@ fn ignore_scripts_skips_build_without_collecting_ignored() {
             patches: None,
             requires_build_by_snapshot: None,
             importers: &importers,
+            dependency_groups: None,
+            build_scope: None,
+            variant_platforms: None,
         },
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),
             user_agent: "pnpm/test",
-            prepend_node_path: ScriptsPrependNodePath::Never,
+            path: crate::ScriptPath { extra_bin_paths: &[], private_hoisting: false },
             shell: None,
             shell_emulator: false,
             unsafe_perm: true,
             ignore: true,
+            patched_engines: crate::PatchedEngineCheck {
+                engine_strict: false,
+                node_version: None,
+                install_state_dir: None,
+            },
         },
 
         allow_build_policy: &policy,
@@ -369,7 +445,7 @@ fn cached_requires_build_false_skips_package_dir_probe() {
 
     let ignored = BuildModules {
         cache: crate::BuildCacheContext {
-            maps_by_snapshot: None,
+            side_effects: crate::CachedSideEffects { overlays: None, rows: None },
             engine_name: None,
             read: true,
             write: false,
@@ -379,6 +455,7 @@ fn cached_requires_build_false_skips_package_dir_probe() {
             frozen_store: false,
         },
         directories: crate::BuildLayout {
+            link_options: &pnpm_cmd_shim::LinkBinsOptions::default(),
             layout: &VirtualStoreLayout::legacy(
                 virtual_store_dir.path(),
                 pnpm_config::default_virtual_store_dir_max_length() as usize,
@@ -396,15 +473,23 @@ fn cached_requires_build_false_skips_package_dir_probe() {
             patches: None,
             requires_build_by_snapshot: Some(&requires_build_by_snapshot),
             importers: &importers,
+            dependency_groups: None,
+            build_scope: None,
+            variant_platforms: None,
         },
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),
             user_agent: "pnpm/test",
-            prepend_node_path: ScriptsPrependNodePath::Never,
+            path: crate::ScriptPath { extra_bin_paths: &[], private_hoisting: false },
             shell: None,
             shell_emulator: false,
             unsafe_perm: true,
             ignore: false,
+            patched_engines: crate::PatchedEngineCheck {
+                engine_strict: false,
+                node_version: None,
+                install_state_dir: None,
+            },
         },
 
         allow_build_policy: &policy,
@@ -452,7 +537,7 @@ fn build_modules_collects_ignored_builds_under_concurrency() {
 
     let ignored = BuildModules {
         cache: crate::BuildCacheContext {
-            maps_by_snapshot: None,
+            side_effects: crate::CachedSideEffects { overlays: None, rows: None },
             engine_name: None,
             read: true,
             write: false,
@@ -462,6 +547,7 @@ fn build_modules_collects_ignored_builds_under_concurrency() {
             frozen_store: false,
         },
         directories: crate::BuildLayout {
+            link_options: &pnpm_cmd_shim::LinkBinsOptions::default(),
             layout: &VirtualStoreLayout::legacy(
                 virtual_store_dir.path(),
                 pnpm_config::default_virtual_store_dir_max_length() as usize,
@@ -479,15 +565,23 @@ fn build_modules_collects_ignored_builds_under_concurrency() {
             patches: None,
             requires_build_by_snapshot: None,
             importers: &importers,
+            dependency_groups: None,
+            build_scope: None,
+            variant_platforms: None,
         },
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),
             user_agent: "pnpm/test",
-            prepend_node_path: ScriptsPrependNodePath::Never,
+            path: crate::ScriptPath { extra_bin_paths: &[], private_hoisting: false },
             shell: None,
             shell_emulator: false,
             unsafe_perm: true,
             ignore: false,
+            patched_engines: crate::PatchedEngineCheck {
+                engine_strict: false,
+                node_version: None,
+                install_state_dir: None,
+            },
         },
 
         allow_build_policy: &policy,
@@ -532,7 +626,7 @@ fn build_modules_excludes_explicit_deny_from_ignored() {
 
     let ignored = BuildModules {
         cache: crate::BuildCacheContext {
-            maps_by_snapshot: None,
+            side_effects: crate::CachedSideEffects { overlays: None, rows: None },
             engine_name: None,
             read: true,
             write: false,
@@ -542,6 +636,7 @@ fn build_modules_excludes_explicit_deny_from_ignored() {
             frozen_store: false,
         },
         directories: crate::BuildLayout {
+            link_options: &pnpm_cmd_shim::LinkBinsOptions::default(),
             layout: &VirtualStoreLayout::legacy(
                 virtual_store_dir.path(),
                 pnpm_config::default_virtual_store_dir_max_length() as usize,
@@ -559,15 +654,23 @@ fn build_modules_excludes_explicit_deny_from_ignored() {
             patches: None,
             requires_build_by_snapshot: None,
             importers: &importers,
+            dependency_groups: None,
+            build_scope: None,
+            variant_platforms: None,
         },
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),
             user_agent: "pnpm/test",
-            prepend_node_path: ScriptsPrependNodePath::Never,
+            path: crate::ScriptPath { extra_bin_paths: &[], private_hoisting: false },
             shell: None,
             shell_emulator: false,
             unsafe_perm: true,
             ignore: false,
+            patched_engines: crate::PatchedEngineCheck {
+                engine_strict: false,
+                node_version: None,
+                install_state_dir: None,
+            },
         },
 
         allow_build_policy: &policy,
@@ -691,16 +794,20 @@ fn using_side_effects_cache_skips_rebuild() {
     overlay.insert(
         expected_cache_key,
         std::collections::HashMap::from([
-            ("package.json".to_string(), pkg_dir.join("package.json")),
-            ("generated-by-postinstall.js".to_string(), side_effect_blob),
-        ]),
+            ("package.json".to_string(), pkg_dir.join("package.json").into()),
+            ("generated-by-postinstall.js".to_string(), side_effect_blob.into()),
+        ])
+        .into(),
     );
     let mut side_effects_maps = std::collections::HashMap::new();
     side_effects_maps.insert(pkg_key.clone(), std::sync::Arc::new(overlay));
 
     BuildModules {
         cache: crate::BuildCacheContext {
-            maps_by_snapshot: Some(&side_effects_maps),
+            side_effects: crate::CachedSideEffects {
+                overlays: Some(&side_effects_maps),
+                rows: None,
+            },
             engine_name: Some(engine),
             read: true,
             write: false,
@@ -710,6 +817,7 @@ fn using_side_effects_cache_skips_rebuild() {
             frozen_store: false,
         },
         directories: crate::BuildLayout {
+            link_options: &pnpm_cmd_shim::LinkBinsOptions::default(),
             layout: &VirtualStoreLayout::legacy(
                 virtual_store_dir.path(),
                 pnpm_config::default_virtual_store_dir_max_length() as usize,
@@ -727,15 +835,23 @@ fn using_side_effects_cache_skips_rebuild() {
             patches: None,
             requires_build_by_snapshot: None,
             importers: &importers,
+            dependency_groups: None,
+            build_scope: None,
+            variant_platforms: None,
         },
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),
             user_agent: "pnpm/test",
-            prepend_node_path: ScriptsPrependNodePath::Never,
+            path: crate::ScriptPath { extra_bin_paths: &[], private_hoisting: false },
             shell: None,
             shell_emulator: false,
             unsafe_perm: true,
             ignore: false,
+            patched_engines: crate::PatchedEngineCheck {
+                engine_strict: false,
+                node_version: None,
+                install_state_dir: None,
+            },
         },
 
         allow_build_policy: &policy,
@@ -830,19 +946,28 @@ fn corrupt_side_effects_cache_falls_back_to_rebuild() {
     // The overlay points `generated.txt` at a CAS path that doesn't
     // exist, so `materialize_side_effects` fails — standing in for a
     // store whose side-effects blob went missing.
-    let overlay = std::collections::HashMap::from([
-        ("package.json".to_string(), pkg_dir.join("package.json")),
-        ("generated.txt".to_string(), virtual_store_dir.path().join("missing-cas-blob")),
+    let overlay = pnpm_fs::CasPaths::from([
+        ("package.json".to_string(), pkg_dir.join("package.json").into()),
+        (
+            "generated.txt".to_string(),
+            virtual_store_dir
+                .path()
+                .join("missing-cas-blob")
+                .into(),
+        ),
     ]);
     let mut side_effects_maps = std::collections::HashMap::new();
     side_effects_maps.insert(
         pkg_key.clone(),
-        std::sync::Arc::new(HashMap::from([(expected_cache_key, overlay)])),
+        std::sync::Arc::new(HashMap::from([(expected_cache_key, overlay.into())])),
     );
 
     BuildModules {
         cache: crate::BuildCacheContext {
-            maps_by_snapshot: Some(&side_effects_maps),
+            side_effects: crate::CachedSideEffects {
+                overlays: Some(&side_effects_maps),
+                rows: None,
+            },
             engine_name: Some(engine),
             read: true,
             write: false,
@@ -852,6 +977,7 @@ fn corrupt_side_effects_cache_falls_back_to_rebuild() {
             frozen_store: false,
         },
         directories: crate::BuildLayout {
+            link_options: &pnpm_cmd_shim::LinkBinsOptions::default(),
             layout: &VirtualStoreLayout::legacy(
                 virtual_store_dir.path(),
                 pnpm_config::default_virtual_store_dir_max_length() as usize,
@@ -869,15 +995,23 @@ fn corrupt_side_effects_cache_falls_back_to_rebuild() {
             patches: None,
             requires_build_by_snapshot: None,
             importers: &importers,
+            dependency_groups: None,
+            build_scope: None,
+            variant_platforms: None,
         },
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),
             user_agent: "pnpm/test",
-            prepend_node_path: ScriptsPrependNodePath::Never,
+            path: crate::ScriptPath { extra_bin_paths: &[], private_hoisting: false },
             shell: None,
             shell_emulator: false,
             unsafe_perm: true,
             ignore: false,
+            patched_engines: crate::PatchedEngineCheck {
+                engine_strict: false,
+                node_version: None,
+                install_state_dir: None,
+            },
         },
 
         allow_build_policy: &policy,
@@ -894,4 +1028,48 @@ fn corrupt_side_effects_cache_falls_back_to_rebuild() {
         pkg_dir.join("generated.txt").exists(),
         "rebuild must run when the cached overlay can't be materialized",
     );
+}
+
+#[test]
+fn side_effects_cache_exclude_keeps_the_named_builds_out_of_the_cache() {
+    let config = Config {
+        side_effects_cache_exclude: Some(vec![
+            "java".to_string(),
+            "@native/*".to_string(),
+            "sharp@1.0.0 || 2.0.0".to_string(),
+        ]),
+        ..Config::default()
+    };
+    let policy = AllowBuildPolicy::from_config(&config).expect("valid patterns");
+
+    for dep_path in [
+        "java@0.12.2",
+        "java@0.12.2(node-gyp@10.0.0)",
+        "java@https://user@example.com/java.tgz",
+        "java@git+ssh://git@github.com/joeferner/node-java.git#0123456789abcdef",
+        "@native/bindings@3.0.0",
+        "sharp@2.0.0",
+        "sharp@work:2.0.0",
+    ] {
+        assert!(!policy.caches_build(&dep_path.parse().unwrap()), "{dep_path} must not be cached");
+    }
+    for dep_path in [
+        "javascript@1.0.0",
+        "@other/bindings@3.0.0",
+        "sharp@3.0.0",
+        "sharp@work:3.0.0",
+        "sharp@https://user@example.com/sharp.tgz",
+    ] {
+        assert!(policy.caches_build(&dep_path.parse().unwrap()), "{dep_path} must be cached");
+    }
+    assert!(AllowBuildPolicy::default().caches_build(&"java@0.12.2".parse().unwrap()));
+}
+
+#[test]
+fn side_effects_cache_exclude_rejects_an_invalid_version_union() {
+    let config = Config {
+        side_effects_cache_exclude: Some(vec!["java@^1".to_string()]),
+        ..Config::default()
+    };
+    assert!(AllowBuildPolicy::from_config(&config).is_err());
 }

@@ -5,6 +5,7 @@ import didYouMean, { ReturnTypeEnums } from 'didyoumean2'
 
 const RECURSIVE_CMDS = new Set(['recursive', 'multi', 'm'])
 const SPECIALLY_ESCAPED_CMDS = new Set(['run', 'dlx', 'with'])
+const CUSTOM_OPTION_PREFIX = 'config.'
 
 export interface ParsedCliArgs {
   argv: {
@@ -13,270 +14,388 @@ export interface ParsedCliArgs {
     original: string[]
   }
   params: string[]
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- option values have command-specific types
   options: Record<string, any>
   cmd: string | null
   unknownOptions: Map<string, string[]>
   fallbackCommandUsed: boolean
   workspaceDir: string | undefined
+  /** The `--config.<key>=<value>` options as given, keyed without the prefix. */
+  rawCliConfig?: Record<string, unknown>
+}
+
+export interface ParseCliArgsOptions {
+  escapeArgs?: string[]
+  fallbackCommand?: string
+  getCommandLongName: (commandName: string) => string | null
+  getTypesByCommandName: (commandName: string) => object
+  renamedOptions?: Record<string, string>
+  shorthandsByCommandName: Record<string, Record<string, string | string[]>>
+  universalOptionsTypes: Record<string, unknown>
+  universalShorthands: Record<string, string | string[]>
+}
+
+interface EarlyResolution {
+  commandName: string
+  cmd: string | null
+  fallbackCommandUsed: boolean
+  recursiveCommandUsed: boolean
 }
 
 export async function parseCliArgs (
-  opts: {
-    escapeArgs?: string[]
-    fallbackCommand?: string
-    getCommandLongName: (commandName: string) => string | null
-    getTypesByCommandName: (commandName: string) => object
-    renamedOptions?: Record<string, string>
-    shorthandsByCommandName: Record<string, Record<string, string | string[]>>
-    universalOptionsTypes: Record<string, unknown>
-    universalShorthands: Record<string, string | string[]>
-  },
+  opts: ParseCliArgsOptions,
   inputArgv: string[]
 ): Promise<ParsedCliArgs> {
-  const noptExploratoryResults = nopt(
-    {
-      filter: [String],
-      help: Boolean,
-      recursive: Boolean,
-      ...opts.universalOptionsTypes,
-      ...opts.getTypesByCommandName('add'),
-      ...opts.getTypesByCommandName('install'),
-    },
-    {
-      r: '--recursive',
-      ...opts.universalShorthands,
-    },
+  const exploratory = parseExploratory(opts, inputArgv)
+  const resolution = resolveCommand(opts, exploratory.argv.remain, inputArgv)
+  const earlyExit = await checkEarlyExit(opts, exploratory, resolution)
+  if (earlyExit != null) return earlyExit
+
+  const types = {
+    ...opts.universalOptionsTypes,
+    ...opts.getTypesByCommandName(resolution.commandName),
+  } as any // eslint-disable-line @typescript-eslint/no-explicit-any -- option types are declared as unknown values
+  const { filteredArgv, configDotArgs } = separateConfigDotArgs(inputArgv, 'config' in types)
+  const escapeArgs = getEscapeArgs(opts, resolution, exploratory)
+  const { argv, ...rawOptions } = parseCommandNopt(opts, resolution.commandName, types, filteredArgv, escapeArgs)
+
+  mergeExtractedConfigArgs(rawOptions, configDotArgs, types)
+  applyRenamedOptions(rawOptions, opts.renamedOptions)
+  const workspaceDir = await getWorkspaceDir(rawOptions)
+  if (SPECIALLY_ESCAPED_CMDS.has(resolution.cmd!) && rawOptions['help']) {
+    return buildEarlyHelpResult(opts, exploratory, workspaceDir)
+  }
+
+  const { cmd, params } = adjustPostParseCommands(rawOptions, argv, resolution, opts)
+  validateWorkspaceOptions(rawOptions, workspaceDir)
+  return {
+    argv,
+    cmd,
+    params,
+    workspaceDir,
+    fallbackCommandUsed: resolution.fallbackCommandUsed,
+    ...normalizeOptions(rawOptions, new Set(Object.keys(types))),
+  }
+}
+
+function parseExploratory (opts: ParseCliArgsOptions, inputArgv: string[]): ReturnType<typeof nopt> {
+  const exploratoryTypes = {
+    filter: [String],
+    help: Boolean,
+    recursive: Boolean,
+    ...VERSION_BOOTSTRAP_TYPES,
+    ...opts.universalOptionsTypes,
+    ...opts.getTypesByCommandName('add'),
+    ...opts.getTypesByCommandName('install'),
+  }
+  return nopt(
+    { ...exploratoryTypes, ...configDotTypes(exploratoryTypes) },
+    { r: '--recursive', ...opts.universalShorthands },
     inputArgv,
     0,
     { escapeArgs: opts.escapeArgs }
   )
+}
 
-  const recursiveCommandUsed = RECURSIVE_CMDS.has(noptExploratoryResults.argv.remain[0])
-  let commandName = getCommandName(noptExploratoryResults.argv.remain)
+function resolveCommand (
+  opts: ParseCliArgsOptions,
+  remain: string[],
+  inputArgv: string[]
+): EarlyResolution {
+  const recursiveCommandUsed = RECURSIVE_CMDS.has(remain[0])
+  let commandName = getCommandName(remain, recursiveCommandUsed, opts)
   let cmd = commandName ? opts.getCommandLongName(commandName) : null
   const fallbackCommandUsed = Boolean(commandName && !cmd && opts.fallbackCommand)
   if (fallbackCommandUsed) {
     cmd = opts.fallbackCommand!
     commandName = opts.fallbackCommand!
     inputArgv.unshift(opts.fallbackCommand!)
-  // The run command has special casing for --help and is handled further below.
-  } else if (!SPECIALLY_ESCAPED_CMDS.has(cmd!)) {
-    if (noptExploratoryResults['help']) {
-      return {
-        ...getParsedArgsForHelp(),
-        workspaceDir: await getWorkspaceDir(noptExploratoryResults, opts.renamedOptions),
-      }
-    }
-    if (noptExploratoryResults['version'] || noptExploratoryResults['v']) {
-      return {
-        argv: noptExploratoryResults.argv,
-        cmd: null,
-        options: {
-          ...pickUniversalOptions(),
-          version: true,
-        },
-        params: noptExploratoryResults.argv.remain,
-        unknownOptions: new Map(),
-        fallbackCommandUsed: false,
-        workspaceDir: await getWorkspaceDir(noptExploratoryResults, opts.renamedOptions),
-      }
-    }
   }
+  return { commandName, cmd, fallbackCommandUsed, recursiveCommandUsed }
+}
 
-  function getParsedArgsForHelp (): Omit<ParsedCliArgs, 'workspaceDir'> {
+function getCommandName (args: string[], recursiveCommandUsed: boolean, opts: ParseCliArgsOptions): string {
+  const effectiveArgs = recursiveCommandUsed ? args.slice(1) : args
+  if (opts.getCommandLongName(effectiveArgs[0]) !== 'install' || effectiveArgs.length === 1) {
+    return effectiveArgs[0]
+  }
+  return 'add'
+}
+
+async function checkEarlyExit (
+  opts: ParseCliArgsOptions,
+  exploratory: ReturnType<typeof nopt>,
+  resolution: EarlyResolution
+): Promise<ParsedCliArgs | undefined> {
+  if (resolution.fallbackCommandUsed || SPECIALLY_ESCAPED_CMDS.has(resolution.cmd!)) {
+    return undefined
+  }
+  if (exploratory['help']) {
+    const { options, rawCliConfig } = pickEarlyExitOptions(opts, exploratory, false)
+    const workspaceDir = await getWorkspaceDir(options, opts.renamedOptions)
+    return buildHelpResult(exploratory, options, rawCliConfig, workspaceDir)
+  }
+  if (exploratory['version'] || exploratory['v']) {
+    const { options, rawCliConfig } = pickEarlyExitOptions(opts, exploratory, true)
     return {
-      argv: noptExploratoryResults.argv,
-      cmd: 'help',
-      options: pickUniversalOptions(),
-      params: noptExploratoryResults.argv.remain,
+      argv: exploratory.argv,
+      cmd: null,
+      options: {
+        ...options,
+        version: true,
+      },
+      rawCliConfig,
+      params: exploratory.argv.remain,
       unknownOptions: new Map(),
       fallbackCommandUsed: false,
+      workspaceDir: await getWorkspaceDir(options, opts.renamedOptions),
     }
   }
+  return undefined
+}
 
-  // The --help and --version short-circuits skip the per-command nopt
-  // parse, so we still need to surface universal options the user typed
-  // alongside them — most importantly --pm-on-fail, which gates the
-  // packageManager / devEngines.packageManager check (#11487). Universal
-  // options were already typed and parsed by the exploratory nopt call,
-  // so we just pluck them back out and apply the same renamedOptions
-  // mapping the regular parse path uses (e.g. --prefix → dir), so
-  // consumers see consistent option names regardless of which path
-  // produced the result. Command-specific options are intentionally
-  // dropped; they belong to a command we are not running.
-  function pickUniversalOptions (): Record<string, unknown> {
-    const result: Record<string, unknown> = {}
-    for (const key of Object.keys(opts.universalOptionsTypes)) {
-      if (!(key in noptExploratoryResults)) continue
-      const renamed = opts.renamedOptions?.[key] ?? key
-      result[renamed] = (noptExploratoryResults as Record<string, unknown>)[key]
-    }
-    return result
+function buildEarlyHelpResult (
+  opts: ParseCliArgsOptions,
+  exploratory: ReturnType<typeof nopt>,
+  workspaceDir: string | undefined
+): ParsedCliArgs {
+  const { options, rawCliConfig } = pickEarlyExitOptions(opts, exploratory, false)
+  return buildHelpResult(exploratory, options, rawCliConfig, workspaceDir)
+}
+
+function buildHelpResult (
+  exploratory: ReturnType<typeof nopt>,
+  options: Record<string, unknown>,
+  rawCliConfig: Record<string, unknown>,
+  workspaceDir: string | undefined
+): ParsedCliArgs {
+  return {
+    argv: exploratory.argv,
+    cmd: 'help',
+    options,
+    rawCliConfig,
+    params: exploratory.argv.remain,
+    unknownOptions: new Map(),
+    fallbackCommandUsed: false,
+    workspaceDir,
   }
+}
 
-  const types = {
-    ...opts.universalOptionsTypes,
-    ...opts.getTypesByCommandName(commandName),
-  } as any // eslint-disable-line @typescript-eslint/no-explicit-any
+const VERSION_BOOTSTRAP_TYPES = {
+  'frozen-lockfile': Boolean,
+  global: Boolean,
+  'global-dir': String,
+  lockfile: Boolean,
+  'lockfile-dir': String,
+  'npmrc-auth-file': String,
+  offline: Boolean,
+  'prefer-offline': Boolean,
+  registry: String,
+  'state-dir': String,
+  'store-dir': String,
+}
 
-  function getCommandName (args: string[]): string {
-    if (recursiveCommandUsed) {
-      args = args.slice(1)
+const VERSION_BOOTSTRAP_KEYS = Object.keys(VERSION_BOOTSTRAP_TYPES)
+
+function pickEarlyExitOptions (
+  opts: ParseCliArgsOptions,
+  exploratory: ReturnType<typeof nopt>,
+  includeVersionBootstrapKeys: boolean
+): { options: Record<string, unknown>, rawCliConfig: Record<string, unknown> } {
+  const keys = includeVersionBootstrapKeys
+    ? [...Object.keys(opts.universalOptionsTypes), ...VERSION_BOOTSTRAP_KEYS]
+    : Object.keys(opts.universalOptionsTypes)
+  const options = pickKnownEarlyExitKeys(exploratory, keys, opts.renamedOptions)
+  const rawCliConfig = pickConfigDotOptions(exploratory, options, opts.renamedOptions)
+  return { options, rawCliConfig }
+}
+
+function pickKnownEarlyExitKeys (
+  exploratory: Record<string, unknown>,
+  keys: string[],
+  renamedOptions?: Record<string, string>
+): Record<string, unknown> {
+  const options: Record<string, unknown> = {}
+  for (const key of keys) {
+    if (key in exploratory) {
+      options[renamedOptions?.[key] ?? key] = exploratory[key]
     }
-    if (opts.getCommandLongName(args[0]) !== 'install' || args.length === 1) {
-      return args[0]
-    }
-    return 'add'
   }
+  return options
+}
 
-  function getEscapeArgsWithSpecialCases (): string[] | undefined {
-    if (!SPECIALLY_ESCAPED_CMDS.has(cmd!)) {
-      // An escape word only escapes when it is the command itself: nopt
-      // stops parsing options at the first occurrence of an escape word
-      // anywhere in argv, so escaping under another command would silently
-      // turn that command's trailing options into parameters (e.g. the
-      // --registry in `pnpm team create @org:x --registry <url>`).
-      return opts.escapeArgs?.includes(commandName) ? opts.escapeArgs : undefined
-    }
-
-    // We'd like everything after the run script's name to be passed to the
-    // script's argv itself. For example, "pnpm run echo --test" should pass
-    // "--test" to the "echo" script. This requires determining the script's
-    // name and declaring it as the "escape arg".
-    //
-    // The name of the run script is normally the second argument (ex: pnpm
-    // run foo), but can be pushed back by recursive commands (ex: pnpm
-    // recursive run foo) or becomes the first argument when the fallback
-    // command (ex: pnpm foo) is set to 'run'.
-    const indexOfRunScriptName = 1 +
-      (recursiveCommandUsed ? 1 : 0) +
-      (fallbackCommandUsed && opts.fallbackCommand === 'run' ? -1 : 0)
-    return [noptExploratoryResults.argv.remain[indexOfRunScriptName]]
+function pickConfigDotOptions (
+  exploratory: Record<string, unknown>,
+  options: Record<string, unknown>,
+  renamedOptions?: Record<string, string>
+): Record<string, unknown> {
+  const rawCliConfig: Record<string, unknown> = {}
+  for (const [optionName, optionValue] of Object.entries(exploratory)) {
+    if (!optionName.startsWith(CUSTOM_OPTION_PREFIX)) continue
+    const rawKey = optionName.substring(CUSTOM_OPTION_PREFIX.length)
+    options[renamedOptions?.[rawKey] ?? rawKey] = optionValue
+    rawCliConfig[rawKey] = optionValue
   }
+  return rawCliConfig
+}
 
-  // When "config" is a registered CLI option (e.g. `pnpm add --config`),
-  // nopt captures --config.xxx=yyy as the "config" flag value instead of
-  // treating it as the nconf-style config override syntax. Work around this
-  // by rewriting --config.xxx=yyy to a placeholder before nopt, then restoring.
-  const hasConfigOption = 'config' in types
+function getEscapeArgs (
+  opts: ParseCliArgsOptions,
+  resolution: EarlyResolution,
+  exploratory: ReturnType<typeof nopt>
+): string[] | undefined {
+  if (!SPECIALLY_ESCAPED_CMDS.has(resolution.cmd!)) {
+    return opts.escapeArgs?.includes(resolution.commandName) ? opts.escapeArgs : undefined
+  }
+  const indexOfRunScriptName = 1 +
+    (resolution.recursiveCommandUsed ? 1 : 0) +
+    (resolution.fallbackCommandUsed && opts.fallbackCommand === 'run' ? -1 : 0)
+  return [exploratory.argv.remain[indexOfRunScriptName]]
+}
+
+function separateConfigDotArgs (
+  inputArgv: string[],
+  hasConfigOption: boolean
+): { filteredArgv: string[], configDotArgs: string[] } {
+  if (!hasConfigOption) return { filteredArgv: inputArgv, configDotArgs: [] }
   const configDotArgs: string[] = []
-  const filteredArgv = hasConfigOption
-    ? inputArgv.map(arg => {
-      if (arg.startsWith('--config.')) {
-        configDotArgs.push(arg)
-        return undefined
-      }
-      return arg
-    }).filter((arg): arg is string => arg !== undefined)
-    : inputArgv
+  const filteredArgv = inputArgv.filter(arg => {
+    if (arg.startsWith('--config.')) {
+      configDotArgs.push(arg)
+      return false
+    }
+    return true
+  })
+  return { filteredArgv, configDotArgs }
+}
 
-  const { argv, ...options } = nopt(
-    {
-      recursive: Boolean,
-      ...types,
-    },
+function parseCommandNopt (
+  opts: ParseCliArgsOptions,
+  commandName: string,
+  types: Parameters<typeof nopt>[0],
+  filteredArgv: string[],
+  escapeArgs?: string[]
+): ReturnType<typeof nopt> {
+  return nopt(
+    { recursive: Boolean, ...types, ...configDotTypes(types) },
     {
       ...opts.universalShorthands,
       ...opts.shorthandsByCommandName[commandName],
     },
     filteredArgv,
     0,
-    { escapeArgs: getEscapeArgsWithSpecialCases() }
+    { escapeArgs }
   )
+}
 
-  // Re-parse extracted --config.xxx args through nopt so they get proper
-  // type coercion (e.g. "false" → false for Boolean settings).
-  if (configDotArgs.length > 0) {
-    const { argv: _, ...configOptions } = nopt({}, {}, configDotArgs, 0)
-    Object.assign(options, configOptions)
-  }
-  // Apply renamedOptions before workspace detection so `--prefix=foo`
-  // (renamed to `dir`) participates in finding the workspace root.
-  // Otherwise getWorkspaceDir falls back to process.cwd() and the
-  // workspace manifest at the prefix dir is missed (#11535).
-  // The canonical option wins if both are supplied (e.g. `--prefix=foo
-  // --dir=bar` keeps `dir=bar`); the alias is always dropped.
-  if (opts.renamedOptions != null) {
-    for (const [cliOption, optionValue] of Object.entries(options)) {
-      const target = opts.renamedOptions[cliOption]
-      if (target) {
-        if (!(target in options)) {
-          options[target] = optionValue
-        }
-        delete options[cliOption]
+function mergeExtractedConfigArgs (options: Record<string, unknown>, configDotArgs: string[], types: Parameters<typeof nopt>[0]): void {
+  if (configDotArgs.length === 0) return
+  const { argv: _, ...configOptions } = nopt(configDotTypes(types), {}, configDotArgs, 0)
+  Object.assign(options, configOptions)
+}
+
+/**
+ * The types of `types` under their `--config.<key>` spellings, so a
+ * `--config.<key>` value takes the type the command declares for `<key>`: a
+ * list setting given once is a one-item list and a number is a number, as
+ * the bare `--<key>` flag would give. A key the command does not declare
+ * keeps its raw value.
+ */
+function configDotTypes (types: Parameters<typeof nopt>[0]): Parameters<typeof nopt>[0] {
+  return Object.fromEntries(
+    Object.entries(types).map(([name, type]) => [`${CUSTOM_OPTION_PREFIX}${name}`, type])
+  )
+}
+
+function applyRenamedOptions (options: Record<string, unknown>, renamedOptions?: Record<string, string>): void {
+  if (renamedOptions == null) return
+  for (const [cliOption, optionValue] of Object.entries(options)) {
+    const target = renamedOptions[cliOption]
+    if (target) {
+      if (!(target in options)) {
+        options[target] = optionValue
       }
+      delete options[cliOption]
     }
   }
-  const workspaceDir = await getWorkspaceDir(options)
+}
 
-  // For the run command, it's not clear whether --help should be passed to the
-  // underlying script or invoke pnpm's help text until an additional nopt call.
-  if (SPECIALLY_ESCAPED_CMDS.has(cmd!) && options['help']) {
-    return {
-      ...getParsedArgsForHelp(),
-      workspaceDir,
-    }
-  }
+interface AdjustedCommands {
+  cmd: string | null
+  params: string[]
+}
 
+function adjustPostParseCommands (
+  options: Record<string, unknown>,
+  argv: { remain: string[] },
+  resolution: EarlyResolution,
+  opts: ParseCliArgsOptions
+): AdjustedCommands {
+  let cmd = resolution.cmd
   const params = argv.remain.slice(1)
-
-  if (options['recursive'] !== true && (options['filter'] || options['filter-prod'] || recursiveCommandUsed)) {
-    options['recursive'] = true
-    const subCmd: string | null = argv.remain[1] && opts.getCommandLongName(argv.remain[1])
-    if (subCmd && recursiveCommandUsed) {
-      params.shift()
-      argv.remain.shift()
-      cmd = subCmd
-    }
-  }
-  if (options['workspace-root']) {
-    if (options['global']) {
-      throw new PnpmError('OPTIONS_CONFLICT', '--workspace-root may not be used with --global')
-    }
-    if (!workspaceDir) {
-      throw new PnpmError('NOT_IN_WORKSPACE', '--workspace-root may only be used inside a workspace')
-    }
-    options['dir'] = workspaceDir
-  }
-
+  cmd = handleRecursiveInvocation(options, argv, resolution, opts, params, cmd)
   if (cmd === 'install' && params.length > 0) {
     cmd = 'add'
   } else if (!cmd && options['recursive']) {
     cmd = 'recursive'
   }
-
-  const knownOptions = new Set(Object.keys(types))
-  return {
-    argv,
-    cmd,
-    params,
-    workspaceDir,
-    fallbackCommandUsed,
-    ...normalizeOptions(options, knownOptions),
-  }
+  return { cmd, params }
 }
 
-const CUSTOM_OPTION_PREFIX = 'config.'
+function handleRecursiveInvocation (
+  options: Record<string, unknown>,
+  argv: { remain: string[] },
+  resolution: EarlyResolution,
+  opts: ParseCliArgsOptions,
+  params: string[],
+  cmd: string | null
+): string | null {
+  if (options['recursive'] === true || (!options['filter'] && !options['filter-prod'] && !resolution.recursiveCommandUsed)) {
+    return cmd
+  }
+  options['recursive'] = true
+  const subCmd: string | null = argv.remain[1] && opts.getCommandLongName(argv.remain[1])
+  if (subCmd && resolution.recursiveCommandUsed) {
+    params.shift()
+    argv.remain.shift()
+    return subCmd
+  }
+  return cmd
+}
+
+function validateWorkspaceOptions (options: Record<string, unknown>, workspaceDir: string | undefined): void {
+  if (!options['workspace-root']) return
+  if (isGlobalScope(options)) {
+    throw new PnpmError('OPTIONS_CONFLICT', '--workspace-root may not be used with --global')
+  }
+  if (!workspaceDir) {
+    throw new PnpmError('NOT_IN_WORKSPACE', '--workspace-root may only be used inside a workspace')
+  }
+  options['dir'] = workspaceDir
+}
 
 interface NormalizeOptionsResult {
   options: Record<string, unknown>
   unknownOptions: Map<string, string[]>
+  rawCliConfig: Record<string, unknown>
 }
 
 function normalizeOptions (options: Record<string, unknown>, knownOptions: Set<string>): NormalizeOptionsResult {
   const standardOptionNames = []
   const normalizedOptions: Record<string, unknown> = {}
+  const rawCliConfig: Record<string, unknown> = {}
   for (const [optionName, optionValue] of Object.entries(options)) {
     if (optionName.startsWith(CUSTOM_OPTION_PREFIX)) {
-      normalizedOptions[optionName.substring(CUSTOM_OPTION_PREFIX.length)] = optionValue
+      const key = optionName.substring(CUSTOM_OPTION_PREFIX.length)
+      normalizedOptions[key] = optionValue
+      rawCliConfig[key] = optionValue
       continue
     }
     normalizedOptions[optionName] = optionValue
     standardOptionNames.push(optionName)
   }
   const unknownOptions = getUnknownOptions(standardOptionNames, knownOptions)
-  return { options: normalizedOptions, unknownOptions }
+  return { options: normalizedOptions, unknownOptions, rawCliConfig }
 }
 
 function getUnknownOptions (usedOptions: string[], knownOptions: Set<string>): Map<string, string[]> {
@@ -304,10 +423,7 @@ async function getWorkspaceDir (
   parsedOpts: Record<string, unknown>,
   renamedOptions?: Record<string, string>
 ): Promise<string | undefined> {
-  if (parsedOpts['global'] || parsedOpts['ignore-workspace']) return undefined
-  // Look up dir, also honoring renamed options like `prefix → dir` so that
-  // `--prefix` works even on code paths that read parsedOpts before the
-  // rename loop has run (e.g. the --help/--version short-circuits).
+  if (isGlobalScope(parsedOpts) || parsedOpts['ignore-workspace']) return undefined
   let dir = parsedOpts['dir']
   if (dir == null && renamedOptions != null) {
     for (const [from, to] of Object.entries(renamedOptions)) {
@@ -318,4 +434,10 @@ async function getWorkspaceDir (
     }
   }
   return findWorkspaceDir((dir ?? process.cwd()) as string)
+}
+
+/** `--location`, which only config commands accept, takes precedence over `--global`. */
+function isGlobalScope (parsedOpts: Record<string, unknown>): boolean {
+  if (parsedOpts['location'] != null) return parsedOpts['location'] === 'global'
+  return Boolean(parsedOpts['global'])
 }

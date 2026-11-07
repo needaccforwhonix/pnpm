@@ -2,22 +2,26 @@ use super::{
     FreshInputs, ManifestSlots, OwnedInputs,
     errors::InstallWithFreshLockfileError,
     fix_lockfile_copy, hook_log_fn, include_transitive_optional_dependencies,
-    is_partial_workspace_selection, manifest_transforms, resolve, resolver_setup,
+    is_partial_workspace_selection, manifest_transforms, resolver_setup,
     seed_policy::{UpdateSeedPolicy, update_reuse_scopes},
     start_early_materialization,
 };
+
+mod stores;
 use crate::store_init::init_store_dir_best_effort;
 use pnpm_config::{Config, NodeLinker, TrustPolicy};
 use pnpm_lockfile::Lockfile;
 use pnpm_network::AuthHeaders;
 use pnpm_reporter::Reporter;
 use std::{collections::BTreeMap, path::Path, sync::Arc};
+use stores::open_stores;
 
 /// What the setup phase hands the resolve phase: the registries, the
 /// pick policy, the store handles and the resolver chain, plus what the
 /// inputs and the resolution observer fix for the whole install.
 pub(super) struct ResolverSetup {
     pub(super) workspace_packages: Option<Arc<pnpm_resolving_resolver_base::WorkspacePackages>>,
+    pub(super) completion_observer: Option<Arc<dyn crate::ResolutionObserver>>,
     pub(super) observer: ObserverSettings,
     pub(super) shape: InstallShape,
     pub(super) policy: crate::resolution_policy::PickPolicy,
@@ -29,7 +33,12 @@ pub(super) struct ResolverSetup {
 pub(super) struct InstallShape {
     pub(super) is_hoisted: bool,
     pub(super) link_options: pnpm_cmd_shim::LinkBinsOptions,
-    pub(super) filtered_isolated: bool,
+    /// Whether the run materializes less than the resolve pass walked, so
+    /// neither the prefetcher nor the early materializer can predict what the
+    /// install imports. A `--filter` workspace selection narrows the
+    /// importers; a `--prod` / `--dev` run narrows their dependency groups
+    /// (pnpm/pnpm#881).
+    pub(super) materializes_subset: bool,
     pub(super) verify_filtered_repair: bool,
     pub(super) include_transitive_optional_dependencies: bool,
 }
@@ -46,12 +55,12 @@ impl InstallShape {
                 install.drivers.config,
                 install.execution.node_linker,
             ),
-            filtered_isolated: partial_selection && !is_hoisted,
+            materializes_subset: partial_selection || install.resolve_widened_groups(),
             verify_filtered_repair: matches!(update_seed_policy, UpdateSeedPolicy::FixLockfile)
                 && partial_selection,
             include_transitive_optional_dependencies: include_transitive_optional_dependencies(
                 install.projects.is_full_install,
-                install.projects.dependency_groups,
+                install.included(),
             ),
         }
     }
@@ -76,6 +85,24 @@ impl ObserverSettings {
         }
     }
 }
+
+fn take_auth(config: &Config, auth_override: &mut Option<Arc<AuthHeaders>>) -> Arc<AuthHeaders> {
+    auth_override.take().unwrap_or_else(|| Arc::clone(&config.auth_headers))
+}
+
+fn take_resolution_observer(
+    observer: &mut Option<Arc<dyn crate::ResolutionObserver>>,
+) -> (
+    Option<Arc<dyn crate::ResolutionObserver>>,
+    ObserverSettings,
+    Option<pnpm_tarball::SharedReportedProgressKeys>,
+) {
+    let observer = observer.take();
+    let settings = ObserverSettings::of(observer.as_ref());
+    let progress_reported = observer.as_ref().and_then(|observer| observer.progress_reported());
+    (observer, settings, progress_reported)
+}
+
 /// Open the store, resolve the registries and build the resolver chain.
 /// Consumes the auth override, the resolution observer, the workspace
 /// packages and the pnpmfile override off `owned`.
@@ -86,11 +113,9 @@ pub(super) async fn set_up_resolvers<Reporter: self::Reporter + 'static>(
     let shape = InstallShape::derive(install, &owned.resolution.update_seed_policy);
     // The pnpr override when supplied, else the config's npmrc headers;
     // shared by every registry-touching resolver below.
-    let auth_headers = owned.resolution.auth_override
-        .take()
-        .unwrap_or_else(|| Arc::clone(&install.drivers.config.auth_headers));
-    let resolution_observer = owned.resolution.observer.take();
-    let observer = ObserverSettings::of(resolution_observer.as_ref());
+    let auth_headers = take_auth(install.drivers.config, &mut owned.resolution.auth_override);
+    let (resolution_observer, observer, progress_reported) =
+        take_resolution_observer(&mut owned.resolution.observer);
 
     let store_dir: &'static _ = &install.drivers.config.store_dir;
     // Eagerly create `files/00..ff` under the v11 store root so per-
@@ -104,16 +129,13 @@ pub(super) async fn set_up_resolvers<Reporter: self::Reporter + 'static>(
         init_store_dir_best_effort(store_dir).await;
     }
 
-    let registries = resolver_setup::resolve_registries(install.drivers.config)?;
+    let registries = resolver_setup::resolve_registries(
+        install.drivers.config,
+        install.lockfiles.locked_registries,
+    )?;
 
-    // `resolutionMode` / `minimumReleaseAge` derivations. `time_based`
-    // and `pick_lowest_direct` steer the deps-resolver's per-depth
-    // version pick; `full_metadata` forces the npm resolver to fetch
-    // per-version `time` fields so the time-based cutoff and the
-    // no-downgrade trust check have publication dates; `published_by`
-    // (+exclude) is the maturity cutoff. Shared with `pacquet add`'s
-    // explicit-spec pre-resolution via [`PickPolicy`] so both pick the
-    // same version.
+    // Shared with `pacquet add`'s explicit-spec pre-resolution via
+    // [`PickPolicy`] so both pick the same version.
     let policy = crate::resolution_policy::PickPolicy::from_config_with_extra_excludes(
         install.drivers.config,
         observer.minimum_release_age_exclude_override.as_deref(),
@@ -124,7 +146,7 @@ pub(super) async fn set_up_resolvers<Reporter: self::Reporter + 'static>(
     // progress emitted by resolve-time prefetches: `CreateVirtualStore`
     // still emits `resolved` later, but skips duplicate `fetched` /
     // `found_in_store` statuses for keys already reported here.
-    let stores = resolver_setup::open_store_index_handles(install.drivers.config, store_dir).await;
+    let stores = open_stores(install, owned, progress_reported, store_dir).await;
 
     let chain = build_fresh_resolver_chain::<Reporter>(
         install,
@@ -133,11 +155,12 @@ pub(super) async fn set_up_resolvers<Reporter: self::Reporter + 'static>(
         &registries,
         &policy,
         &shape,
-        ResolverAccess { auth_headers, observer: resolution_observer },
+        ResolverAccess { auth_headers, observer: resolution_observer.clone() },
     )
     .await?;
     Ok(ResolverSetup {
-        workspace_packages: owned.projects.workspace_packages.take().map(Arc::new),
+        workspace_packages: owned.projects.workspace_packages.take(),
+        completion_observer: resolution_observer,
         observer,
         shape,
         policy,
@@ -166,7 +189,9 @@ pub(super) async fn build_fresh_resolver_chain<Reporter: self::Reporter + 'stati
             tarballs: &owned.fetching.tarball_mem_cache,
             auth_headers: &access.auth_headers,
             progress_reported: &stores.caches.progress_reported,
-            prefetch: prefetch_downloads(install.execution.lockfile_only, shape.filtered_isolated),
+            prefetch: install.execution.fetches_into_store()
+                || prefetch_downloads(install.execution.lockfile_only(), shape.materializes_subset),
+            tracked: owned.fetching.prefetch_downloads.as_ref(),
         },
         hooks: crate::install_with_fresh_lockfile::resolution_inputs::ResolverChainHooks {
             pnpmfile: owned.pnpmfile_hook_override.take(),
@@ -181,6 +206,7 @@ pub(super) async fn build_fresh_resolver_chain<Reporter: self::Reporter + 'stati
         registry: crate::install_with_fresh_lockfile::resolution_inputs::ResolverRegistryContext {
             named: &registries.by_scope,
             by_prefix: &registries.named,
+            declared: &registries.declared,
             cache: &owned.fetching.meta_cache,
             full_metadata: policy.full_metadata,
             needs_full_metadata: Arc::clone(&policy.needs_full_metadata_for),
@@ -202,23 +228,6 @@ pub(super) struct PnpmfileHooks {
     pub(super) after_all_resolved_log: Option<pnpm_hooks::LogFn>,
 }
 impl PnpmfileHooks {
-    async fn run_pre_resolution<Reporter: self::Reporter>(
-        &self,
-        config: &Config,
-        lockfile_dir: &Path,
-        wanted_lockfile: Option<&Lockfile>,
-    ) {
-        if let Some(hook) = self.pnpmfile_hook.as_ref() {
-            resolve::run_pre_resolution_hook::<Reporter>(
-                hook,
-                config,
-                lockfile_dir,
-                wanted_lockfile,
-            )
-            .await;
-        }
-    }
-
     fn load<Reporter: self::Reporter>(
         pnpmfile_hook: Option<Arc<dyn pnpm_hooks::PnpmfileHooks>>,
         lockfile_dir: &Path,
@@ -320,10 +329,8 @@ impl UpdateReuseScopes {
         Ok(Self { scope, by_importer })
     }
 }
-/// Runs between the resolvers being built and the resolve pass, in the
-/// order pnpm's install applies these: the pnpmfile's pre-resolution hook
-/// fires once the lockfile to resolve against is fixed, and a custom
-/// resolver may still drop every reuse scope after that.
+/// Runs between the resolvers being built and the resolve pass. A custom
+/// resolver may drop every reuse scope here.
 pub(super) async fn prepare_resolution<'a, Reporter: self::Reporter + 'static>(
     install: FreshInputs<'a>,
     owned: &mut OwnedInputs,
@@ -356,7 +363,6 @@ pub(super) async fn prepare_resolution<'a, Reporter: self::Reporter + 'static>(
     // the `afterAllResolved` hook can transform the lockfile before it is
     // written.
     let hooks = PnpmfileHooks::load::<Reporter>(setup.chain.pnpmfile_hook.take(), lockfile_dir);
-    hooks.run_pre_resolution::<Reporter>(config, lockfile_dir, wanted_lockfile).await;
     let reuse = UpdateReuseScopes::settle(
         &owned.resolution.update_seed_policy,
         &setup.chain.custom_resolvers,
@@ -397,10 +403,13 @@ pub(super) async fn pnpmfile_checksum(
     let hook = after_all_resolved_hook?;
     hook.calculate_pnpmfile_checksum().await
 }
-/// A lockfile-only resolve never fetches, and a filtered isolated install
-/// materializes a subset the prefetcher cannot predict.
-pub(super) fn prefetch_downloads(lockfile_only: bool, filtered_isolated: bool) -> bool {
-    !lockfile_only && !filtered_isolated
+/// Whether the resolver prefetches the tarball of each package it resolves.
+/// A lockfile-only resolve never fetches, and see
+/// [`InstallShape::materializes_subset`] for the other case. A run that
+/// fetches into the store (`FreshInstallExecution::fetches_into_store`)
+/// prefetches regardless: the prefetch is its fetch.
+pub(super) fn prefetch_downloads(lockfile_only: bool, materializes_subset: bool) -> bool {
+    !lockfile_only && !materializes_subset
 }
 /// The trust policy the resolver enforces: `Off` means it enforces none.
 pub(super) fn resolver_trust_policy(configured: TrustPolicy) -> Option<TrustPolicy> {

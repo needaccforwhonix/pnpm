@@ -1,12 +1,12 @@
 use super::{
-    EnsureFileError, create_exclusive_temp_file, ensure_file, file_equals_bytes, strip_dash_suffix,
-    temp_path_in,
+    EnsureFileError, TempFile, create_exclusive_temp_file, ensure_file, ensure_file_atomically,
+    file_equals_bytes, strip_dash_suffix, temp_path_in,
 };
 use std::{fs, io, path::Path};
 use tempfile::tempdir;
 
 #[cfg(unix)]
-use super::{EMFILE, ENFILE, retry_on_fd_pressure};
+use super::{EMFILE, ENFILE, ensure_cas_file, retry_on_fd_pressure};
 
 #[test]
 fn writes_a_new_file() {
@@ -16,6 +16,50 @@ fn writes_a_new_file() {
     ensure_file(&path, b"hello", None).expect("new-file write succeeds");
 
     assert_eq!(fs::read(&path).unwrap(), b"hello");
+}
+
+#[test]
+fn atomic_variant_publishes_a_new_file_without_leaving_temp_files() {
+    let tmp = tempdir().unwrap();
+    let path = tmp.path().join("published.json");
+
+    ensure_file_atomically(&path, b"{}", None).expect("new-file write succeeds");
+
+    assert_eq!(fs::read(&path).unwrap(), b"{}");
+    let siblings: Vec<_> = fs::read_dir(tmp.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(siblings, vec![std::ffi::OsString::from("published.json")]);
+}
+
+#[cfg(unix)]
+#[test]
+fn atomic_variant_keeps_a_file_that_already_matches() {
+    use std::os::unix::fs::MetadataExt as _;
+    let tmp = tempdir().unwrap();
+    let path = tmp.path().join("published.json");
+    fs::write(&path, b"{}").unwrap();
+    let inode = fs::metadata(&path).unwrap().ino();
+
+    ensure_file_atomically(&path, b"{}", None).expect("matching contents short-circuit");
+
+    assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+}
+
+#[cfg(unix)]
+#[test]
+fn atomic_variant_replaces_a_mismatched_file_with_a_new_inode() {
+    use std::os::unix::fs::MetadataExt as _;
+    let tmp = tempdir().unwrap();
+    let path = tmp.path().join("published.json");
+    fs::write(&path, b"{\"old\":true}").unwrap();
+    let inode = fs::metadata(&path).unwrap().ino();
+
+    ensure_file_atomically(&path, b"{}", None).expect("mismatch is replaced");
+
+    assert_eq!(fs::read(&path).unwrap(), b"{}");
+    assert_ne!(fs::metadata(&path).unwrap().ino(), inode, "a reader keeps the old inode's bytes");
 }
 
 #[test]
@@ -45,6 +89,76 @@ fn existing_target_with_wrong_content_is_overwritten_atomically() {
     assert_eq!(siblings, vec![std::ffi::OsString::from("torn.txt")]);
 }
 
+/// Repairing a corrupt CAS blob with `ensure_cas_file` must keep the
+/// inode so hard-linked copies — other projects' `node_modules`
+/// entries importing the same blob — are healed by the same write
+/// (pnpm/pnpm#3445). `ensure_file`'s rename repair would swap the
+/// inode and leave the linked copy corrupt.
+#[cfg(unix)]
+#[test]
+fn cas_repair_preserves_inode_and_heals_hard_links() {
+    use std::os::unix::fs::MetadataExt;
+
+    let tmp = tempdir().unwrap();
+    let path = tmp.path().join("cas_entry");
+    ensure_cas_file(&path, b"original", None).unwrap();
+    let linked = tmp.path().join("linked_copy");
+    fs::hard_link(&path, &linked).unwrap();
+    let ino_before = fs::metadata(&path).unwrap().ino();
+
+    // Editing through the hard link corrupts the store blob in place,
+    // changing its size (an appended line) — the size-mismatch branch.
+    fs::write(&linked, b"hacked from another project").unwrap();
+
+    ensure_cas_file(&path, b"original", None).expect("in-place repair");
+
+    assert_eq!(fs::metadata(&path).unwrap().ino(), ino_before, "inode must survive repair");
+    assert_eq!(fs::read(&linked).unwrap(), b"original", "hard-linked copy must be healed");
+}
+
+/// Same as above through the same-length byte-mismatch branch, where
+/// the size-check short-circuit does not fire.
+#[cfg(unix)]
+#[test]
+fn cas_repair_preserves_inode_for_same_length_corruption() {
+    use std::os::unix::fs::MetadataExt;
+
+    let tmp = tempdir().unwrap();
+    let path = tmp.path().join("cas_entry");
+    ensure_cas_file(&path, b"original", None).unwrap();
+    let linked = tmp.path().join("linked_copy");
+    fs::hard_link(&path, &linked).unwrap();
+    let ino_before = fs::metadata(&path).unwrap().ino();
+
+    fs::write(&linked, b"tampered").unwrap();
+
+    ensure_cas_file(&path, b"original", None).expect("in-place repair");
+
+    assert_eq!(fs::metadata(&path).unwrap().ino(), ino_before, "inode must survive repair");
+    assert_eq!(fs::read(&linked).unwrap(), b"original");
+}
+
+/// A corrupt blob without the owner-write bit refuses the in-place
+/// write open, so the repair falls back to the atomic rename and still
+/// restores the content.
+#[cfg(unix)]
+#[test]
+fn cas_repair_of_write_protected_blob_falls_back_to_rename() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for mode in [0o444, 0o464] {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("cas_entry");
+        ensure_cas_file(&path, b"original", None).unwrap();
+        fs::write(&path, b"tampered").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+
+        ensure_cas_file(&path, b"original", None).expect("repair of a write-protected blob");
+
+        assert_eq!(fs::read(&path).unwrap(), b"original", "mode {mode:o}");
+    }
+}
+
 #[test]
 fn missing_parent_dir_errors() {
     let tmp = tempdir().unwrap();
@@ -67,10 +181,7 @@ fn missing_parent_dir_errors() {
 /// process umask, which strips group / other bits on systems with
 /// a restrictive default (e.g. `umask 0o077` CI shells). Owner
 /// bits are preserved under every sensible umask, so pinning just
-/// those keeps the test robust without weakening what it verifies
-/// (that `mode` is being threaded through to the syscall at all
-/// and that the owner-exec bit survives — the observable property
-/// that distinguishes an executable CAS blob from a data blob).
+/// those keeps the test stable without weakening what it verifies.
 #[cfg(unix)]
 #[test]
 fn unix_mode_is_applied_on_new_files() {
@@ -121,9 +232,9 @@ fn create_exclusive_temp_file_yields_distinct_open_files() {
     use std::io::Write;
 
     let tmp = tempdir().unwrap();
-    let (path_a, mut file_a) =
+    let TempFile { path: path_a, file: mut file_a, .. } =
         create_exclusive_temp_file(tmp.path(), "stream", None).expect("first temp file");
-    let (path_b, _file_b) =
+    let TempFile { path: path_b, .. } =
         create_exclusive_temp_file(tmp.path(), "stream", None).expect("second temp file");
 
     assert_ne!(path_a, path_b);
@@ -306,4 +417,99 @@ fn retry_on_fd_pressure_propagates_non_fd_errors() {
     });
     assert_eq!(result.unwrap_err().kind(), io::ErrorKind::NotFound);
     assert_eq!(attempts.get(), 1, "non-fd-pressure errors must not retry");
+}
+
+#[cfg(unix)]
+#[test]
+fn new_files_in_a_group_writable_directory_keep_group_write() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let tmp = tempdir().unwrap();
+    fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o2775)).unwrap();
+    let parent_gid = fs::metadata(tmp.path()).unwrap().gid();
+
+    let path = tmp.path().join("blob");
+    ensure_file(&path, b"data", None).unwrap();
+    let meta = fs::metadata(&path).unwrap();
+    assert_eq!(meta.permissions().mode() & 0o777, 0o664);
+    assert_eq!(meta.gid(), parent_gid);
+
+    let exec = tmp.path().join("exec.sh");
+    ensure_file(&exec, b"#!/bin/sh\n", Some(0o755)).unwrap();
+    assert_eq!(
+        fs::metadata(&exec)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o775,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn existing_file_keeps_its_mode_owner_and_inode() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let tmp = tempdir().unwrap();
+    fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o2775)).unwrap();
+    let path = tmp.path().join("blob");
+    fs::write(&path, b"same").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o664)).unwrap();
+    let before = fs::metadata(&path).unwrap();
+
+    ensure_file(&path, b"same", None).unwrap();
+    ensure_cas_file(&path, b"same", Some(0o755)).unwrap();
+
+    let after = fs::metadata(&path).unwrap();
+    assert_eq!(after.uid(), before.uid());
+    assert_eq!(after.gid(), before.gid());
+    assert_eq!(after.ino(), before.ino());
+    assert_eq!(after.permissions().mode() & 0o777, 0o664);
+}
+
+#[cfg(unix)]
+#[test]
+fn private_mode_is_not_widened_in_a_group_writable_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempdir().unwrap();
+    fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o2775)).unwrap();
+    let path = tmp.path().join("secret");
+    ensure_file(&path, b"x", Some(0o600)).unwrap();
+    assert_eq!(
+        fs::metadata(&path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn new_directories_inherit_group_write_and_setgid() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempdir().unwrap();
+    fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o2775)).unwrap();
+    let nested = tmp.path().join("v11/files/ab");
+    super::ensure_parent_dir(&nested).unwrap();
+
+    for dir in [tmp.path().join("v11"), tmp.path().join("v11/files"), nested] {
+        let mode = fs::metadata(&dir)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & (0o020 | 0o2000), 0o020 | 0o2000, "{dir:?} mode {mode:o}");
+    }
+    assert_eq!(
+        fs::metadata(tmp.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o2775,
+    );
 }

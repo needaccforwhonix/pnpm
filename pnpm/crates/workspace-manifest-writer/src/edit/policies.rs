@@ -1,7 +1,8 @@
 use super::{
-    Inline, Manifest, flow, insert_top_level_block, locate, locate_sequence, mapping_keys,
-    reconcile_sequence_items, remove_mapping_entries, remove_top_level_block, render,
-    render_top_level_sequence, replace_top_level_block, top_level_span, upsert_sequence_entry,
+    Inline, Manifest, detect_sequence_indent, flow, insert_top_level_block, locate,
+    locate_sequence, mapping_keys, reconcile_sequence_items, remove_mapping_entries,
+    remove_top_level_block, render, render_top_level_sequence, replace_top_level_block,
+    top_level_span, upsert_sequence_entry,
 };
 
 /// Set the ignore list to `ghsas` (the complete desired list) in whichever
@@ -11,9 +12,7 @@ use super::{
 /// both spellings are present, the shadowed deprecated list is removed as
 /// part of the write. `auditConfig.ignoreGhsas` is created when neither is
 /// present. An empty `ghsas` removes the list, dropping its block when
-/// nothing else remains in it. `pnpm audit --ignore` and `audit.ignorePrune`
-/// call this with the complete desired list. Returns whether anything
-/// changed.
+/// nothing else remains in it. Returns whether anything changed.
 pub(crate) fn set_audit_ignore_ghsas(
     manifest: &mut Manifest,
     ghsas: &[String],
@@ -159,11 +158,12 @@ fn set_exclude_list(manifest: &mut Manifest, list: ExcludeList, items: &[String]
         .to_vec();
 
     let text = manifest.document.text();
+    let quote_style = render::detect_quote_style(text);
     match locate_sequence(text, &[block]) {
         Inline::Flow(collection) => {
             let rendered: Vec<String> = items
                 .iter()
-                .map(|item| render::render_value(item))
+                .map(|item| render::render_value_with_quotes(item, quote_style))
                 .collect();
             manifest.document.set_text(flow::set_items(text, &collection, &rendered));
             *decoded(manifest) = Some(items.to_vec());
@@ -176,19 +176,25 @@ fn set_exclude_list(manifest: &mut Manifest, list: ExcludeList, items: &[String]
         Inline::Block => {}
     }
 
-    if let Some(new_text) = reconcile_sequence_items(text, block, &current, items) {
+    if let Some(new_text) = reconcile_sequence_items(text, block, &current, items, quote_style) {
         manifest.document.set_text(new_text);
         *decoded(manifest) = Some(items.to_vec());
         return true;
     }
 
-    replace_exclude_sequence(manifest, block, items);
+    replace_exclude_sequence(manifest, block, items, quote_style);
     *decoded(manifest) = Some(items.to_vec());
     true
 }
 
-fn replace_exclude_sequence(manifest: &mut Manifest, block: &str, items: &[String]) {
-    let rendered = render_top_level_sequence(block, items);
+fn replace_exclude_sequence(
+    manifest: &mut Manifest,
+    block: &str,
+    items: &[String],
+    quote_style: render::QuoteStyle,
+) {
+    let indent = detect_sequence_indent(manifest.document.text(), Some(block));
+    let rendered = render_top_level_sequence(block, items, quote_style, indent);
     if let Some(span) = top_level_span(manifest.document.text(), block) {
         manifest.document.set_text(replace_top_level_block(
             manifest.document.text(),

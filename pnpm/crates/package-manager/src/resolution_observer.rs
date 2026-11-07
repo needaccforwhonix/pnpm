@@ -9,13 +9,14 @@
 //! while the server is still resolving.
 
 use crate::install_package_from_registry::{
-    extract_tarball, manifest_file_count, manifest_unpacked_size,
+    extract_tarball, manifest_file_count, manifest_requires_build, manifest_unpacked_size,
 };
 use dashmap::DashSet;
 use pnpm_resolving_resolver_base::{
     LatestQuery, PackageVersionGuard, ResolveFuture, ResolveLatestFuture, ResolveOptions,
     ResolveResult, Resolver, WantedDependency,
 };
+use pnpm_tarball::SharedReportedProgressKeys;
 use std::sync::Arc;
 
 /// One resolved tarball-shaped package, surfaced as the resolver's tree
@@ -40,6 +41,9 @@ pub struct ResolvedPackageHint<'a> {
     /// Registry artifact revision. Its presence selects the immutable
     /// one-request, no-redirect download policy on the client.
     pub revision: Option<u64>,
+    /// `dist.pnpr.requiresBuild` from the resolver-fetched manifest, when
+    /// the registry published one.
+    pub requires_build: Option<bool>,
     /// Whether the package resolved from a registry (npm / named / jsr), so
     /// [`Self::tarball_url`] is the registry packument's `dist.tarball`. A
     /// server router must classify such a package by its *registry* route, not
@@ -76,6 +80,17 @@ pub trait ResolutionObserver: Send + Sync {
     fn minimum_release_age_exclude_override(&self) -> Option<Vec<String>> {
         None
     }
+
+    /// Install-scoped package-status keys this observer coordinates with
+    /// fetch and materialization paths.
+    fn progress_reported(&self) -> Option<SharedReportedProgressKeys> {
+        None
+    }
+
+    /// Emit deferred package progress after fetch and materialization paths
+    /// settle, before `ImportingDone` and `Summary`. Called once on a
+    /// successful fresh-resolution install.
+    fn flush_progress(&self) {}
 }
 
 /// Wraps an inner [`Resolver`], forwarding each tarball-shaped result to
@@ -88,10 +103,13 @@ pub trait ResolutionObserver: Send + Sync {
 pub struct ObservingResolver {
     inner: Box<dyn Resolver>,
     observer: Arc<dyn ResolutionObserver>,
-    /// Tarball URLs already reported. The deps-resolver calls `resolve`
-    /// once per `(parent, child)` edge, so the same package surfaces many
-    /// times; dedup by URL collapses those to a single frame. Mirrors
-    /// `PrefetchingResolver::spawned_urls`.
+    /// Cache identities already reported. The deps-resolver calls
+    /// `resolve` once per `(parent, child)` edge, so the same package
+    /// surfaces many times; dedup collapses those to a single frame.
+    /// Two resolutions naming one URL are two archives when they pin
+    /// different hashes, and the prefetch the frame starts keys them
+    /// apart, so the identity is what dedups here too. Mirrors
+    /// `PrefetchingResolver::spawned_downloads`.
     seen: DashSet<String>,
 }
 
@@ -109,25 +127,30 @@ impl ObservingResolver {
         let Some(name_ver) = result.package.name_ver.as_ref() else {
             return;
         };
-        if !self.seen.insert(tarball_url.to_string()) {
-            return;
-        }
-        let id = name_ver.to_string();
-        let name = name_ver.name.to_string();
-        let version = name_ver.suffix.to_string();
-        let integrity = integrity.to_string();
         let revision = match &result.resolution {
             pnpm_lockfile::LockfileResolution::Tarball(tarball) => {
                 tarball.revision.map(pnpm_lockfile::TarballRevision::get)
             }
             _ => None,
         };
+        if !self.seen.insert(pnpm_tarball::package_mem_cache_key(
+            tarball_url,
+            Some(&integrity),
+            revision.is_some(),
+        )) {
+            return;
+        }
+        let id = name_ver.to_string();
+        let name = name_ver.name.to_string();
+        let version = name_ver.suffix.to_string();
+        let integrity = integrity.to_string();
         self.observer.on_resolved(ResolvedPackageHint {
             integrity: &integrity,
             tarball_url,
             unpacked_size: manifest_unpacked_size(result.package.manifest.as_deref()),
             file_count: manifest_file_count(result.package.manifest.as_deref()),
             revision,
+            requires_build: manifest_requires_build(result.package.manifest.as_deref()),
             from_registry: is_registry_resolution(&result.resolved_via),
             identity: crate::ResolvedPackageIdentity { id: &id, name: &name, version: &version },
         });

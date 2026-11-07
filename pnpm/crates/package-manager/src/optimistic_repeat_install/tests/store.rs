@@ -1,10 +1,10 @@
 use super::{
-    super::{Decision, settings::current_settings},
-    check, isolated_included, setup_fresh_install, write_state,
+    super::Decision, backdate_validated_files, check, isolated_included, setup_fresh_install,
+    write_state,
 };
+use crate::install_state::settings::current_settings;
 use pnpm_config::Config;
 use pnpm_package_manifest::PackageManifest;
-use pnpm_testing_utils::fs::backdate_existing_files;
 use pnpm_workspace_state::ProjectEntry;
 use std::{collections::BTreeMap, fs};
 use tempfile::tempdir;
@@ -40,9 +40,13 @@ fn returns_skipped_when_enable_global_virtual_store_drifts() {
     let mut projects = BTreeMap::new();
     projects.insert(
         workspace_root.to_string_lossy().into_owned(),
-        ProjectEntry { name: Some("root".into()), version: Some("1.0.0".into()) },
+        ProjectEntry {
+            name: Some("root".into()),
+            version: Some("1.0.0".into()),
+            has_modules_dir: false,
+        },
     );
-    write_state(workspace_root, backdate_existing_files(workspace_root), stale_settings, projects);
+    write_state(workspace_root, backdate_validated_files(workspace_root), stale_settings, projects);
 
     let decision = check(
         workspace_root,
@@ -71,9 +75,13 @@ fn returns_up_to_date_when_recorded_global_virtual_store_is_explicit_off() {
         dir.path()
             .to_string_lossy()
             .into_owned(),
-        ProjectEntry { name: Some("root".into()), version: Some("1.0.0".into()) },
+        ProjectEntry {
+            name: Some("root".into()),
+            version: Some("1.0.0".into()),
+            has_modules_dir: false,
+        },
     );
-    write_state(dir.path(), backdate_existing_files(dir.path()), settings, projects);
+    write_state(dir.path(), backdate_validated_files(dir.path()), settings, projects);
 
     let decision = check(
         dir.path(),

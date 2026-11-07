@@ -13,9 +13,12 @@ pub(super) async fn enforce_resolution_policies<Reporter: self::Reporter + 'stat
         install.execution.policy_excludes,
         install.execution.dry_run,
     );
+    let target_workspace_dir = install.drivers.config.target_workspace_dir
+        .as_deref()
+        .unwrap_or(install.projects.lockfile_dir);
     crate::minimum_release_age::handle_minimum_release_age_violations::<Reporter>(
         install.drivers.config,
-        install.projects.lockfile_dir,
+        target_workspace_dir,
         &workspace_result.merged_tree.policy_violations,
         can_prompt_now,
         policy_excludes_now,
@@ -64,12 +67,7 @@ pub(super) async fn collect_resolution<'m, Reporter: self::Reporter + 'static>(
             after_all_resolved_hook: prep.hooks.pnpmfile_hook,
             after_all_resolved_log: prep.hooks.after_all_resolved_log,
         },
-        reuse: crate::install_with_fresh_lockfile::resolution::ResolutionReuseGuard {
-            guard_previous_importers: install.lockfiles.merge_wanted
-                .filter(|_| install.drivers.config.dedupe_injected_deps)
-                .map(|lockfile| &lockfile.importers),
-            guard_update_reuse_scope: prep.reuse.scope,
-            guard_update_reuse_scopes_by_importer: prep.reuse.by_importer,
+        reuse: crate::install_with_fresh_lockfile::resolution::ResolutionReuse {
             full_resolution: pass.full_resolution,
         },
         graph: crate::install_with_fresh_lockfile::resolution::ResolvedGraph {

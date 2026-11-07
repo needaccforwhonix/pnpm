@@ -5,8 +5,8 @@ use super::{
     ResolveProject, SkippedSnapshots, State, TarballPrefetcher, VerifyLockfileOptions,
     VerifyLockfileResolutionsOptions, build_resolution_verifiers, lockfile_verification_is_cached,
     lockfile_verification_is_cached_by_content, materialization_closure,
-    merge_filtered_wanted_lockfile, record_lockfile_verified, verify_lockfile_resolutions,
-    workspace_install_selection,
+    merge_filtered_wanted_lockfile, record_lockfile_verified, record_pnpmfile,
+    verify_lockfile_resolutions, workspace_install_selection,
 };
 
 /// Link `node_modules` from the server-produced lockfile through the normal
@@ -16,6 +16,7 @@ pub(super) async fn link_pnpr_lockfile<Reporter: self::Reporter + 'static>(
     selection: Option<&InstallFamilySelection>,
     link: PnprLink<'_>,
     lockfile: &Lockfile,
+    known_requires_build: Option<std::collections::HashMap<pnpm_lockfile::PackageKey, bool>>,
     pnpmfile_hook: Option<std::sync::Arc<dyn pnpm_hooks::PnpmfileHooks>>,
 ) -> miette::Result<()> {
     let install = {
@@ -33,9 +34,13 @@ pub(super) async fn link_pnpr_lockfile<Reporter: self::Reporter + 'static>(
     };
     match selection {
         Some(selection) => {
-            Box::pin(install.run_selected::<Reporter>(workspace_install_selection(selection))).await
+            Box::pin(install.run_selected_with_known_requires_build::<Reporter>(
+                workspace_install_selection(selection),
+                known_requires_build,
+            ))
+            .await
         }
-        None => install.run::<Reporter>().await,
+        None => install.run_with_known_requires_build::<Reporter>(known_requires_build).await,
     }
     .wrap_err("linking dependencies resolved via the pnpr server")
 }
@@ -158,7 +163,7 @@ fn save_pnpr_lockfile(
         return Ok(());
     }
     lockfile
-        .save_to_path(lockfile_path)
+        .save_to_path(lockfile_path, state.config.symlinked_lockfile())
         .map_err(|err| miette::miette!("{err}"))
         .wrap_err("writing the pnpr-resolved lockfile")?;
     if link.lockfile.trust {
@@ -171,6 +176,7 @@ fn save_pnpr_lockfile(
     if let Ok(verifiers) = build_resolution_verifiers(
         state.config,
         std::sync::Arc::clone(&state.http_client),
+        None,
         None,
         None,
         None,
@@ -213,22 +219,17 @@ pub(super) async fn install_from_local_lockfile<Reporter: self::Reporter + 'stat
     let lockfile_verification_override =
         local_lockfile_verification(state, pnpr_server, link, local)?;
 
-    let install = {
-        let mut base_install = state.install(link.dependency_groups.clone());
-        base_install.lockfile_policy.frozen = true;
-        base_install.lockfile_policy.ignore_manifest_check = link.lockfile.ignore_manifest_check;
-        base_install.lockfile_policy.trust = true;
-        base_install.execution.skip_runtimes = link.skip_runtimes;
-        base_install.execution.node_linker = link.node_linker;
-        base_install.execution.lockfile_only = link.lockfile.only;
-        base_install.context.lockfile_path = link.lockfile_path;
-        base_install.context.lockfile = MaybeLazyLockfile::Loaded(Some(local.lockfile));
-        base_install.projects.supported_architectures = link
-            .supported_architectures
-            .clone();
-        base_install.projects.pnpmfile_hook_override = local.pnpmfile_hook.clone();
-        base_install
-    };
+    let mut install = state.install(link.dependency_groups.clone());
+    install.lockfile_policy.frozen = true;
+    install.lockfile_policy.ignore_manifest_check = link.lockfile.ignore_manifest_check;
+    install.lockfile_policy.trust = true;
+    install.execution.skip_runtimes = link.skip_runtimes;
+    install.execution.node_linker = link.node_linker;
+    install.execution.lockfile_only = link.lockfile.only;
+    install.context.lockfile_path = link.lockfile_path;
+    install.context.lockfile = MaybeLazyLockfile::Loaded(Some(local.lockfile));
+    install.projects.supported_architectures = link.supported_architectures.clone();
+    install.projects.pnpmfile_hook_override = local.pnpmfile_hook.clone();
 
     let result = match (selection, lockfile_verification_override) {
         (Some(selection), Some(lockfile_verification_override)) => {
@@ -272,13 +273,14 @@ async fn prefetch_local_lockfile(
     if link.lockfile.only || !local.prefetch_allowed {
         return None;
     }
-    let selected_prefetch_lockfile = selected_prefetch_lockfile(link, local);
+    let selected_prefetch_lockfile = selected_prefetch_lockfile(link, local, state.config);
     let prefetcher = TarballPrefetcher::new(
         state.config,
         &state.http_client,
         &state.tarball_mem_cache,
         None,
         &local.lockfile_dir.to_string_lossy(),
+        None,
     )
     .await;
     prefetcher.prefetch_lockfile(
@@ -359,24 +361,32 @@ fn local_verify_options(
 fn selected_prefetch_lockfile(
     link: &PnprLink<'_>,
     local: &LocalLockfileInstall<'_>,
+    config: &pnpm_config::Config,
 ) -> Option<Lockfile> {
     local.selection_importer_ids.map(|(_, selected_importer_ids)| {
-        let hoisted_importer_ids = matches!(link.node_linker, NodeLinker::Hoisted).then(|| {
+        let hoisted_ids = matches!(link.node_linker, NodeLinker::Hoisted).then(|| {
             local.lockfile.importers
                 .keys()
                 .cloned()
-                .collect::<std::collections::HashSet<_>>()
+                .collect()
         });
-        let initial_importer_ids = hoisted_importer_ids.as_ref().unwrap_or(selected_importer_ids);
+        let initial_importer_ids = hoisted_ids.as_ref().unwrap_or(selected_importer_ids);
         materialization_closure(
             local.lockfile,
             local.lockfile_dir,
             initial_importer_ids,
-            IncludedDependencies {
-                dependencies: link.dependency_groups.contains(&DependencyGroup::Prod),
-                dev_dependencies: link.dependency_groups.contains(&DependencyGroup::Dev),
-                optional_dependencies: link.dependency_groups.contains(&DependencyGroup::Optional),
-            },
+            &pnpm_package_manager::GroupSelection::classify(
+                local.lockfile,
+                IncludedDependencies {
+                    dependencies: link.dependency_groups.contains(&DependencyGroup::Prod),
+                    dev_dependencies: link.dependency_groups.contains(&DependencyGroup::Dev),
+                    optional_dependencies: link.dependency_groups.contains(
+                        &DependencyGroup::Optional,
+                    ),
+                },
+                config.peer_edge_options(),
+            )
+            .linking_for(link.supported_architectures.as_ref()),
             &SkippedSnapshots::new(),
         )
         .lockfile
@@ -389,6 +399,7 @@ fn state_resolution_verifiers(
     build_resolution_verifiers(
         state.config,
         std::sync::Arc::clone(&state.http_client),
+        None,
         None,
         None,
         None,
@@ -428,6 +439,9 @@ pub(super) async fn merge_and_save_pnpr_lockfile<Reporter: self::Reporter + 'sta
         session.merge_wanted,
         lockfile,
     )?;
+    if !link.lockfile.frozen {
+        record_pnpmfile(inputs.pnpmfile_hook.as_ref(), &mut lockfile).await?;
+    }
     let merged_repair_verifiers =
         verify_merged_repair::<Reporter>(state, link, session.partial_selection, &lockfile).await?;
 

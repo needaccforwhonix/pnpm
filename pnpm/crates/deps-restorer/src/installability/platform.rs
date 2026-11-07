@@ -10,6 +10,7 @@ use std::{borrow::Cow, collections::HashMap};
 /// Host context for the installability check. Built once per install
 /// so the per-snapshot calls don't each re-spawn `node --version`
 /// or re-read `std::env::consts::OS`.
+#[derive(Clone)]
 pub struct InstallabilityHost {
     pub node_version: String,
     /// `true` when `node_version` was discovered by spawning
@@ -177,12 +178,18 @@ pub(super) fn read_string_list(manifest: Option<&Value>, key: &str) -> Option<Ve
 /// `pub` so `install_frozen_lockfile` can gate the host detection
 /// on it — the spawn is otherwise on the critical path of
 /// `CreateVirtualStore::run` and serializes ~100ms of node-binary
-/// startup with extraction it used to overlap with.
+/// startup with extraction.
+#[must_use]
 pub fn any_installability_constraint(
     snapshots: &HashMap<PackageKey, SnapshotEntry>,
     packages: &HashMap<PackageKey, PackageMetadata>,
 ) -> bool {
-    packages.values().any(metadata_has_meaningful_constraint)
+    packages
+        .values()
+        .any(|metadata| {
+            metadata_has_meaningful_constraint(metadata)
+                || super::variants::variants_only(metadata).is_some()
+        })
         || snapshots
             .iter()
             .any(|(snapshot_key, snapshot)| {
@@ -220,6 +227,7 @@ pub fn any_optional_installability_constraint(
                 .get(&metadata_key)
                 .is_some_and(|metadata| {
                     metadata_has_meaningful_constraint(metadata)
+                        || super::variants::variants_only(metadata).is_some()
                         || inferred_platform(
                             metadata_key.name.bare.as_str(),
                             WantedPlatformRef {

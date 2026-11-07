@@ -1,17 +1,51 @@
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 use super::is_shim_pointing_at;
 #[cfg(windows)]
 use super::shim_writer::with_extension_appended;
 use super::{FsEnsureExecutableBits, FsReadToString, LinkBinsError, Path, io, remove_stale_bin};
+use crate::shim::is_within_root;
+#[cfg(any(unix, target_os = "wasi"))]
+use crate::{FsReadHead, read_head_filled};
 
-/// Make the underlying script executable: apply a minimum mode of
-/// 0o755 without rewriting CRLF shebangs. Targets shipped by npm
-/// already use LF in practice, so a chmod alone suffices.
-pub(super) fn ensure_target_executable<Sys>(target_path: &Path) -> Result<(), LinkBinsError>
+/// Add missing executable bits to installed targets without modifying
+/// workspace files or rewriting CRLF shebangs.
+pub(super) fn ensure_target_executable<Sys>(
+    target_path: &Path,
+    installed_modules_dir: Option<&Path>,
+) -> Result<(), LinkBinsError>
 where
     Sys: FsEnsureExecutableBits,
 {
-    chmod_tolerating_removal(target_path, Sys::ensure_executable_bits)
+    chmod_tolerating_removal(target_path, |path| {
+        Sys::ensure_executable_bits(path, installed_modules_dir)
+    })
+}
+
+#[cfg(any(unix, target_os = "wasi"))]
+pub(super) fn target_requires_shim<Sys: FsReadHead>(target_path: &Path) -> bool {
+    let needs_executable_bits = pnpm_fs::copy_permissions(target_path)
+        .is_ok_and(|permissions| permissions.mode() & 0o111 != 0o111);
+    if needs_executable_bits {
+        return true;
+    }
+    let mut head = [0; 2048];
+    let Ok(read) = read_head_filled::<Sys>(target_path, &mut head) else {
+        return false;
+    };
+    head.starts_with(b"#!")
+        && head[..read]
+            .split(|&byte| byte == b'\n')
+            .next()
+            .is_some_and(|line| line.ends_with(b"\r"))
+}
+
+#[cfg(not(any(unix, target_os = "wasi")))]
+#[expect(
+    clippy::extra_unused_type_parameters,
+    reason = "The Windows stub shares the Unix call site."
+)]
+pub(super) fn target_requires_shim<Sys>(_target_path: &Path) -> bool {
+    false
 }
 
 /// Apply `chmod` to `path`, treating a path that has vanished as success.
@@ -39,7 +73,7 @@ pub(super) fn chmod_tolerating_removal(
 /// `node_modules` (bundled deps) followed by the slot's
 /// `node_modules` (sibling deps), so tools that resolve from CWD
 /// (`import-local` in jest, eslint, ...) find the correct versions.
-/// `dir` must already be symlink-free — [`shim_node_path`](super::shim_node_path) passes the
+/// `dir` must already be symlink-free — [`shim_node_path`](super::linking_paths::shim_node_path) passes the
 /// caller-resolved location or a canonicalized fallback.
 pub(super) fn bin_node_paths(dir: &Path) -> Vec<String> {
     let Some(node_modules_dir) = dir
@@ -81,8 +115,7 @@ pub(super) fn bin_node_paths(dir: &Path) -> Vec<String> {
 }
 
 /// Whether `shim_path`'s file name is exactly `node` — the trigger for the
-/// node-runtime short-circuit in [`write_shim`](super::shim_writer::write_shim). Lifted out so the check
-/// is unit-testable and the call site reads as a predicate.
+/// node-runtime short-circuit in [`write_shim`](super::shim_writer::write_shim).
 pub(super) fn is_node_bin_name(shim_path: &Path) -> bool {
     matches!(shim_path.file_name().and_then(|s| s.to_str()), Some("node"))
 }
@@ -95,10 +128,11 @@ pub(super) fn is_node_bin_name(shim_path: &Path) -> bool {
 ///
 /// Two halves, by platform:
 ///
-/// - **Unix** symlinks `shim_path` → absolute `target_path`. The
-///   existing dirent (if any) is removed first because `fs::symlink`
-///   rejects with `AlreadyExists` and we don't want to silently leave
-///   a stale shim in place.
+/// - **Unix** symlinks `shim_path` → `target_path`, relative to the bin
+///   directory when both lie inside `relocatable_root` and absolute
+///   otherwise. The existing dirent (if any) is removed first because
+///   `fs::symlink` rejects with `AlreadyExists` and we don't want to
+///   silently leave a stale shim in place.
 /// - **Windows** hardlinks `target_path` to `<shim_path>.exe`, falling
 ///   back to `fs::copy` on hardlink failure (cross-device, ACL deny,
 ///   ...). The source must end in `.exe`; otherwise the caller falls
@@ -109,21 +143,38 @@ pub(super) fn is_node_bin_name(shim_path: &Path) -> bool {
 /// regular file hardlinked to the source binary, truncating through
 /// the hardlink would corrupt the binary itself. Removing the dirent
 /// leaves the hardlinked content intact.
-#[cfg(unix)]
-pub(super) fn link_node_bin(target_path: &Path, shim_path: &Path) -> Result<bool, LinkBinsError> {
+#[cfg(any(unix, target_os = "wasi"))]
+pub(super) fn link_node_bin(
+    target_path: &Path,
+    shim_path: &Path,
+    relocatable_root: Option<&Path>,
+) -> Result<bool, LinkBinsError> {
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
+    let link_target = match shim_path.parent() {
+        Some(bins_dir) if is_within_root(relocatable_root, bins_dir, target_path) => {
+            pnpm_fs::relative_path(bins_dir, target_path)
+        }
+        _ => target_path.to_path_buf(),
+    };
     remove_stale_bin(shim_path)?;
-    symlink(target_path, shim_path)
-        .map_err(|error| LinkBinsError::LinkNodeBin {
-            src: target_path.to_path_buf(),
-            dst: shim_path.to_path_buf(),
-            error,
-        })?;
+    symlink_tolerating_concurrent_writers(shim_path, target_path, relocatable_root, || {
+        symlink(&link_target, shim_path)
+    })
+    .map_err(|error| LinkBinsError::LinkNodeBin {
+        src: target_path.to_path_buf(),
+        dst: shim_path.to_path_buf(),
+        error,
+    })?;
     Ok(true)
 }
 
 #[cfg(windows)]
-pub(super) fn link_node_bin(target_path: &Path, shim_path: &Path) -> Result<bool, LinkBinsError> {
+pub(super) fn link_node_bin(
+    target_path: &Path,
+    shim_path: &Path,
+    _relocatable_root: Option<&Path>,
+) -> Result<bool, LinkBinsError> {
     use std::fs;
     let is_exe = target_path
         .extension()
@@ -153,23 +204,24 @@ pub(super) fn link_node_bin(target_path: &Path, shim_path: &Path) -> Result<bool
 /// pnpm's `preferSymlinkedExecutables` bin materialization: a relative
 /// symlink from the `.bin` entry to the target file, matching pnpm's
 /// `symlink-dir` call (relative so a moved project keeps working; the
-/// node runtime handled by [`link_node_bin`] keeps its absolute link,
-/// also like pnpm). The target file — not the link — gets its
-/// executable bits raised, and a dangling target is tolerated: the
+/// node runtime handled by [`link_node_bin`] links relatively only inside
+/// a relocatable root). The target file gets its executable bits
+/// raised, and a dangling target is tolerated: the
 /// symlink is created anyway with a warning, pnpm's
 /// warn-and-continue.
 ///
 /// Returns `Ok(true)` when the symlink path handled the bin, `Ok(false)`
 /// when the caller must fall through to the shim path (Windows, where
 /// the setting is inert — pnpm gates on `!isWindows()` the same way).
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 pub(super) fn link_symlinked_executable<Sys>(
     target_path: &Path,
     shim_path: &Path,
 ) -> Result<bool, LinkBinsError>
 where
-    Sys: FsReadToString + FsEnsureExecutableBits,
+    Sys: FsReadToString,
 {
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
     // pnpm's warm-install short-circuit also accepts an existing shim
     // that points at the target, so enabling the setting rewrites no
@@ -178,45 +230,81 @@ where
     // accepted before this branch was reached.)
     if matches!(
         Sys::read_to_string(shim_path),
-        Ok(existing) if is_shim_pointing_at(&existing, target_path),
+        Ok(existing) if is_shim_pointing_at(&existing, shim_path, target_path),
     ) {
-        ensure_target_executable::<Sys>(target_path)?;
         return Ok(true);
     }
-    let link_target = shim_path
-        .parent()
-        .map_or_else(
-            || target_path.to_path_buf(),
-            |bins_dir| pnpm_fs::relative_path(bins_dir, target_path),
-        );
+    let link_target = match shim_path.parent() {
+        Some(bins_dir) => pnpm_fs::relative_path(bins_dir, target_path),
+        None => target_path.to_path_buf(),
+    };
     remove_stale_bin(shim_path)?;
-    symlink(&link_target, shim_path)
-        .map_err(|error| LinkBinsError::SymlinkBin {
-            src: target_path.to_path_buf(),
-            dst: shim_path.to_path_buf(),
-            error,
-        })?;
-    match Sys::ensure_executable_bits(target_path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            // pnpm's `Failed to create bin at ...` globalWarn: the
-            // symlink dangles until a later step materializes the
-            // target, which is worth telling the user about but not
-            // worth failing the install over.
-            let shim_path = shim_path.display();
-            let target_path = target_path.display();
-            tracing::warn!(
-                "Failed to create bin at {shim_path}. The target {target_path} does not exist",
-            );
-        }
-        Err(error) => {
-            return Err(LinkBinsError::Chmod { path: target_path.to_path_buf(), error });
-        }
+    symlink_tolerating_concurrent_writers(shim_path, target_path, None, || {
+        symlink(&link_target, shim_path)
+    })
+    .map_err(|error| LinkBinsError::SymlinkBin {
+        src: target_path.to_path_buf(),
+        dst: shim_path.to_path_buf(),
+        error,
+    })?;
+    if !target_path.exists() {
+        // pnpm's `Failed to create bin at ...` globalWarn: the
+        // symlink dangles until a later step materializes the
+        // target, which is worth telling the user about but not
+        // worth failing the install over.
+        let shim_path = shim_path.display();
+        let target_path = target_path.display();
+        tracing::warn!(
+            "Failed to create bin at {shim_path}. The target {target_path} does not exist",
+        );
     }
     Ok(true)
 }
 
+/// Create the link at `shim_path` with `create_link`, treating a link that a
+/// concurrent install sharing the store created as success.
+///
+/// - `Ok` when `create_link` succeeds, or when it reports `AlreadyExists` and
+///   the occupant satisfies [`symlink_already_points_at`].
+/// - `create_link`'s error otherwise. An occupant that vanished after the
+///   conflict was removed by a third writer, so it is retried a bounded number
+///   of times first.
+#[cfg(any(unix, target_os = "wasi"))]
+pub(super) fn symlink_tolerating_concurrent_writers(
+    shim_path: &Path,
+    target_path: &Path,
+    relocatable_root: Option<&Path>,
+    mut create_link: impl FnMut() -> io::Result<()>,
+) -> io::Result<()> {
+    const MAX_ATTEMPTS: usize = 4;
+    let mut attempt = 1;
+    loop {
+        let error = match create_link() {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            return Err(error);
+        }
+        if symlink_already_points_at(shim_path, target_path, relocatable_root) {
+            return Ok(());
+        }
+        let occupant_removed = matches!(
+            std::fs::symlink_metadata(shim_path),
+            Err(metadata_error) if metadata_error.kind() == io::ErrorKind::NotFound,
+        );
+        if !occupant_removed || attempt == MAX_ATTEMPTS {
+            return Err(error);
+        }
+        attempt += 1;
+    }
+}
+
 #[cfg(windows)]
+#[expect(
+    clippy::extra_unused_type_parameters,
+    reason = "the stub keeps the unix signature so callers stay platform-agnostic"
+)]
 pub(super) fn link_symlinked_executable<Sys>(
     _target_path: &Path,
     _shim_path: &Path,
@@ -229,11 +317,24 @@ where
 
 /// Whether the dirent at `shim_path` is a symlink that already resolves
 /// to `target_path` — raw, or resolved against the bin dir — pnpm's
-/// warm-install short-circuit arm for symlinked bins.
-pub(super) fn symlink_already_points_at(shim_path: &Path, target_path: &Path) -> bool {
+/// warm-install short-circuit arm for symlinked bins. An absolute node
+/// link inside the relocatable root must be rewritten before it can move.
+pub(super) fn symlink_already_points_at(
+    shim_path: &Path,
+    target_path: &Path,
+    relocatable_root: Option<&Path>,
+) -> bool {
     let Ok(existing) = std::fs::read_link(shim_path) else {
         return false;
     };
+    if existing.is_absolute()
+        && is_node_bin_name(shim_path)
+        && shim_path
+            .parent()
+            .is_some_and(|bins_dir| is_within_root(relocatable_root, bins_dir, target_path))
+    {
+        return false;
+    }
     if existing == target_path {
         return true;
     }
@@ -243,22 +344,25 @@ pub(super) fn symlink_already_points_at(shim_path: &Path, target_path: &Path) ->
     pnpm_fs::lexical_normalize(&bins_dir.join(&existing)) == pnpm_fs::lexical_normalize(target_path)
 }
 
-/// Whether `a` and `b` are the same file. [`same_file::Handle`] proves a hard
-/// link cheaply via the OS file identity (device + inode on Unix, file index +
-/// volume serial on Windows). When that identity can't be obtained — a missing
-/// file, or a filesystem that doesn't expose a stable index — we fall back to
-/// comparing the file contents after a quick size check, which also treats a
-/// byte-identical copy as the same file.
+/// Whether `first_path` and `second_path` are the same file.
+/// [`same_file::Handle`] proves a hard link cheaply via the OS file identity
+/// (device + inode on Unix, file index + volume serial on Windows). When
+/// that identity can't be obtained — a missing file, or a filesystem that
+/// doesn't expose a stable index — we fall back to comparing the file contents
+/// after a quick size check, which also treats a byte-identical copy as the
+/// same file.
 #[cfg(windows)]
-fn is_same_file(a: &Path, b: &Path) -> bool {
+fn is_same_file(first_path: &Path, second_path: &Path) -> bool {
     if let (Ok(handle_a), Ok(handle_b)) =
-        (same_file::Handle::from_path(a), same_file::Handle::from_path(b))
+        (same_file::Handle::from_path(first_path), same_file::Handle::from_path(second_path))
         && handle_a == handle_b
     {
         return true;
     }
-    match (std::fs::metadata(a), std::fs::metadata(b)) {
-        (Ok(meta_a), Ok(meta_b)) => meta_a.len() == meta_b.len() && have_equal_contents(a, b),
+    match (std::fs::metadata(first_path), std::fs::metadata(second_path)) {
+        (Ok(meta_a), Ok(meta_b)) => {
+            meta_a.len() == meta_b.len() && have_equal_contents(first_path, second_path)
+        }
         _ => false,
     }
 }
@@ -266,9 +370,11 @@ fn is_same_file(a: &Path, b: &Path) -> bool {
 /// Compare two equally-sized files chunk by chunk, so an executable is never
 /// fully buffered in memory and a mismatch returns as early as possible.
 #[cfg(windows)]
-fn have_equal_contents(a: &Path, b: &Path) -> bool {
+fn have_equal_contents(first_path: &Path, second_path: &Path) -> bool {
     const CHUNK_SIZE: usize = 64 * 1024;
-    let (Ok(mut file_a), Ok(mut file_b)) = (std::fs::File::open(a), std::fs::File::open(b)) else {
+    let (Ok(mut file_a), Ok(mut file_b)) =
+        (std::fs::File::open(first_path), std::fs::File::open(second_path))
+    else {
         return false;
     };
     let mut buf_a = vec![0u8; CHUNK_SIZE];
@@ -306,4 +412,9 @@ fn read_chunk(reader: &mut impl std::io::Read, buf: &mut [u8]) -> io::Result<usi
         }
     }
     Ok(filled)
+}
+
+#[cfg(target_os = "wasi")]
+fn symlink(target: impl AsRef<Path>, link: &Path) -> io::Result<()> {
+    pnpm_fs::create_symlink(target.as_ref(), link, false)
 }

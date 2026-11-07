@@ -19,6 +19,11 @@ pub mod diff;
 pub mod format;
 pub mod state;
 
+pub use colors::{colors_enabled, set_color_mode};
+pub use progress::set_progress;
+
+mod progress;
+
 use std::{
     io::{IsTerminal, Write},
     sync::{LazyLock, Mutex, OnceLock},
@@ -26,12 +31,12 @@ use std::{
 };
 
 use console::Term;
-use pnpm_config::ColorMode;
-use pnpm_reporter::{FetchingProgressMessage, LogEvent, PromptAction, Reporter};
+use pnpm_reporter::{LogEvent, PromptAction, Reporter};
 
 use crate::{
     colors::Colors,
     format::visible_width,
+    progress::is_coalesceable,
     state::{Output, ReporterState},
 };
 
@@ -45,9 +50,9 @@ static HIDE_ADDED_PKGS_PROGRESS: OnceLock<bool> = OnceLock::new();
 static STREAM_LIFECYCLE_OUTPUT: OnceLock<bool> = OnceLock::new();
 static AGGREGATE_OUTPUT: OnceLock<bool> = OnceLock::new();
 static HIDE_LIFECYCLE_PREFIX: OnceLock<bool> = OnceLock::new();
+static IS_GLOBAL: OnceLock<bool> = OnceLock::new();
 static IS_RECURSIVE: OnceLock<bool> = OnceLock::new();
 static MAX_LOG_LEVEL: OnceLock<MaxLogLevel> = OnceLock::new();
-static COLOR_MODE: OnceLock<ColorMode> = OnceLock::new();
 
 /// Verbosity ceiling for the rendered output, from pnpm's `--loglevel`
 /// setting. Mirrors `LOG_LEVEL_NUMBER` in `@pnpm/cli.default-reporter`
@@ -69,6 +74,11 @@ pub enum SummaryScope {
     CurrentPrefix,
     /// Include events from every prefix, used by global install groups.
     AllPrefixes,
+}
+
+/// Whether the command operates on global packages. Call before the first event.
+pub fn set_is_global(is_global: bool) {
+    let _ = IS_GLOBAL.set(is_global);
 }
 
 /// Set the project root the reporter renders paths relative to. Call once
@@ -167,20 +177,27 @@ pub fn set_max_log_level(level: MaxLogLevel) {
     let _ = MAX_LOG_LEVEL.set(level);
 }
 
-/// Configure ANSI color rendering. Call before the first reporter event.
-pub fn set_color_mode(mode: ColorMode) {
-    let _ = COLOR_MODE.set(mode);
-}
-
-pub fn colors_enabled(is_terminal: bool) -> bool {
-    match COLOR_MODE
+/// The configured verbosity ceiling, or [`MaxLogLevel::Info`] when
+/// [`set_max_log_level`] was not called. Output written outside the reporter
+/// reads it to stay behind the same `--loglevel` gate.
+pub fn max_log_level() -> MaxLogLevel {
+    MAX_LOG_LEVEL
         .get()
         .copied()
-        .unwrap_or_default()
-    {
-        ColorMode::Always => true,
-        ColorMode::Auto => is_terminal && std::env::var_os("NO_COLOR").is_none(),
-        ColorMode::Never => false,
+        .unwrap_or(MaxLogLevel::Info)
+}
+
+/// Whether the default reporter paints its output in color.
+#[must_use]
+pub fn output_colors_enabled() -> bool {
+    colors_enabled(output_is_terminal())
+}
+
+fn output_is_terminal() -> bool {
+    if is_stderr_output() {
+        std::io::stderr().is_terminal()
+    } else {
+        std::io::stdout().is_terminal()
     }
 }
 
@@ -199,7 +216,14 @@ fn cwd() -> String {
 pub struct DefaultReporter;
 
 impl Reporter for DefaultReporter {
+    fn report_fatal_error(message: String) -> Option<String> {
+        Some(message)
+    }
+
     fn emit(event: &LogEvent) {
+        if progress::is_suppressed(event) {
+            return;
+        }
         let mut sink = SINK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let LogEvent::Prompt(log) = event {
             sink.on_prompt(log.action);
@@ -207,19 +231,6 @@ impl Reporter for DefaultReporter {
         }
         let output = sink.state.handle(event);
         sink.write(output, is_coalesceable(event));
-    }
-}
-
-/// Whether an event is a high-volume progress update that may be dropped
-/// under throttling, mirroring pnpm's `throttleProgress` on the progress
-/// stream.
-fn is_coalesceable(event: &LogEvent) -> bool {
-    match event {
-        LogEvent::Progress(_) => true,
-        LogEvent::FetchingProgress(log) => {
-            matches!(log.message, FetchingProgressMessage::InProgress { .. })
-        }
-        _ => false,
     }
 }
 
@@ -263,11 +274,7 @@ struct PromptBuffer {
 
 impl Sink {
     fn new() -> Self {
-        let is_tty = if is_stderr_output() {
-            std::io::stderr().is_terminal()
-        } else {
-            std::io::stdout().is_terminal()
-        };
+        let is_tty = output_is_terminal();
         let append_only = !is_tty
             || FORCE_APPEND_ONLY
                 .get()
@@ -465,16 +472,16 @@ impl Sink {
         }
         self.viewport.rendered_frame_rows = frame_rows;
         self.viewport.rendered_frame_outgrew_terminal = false;
-        // Shrinking the frame to just the overflow leaves those lines untouched
-        // where they already are, erases the rest of the frame below them, and
-        // parks the cursor on the next line — where the restarted differ picks
-        // up.
-        let handover =
-            format!("{}\n", lines[self.viewport.committed_lines..first_visible].join("\n"));
+        // The previous frame is still on screen, so the differ can draw the
+        // whole uncommitted frame over it; the overflow scrolls away as the new
+        // lines are appended. The restarted differ then takes the lines that
+        // stayed on screen as already drawn, rather than drawing them again.
+        let handover = format!("{}\n", lines[self.viewport.committed_lines..].join("\n"));
         let mut buf = std::mem::take(&mut self.frame_buf);
         self.diff.update_into(&handover, &mut buf);
         self.frame_buf = buf;
         self.diff = diff::Diff::new(self.viewport.columns);
+        self.diff.assume_drawn(&format!("{}\n", lines[first_visible..].join("\n")));
         self.viewport.committed_lines = first_visible;
     }
 }
@@ -482,10 +489,7 @@ impl Sink {
 fn reporter_options(append_only: bool) -> state::ReporterOptions {
     state::ReporterOptions {
         append_only,
-        max_log_level: MAX_LOG_LEVEL
-            .get()
-            .copied()
-            .unwrap_or(MaxLogLevel::Info),
+        max_log_level: max_log_level(),
         lifecycle: crate::state::LifecycleOptions {
             stream_output: STREAM_LIFECYCLE_OUTPUT.get().is_some_and(|value| *value),
             aggregate_output: AGGREGATE_OUTPUT.get().is_some_and(|value| *value),
@@ -502,6 +506,7 @@ fn reporter_options(append_only: bool) -> state::ReporterOptions {
                 .copied()
                 .unwrap_or(SummaryScope::CurrentPrefix),
             reports_scope: REPORTS_SCOPE.get().is_some_and(|value| *value),
+            is_global: IS_GLOBAL.get().is_some_and(|value| *value),
             recursive: IS_RECURSIVE.get().is_some_and(|value| *value),
         },
         ..state::ReporterOptions::default()

@@ -1,7 +1,9 @@
 use super::{
-    BTreeMap, DirectDep, HashSet, PackageManifestError, Path, ResolvedTree, Version,
-    WorkspaceRootDep, io, safe_read_package_json_from_dir, unwrap_package_name,
+    BTreeMap, DirectDep, HashSet, Path, ResolvedTree, WorkspaceRootDep, io,
+    safe_read_package_json_from_dir, unwrap_package_name,
 };
+use node_semver::Version;
+use pnpm_package_manifest::PackageManifestError;
 
 /// `link:` / `file:` and the path form of `workspace:` name a directory
 /// relative to the project that declares them, so the root's specifier
@@ -10,7 +12,9 @@ use super::{
 /// not path-relative: it selects the same workspace package from every
 /// importer, so it needs none of this.
 pub(super) fn is_project_relative_specifier(spec: &str) -> bool {
-    spec.starts_with("link:") || spec.starts_with("file:") || spec.starts_with("workspace:.")
+    spec.starts_with("link:")
+        || spec.starts_with("file:")
+        || pnpm_workspace_spec::is_workspace_path_specifier(spec)
 }
 
 /// The name and version of the package a project-relative specifier points
@@ -62,7 +66,9 @@ pub(super) fn read_manifest_of_local_target(
     dir: &Path,
 ) -> Result<Option<serde_json::Value>, PackageManifestError> {
     match safe_read_package_json_from_dir(dir) {
-        Err(PackageManifestError::Io(err)) if err.kind() == io::ErrorKind::NotADirectory => {
+        Err(PackageManifestError::Read { source, .. })
+            if source.kind() == io::ErrorKind::NotADirectory =>
+        {
             Ok(None)
         }
         result => result,
@@ -101,13 +107,15 @@ pub(super) fn build_workspace_root_deps(
     let mut out = Vec::with_capacity(direct.len());
     let mut named = HashSet::default();
     for dep in direct {
-        let Some(pkg) = snapshot.packages.get(dep.id.as_str()) else { continue };
-        let Some(pkg_name) = resolved_pkg_name(&pkg.result) else { continue };
+        let Some(pkg) = snapshot.packages.get(&dep.id) else { continue };
+        let Some(pkg_name) = resolved_pkg_name(pkg.result()) else { continue };
         named.insert(dep.alias.as_str());
         out.push(WorkspaceRootDep {
             alias: dep.alias.clone(),
             pkg_name,
-            normalized_bare_specifier: pkg.result.normalized_bare_specifier
+            normalized_bare_specifier: pkg
+                .result()
+                .normalized_bare_specifier
                 .clone()
                 .or_else(|| declared.get(&dep.alias).cloned()),
         });

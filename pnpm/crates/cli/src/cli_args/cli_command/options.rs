@@ -1,7 +1,12 @@
 use super::{
-    CliArgs, CliCommand, CommandFactory, Diagnostic, Display, Error, ErrorKind, LogLevelSetting,
-    Pipe, ReporterType,
+    CliArgs, CliCommand, CommandFactory, Diagnostic, Display, Error, ErrorKind, Pipe, ReporterType,
 };
+
+use crate::{
+    cli_args::reporter::ReporterFlags,
+    config_overrides::{ConfigOverrides, GlobalConflict},
+};
+use std::path::{Path, PathBuf};
 
 /// Error type of [`CliArgs::apply_workspace_root`].
 #[derive(Debug, Display, Error, Diagnostic)]
@@ -19,17 +24,43 @@ pub enum WorkspaceRootError {
 }
 
 impl CliArgs {
-    /// The reporter the command should drive: `--loglevel silent` forces
-    /// the silent reporter over any `--reporter` choice, mirroring the
-    /// reporter selection in pnpm 11's `main.ts`.
-    pub(crate) fn effective_reporter(&self) -> ReporterType {
-        if self.output.presentation.loglevel == Some(LogLevelSetting::Silent) {
-            return ReporterType::Silent;
+    pub(crate) fn reporter_flags(&self) -> ReporterFlags {
+        ReporterFlags {
+            reporter: self.output.presentation.reporter,
+            loglevel: self.output.presentation.loglevel,
         }
-        self.output.presentation.reporter
+    }
+
+    pub(crate) fn effective_reporter(&self) -> ReporterType {
+        self.effective_reporter_with_config(None, None)
+    }
+
+    pub(crate) fn effective_reporter_with_config(
+        &self,
+        config_loglevel: Option<pnpm_config::LogLevel>,
+        config_reporter: Option<pnpm_config::ReporterType>,
+    ) -> ReporterType {
+        self.reporter_flags().resolve(config_loglevel, config_reporter)
+    }
+
+    /// Reject the command-line settings a `--global` command cannot honour.
+    /// The `config` commands read `--global` as `--location=global`, so
+    /// pnpm does not check them.
+    pub(crate) fn check_global_conflicts(
+        &self,
+        config_overrides: &ConfigOverrides,
+    ) -> Result<(), GlobalConflict> {
+        match self.command {
+            CliCommand::Config(_) | CliCommand::Get(_) | CliCommand::Set(_) => Ok(()),
+            _ if self.command.is_global() => config_overrides.check_global_conflicts(),
+            _ => Ok(()),
+        }
     }
 
     pub fn validate_command_scoped_global_options(&self) -> Result<(), clap::Error> {
+        if matches!(&self.command, CliCommand::Add(args) if args.save.hidden_ambiguous_t) {
+            return Err(Self::ambiguous_add_short_option_error());
+        }
         if self.workspace.ordering.resume_from.is_some() {
             self.validate_run_scoped_global_option("--resume-from")?;
         }
@@ -44,6 +75,9 @@ impl CliArgs {
         }
         if self.workspace.ordering.parallel {
             self.validate_parallel_global_option()?;
+        }
+        if self.workspace.execution.sequential {
+            self.validate_sequential_top_level_option()?;
         }
         if self.output.lifecycle.hide_prefix {
             self.validate_run_scoped_global_option("--reporter-hide-prefix")?;
@@ -128,31 +162,39 @@ impl CliArgs {
         if self.command.is_global() {
             return Err(WorkspaceRootError::GlobalConflict);
         }
-        let dir = dunce::canonicalize(&self.paths.dir)
-            .or_else(|_| std::path::absolute(&self.paths.dir))
-            .unwrap_or_else(|_| self.paths.dir.clone())
-            .pipe_deref(pnpm_fs::lexical_normalize);
-        let workspace_dir = pnpm_workspace::find_workspace_dir(&dir)
-            .map_err(WorkspaceRootError::FindWorkspaceDir)?
-            .ok_or(WorkspaceRootError::NotInWorkspace)?;
-        self.paths.dir = workspace_dir;
+        self.paths.dir = find_workspace_root_dir(&self.paths.dir)?;
         // pnpm's parser writes the workspace root into `cliOptions.dir`, so
         // `-w` also decides where `init` scaffolds.
         self.paths.dir_from_command_line = true;
         Ok(())
     }
 
+    /// A read of the global config takes no settings from a workspace, not
+    /// even one named by `PNPM_CONFIG_WORKSPACE_DIR`.
+    pub fn ignore_workspace_for_global_config_read(&mut self) {
+        if self.command.reads_global_config() {
+            self.paths.ignore_workspace = true;
+        }
+    }
+
     /// Promote commands marked recursive-by-default by pnpm when they run
     /// inside a workspace.
     pub fn promote_recursive_by_default(&mut self) {
-        let dir = dunce::canonicalize(&self.paths.dir)
-            .or_else(|_| std::path::absolute(&self.paths.dir))
-            .unwrap_or_else(|_| self.paths.dir.clone())
-            .pipe_deref(pnpm_fs::lexical_normalize);
+        let dir = resolve_real_dir(&self.paths.dir);
+        // `--ignore-workspace` runs the project standalone, so there is no
+        // workspace to be recursive over: promoting anyway makes the
+        // selection discover the project's own subdirectories as if they
+        // were workspace projects.
         if !self.workspace.recursive
+            && !self.paths.ignore_workspace
             && self.command.recursive_by_default()
-            && pnpm_workspace::find_workspace_dir(&dir).is_ok_and(|dir| dir.is_some())
+            && let Ok(Some(workspace_dir)) = pnpm_workspace::find_workspace_dir(&dir)
         {
+            if matches!(self.command, CliCommand::List(_) | CliCommand::Ll(_))
+                && dir != resolve_real_dir(&workspace_dir)
+            {
+                return;
+            }
             self.workspace.recursive = true;
         }
     }
@@ -169,6 +211,13 @@ impl CliArgs {
             CliCommand::Exec(_) => Err(Self::unexpected_argument_error("--if-present")),
             _ => self.validate_run_scoped_global_option("--if-present"),
         }
+    }
+
+    fn validate_sequential_top_level_option(&self) -> Result<(), clap::Error> {
+        if matches!(self.command, CliCommand::Run(_) | CliCommand::External(_)) {
+            return Ok(());
+        }
+        Err(Self::unexpected_argument_error("--sequential"))
     }
 
     fn validate_run_scoped_global_option(&self, option: &str) -> Result<(), clap::Error> {
@@ -191,6 +240,14 @@ impl CliArgs {
             .error(ErrorKind::UnknownArgument, format!("unexpected argument '{option}' found"))
     }
 
+    fn ambiguous_add_short_option_error() -> clap::Error {
+        Self::command()
+            .error(
+                ErrorKind::UnknownArgument,
+                "short option '-T' is ambiguous, use '--save-types' or '--tilde'",
+            )
+    }
+
     fn validate_report_summary_global_option(&self) -> Result<(), clap::Error> {
         if matches!(self.command, CliCommand::Publish(_) | CliCommand::Stage(_)) {
             return Ok(());
@@ -199,7 +256,10 @@ impl CliArgs {
     }
 
     fn validate_no_bail_global_option(&self) -> Result<(), clap::Error> {
-        if matches!(self.command, CliCommand::Rebuild(_)) {
+        if matches!(
+            self.command,
+            CliCommand::Rebuild(_) | CliCommand::Rb(_) | CliCommand::InstallTest(_),
+        ) {
             return Ok(());
         }
         self.validate_run_scoped_global_option("--no-bail")
@@ -228,8 +288,46 @@ impl super::CliNetworkArgs {
             self.http_proxy.as_deref(),
             self.no_proxy.as_deref(),
         );
+        if let Some(https_proxy) = &self.https_proxy {
+            config.cli_settings.insert("httpsProxy".to_string());
+            push_cli_token(config, "https-proxy", https_proxy);
+        }
+        if let Some(http_proxy) = &self.http_proxy {
+            config.cli_settings.insert("httpProxy".to_string());
+            push_cli_token(config, "http-proxy", http_proxy);
+        }
+        if let Some(no_proxy) = &self.no_proxy {
+            config.cli_settings.insert("noProxy".to_string());
+            config.cli_settings.insert("noproxy".to_string());
+            push_cli_token(config, "no-proxy", no_proxy);
+        }
         if let Some(registry) = self.registry.as_deref() {
-            crate::config_overrides::apply_registry_override(config, registry);
+            push_cli_token(config, "registry", registry);
         }
     }
+}
+
+pub(in crate::cli_args) fn push_cli_token(
+    config: &mut pnpm_config::Config,
+    key: &str,
+    value: &str,
+) {
+    config.cli.npmrc_tokens.retain(|(existing, _)| {
+        let normalized = pnpm_config::naming_cases::to_kebab_case(existing);
+        normalized != key && !(key == "no-proxy" && normalized == "noproxy")
+    });
+    config.cli.npmrc_tokens.push((key.to_string(), value.to_string()));
+}
+
+pub(crate) fn find_workspace_root_dir(dir: &Path) -> Result<PathBuf, WorkspaceRootError> {
+    pnpm_workspace::find_workspace_dir(&resolve_real_dir(dir))
+        .map_err(WorkspaceRootError::FindWorkspaceDir)?
+        .ok_or(WorkspaceRootError::NotInWorkspace)
+}
+
+fn resolve_real_dir(dir: &Path) -> PathBuf {
+    pnpm_fs::canonicalize_preserving_mapped_drive(dir)
+        .or_else(|_| std::path::absolute(dir))
+        .unwrap_or_else(|_| dir.to_path_buf())
+        .pipe_deref(pnpm_fs::lexical_normalize)
 }

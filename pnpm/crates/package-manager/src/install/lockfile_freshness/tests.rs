@@ -75,3 +75,91 @@ importers:
         "an override incorrectly anchored at the nested project must be rejected",
     );
 }
+
+/// Regression test for [pnpm/pnpm#3960](https://github.com/pnpm/pnpm/issues/3960).
+#[test]
+fn unresolved_optional_dependency_is_satisfied_only_when_allowed() {
+    let root = tempdir().expect("create fixture directory");
+    fs::write(
+        root.path().join("package.json"),
+        r#"{"name":"root","dependencies":{"is-negative":"1.0.0"},"optionalDependencies":{"is-positive":"^30000.0.0"}}"#,
+    )
+    .expect("write manifest");
+    let manifest =
+        PackageManifest::from_path(root.path().join("package.json")).expect("read manifest");
+    let lockfile: Lockfile = serde_saphyr::from_str(
+        r"lockfileVersion: '9.0'
+importers:
+  .:
+    dependencies:
+      is-negative:
+        specifier: 1.0.0
+        version: 1.0.0
+",
+    )
+    .expect("parse lockfile");
+    let config = Config::new();
+    let ignored_optional_matcher = pnpm_matcher::create_matcher(&[]);
+    fn importer_check<'a>(
+        (lockfile, lockfile_dir, config): (&'a Lockfile, &'a std::path::Path, &'a Config),
+        manifest: &'a PackageManifest,
+        (ignored, frozen_lockfile): (&'a pnpm_matcher::Matcher, bool),
+    ) -> super::ImporterSatisfactionCheck<'a> {
+        super::ImporterSatisfactionCheck {
+            lockfile,
+            lockfile_dir,
+            manifest,
+            importer_id: ".",
+            config,
+            workspace: super::WorkspaceProjects {
+                packages: None,
+                manifests_by_dir: Box::leak(Box::default()),
+                directory_manifests: crate::install::DirectoryManifests::none(),
+                catalogs: Box::leak(Box::default()),
+                canonical_paths: Box::leak(Box::default()),
+                registries: Box::leak(Box::default()),
+            },
+            optional_exclusions: super::OptionalDependencyExclusions { ignored, frozen_lockfile },
+            parsed_overrides: None,
+        }
+    }
+    let fixture = (&lockfile, root.path(), &config);
+    let check = |manifest: &PackageManifest, frozen_lockfile: bool| {
+        super::check_importer_satisfies(&importer_check(
+            fixture,
+            manifest,
+            (&ignored_optional_matcher, frozen_lockfile),
+        ))
+    };
+
+    let error = check(&manifest, false).expect_err("a resolving install retries the optional");
+    assert!(
+        matches!(
+            &error,
+            super::FreshnessCheckError::Stale(pnpm_lockfile::StalenessReason::SpecifiersDiffer(
+                diff
+            )) if diff.added.contains_key("is-positive")
+        ),
+        "expected is-positive reported as added, got {error:?}",
+    );
+    let skipped = check(&manifest, true).expect("a frozen install skips the optional again");
+    assert_eq!(skipped, vec![("is-positive".to_string(), "^30000.0.0".to_string())]);
+
+    fs::write(
+        root.path().join("package.json"),
+        r#"{"name":"root","dependencies":{"is-negative":"1.0.0","is-odd":"1.0.0"},"optionalDependencies":{"is-positive":"^30000.0.0"}}"#,
+    )
+    .expect("write manifest with an added dependency");
+    let manifest =
+        PackageManifest::from_path(root.path().join("package.json")).expect("read manifest");
+    let error = check(&manifest, true).expect_err("an added regular dependency is still drift");
+    assert!(
+        matches!(
+            &error,
+            super::FreshnessCheckError::Stale(pnpm_lockfile::StalenessReason::SpecifiersDiffer(
+                diff
+            )) if diff.added.contains_key("is-odd") && !diff.added.contains_key("is-positive")
+        ),
+        "expected only is-odd reported as added, got {error:?}",
+    );
+}

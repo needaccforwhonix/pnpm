@@ -1,6 +1,12 @@
+use assert_cmd::cargo::CommandCargoExt;
 use command_extra::CommandExtra;
-use pnpm_testing_utils::bin::CommandTempCwd;
-use std::{fs, path::Path};
+use pnpm_store_dir::StoreDir;
+use pnpm_testing_utils::{bin::CommandTempCwd, command_env::CommandTestExt};
+use std::{
+    fs, io,
+    path::Path,
+    process::{Command, Stdio},
+};
 
 /// Create `dir/node_modules/<name>/package.json` so the directory
 /// looks like an installed package that `clean` must remove.
@@ -40,6 +46,29 @@ fn clean_removes_packages_and_pnpm_entries_but_preserves_non_pnpm_dotfiles() {
     // node_modules directory itself.
     assert!(node_modules.join(".cache").exists(), ".cache should be preserved");
     assert!(node_modules.exists(), "node_modules directory should remain");
+
+    drop(root);
+}
+
+/// `clean` announces each removal before making it, so a closed stdout
+/// must not stop it halfway (pnpm/tasks#132).
+#[test]
+fn clean_finishes_when_stdout_is_closed() {
+    let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+    let node_modules = workspace.join("node_modules");
+    seed_package(&node_modules, "lodash");
+    fs::write(workspace.join("pnpm-lock.yaml"), "").expect("write pnpm-lock.yaml");
+    let (stdout_reader, stdout_writer) = io::pipe().expect("create stdout pipe");
+    drop(stdout_reader);
+
+    let output = pacquet
+        .with_args(["clean", "--lockfile"])
+        .with_stdout(Stdio::from(stdout_writer))
+        .output()
+        .expect("run pacquet clean");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(!node_modules.join("lodash").exists(), "lodash package should be removed");
+    assert!(!workspace.join("pnpm-lock.yaml").exists(), "the lockfile should be removed");
 
     drop(root);
 }
@@ -134,6 +163,58 @@ fn clean_lockfile_removes_lockfile() {
     assert!(output.status.success(), "pacquet clean --lockfile should succeed");
 
     assert!(!lockfile.exists(), "pnpm-lock.yaml should be removed with --lockfile");
+
+    drop(root);
+}
+
+/// `pnpm ci` never removes the lockfile. `--lockfile` and
+/// `--config.lockfile=true` name the `lockfile` setting, so the install
+/// still runs frozen from the existing lockfile.
+#[test]
+fn ci_keeps_the_lockfile_when_the_lockfile_setting_is_given() {
+    let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+    let dependency = workspace.join("dependency");
+    fs::create_dir_all(&dependency).expect("create the local dependency");
+    fs::write(dependency.join("package.json"), r#"{"name":"local-dependency","version":"1.0.0"}"#)
+        .expect("write the local dependency manifest");
+    fs::write(
+        workspace.join("package.json"),
+        r#"{"dependencies":{"local-dependency":"file:dependency"}}"#,
+    )
+    .expect("write the project manifest");
+    let store_dir = root.path().join("store");
+    fs::write(
+        workspace.join("pnpm-workspace.yaml"),
+        format!("storeDir: {}\n", serde_json::to_string(&store_dir).expect("quote the store dir")),
+    )
+    .expect("write pnpm-workspace.yaml");
+    let output = pacquet
+        .with_args(["install"])
+        .output()
+        .expect("run pnpm install");
+    assert!(output.status.success(), "{output:?}");
+    let lockfile_path = workspace.join("pnpm-lock.yaml");
+    let lockfile = fs::read_to_string(&lockfile_path).expect("read the lockfile");
+
+    for flag in ["--lockfile", "--config.lockfile=true"] {
+        let output = Command::cargo_bin("pnpm")
+            .expect("find the pnpm binary")
+            .with_current_dir(&workspace)
+            .without_ambient_pnpm_config()
+            .with_args(["ci", flag])
+            .output()
+            .expect("run pnpm ci");
+        assert!(output.status.success(), "pnpm ci {flag} should succeed: {output:?}");
+        assert_eq!(
+            fs::read_to_string(&lockfile_path).expect("the lockfile must survive pnpm ci"),
+            lockfile,
+            "pnpm ci {flag} must leave the lockfile unchanged",
+        );
+        assert!(
+            workspace.join("node_modules/local-dependency/package.json").exists(),
+            "pnpm ci {flag} should install the dependency",
+        );
+    }
 
     drop(root);
 }
@@ -266,21 +347,97 @@ fn clean_works_in_a_workspace() {
     drop(root);
 }
 
+/// Under a global virtual store the custom directory is the shared store's
+/// root, and `clean` removes it too.
 #[test]
 fn clean_removes_custom_virtual_store_dir_inside_the_project() {
+    for global_virtual_store in [false, true] {
+        let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+
+        fs::write(
+            workspace.join("pnpm-workspace.yaml"),
+            format!(
+                "enableGlobalVirtualStore: {global_virtual_store}\nvirtualStoreDir: .pnpm-store\npackages:\n  - .\n",
+            ),
+        )
+        .expect("write pnpm-workspace.yaml");
+        fs::write(workspace.join("package.json"), "{}").expect("write root manifest");
+        let node_modules = workspace.join("node_modules");
+        fs::create_dir_all(&node_modules).expect("create node_modules");
+        seed_package(&node_modules, "lodash");
+        let virtual_store = workspace.join(".pnpm-store");
+        fs::create_dir_all(&virtual_store).expect("create custom virtual store");
+
+        let output = pacquet
+            .with_args(["clean"])
+            .output()
+            .expect("run pacquet clean");
+        assert!(output.status.success(), "pacquet clean should succeed");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("Removing .pnpm-store"),
+            "expected custom store removal (global virtual store: {global_virtual_store}): {stdout}",
+        );
+        assert!(!virtual_store.exists(), "custom virtual store should be removed");
+        assert!(!node_modules.join("lodash").exists(), "packages removed");
+
+        drop(root);
+    }
+}
+
+/// `globalVirtualStoreDir` names the shared store's root, with or without
+/// `virtualStoreDir`, so `clean` removes the store it names.
+#[test]
+fn clean_removes_the_configured_global_virtual_store_dir() {
+    for virtual_store_dir in ["", "virtualStoreDir: .unused-links\n"] {
+        let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+
+        fs::write(
+            workspace.join("pnpm-workspace.yaml"),
+            format!(
+                "enableGlobalVirtualStore: true\n{virtual_store_dir}globalVirtualStoreDir: .shared-links\npackages:\n  - .\n",
+            ),
+        )
+        .expect("write pnpm-workspace.yaml");
+        fs::write(workspace.join("package.json"), "{}").expect("write root manifest");
+        let unused_store = workspace.join(".unused-links");
+        let shared_store = workspace.join(".shared-links");
+        fs::create_dir_all(&unused_store).expect("create unused store");
+        fs::create_dir_all(&shared_store).expect("create shared store");
+
+        let output = pacquet
+            .with_args(["clean"])
+            .output()
+            .expect("run pacquet clean");
+        assert!(output.status.success(), "pacquet clean should succeed");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("Removing .shared-links"),
+            "expected shared store removal with {virtual_store_dir:?}: {stdout}",
+        );
+        assert!(!shared_store.exists(), "the shared store should be removed");
+        assert!(unused_store.exists(), "a directory pnpm did not populate should be kept");
+
+        drop(root);
+    }
+}
+
+/// The default global virtual store lives under the store directory, which
+/// `clean` leaves alone even when the store sits inside the project.
+#[test]
+fn clean_keeps_the_default_global_virtual_store_inside_the_project() {
     let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
 
     fs::write(
         workspace.join("pnpm-workspace.yaml"),
-        "virtualStoreDir: .pnpm-store\npackages:\n  - .\n",
+        "enableGlobalVirtualStore: true\nstoreDir: .pnpm-store\npackages:\n  - .\n",
     )
     .expect("write pnpm-workspace.yaml");
     fs::write(workspace.join("package.json"), "{}").expect("write root manifest");
-    let node_modules = workspace.join("node_modules");
-    fs::create_dir_all(&node_modules).expect("create node_modules");
-    seed_package(&node_modules, "lodash");
-    let virtual_store = workspace.join(".pnpm-store");
-    fs::create_dir_all(&virtual_store).expect("create custom virtual store");
+    let links = StoreDir::from(workspace.join(".pnpm-store")).links();
+    fs::create_dir_all(&links).expect("create the global virtual store");
 
     let output = pacquet
         .with_args(["clean"])
@@ -288,10 +445,64 @@ fn clean_removes_custom_virtual_store_dir_inside_the_project() {
         .expect("run pacquet clean");
     assert!(output.status.success(), "pacquet clean should succeed");
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Removing .pnpm-store"), "expected custom store removal: {stdout}");
-    assert!(!virtual_store.exists(), "custom virtual store should be removed");
-    assert!(!node_modules.join("lodash").exists(), "packages removed");
+    assert!(links.exists(), "the default global virtual store must be kept");
+
+    drop(root);
+}
+
+/// A store setting of `.` names the project itself, which `clean` never
+/// removes.
+#[test]
+fn clean_keeps_the_project_when_a_virtual_store_setting_names_it() {
+    for settings in [
+        "virtualStoreDir: .\n",
+        "enableGlobalVirtualStore: true\nvirtualStoreDir: .pnpm-store\nglobalVirtualStoreDir: .\n",
+    ] {
+        let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+
+        fs::write(workspace.join("pnpm-workspace.yaml"), format!("{settings}packages:\n  - .\n"))
+            .expect("write pnpm-workspace.yaml");
+        fs::write(workspace.join("package.json"), "{}").expect("write root manifest");
+
+        let output = pacquet
+            .with_args(["clean"])
+            .output()
+            .expect("run pacquet clean");
+        assert!(output.status.success(), "pacquet clean should succeed");
+
+        assert!(
+            workspace.join("package.json").exists(),
+            "the project must be kept with {settings:?}",
+        );
+
+        drop(root);
+    }
+}
+
+/// A store path that only looks contained, because it runs through a
+/// symlink pointing out of the project, is not removed.
+#[test]
+fn clean_does_not_follow_a_symlinked_parent_out_of_the_project() {
+    let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+
+    let outside = root.path().join("outside");
+    let outside_store = outside.join("store");
+    fs::create_dir_all(&outside_store).expect("create a directory outside the project");
+    pnpm_fs::symlink_dir(&outside, &workspace.join("escape")).expect("link out of the project");
+    fs::write(
+        workspace.join("pnpm-workspace.yaml"),
+        "virtualStoreDir: escape/store\npackages:\n  - .\n",
+    )
+    .expect("write pnpm-workspace.yaml");
+    fs::write(workspace.join("package.json"), "{}").expect("write root manifest");
+
+    let output = pacquet
+        .with_args(["clean"])
+        .output()
+        .expect("run pacquet clean");
+    assert!(output.status.success(), "pacquet clean should succeed");
+
+    assert!(outside_store.exists(), "a directory outside the project must be kept");
 
     drop(root);
 }

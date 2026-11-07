@@ -1,10 +1,10 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use pnpm_deps_path::DepPath;
 use pnpm_resolving_resolver_base::ResolveResult;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
-use crate::{resolve_peers::SharedChain, resolved_tree::PeerDep};
+use crate::{resolve_peers::SharedChain, resolved_tree::PeerSet};
 
 /// Post-peer-resolution graph keyed by depPath.
 ///
@@ -29,7 +29,6 @@ pub struct DependenciesGraphNode {
     /// mutates the inner `ResolveResult` after `resolve_peers`.
     pub resolve_result: std::sync::Arc<ResolveResult>,
     pub depth: i32,
-    pub installable: bool,
     /// `true` when this snapshot has zero unresolved + missing peers,
     /// i.e. its depPath equals its `pkgIdWithPatchHash`.
     pub is_pure: bool,
@@ -55,7 +54,7 @@ pub struct ResolvedDependencyEdges {
     /// snapshot whose synthetic manifest no longer carries an
     /// `optionalDependencies` block.
     pub optional_children: HashSet<String>,
-    pub peer_dependencies: BTreeMap<String, PeerDep>,
+    pub peer_set: PeerSet,
     /// Names of peers resolved from outside this node's own peer-deps —
     /// i.e. peers it inherited from its parents' context.
     pub transitive_peer_dependencies: HashSet<String>,
@@ -112,7 +111,7 @@ pub struct PeerDependencyIssue {
 /// record per occurrence; the names are cloned out only when a
 /// consumer materializes the chain via [`Self::to_refs`].
 #[derive(Default, Clone)]
-pub struct ParentChain(pub(crate) SharedChain<String>);
+pub struct ParentChain(pub(crate) SharedChain<Arc<str>>);
 
 impl ParentChain {
     /// Build a chain from names given root importer first.
@@ -120,7 +119,7 @@ impl ParentChain {
     pub fn from_names(names: impl IntoIterator<Item = String>) -> Self {
         let mut chain = SharedChain::default();
         for name in names {
-            chain = chain.pushed(name);
+            chain = chain.pushed(name.into());
         }
         ParentChain(chain)
     }
@@ -134,7 +133,7 @@ impl ParentChain {
         self.0
             .to_root_vec()
             .into_iter()
-            .map(|name| ParentPackageRef { name, version: String::new() })
+            .map(|name| ParentPackageRef { name: name.to_string(), version: String::new() })
             .collect()
     }
 }

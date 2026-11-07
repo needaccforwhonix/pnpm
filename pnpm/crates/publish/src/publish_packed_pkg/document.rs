@@ -113,16 +113,15 @@ fn attachment_object(tarball_data: &[u8]) -> Value {
 
 /// Clean a version string to `major.minor.patch` plus any prerelease,
 /// dropping build metadata.
-pub(super) fn clean_version(version: &str) -> Result<String, PublishPackedPkgError> {
+pub(crate) fn clean_version(version: &str) -> Result<String, PublishPackedPkgError> {
     let trimmed = version
         .trim()
         .trim_start_matches(['=', 'v']);
     let mut parsed = trimmed
         .parse::<node_semver::Version>()
         .map_err(|_| PublishPackedPkgError::BadSemver { version: version.to_owned() })?;
-    // The published version is `major.minor.patch` plus any prerelease but
-    // never build metadata. node_semver's `Display` appends `+build`, so drop
-    // it to keep the published version identical to what pnpm registers (e.g.
+    // node_semver's `Display` appends `+build`, so drop it to keep the
+    // published version identical to what pnpm registers (e.g.
     // `1.2.3+build` -> `1.2.3`).
     parsed.build.clear();
     Ok(parsed.to_string())

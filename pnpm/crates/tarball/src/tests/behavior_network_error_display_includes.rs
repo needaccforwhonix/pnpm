@@ -2,26 +2,26 @@ use super::{
     Arc, ArchiveStoreProjection, AuthHeaders, CafsFileInfo, Duration, FASTIFY_ERROR_INTEGRITY,
     FASTIFY_ERROR_TARBALL, HashMap, HttpStatusError, IngestTarballToStore, Integrity, MemCache,
     NetworkError, PackageFilesIndex, RetryOpts, SharedVerifiedFilesCache, SilentReporter,
-    StoreIndex, StoreIndexWriter, TarballError, ThrottledClient, VerifyChecksumError, assert_eq,
-    fast_fail_client, fast_retry_opts, fetch_and_extract_with_retry, gzipped_tar, integrity,
-    is_transient_error, seed_row_holding_another_package, store_index_cache_key, store_index_key,
-    tempdir, tempdir_with_leaked_path, test_retry_opts,
+    StoreIndex, StoreIndexWriter, TarballError, ThrottledClient, UNREACHABLE_URL,
+    VerifyChecksumError, assert_eq, fast_fail_client, fast_fail_client_with_connect_timeout,
+    fast_retry_opts, fetch_and_extract_with_retry, gzipped_tar, integrity, is_transient_error,
+    seed_row_holding_another_package, store_index_cache_key, store_index_key, store_paths, tempdir,
+    tempdir_with_leaked_path, test_retry_opts,
 };
 
 /// Pin `walk_reqwest_chain`'s contract: a `NetworkError` formed
 /// from a real reqwest connect failure must surface the leaf
 /// reason (e.g. `Connection refused`) appended to the wrapper
 /// message, not stop at reqwest's `error sending request for url
-/// (URL)`. Without the helper, the user sees only the wrapper —
-/// which is what triggered the original "what's actually failing?"
-/// debugging round on this branch.
+/// (URL)`. Without the helper, the user sees only the wrapper.
 ///
-/// Uses `127.0.0.1:1` and [`fast_fail_client`]'s 1 s bounds. A
-/// firewalled runner may time out instead of refusing the connection.
+/// Uses `127.0.0.1:1`, which Linux and macOS refuse at once. Windows
+/// and a firewalled runner report no refusal within the 100 ms connect
+/// bound, so they take the timeout branch instead of waiting it out.
 #[tokio::test]
 async fn network_error_display_includes_reqwest_inner_chain() {
     let url = "http://127.0.0.1:1/ssl-package.tgz";
-    let client = fast_fail_client();
+    let client = fast_fail_client_with_connect_timeout(Duration::from_millis(100));
     let err = client
         .acquire()
         .await
@@ -73,8 +73,8 @@ async fn network_error_display_includes_reqwest_inner_chain() {
 async fn packages_under_orgs_should_work() {
     let (store_dir, store_path) = tempdir_with_leaked_path();
     let cas_files = IngestTarballToStore {
-fetching: crate::ArchiveFetchOptions {http_client: &ThrottledClient::default(),auth_headers: &AuthHeaders::default(),retry_opts: test_retry_opts(),offline: false},
-package: crate::TarballPackage {integrity: Some(&integrity("sha512-dj7vjIn1Ar8sVXj2yAXiMNCJDmS9MQ9XMlIecX2dIzzhjSHCyKo4DdXjXMs7wKW2kj6yvVRSpuQjOZ3YLrh56w==")),unpacked_size: Some(16697),file_count: None,url: "https://registry.npmjs.org/@fastify/error/-/error-3.3.0.tgz",id: "@fastify/error@3.3.0"},
+fetching: crate::ArchiveFetchOptions {http_client: &ThrottledClient::default(),auth_headers: &AuthHeaders::default(),retry_opts: test_retry_opts(),offline: false, tar_limits: crate::TarLimits::default()},
+package: crate::TarballPackage {integrity_kind: crate::IntegrityKind::Resource,integrity: Some(&integrity("sha512-dj7vjIn1Ar8sVXj2yAXiMNCJDmS9MQ9XMlIecX2dIzzhjSHCyKo4DdXjXMs7wKW2kj6yvVRSpuQjOZ3YLrh56w==")),unpacked_size: Some(16697),file_count: None,url: "https://registry.npmjs.org/@fastify/error/-/error-3.3.0.tgz",id: "@fastify/error@3.3.0"},
 store: crate::ArchiveStoreContext {dir: store_path,index: None,index_writer: None,verify_integrity: true,strict_pkg_content_check: true,verified_files_cache: SharedVerifiedFilesCache::default(),prefetched_cas_paths: None},
 
 
@@ -148,12 +148,14 @@ async fn store_row_holding_another_package_fails_the_read() {
             auth_headers: &AuthHeaders::default(),
             retry_opts: test_retry_opts(),
             offline: false,
+            tar_limits: crate::TarLimits::default(),
         },
         package: crate::TarballPackage {
+            integrity_kind: crate::IntegrityKind::Resource,
             integrity: Some(&pkg_integrity),
             unpacked_size: None,
             file_count: None,
-            url: "http://127.0.0.1:1/unreachable.tgz",
+            url: UNREACHABLE_URL,
             id: pkg_id,
         },
         store: crate::ArchiveStoreContext {
@@ -260,15 +262,29 @@ fn package_projection_preserves_existing_store_index_keys() {
     );
 }
 
+/// <https://github.com/pnpm/pnpm/issues/15021>
 #[test]
-fn ordinary_package_projection_preserves_existing_mem_cache_keys() {
+fn mem_cache_keys_separate_two_integrities_pinned_to_one_url() {
     let package_url = "https://example.test/artifact.tgz";
+    let first = integrity("sha256-q80k8iD1xuGM3a48ipTFD+P7KQnhs4e5Blnos+dQpJM=");
+    let second = integrity("sha256-6WwHtTJTiQQcZeNSCPC+XaKFyZoF9DP1D0AhWvNdSFY=");
     let package = ArchiveStoreProjection::Package { append_manifest: None };
 
-    assert_eq!(package.mem_cache_key(package_url, false), package_url);
+    assert_ne!(
+        package.mem_cache_key(package_url, Some(&first), false),
+        package.mem_cache_key(package_url, Some(&second), false),
+    );
     assert_eq!(
-        package.mem_cache_key(package_url, true),
-        format!("revision-addressed:{package_url}"),
+        package.mem_cache_key(package_url, Some(&first), false),
+        package.mem_cache_key(package_url, Some(&first), false),
+    );
+    assert_ne!(
+        package.mem_cache_key(package_url, Some(&first), false),
+        package.mem_cache_key(package_url, None, false),
+    );
+    assert_ne!(
+        package.mem_cache_key(package_url, Some(&first), false),
+        package.mem_cache_key(package_url, Some(&first), true),
     );
 }
 
@@ -290,8 +306,10 @@ async fn mem_cache_partitions_raw_and_package_projections_in_both_orders() {
                 auth_headers: &auth_headers,
                 retry_opts: test_retry_opts(),
                 offline: true,
+                tar_limits: crate::TarLimits::default(),
             },
             package: crate::TarballPackage {
+                integrity_kind: crate::IntegrityKind::Resource,
                 integrity: None,
                 unpacked_size: None,
                 file_count: None,
@@ -368,8 +386,8 @@ async fn synthesized_projection_reuses_only_a_matching_legacy_row_offline() {
     );
     let manifest = br#"{"name":"artifact","version":"1.0.0"}"#;
     let readme = b"legacy runtime archive";
-    let (_, manifest_hash) = store_path.write_cas_file(manifest, false).unwrap();
-    let (_, readme_hash) = store_path.write_cas_file(readme, false).unwrap();
+    let manifest_hash = store_path.write_cas_file(manifest, false).unwrap().hash;
+    let readme_hash = store_path.write_cas_file(readme, false).unwrap().hash;
     let legacy_key = store_index_key(&package_integrity.to_string(), package_id);
     StoreIndex::open_in(store_path)
         .unwrap()
@@ -402,6 +420,7 @@ async fn synthesized_projection_reuses_only_a_matching_legacy_row_offline() {
                 ]),
                 side_effects: None,
                 remote_side_effects_quarantine: None,
+                tar_integrity: None,
             },
         )
         .unwrap();
@@ -415,8 +434,10 @@ async fn synthesized_projection_reuses_only_a_matching_legacy_row_offline() {
             auth_headers: &auth_headers,
             retry_opts: test_retry_opts(),
             offline: true,
+            tar_limits: crate::TarLimits::default(),
         },
         package: crate::TarballPackage {
+            integrity_kind: crate::IntegrityKind::Resource,
             integrity: Some(&package_integrity),
             unpacked_size: None,
             file_count: None,
@@ -463,7 +484,8 @@ async fn raw_archive_projection_skips_npm_identity_checks_on_store_hits() {
     let (store_dir, store_path) = tempdir_with_leaked_path();
     store_path.init().unwrap();
     let contents = b"raw artifact";
-    let (cas_path, file_hash) = store_path.write_cas_file(contents, false).unwrap();
+    let pnpm_store_dir::WrittenFile { file: cas_path, hash: file_hash, .. } =
+        store_path.write_cas_file(contents, false).unwrap();
     let integrity = integrity("sha256-q80k8iD1xuGM3a48ipTFD+P7KQnhs4e5Blnos+dQpJM=");
     let package_id = "crate:artifact@1.0.0";
     StoreIndex::open_in(store_path)
@@ -491,6 +513,7 @@ async fn raw_archive_projection_skips_npm_identity_checks_on_store_hits() {
                 )]),
                 side_effects: None,
                 remote_side_effects_quarantine: None,
+                tar_integrity: None,
             },
         )
         .unwrap();
@@ -501,8 +524,10 @@ async fn raw_archive_projection_skips_npm_identity_checks_on_store_hits() {
             auth_headers: &AuthHeaders::default(),
             retry_opts: test_retry_opts(),
             offline: true,
+            tar_limits: crate::TarLimits::default(),
         },
         package: crate::TarballPackage {
+            integrity_kind: crate::IntegrityKind::Resource,
             integrity: Some(&integrity),
             unpacked_size: None,
             file_count: None,
@@ -530,7 +555,7 @@ async fn raw_archive_projection_skips_npm_identity_checks_on_store_hits() {
     .await
     .expect("raw archive cache hits must not use npm package identity semantics");
 
-    assert_eq!(cas_paths, HashMap::from([("README.md".to_string(), cas_path)]));
+    assert_eq!(store_paths(&cas_paths), HashMap::from([("README.md", cas_path.path.as_path())]));
     drop(store_dir);
 }
 
@@ -555,8 +580,10 @@ async fn run_without_mem_cache_fetches_unverified_and_writes_no_index_row() {
             auth_headers: &AuthHeaders::default(),
             retry_opts: test_retry_opts(),
             offline: true,
+            tar_limits: crate::TarLimits::default(),
         },
         package: crate::TarballPackage {
+            integrity_kind: crate::IntegrityKind::Resource,
             integrity: None,
             unpacked_size: None,
             file_count: None,
@@ -620,8 +647,12 @@ async fn retries_then_succeeds_on_transient_5xx() {
     let (_integrity, cas_paths, _idx) = fetch_and_extract_with_retry::<SilentReporter>(
         &client,
         &url,
-        Some(&pkg_integrity),
+        &crate::archive_integrity::ArchiveVerification::new(
+            Some(&pkg_integrity),
+            crate::IntegrityKind::Resource,
+        ),
         None,
+        crate::TarLimits::default(),
         0,
         "test-pkg",
         "",
@@ -647,9 +678,9 @@ async fn revision_addressed_mem_cache_does_not_retry_a_failed_prefetch() {
     let (store_dir_keep, store_path) = tempdir_with_leaked_path();
     let mut server = mockito::Server::new_async().await;
     let digest = "A".repeat(86);
-    let path = format!("/-/tarballs/sha512/{digest}");
+    let path = "/test-pkg@1.0.0+r1";
     let mock = server
-        .mock("GET", path.as_str())
+        .mock("GET", path)
         .with_status(503)
         .expect(1)
         .create_async()
@@ -666,8 +697,10 @@ async fn revision_addressed_mem_cache_does_not_retry_a_failed_prefetch() {
             auth_headers: &auth_headers,
             retry_opts: test_retry_opts(),
             offline: false,
+            tar_limits: crate::TarLimits::default(),
         },
         package: crate::TarballPackage {
+            integrity_kind: crate::IntegrityKind::Resource,
             integrity: Some(&expected),
             unpacked_size: None,
             file_count: None,
@@ -718,11 +751,81 @@ async fn revision_addressed_mem_cache_does_not_retry_a_failed_prefetch() {
 }
 
 #[tokio::test]
+async fn mem_cache_spends_one_retry_budget_on_a_failing_archive() {
+    let (store_dir_keep, store_path) = tempdir_with_leaked_path();
+    let mut server = mockito::Server::new_async().await;
+    let path = "/test-pkg-1.0.0.tgz";
+    let retry_opts = fast_retry_opts();
+    let mock = server
+        .mock("GET", path)
+        .with_status(503)
+        .expect(usize::try_from(retry_opts.retries).unwrap() + 1)
+        .create_async()
+        .await;
+    let url = format!("{}{path}", server.url());
+    let expected = integrity(FASTIFY_ERROR_INTEGRITY);
+    let client = ThrottledClient::default();
+    let mem_cache = MemCache::default();
+    let auth_headers = AuthHeaders::default();
+    let verified_files_cache = SharedVerifiedFilesCache::default();
+    let download = || IngestTarballToStore {
+        fetching: crate::ArchiveFetchOptions {
+            http_client: &client,
+            auth_headers: &auth_headers,
+            retry_opts,
+            offline: false,
+            tar_limits: crate::TarLimits::default(),
+        },
+        package: crate::TarballPackage {
+            integrity_kind: crate::IntegrityKind::Resource,
+            integrity: Some(&expected),
+            unpacked_size: None,
+            file_count: None,
+            url: &url,
+            id: "test-pkg@1.0.0",
+        },
+        store: crate::ArchiveStoreContext {
+            dir: store_path,
+            index: None,
+            index_writer: None,
+            verify_integrity: true,
+            strict_pkg_content_check: true,
+            verified_files_cache: SharedVerifiedFilesCache::clone(&verified_files_cache),
+            prefetched_cas_paths: None,
+        },
+
+        requester: "",
+
+        ignore_file_pattern: None,
+
+        progress_reported: None,
+        store_projection: ArchiveStoreProjection::Package { append_manifest: None },
+    };
+
+    let (first, second) = futures_util::future::join(
+        download().run_with_mem_cache::<SilentReporter>(&mem_cache),
+        download().run_with_mem_cache::<SilentReporter>(&mem_cache),
+    )
+    .await;
+    let later = download().run_with_mem_cache::<SilentReporter>(&mem_cache).await;
+
+    for result in [first, second, later] {
+        let error = result.expect_err("every consumer must fail");
+        assert!(
+            error.to_string().contains("HTTP 503"),
+            "the owner's error must be reported; got {error}",
+        );
+    }
+    mock.assert_async().await;
+    drop(store_dir_keep);
+}
+
+#[tokio::test]
 async fn revision_addressed_mem_cache_does_not_reuse_a_redirect_permitting_fetch() {
     let (store_dir_keep, store_path) = tempdir_with_leaked_path();
     let mut server = mockito::Server::new_async().await;
     let redirect = server
-        .mock("GET", "/-/tarballs/sha512/digest")
+        .mock("GET", "/test-pkg@1.0.0+r1")
         .with_status(302)
         .with_header("location", "/redirected.tgz")
         .expect(2)
@@ -735,7 +838,7 @@ async fn revision_addressed_mem_cache_does_not_reuse_a_redirect_permitting_fetch
         .expect(1)
         .create_async()
         .await;
-    let url = format!("{}/-/tarballs/sha512/digest", server.url());
+    let url = format!("{}/test-pkg@1.0.0+r1", server.url());
     let expected = integrity(FASTIFY_ERROR_INTEGRITY);
     let client = ThrottledClient::default();
     let mem_cache = MemCache::default();
@@ -747,8 +850,10 @@ async fn revision_addressed_mem_cache_does_not_reuse_a_redirect_permitting_fetch
             auth_headers: &auth_headers,
             retry_opts: test_retry_opts(),
             offline: false,
+            tar_limits: crate::TarLimits::default(),
         },
         package: crate::TarballPackage {
+            integrity_kind: crate::IntegrityKind::Resource,
             integrity: Some(&expected),
             unpacked_size: None,
             file_count: None,
@@ -809,8 +914,12 @@ async fn fails_fast_on_404() {
     let err = fetch_and_extract_with_retry::<SilentReporter>(
         &client,
         &url,
-        Some(&pkg_integrity),
+        &crate::archive_integrity::ArchiveVerification::new(
+            Some(&pkg_integrity),
+            crate::IntegrityKind::Resource,
+        ),
         None,
+        crate::TarLimits::default(),
         0,
         "test-pkg",
         "",

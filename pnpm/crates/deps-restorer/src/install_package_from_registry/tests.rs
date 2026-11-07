@@ -14,7 +14,7 @@ use pnpm_resolving_npm_resolver::{
     shared_picked_manifest_cache,
 };
 use pnpm_resolving_resolver_base::{ResolveOptions, ResolveResult, Resolver, WantedDependency};
-use pnpm_store_dir::{SharedVerifiedFilesCache, StoreDir};
+use pnpm_store_dir::{SharedVerifiedFilesCache, StoreDir, StoreIndexFormat};
 use pnpm_testing_utils::registry::TestRegistry;
 use pretty_assertions::assert_eq;
 use std::{
@@ -31,8 +31,16 @@ fn create_config(
     cache_dir: &Path,
 ) -> Config {
     Config {
+        node_linker_excluded: Vec::new(),
+        prune_direct_dependencies: false,
+        tools: std::collections::BTreeMap::new(),
+        indexes_by_ecosystem: std::collections::BTreeMap::new(),
+        network_concurrency_by_registry: std::collections::BTreeMap::new(),
+        publish_branch: None,
         bail: true,
         ci: false,
+        source_date_epoch: None,
+        progress: true,
         update_notifier: true,
         color: Default::default(),
         embed_readme: false,
@@ -46,13 +54,18 @@ fn create_config(
         aggregate_output: false,
         reporter_hide_prefix: None,
         use_stderr: false,
+        git_tag_version: true,
         ignore_workspace: false,
+        workspace_search_skipped: false,
         workspace_package_patterns: None,
         shell_emulator: false,
         skip_manifest_obfuscation: false,
         sort: true,
         use_beta_cli: false,
+        loglevel: Default::default(),
+        reporter: Default::default(),
         workspace_key_issues: Default::default(),
+        npmrc_warnings: Vec::new(),
         versioning: Default::default(),
         hoist: false,
         hoist_pattern: None,
@@ -62,13 +75,24 @@ fn create_config(
         prefer_symlinked_executables: None,
         shamefully_hoist: false,
         store_dir: StoreDir::new(store_dir),
+        skip_store_dir_resolution: false,
+        settings_read: Default::default(),
+        store_dir_placement_skipped: false,
+        store_relocation: None,
         state_dir: store_dir.join("state"),
         modules_dir: modules_dir.to_path_buf(),
+        macos_backup: Default::default(),
+        workspace_includes: None,
+        boot_config: None,
+        boot_inherited: Default::default(),
+        boot_overrides: Default::default(),
         node_linker: Default::default(),
-        node_experimental_package_map: false,
+        node_package_map_mode: Default::default(),
         node_package_map_type: Default::default(),
         symlink: false,
-        virtual_store_dir: virtual_store_dir.to_path_buf(),
+        install_state_dir: virtual_store_dir.to_path_buf(),
+        configured_virtual_store_dir: None,
+        global_virtual_store_before_loaded: None,
         enable_global_virtual_store: false,
         global_shims: Default::default(),
         virtual_store_only: false,
@@ -89,6 +113,7 @@ fn create_config(
         optimistic_repeat_install: false,
         skip_runtimes: false,
         engine_strict: false,
+        force_ignores_platform: false,
         node_version: None,
         runtime_on_fail: None,
         node_download_mirrors: Default::default(),
@@ -99,9 +124,13 @@ fn create_config(
         merge_git_branch_lockfiles: false,
         merge_git_branch_lockfiles_branch_pattern: Vec::new(),
         git_branch_lockfile_name: None,
+        git_branch_lockfile_candidates: Vec::new(),
         offline: false,
         prefer_offline: false,
         lockfile_include_tarball_url: false,
+        symlinked_lockfile_target_dirs: Vec::new(),
+        lockfile_include_resolution_settings: false,
+        lockfile_integrity_target: pnpm_lockfile::IntegrityTarget::Resource,
         registry: "https://registry.npmjs.com/".to_string(),
         scope: None,
         registries_by_scope: Default::default(),
@@ -109,6 +138,7 @@ fn create_config(
         cargo: Default::default(),
         python: Default::default(),
         remote_side_effects_cache: None,
+        remote_cache: None,
         registries_by_prefix: Default::default(),
         registry_options_by_url: Default::default(),
         auto_install_peers: false,
@@ -122,11 +152,14 @@ fn create_config(
         prefer_workspace_packages: false,
         external_dependencies: Default::default(),
         dedupe_peer_dependents: false,
+        project_scoped_optional_peers: false,
         dedupe_peers: false,
+        auto_dedupe: false,
         dedupe_direct_deps: true,
         dedupe_injected_deps: false,
         strict_peer_dependencies: false,
         ignore_compatibility_db: false,
+        add_missing_peer_types: false,
         resolve_peers_from_workspace_root: false,
         block_exotic_subdeps: false,
         verify_store_integrity: true,
@@ -135,9 +168,12 @@ fn create_config(
         disallow_workspace_cycles: false,
         strict_store_pkg_content_check: true,
         frozen_store: false,
+        store_index_format: StoreIndexFormat::Sqlite,
         force: false,
+        isolate_local_directory_imports: false,
         side_effects_cache: true,
         side_effects_cache_readonly: false,
+        side_effects_cache_exclude: None,
         side_effects_cache_read_setting: None,
         side_effects_cache_write_setting: None,
         fetch_retries: 2,
@@ -149,9 +185,11 @@ fn create_config(
         fetch_timeout: 60_000,
         fetch_warn_timeout_ms: 10_000,
         fetch_min_speed_ki_bps: 50,
+        max_tarball_unpacked_size: pnpm_tarball::DEFAULT_MAX_TARBALL_UNPACKED_SIZE,
         user_agent: "pnpm".to_string(),
         npmrc_auth_file: None,
         workspace_dir: None,
+        target_workspace_dir: None,
         patched_dependencies: None,
         patched_dependency_hashes_override: None,
         patches_dir: None,
@@ -160,12 +198,17 @@ fn create_config(
         allow_unused_patches: false,
         config_dependencies: None,
         allow_builds: Default::default(),
+        allow_skills: Default::default(),
+        skills_dirs: Default::default(),
+        agent_skills_disabled: false,
         dangerously_allow_all_builds: false,
         strict_dep_builds: true,
         ignore_scripts: false,
         ignore_pnpmfile: false,
         git_checks: true,
-        scripts_prepend_node_path: Default::default(),
+        publish_wait_timeout: 0,
+        provenance: None,
+        tag_version_prefix: "v".to_string(),
         enable_pre_post_scripts: false,
         script_shell: None,
         node_options: None,
@@ -182,6 +225,7 @@ fn create_config(
         test_pattern: Vec::new(),
         legacy_dir_filtering: false,
         sync_injected_deps_after_scripts: Vec::new(),
+        required_scripts: Vec::new(),
         changed_files_ignore_pattern: Vec::new(),
         git_shallow_hosts: pnpm_config::default_git_shallow_hosts(),
         supported_architectures: None,
@@ -218,15 +262,18 @@ fn create_config(
         minimum_release_age_exclude_prune: false,
         catalogs: None,
         save_catalog_name: None,
+        tag: None,
         save_prefix: None,
         save_exact: false,
         save_peer: false,
+        save_types: false,
         registry_supports_time_field: false,
         allowed_deprecated_versions: Default::default(),
         update_config: Default::default(),
         tasks: Default::default(),
         pipelines: Default::default(),
         pipeline_base: Default::default(),
+        concurrency_groups: Default::default(),
         peer_dependency_rules: Default::default(),
         auth_headers: Default::default(),
         auth_tokens_by_uri: Default::default(),
@@ -237,6 +284,8 @@ fn create_config(
         tls_by_uri: Default::default(),
         package_manager_bootstrap: Default::default(),
         explicit_settings: Default::default(),
+        cli_settings: Default::default(),
+        cli: Default::default(),
         raw_auth_config: Default::default(),
         config_dir: None,
     }
@@ -253,7 +302,7 @@ async fn resolve_via_mock(
     registries.insert("default".to_string(), registry.to_string());
     let resolver = NpmResolver {
         registries,
-        registries_by_prefix: HashMap::new(),
+        declared_prefixes: pnpm_lockfile::DeclaredRegistryPrefixes::default(),
         metadata: pnpm_resolving_npm_resolver::RegistryMetadataClient {
             http_client,
             auth_headers: Default::default(),
@@ -267,12 +316,14 @@ async fn resolve_via_mock(
             full_metadata: false,
             needs_full_metadata_for: None,
             filter_metadata: false,
+            registry_options_by_url: std::sync::Arc::default(),
+            minimum_release_age: None,
         },
         cache_policy: pnpm_resolving_npm_resolver::MetadataCachePolicy {
-            offline: false,
-            prefer_offline: false,
+            network: pnpm_config::NetworkPolicy::Online,
             ignore_missing_time_field: true,
         },
+        store_view: None,
     };
     let wanted = WantedDependency {
         alias: Some(alias.to_string()),
@@ -300,7 +351,7 @@ pub async fn should_install_package_from_pre_resolved_result() {
         virtual_store_dir.path(),
         cache_dir.path(),
     );
-    config.registry = mock_instance.url();
+    config.registry = mock_instance.url().to_string();
     let config: &'static Config = config.pipe(Box::new).pipe(Box::leak);
 
     let http_client = Arc::new(ThrottledClient::new_for_installs());
@@ -391,7 +442,7 @@ async fn second_visit_skips_progress_emits_but_still_links() {
         virtual_store_dir.path(),
         cache_dir.path(),
     );
-    config.registry = mock_instance.url();
+    config.registry = mock_instance.url().to_string();
     let config: &'static Config = config.pipe(Box::new).pipe(Box::leak);
 
     let http_client = Arc::new(ThrottledClient::new_for_installs());
@@ -515,7 +566,7 @@ async fn install_emits_progress_sequence() {
         virtual_store_dir.path(),
         cache_dir.path(),
     );
-    config.registry = mock_instance.url();
+    config.registry = mock_instance.url().to_string();
     let config: &'static Config = config.pipe(Box::new).pipe(Box::leak);
 
     let http_client = Arc::new(ThrottledClient::new_for_installs());
@@ -638,6 +689,7 @@ async fn install_returns_unsupported_resolution_when_name_ver_missing() {
             latest: None,
             published_at: None,
             manifest: None,
+            non_deprecated_alternative: None,
         },
     };
 
@@ -724,6 +776,7 @@ async fn install_rejects_traversal_manifest_name() {
                 "name": traversal_name,
                 "version": "1.0.0",
             }))),
+            non_deprecated_alternative: None,
         },
     };
 

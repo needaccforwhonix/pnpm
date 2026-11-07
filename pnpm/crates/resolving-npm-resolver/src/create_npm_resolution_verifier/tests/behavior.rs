@@ -1,9 +1,10 @@
 use super::{
     FAKE_INTEGRITY, HashMap, LockfileResolution, PkgName, REVISION_ONE_DIGEST, REVISION_TWO_DIGEST,
-    RegistryResolution, ResolutionVerification, TarballResolution, TarballRevision, TrustPolicy,
-    Utc, abbreviated_packument_json, assert_eq, create_npm_resolution_verifier,
-    create_package_version_policy, ctx, default_opts, fake_integrity, min_age_packument_json,
-    now_at, registry_resolution, revision_integrity, tarball_resolution,
+    REVISION_ZERO_DIGEST, RegistryResolution, ResolutionVerification, TarballResolution,
+    TarballRevision, TrustPolicy, Utc, abbreviated_packument_json, assert_eq,
+    create_npm_resolution_verifier, create_package_version_policy, ctx, default_opts,
+    fake_integrity, min_age_packument_json, now_at, registry_resolution, revision_integrity,
+    tarball_resolution,
 };
 use pnpm_resolving_resolver_base::ResolutionVerifier;
 
@@ -19,7 +20,7 @@ fn does_not_verify_a_revision_without_an_active_policy() {
 }
 
 #[tokio::test]
-async fn rejects_an_explicit_zero_current_revision() {
+async fn rejects_a_current_revision_without_history() {
     let mut server = mockito::Server::new_async().await;
     let registry = format!("{}/", server.url());
     let packument = serde_json::json!({
@@ -30,8 +31,8 @@ async fn rejects_an_explicit_zero_current_revision() {
                 "name": "revision-pkg",
                 "version": "1.0.0",
                 "dist": {
-                    "integrity": revision_integrity(REVISION_ONE_DIGEST).to_string(),
-                    "tarball": format!("{registry}revision-pkg/-/revision-pkg-1.0.0.tgz"),
+                    "integrity": revision_integrity(REVISION_ZERO_DIGEST).to_string(),
+                    "tarball": format!("{registry}revision-pkg@1.0.0+r0"),
                     "revision": 0,
                 }
             }
@@ -47,16 +48,60 @@ async fn rejects_an_explicit_zero_current_revision() {
     let mut opts = default_opts(&registry);
     opts.release_age.minimum_minutes = Some(1);
     let verifier = create_npm_resolution_verifier(opts);
-    let resolution = tarball_resolution(
-        &format!("{registry}revision-pkg/-/revision-pkg-1.0.0.tgz"),
-        Some(fake_integrity()),
-    );
+    let resolution = LockfileResolution::Registry(RegistryResolution {
+        integrity: revision_integrity(REVISION_ZERO_DIGEST),
+        revision: Some(TarballRevision::try_from(0).unwrap()),
+    });
     let name = "revision-pkg".parse::<PkgName>().unwrap();
     let result = verifier.verify(&resolution, ctx(&name, "1.0.0")).await;
     let ResolutionVerification::Err { code, .. } = result else {
         panic!("expected Err, got {result:?}");
     };
     assert_eq!(code, "TARBALL_REVISION_MISMATCH");
+}
+
+#[tokio::test]
+async fn accepts_a_selected_revision_zero() {
+    let mut server = mockito::Server::new_async().await;
+    let registry = format!("{}/", server.url());
+    let original = serde_json::json!({
+        "revision": 0,
+        "integrity": revision_integrity(REVISION_ZERO_DIGEST).to_string(),
+        "tarball": format!("{registry}revision-pkg@1.0.0+r0"),
+        "manifest": {},
+    });
+    let packument = serde_json::json!({
+        "name": "revision-pkg",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "revision-pkg",
+                "version": "1.0.0",
+                "dist": {
+                    "integrity": original["integrity"],
+                    "tarball": original["tarball"],
+                    "revision": 0,
+                    "revisions": [original],
+                }
+            }
+        },
+        "time": { "1.0.0": "2020-01-01T00:00:00.000Z" }
+    });
+    server
+        .mock("GET", "/revision-pkg")
+        .with_status(200)
+        .with_body(packument.to_string())
+        .create_async()
+        .await;
+    let mut opts = default_opts(&registry);
+    opts.release_age.minimum_minutes = Some(1);
+    let verifier = create_npm_resolution_verifier(opts);
+    let resolution = LockfileResolution::Registry(RegistryResolution {
+        integrity: revision_integrity(REVISION_ZERO_DIGEST),
+        revision: Some(TarballRevision::try_from(0).unwrap()),
+    });
+    let name = "revision-pkg".parse::<PkgName>().unwrap();
+    assert_eq!(verifier.verify(&resolution, ctx(&name, "1.0.0")).await, ResolutionVerification::Ok);
 }
 
 #[tokio::test]
@@ -113,17 +158,22 @@ async fn accepts_an_advertised_historical_revision() {
                 "version": "1.0.0",
                 "dist": {
                     "integrity": revision_integrity(REVISION_TWO_DIGEST).to_string(),
-                    "tarball": format!("{registry}-/tarballs/sha512/{REVISION_TWO_DIGEST}"),
+                    "tarball": format!("{registry}revision-pkg@1.0.0+r2"),
                     "revision": 2,
                     "revisions": [{
+                        "revision": 0,
+                        "integrity": revision_integrity(REVISION_ZERO_DIGEST).to_string(),
+                        "tarball": format!("{registry}revision-pkg@1.0.0+r0"),
+                        "manifest": {},
+                    }, {
                         "revision": 1,
                         "integrity": revision_integrity(REVISION_ONE_DIGEST).to_string(),
-                        "tarball": format!("{registry}-/tarballs/sha512/{REVISION_ONE_DIGEST}"),
+                        "tarball": format!("{registry}revision-pkg@1.0.0+r1"),
                         "manifest": {},
                     }, {
                         "revision": 2,
                         "integrity": revision_integrity(REVISION_TWO_DIGEST).to_string(),
-                        "tarball": format!("{registry}-/tarballs/sha512/{REVISION_TWO_DIGEST}"),
+                        "tarball": format!("{registry}revision-pkg@1.0.0+r2"),
                         "manifest": {},
                     }],
                 }
@@ -418,4 +468,234 @@ async fn without_registry_supports_time_field_abbreviated_time_is_not_consulted(
     assert_eq!(result, ResolutionVerification::Ok);
     meta_mock.assert_async().await;
     attestation_mock.assert_async().await;
+}
+
+#[tokio::test]
+async fn verifies_tarball_routes_to_matching_configured_registry() {
+    let mut server = mockito::Server::new_async().await;
+    let server_url = server.url();
+    let packument = serde_json::json!({
+        "name": "unscoped-pkg",
+        "dist-tags": { "latest": "1.0.0" },
+        "time": { "1.0.0": "2020-01-01T00:00:00.000Z" },
+        "versions": {
+            "1.0.0": {
+                "name": "unscoped-pkg",
+                "version": "1.0.0",
+                "dist": {
+                    "integrity": FAKE_INTEGRITY,
+                    "shasum": "0000000000000000000000000000000000000000",
+                    "tarball": format!("{server_url}/unscoped-pkg/-/unscoped-pkg-1.0.0.tgz"),
+                }
+            }
+        }
+    });
+    let _mock = server
+        .mock("GET", "/unscoped-pkg")
+        .with_status(200)
+        .with_body(packument.to_string())
+        .expect(1)
+        .create_async()
+        .await;
+
+    let mut registries = HashMap::new();
+    // Default registry is bogus. If tarball routing fails to match the configured registry,
+    // it falls back to the bogus default and fails with a connection error.
+    registries.insert("default".to_string(), "http://nonexistent.example.invalid/".to_string());
+    registries.insert(
+        "@scoped".to_string(),
+        "http://scoped.nonexistent.example.invalid/".to_string(),
+    );
+    registries.insert("hosted".to_string(), format!("{server_url}/"));
+
+    let mut opts = default_opts("http://nonexistent.example.invalid/");
+    opts.registries = registries;
+    opts.release_age.minimum_minutes = Some(60 * 24);
+    opts.now = Some(now_at("2025-12-01T00:00:00Z"));
+    let verifier = create_npm_resolution_verifier(opts);
+
+    let tarball = LockfileResolution::Tarball(TarballResolution {
+        tarball: format!("{server_url}/unscoped-pkg/-/unscoped-pkg-1.0.0.tgz"),
+        integrity: Some(fake_integrity()),
+        revision: None,
+        git_hosted: None,
+        path: None,
+    });
+    let name: PkgName = "unscoped-pkg".parse().expect("parse");
+    let result = verifier.verify(&tarball, ctx(&name, "1.0.0")).await;
+    assert_eq!(result, ResolutionVerification::Ok);
+}
+
+#[tokio::test]
+async fn queries_private_scoped_registry_and_rejects_mismatched_default_registry_tarball() {
+    let mut server = mockito::Server::new_async().await;
+    let server_url = server.url();
+    let packument = serde_json::json!({
+        "name": "@private/pkg",
+        "dist-tags": { "latest": "1.0.0" },
+        "time": { "1.0.0": "2020-01-01T00:00:00.000Z" },
+        "versions": {
+            "1.0.0": {
+                "name": "@private/pkg",
+                "version": "1.0.0",
+                "dist": {
+                    "integrity": FAKE_INTEGRITY,
+                    "shasum": "0000000000000000000000000000000000000000",
+                    "tarball": format!("{server_url}/@private/pkg/-/pkg-1.0.0.tgz"),
+                }
+            }
+        }
+    });
+    let _mock = server
+        .mock("GET", "/@private%2Fpkg")
+        .with_status(200)
+        .with_body(packument.to_string())
+        .expect(1)
+        .create_async()
+        .await;
+
+    let mut registries = HashMap::new();
+    registries.insert("default".to_string(), "http://public.example.com/".to_string());
+    registries.insert("@private".to_string(), format!("{server_url}/"));
+
+    let mut opts = default_opts("http://public.example.com/");
+    opts.registries = registries;
+    opts.release_age.minimum_minutes = Some(60 * 24);
+    opts.now = Some(now_at("2025-12-01T00:00:00Z"));
+    let verifier = create_npm_resolution_verifier(opts);
+
+    // Lockfile tarball URL points to the default registry, not the private registry
+    let tarball = LockfileResolution::Tarball(TarballResolution {
+        tarball: "http://public.example.com/@private/pkg/-/pkg-1.0.0.tgz".to_string(),
+        integrity: Some(fake_integrity()),
+        revision: None,
+        git_hosted: None,
+        path: None,
+    });
+    let name: PkgName = "@private/pkg".parse().expect("parse");
+    let result = verifier.verify(&tarball, ctx(&name, "1.0.0")).await;
+    let ResolutionVerification::Err { code, .. } = result else {
+        panic!("expected Err, got {result:?}");
+    };
+    assert_eq!(code, "TARBALL_URL_MISMATCH");
+}
+
+#[tokio::test]
+async fn routes_to_more_specific_scoped_registry_when_broad_named_registry_contains_it() {
+    let mut server = mockito::Server::new_async().await;
+    let server_url = server.url();
+    let packument = serde_json::json!({
+        "name": "@corp/pkg",
+        "dist-tags": { "latest": "1.0.0" },
+        "time": { "1.0.0": "2020-01-01T00:00:00.000Z" },
+        "versions": {
+            "1.0.0": {
+                "name": "@corp/pkg",
+                "version": "1.0.0",
+                "dist": {
+                    "integrity": FAKE_INTEGRITY,
+                    "shasum": "0000000000000000000000000000000000000000",
+                    "tarball": format!("{server_url}/npm/corp/@corp/pkg/-/pkg-1.0.0.tgz"),
+                }
+            }
+        }
+    });
+    let _mock = server
+        .mock("GET", "/npm/corp/@corp%2Fpkg")
+        .with_status(200)
+        .with_body(packument.to_string())
+        .expect(1)
+        .create_async()
+        .await;
+
+    let mut registries = HashMap::new();
+    registries.insert("default".to_string(), "http://public.example.com/".to_string());
+    registries.insert("@corp".to_string(), format!("{server_url}/npm/corp/"));
+
+    let mut registries_by_prefix = HashMap::new();
+    registries_by_prefix.insert("broad".to_string(), format!("{server_url}/npm/"));
+
+    let mut opts = default_opts("http://public.example.com/");
+    opts.registries = registries;
+    opts.registries_by_prefix = registries_by_prefix;
+    opts.release_age.minimum_minutes = Some(60 * 24);
+    opts.now = Some(now_at("2025-12-01T00:00:00Z"));
+    let verifier = create_npm_resolution_verifier(opts);
+
+    let tarball = LockfileResolution::Tarball(TarballResolution {
+        tarball: format!("{server_url}/npm/corp/@corp/pkg/-/pkg-1.0.0.tgz"),
+        integrity: Some(fake_integrity()),
+        revision: None,
+        git_hosted: None,
+        path: None,
+    });
+    let name: PkgName = "@corp/pkg".parse().expect("parse");
+    let result = verifier.verify(&tarball, ctx(&name, "1.0.0")).await;
+    assert_eq!(result, ResolutionVerification::Ok);
+}
+
+#[tokio::test]
+async fn keeps_a_scope_routed_package_on_its_registry_when_the_tarball_points_at_another_scope() {
+    let mut server = mockito::Server::new_async().await;
+    let server_url = server.url();
+    let packument = |registry: &str| {
+        serde_json::json!({
+            "name": "@private/pkg",
+            "dist-tags": { "latest": "1.0.0" },
+            "time": { "1.0.0": "2020-01-01T00:00:00.000Z" },
+            "versions": {
+                "1.0.0": {
+                    "name": "@private/pkg",
+                    "version": "1.0.0",
+                    "dist": {
+                        "integrity": FAKE_INTEGRITY,
+                        "shasum": "0000000000000000000000000000000000000000",
+                        "tarball": format!("{server_url}/{registry}/@private/pkg/-/pkg-1.0.0.tgz"),
+                    }
+                }
+            }
+        })
+        .to_string()
+    };
+    let private_mock = server
+        .mock("GET", "/private/@private%2Fpkg")
+        .with_status(200)
+        .with_body(packument("private"))
+        .expect(1)
+        .create_async()
+        .await;
+    let proxy_mock = server
+        .mock("GET", "/proxy/@private%2Fpkg")
+        .with_status(200)
+        .with_body(packument("proxy"))
+        .expect(0)
+        .create_async()
+        .await;
+
+    let mut registries = HashMap::new();
+    registries.insert("default".to_string(), "http://public.example.com/".to_string());
+    registries.insert("@private".to_string(), format!("{server_url}/private/"));
+    registries.insert("@other".to_string(), format!("{server_url}/proxy/"));
+
+    let mut opts = default_opts("http://public.example.com/");
+    opts.registries = registries;
+    opts.release_age.minimum_minutes = Some(60 * 24);
+    opts.now = Some(now_at("2025-12-01T00:00:00Z"));
+    let verifier = create_npm_resolution_verifier(opts);
+
+    let tarball = LockfileResolution::Tarball(TarballResolution {
+        tarball: format!("{server_url}/proxy/@private/pkg/-/pkg-1.0.0.tgz"),
+        integrity: Some(fake_integrity()),
+        revision: None,
+        git_hosted: None,
+        path: None,
+    });
+    let name: PkgName = "@private/pkg".parse().expect("parse");
+    let result = verifier.verify(&tarball, ctx(&name, "1.0.0")).await;
+    let ResolutionVerification::Err { code, .. } = result else {
+        panic!("expected Err, got {result:?}");
+    };
+    assert_eq!(code, "TARBALL_URL_MISMATCH");
+    private_mock.assert_async().await;
+    proxy_mock.assert_async().await;
 }

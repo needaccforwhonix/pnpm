@@ -3,6 +3,7 @@ use super::{
     ReporterType, RunCtx, UpdateCheckPolicy, WatchInvocation, install_with_config,
     install_with_update_check, reporter_emit, run_pipeline, run_watch,
 };
+use crate::cli_args::reporter::selected_reporter;
 
 pub(in super::super) fn install_test<'a>(
     ctx: &RunCtx<'a>,
@@ -30,12 +31,12 @@ pub(in super::super) fn install_test<'a>(
     let dir = ctx.locations.dir;
     let recursive = ctx.workspace.recursive;
     let config = ctx.loaders.config;
-    let reporter = ctx.reporter;
 
     Ok(Box::pin(async move {
         install_future.await?;
 
         let cfg = config()?;
+        let reporter = selected_reporter();
         run_args.workspace.no_bail = !cfg.bail;
         run_args.workspace.sort = cfg.sort;
         run_args.workspace.reverse = cfg.reverse;
@@ -70,10 +71,10 @@ pub(in super::super) fn pipeline<'a>(
         Some(install_with_config(ctx, install_args, UpdateCheckPolicy::Skip)?)
     };
     let dir = ctx.locations.dir;
-    let reporter = ctx.reporter;
     let config = ctx.loaders.config;
     Ok(Box::pin(async move {
         let cfg = if let Some(install) = install_future { install.await? } else { config()? };
+        let reporter = selected_reporter();
         let outcome = run_pipeline(&invocation, cfg, dir, reporter)?;
         // The run is recorded before the failure exit is raised, so a red
         // run reaches the server too.
@@ -142,16 +143,17 @@ async fn report_pipeline_run(
             prefix: String::new(),
         }));
     };
-    let Some(server) = report_to.or(cfg.pnpr_server.as_deref()) else {
-        warn(
-            "--report is set but neither --report-to nor pnprServer names a server; the run was not published"
-                .to_string(),
-        );
-        return;
+    let (server, org) = match report_destination(cfg, report_to) {
+        Ok(destination) => destination,
+        Err(reason) => {
+            warn(format!("--report is set but {reason}; the run was not published"));
+            return;
+        }
     };
     let client = pnpm_pnpr_client::PnprClient::new(server);
     let authorization = cfg.auth_headers.for_secure_url(server);
     let request = pnpm_pnpr_client::PublishPipelineRunRequest {
+        org,
         workspace: upload.workspace,
         run_id: upload.run_id,
         summary: upload.summary,
@@ -161,11 +163,26 @@ async fn report_pipeline_run(
         Ok(()) => emit(&pnpm_reporter::LogEvent::Pnpm(pnpm_reporter::PnpmLog {
             level: pnpm_reporter::LogLevel::Info,
             message: format!(
-                "Run recorded on {server} as {}/{}",
-                request.workspace, request.run_id,
+                "Run recorded on {server} as {}/{}/{}",
+                request.org, request.workspace, request.run_id,
             ),
             prefix: String::new(),
         })),
         Err(error) => warn(format!("failed to publish the pipeline run to {server}: {error}")),
     }
+}
+
+/// The server and organization a run is reported to, or what is missing.
+fn report_destination<'a>(
+    cfg: &'a Config,
+    report_to: Option<&'a str>,
+) -> Result<(&'a str, String), &'static str> {
+    let server = report_to
+        .or(cfg.pnpr_server.as_deref())
+        .ok_or("neither --report-to nor pnprServer names a server")?;
+    let org = cfg
+        .remote_cache_settings()
+        .org
+        .ok_or("remoteCache.org does not name the organization to record the run under")?;
+    Ok((server, org))
 }

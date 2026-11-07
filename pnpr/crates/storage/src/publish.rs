@@ -9,72 +9,27 @@
 //! it inside [`tokio::task::spawn_blocking`] without blocking the
 //! async runtime, and so these helpers stay easy to unit-test.
 
-use crate::{
-    journal::DocumentMerge,
-    streaming::{integrity_checker, parse_integrity},
-};
+pub mod sigstore;
+pub use attachment::{AttachmentPayload, PendingAttachment, extract_attachments};
+pub use sigstore::{extract_predicate_type, sigstore_bundle_bytes, write_sigstore_bundle};
+pub use time::{iso_from_unix_millis, now_iso};
+
+mod time;
+
+mod attachment;
+
+use crate::streaming::{integrity_checker, parse_integrity};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64, read::DecoderReader};
 use pnpr_error::{RegistryError, Result};
 use serde_json::{Map, Value};
 use ssri::{Algorithm, Integrity, IntegrityChecker, IntegrityOpts};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::BTreeMap,
     fmt::Write as FmtWrite,
     fs::File,
     io::{Cursor, Read, Write},
     path::Path,
 };
-
-/// Per-tarball metadata pulled out of an `_attachments` entry. We
-/// hold the base64 payload as an owned `String` rather than decoding
-/// it eagerly — the streaming write path consumes it directly and
-/// the decoded bytes never have to live in memory.
-#[derive(Debug)]
-pub struct PendingAttachment {
-    pub filename: String,
-    /// Base64-encoded tarball, taken verbatim from the publish body.
-    pub data: String,
-    /// `_attachments.<filename>.length` — the declared byte count of
-    /// the *decoded* tarball, used to catch truncated uploads.
-    pub declared_length: Option<u64>,
-}
-
-/// Pull all `_attachments` out of a publish body. Returns one
-/// [`PendingAttachment`] per entry and removes the `_attachments`
-/// field from `body` so the saved packument doesn't duplicate the
-/// on-disk tarball. Base64 decoding is deferred to the streaming
-/// write path; this function just validates shape.
-pub fn extract_attachments(body: &mut Value) -> Result<Vec<PendingAttachment>, RegistryError> {
-    let Some(obj) = body.as_object_mut() else {
-        return Ok(Vec::new());
-    };
-    let Some(attachments_value) = obj.remove("_attachments") else {
-        return Ok(Vec::new());
-    };
-    let Value::Object(attachments) = attachments_value else {
-        return Err(RegistryError::BadRequest {
-            reason: "_attachments must be an object".to_string(),
-        });
-    };
-    let mut out = Vec::with_capacity(attachments.len());
-    for (filename, value) in attachments {
-        let Value::Object(mut value_obj) = value else {
-            return Err(RegistryError::InvalidAttachment {
-                filename,
-                reason: "expected object".to_string(),
-            });
-        };
-        let Some(Value::String(data)) = value_obj.remove("data") else {
-            return Err(RegistryError::InvalidAttachment {
-                filename,
-                reason: "missing string field `data`".to_string(),
-            });
-        };
-        let declared_length = value_obj.get("length").and_then(Value::as_u64);
-        out.push(PendingAttachment { filename, data, declared_length });
-    }
-    Ok(out)
-}
 
 /// Stream-decode a base64 attachment, hash it as it flows by, and
 /// write the bytes to `dest`. Fails fast (and leaves no on-disk
@@ -102,8 +57,22 @@ pub fn stream_decode_verify_and_write(
     dist: Option<&Value>,
     dest: &Path,
 ) -> Result<u64, RegistryError> {
+    let decoder = DecoderReader::new(Cursor::new(base64_data.as_bytes()), &BASE64);
+    verify_and_write(filename, decoder, declared_length, dist, dest)
+}
+
+/// [`stream_decode_verify_and_write`] for bytes that are not base64-encoded,
+/// such as an archive staged before the commit: hash `bytes` as they are
+/// written to `dest` and verify them against the packument's `dist`.
+pub fn verify_and_write(
+    filename: &str,
+    bytes: impl Read,
+    declared_length: Option<u64>,
+    dist: Option<&Value>,
+    dest: &Path,
+) -> Result<u64, RegistryError> {
     let expected = ExpectedAttachment::from_dist(filename, dist, declared_length)?;
-    let written = decode_and_write(base64_data, dest, &expected);
+    let written = decode_and_write(bytes, dest, &expected);
     if written.is_err() {
         // A partial or mismatched decode leaves nothing publishable behind.
         let _ = std::fs::remove_file(dest);
@@ -180,10 +149,10 @@ impl<'a> ExpectedAttachment<'a> {
     }
 }
 
-/// Decode the base64 attachment straight to `dest`, hashing as it goes, and
-/// verify what landed. The bytes are never held in memory whole.
+/// Decode the attachment straight to `dest`, hashing as it goes, and verify
+/// what landed. The bytes are never held in memory whole.
 fn decode_and_write(
-    base64_data: &str,
+    mut decoder: impl Read,
     dest: &Path,
     expected: &ExpectedAttachment<'_>,
 ) -> Result<u64, RegistryError> {
@@ -193,7 +162,6 @@ fn decode_and_write(
         .is_some()
         .then(|| IntegrityOpts::new().algorithm(Algorithm::Sha1));
 
-    let mut decoder = DecoderReader::new(Cursor::new(base64_data.as_bytes()), &BASE64);
     let mut file = File::create(dest).map_err(RegistryError::Io)?;
     const CHUNK_BYTES: usize = 64 * 1024;
     let mut buf = vec![0u8; CHUNK_BYTES];
@@ -254,6 +222,8 @@ fn sha1_hex_from_integrity_opts(opts: IntegrityOpts) -> String {
 /// * `dist-tags` — union, new body overrides on key collision.
 /// * `time` — union, new entries override on key collision.
 ///   `time.modified` is always bumped to "now".
+pub const PACKUMENT_FORMAT_VERSION: u32 = 1;
+
 /// * Other top-level keys (`description`, `readme`, `maintainers`,
 ///   `users`, etc.) come from the new body when present, falling
 ///   back to the existing packument otherwise.
@@ -273,6 +243,8 @@ pub fn merge_manifest(
             merge_manifest_field(&mut out, key, value, hosted);
         }
     }
+
+    out.insert("formatVersion".to_string(), Value::from(PACKUMENT_FORMAT_VERSION));
 
     stamp_time_entries(&mut out, now_iso);
 
@@ -345,18 +317,6 @@ fn merge_objects(existing: Option<&Value>, incoming: &Value) -> Value {
     Value::Object(merged)
 }
 
-/// Merge the `versions` map onto the seed `existing`. A version that is
-/// already **hosted** is immutable except for its `deprecated` flag: the
-/// hosted manifest is kept and only `deprecated` is applied from the body
-/// (set it, or remove it for undeprecate), so `dist`, `dependencies`, `bin`,
-/// `engines` and every other resolution-relevant field stay as published. A
-/// malformed incoming entry for a hosted version is ignored. Any other
-/// version — brand-new, or one that exists only upstream in the seed — is
-/// taken from the body, so its manifest matches the tarball being published.
-///
-/// Immutability keys off `hosted` (the locally hosted packument), not the
-/// seed: `existing` may be the upstream packument, and upstream versions are
-/// not immutable here — a first local publish of one must win.
 /// Merge one top-level packument field into the document being written.
 fn merge_manifest_field(
     out: &mut Map<String, Value>,
@@ -367,6 +327,13 @@ fn merge_manifest_field(
     let merged = match key.as_str() {
         "versions" => merge_versions(out.get(key), value, hosted),
         "dist-tags" | "time" => merge_objects(out.get(key), value),
+        "maintainers" => {
+            if let Some(existing) = hosted.and_then(|h| h.get("maintainers")) {
+                existing.clone()
+            } else {
+                value.clone()
+            }
+        }
         // Already stripped by extract_attachments; if it slips through
         // somehow, drop it so we don't persist base64 blobs alongside the
         // packument.
@@ -398,6 +365,18 @@ fn stamp_time_entries(out: &mut Map<String, Value>, now_iso: &str) {
     }
 }
 
+/// Merge the `versions` map onto the seed `existing`. A version that is
+/// already **hosted** is immutable except for its `deprecated` flag: the
+/// hosted manifest is kept and only `deprecated` is applied from the body
+/// (set it, or remove it for undeprecate), so `dist`, `dependencies`, `bin`,
+/// `engines` and every other resolution-relevant field stay as published. A
+/// malformed incoming entry for a hosted version is ignored. Any other
+/// version — brand-new, or one that exists only upstream in the seed — is
+/// taken from the body, so its manifest matches the tarball being published.
+///
+/// Immutability keys off `hosted` (the locally hosted packument), not the
+/// seed: `existing` may be the upstream packument, and upstream versions are
+/// not immutable here — a first local publish of one must win.
 fn merge_versions(existing: Option<&Value>, incoming: &Value, hosted: Option<&Value>) -> Value {
     let hosted_versions = hosted
         .and_then(|h| h.get("versions"))
@@ -418,12 +397,25 @@ fn merge_versions(existing: Option<&Value>, incoming: &Value, hosted: Option<&Va
                 // Malformed incoming entry for a hosted version: keep the
                 // hosted manifest rather than overwrite it with junk.
                 (Some(hosted_manifest), None) => Value::Object(hosted_manifest.clone()),
-                _ => manifest.clone(),
+                (None, Some(incoming_manifest)) => {
+                    Value::Object(without_dist_pnpr(incoming_manifest))
+                }
+                (None, None) => manifest.clone(),
             };
             merged.insert(version.clone(), entry);
         }
     }
     Value::Object(merged)
+}
+
+/// Strip any publisher-supplied `dist.pnpr`: `pnpr` overlays are derived from
+/// the verified tarball and never trusted from a publish body.
+fn without_dist_pnpr(manifest: &Map<String, Value>) -> Map<String, Value> {
+    let mut cleaned = manifest.clone();
+    if let Some(dist) = cleaned.get_mut("dist").and_then(Value::as_object_mut) {
+        dist.remove("pnpr");
+    }
+    cleaned
 }
 
 /// The hosted manifest with only its deprecation taken from the incoming one.
@@ -439,103 +431,6 @@ fn with_incoming_deprecation(
         None => updated.remove("deprecated"),
     };
     updated
-}
-
-/// The npm half of the journal's [`crate::journal::HostedDocuments`]: merge a
-/// journaled packument into the packument the store holds, minus the versions
-/// whose tarball the transaction lost. Publishing and startup recovery both
-/// land here, so a re-applied transaction adds its versions to whatever was
-/// published in the meantime instead of erasing it.
-pub fn merge_journaled_packument(merge: &DocumentMerge<'_>) -> Result<Option<Vec<u8>>> {
-    let mut journaled: Value = serde_json::from_slice(merge.journaled)?;
-    if !merge.lost_blobs.is_empty() {
-        let lost_versions = merge.lost_blobs
-            .iter()
-            .map(|filename| merge.name.parse_tarball_name(filename).map(|(_, version)| version))
-            .collect::<Result<HashSet<String>>>()?;
-        drop_lost_versions(&mut journaled, &lost_versions);
-    }
-    let existing: Option<Value> = match merge.existing {
-        Some(bytes) => Some(serde_json::from_slice(bytes)?),
-        None => None,
-    };
-    let merged = merge_manifest(existing.as_ref(), &journaled, existing.as_ref(), &now_iso());
-    Ok(Some(serde_json::to_vec_pretty(&merged)?))
-}
-
-/// Drop from a journaled packument every version the transaction could not
-/// place: one whose tarball slot another writer already owned, or that could
-/// not reserve a bounded digest-reference slot. The journal keeps each staged
-/// attachment's canonical filename, so callers resolve that name to the
-/// version before reaching this helper instead of trusting a publisher-
-/// supplied `dist.tarball` URL as the transaction identity.
-fn drop_lost_versions(journaled: &mut Value, lost: &HashSet<String>) {
-    let Some(versions) = journaled.get_mut("versions").and_then(Value::as_object_mut) else {
-        return;
-    };
-    let mut removed_versions = HashSet::new();
-    versions.retain(|version, _| {
-        let keep = !lost.contains(version);
-        if !keep {
-            removed_versions.insert(version.clone());
-        }
-        keep
-    });
-
-    if let Some(tags) = journaled.get_mut("dist-tags").and_then(Value::as_object_mut) {
-        tags.retain(|_, version| {
-            version
-                .as_str()
-                .is_none_or(|version| !removed_versions.contains(version))
-        });
-    }
-    if let Some(time) = journaled.get_mut("time").and_then(Value::as_object_mut) {
-        time.retain(|version, _| !removed_versions.contains(version));
-    }
-}
-
-/// Format the current time as an ISO-8601 / RFC-3339 string with
-/// millisecond precision (e.g. `2025-01-02T03:04:05.678Z`). Matches
-/// the shape npm and verdaccio use in `time.modified`.
-#[must_use]
-pub fn now_iso() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let since_epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-    iso_from_unix_millis(since_epoch.as_millis() as i64)
-}
-
-/// Format a unix-millis timestamp as an ISO-8601 / RFC-3339 string
-/// with millisecond precision. The token-listing endpoint surfaces
-/// `TokenRecord::created_at` (seconds since epoch) through this same
-/// helper so both `time.modified` on packuments and `created` on
-/// tokens render with identical shape.
-#[must_use]
-pub fn iso_from_unix_millis(millis: i64) -> String {
-    // Civil-time conversion without pulling in `chrono`.
-    // 86_400_000 ms in a day.
-    let (days, ms_in_day) = (millis / 86_400_000, millis.rem_euclid(86_400_000));
-    let (h, rem) = (ms_in_day / 3_600_000, ms_in_day.rem_euclid(3_600_000));
-    let (m, rem) = (rem / 60_000, rem.rem_euclid(60_000));
-    let (s, ms) = (rem / 1000, rem.rem_euclid(1000));
-    let (year, month, day) = civil_from_days(days);
-    format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}.{ms:03}Z")
-}
-
-/// Days since 1970-01-01 → year/month/day. Howard Hinnant's
-/// algorithm, adapted to integer days from epoch. Shift so era
-/// is positive (`719_468` = days from 0000-03-01 to 1970-01-01).
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let epoch_days = days + 719_468;
-    let era = epoch_days.div_euclid(146_097);
-    let doe = epoch_days.rem_euclid(146_097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let year = i64::from(yoe) + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if month <= 2 { year + 1 } else { year };
-    (year, month, day)
 }
 
 #[cfg(test)]

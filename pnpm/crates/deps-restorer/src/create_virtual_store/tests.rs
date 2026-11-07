@@ -1,10 +1,20 @@
+mod cas_paths;
+
+mod dir_clone;
+
 mod integrity;
+
+mod slot_reuse;
 
 mod store;
 
 mod installation;
 
+mod optional_progress;
+
 mod reporting;
+
+mod loaded_prefetch;
 
 use super::CreateVirtualStore;
 use pnpm_lockfile::{
@@ -13,6 +23,22 @@ use pnpm_lockfile::{
 };
 use pnpm_reporter::SilentReporter;
 use std::{collections::HashMap, fs, sync::atomic::AtomicU8};
+
+thread_local! {
+    static PREFETCH_STARTS: std::cell::RefCell<Vec<Vec<String>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Called by [`super::CasPrefetch::start`]. Per thread, so a test on a
+/// current-thread runtime sees only its own prefetches.
+pub(super) fn record_prefetch_start(keys: &[String]) {
+    PREFETCH_STARTS.with_borrow_mut(|starts| starts.push(keys.to_vec()));
+}
+
+/// The store-index keys of every prefetch this thread started.
+fn take_prefetch_starts() -> Vec<Vec<String>> {
+    PREFETCH_STARTS.take()
+}
 
 fn name(text: &str) -> PkgName {
     PkgName::parse(text).expect("parse pkg name")
@@ -103,7 +129,7 @@ impl SeededStoreInstall {
         config.registry = "https://registry.test".to_string();
         config.store_dir = root.path().join("store").into();
         config.modules_dir = modules_dir.clone();
-        config.virtual_store_dir = modules_dir.join(".pacquet");
+        config.install_state_dir = modules_dir.join(".pacquet");
         config.enable_global_virtual_store = true;
         config.global_virtual_store_dir = root.path().join("links");
         config.package_import_method = PackageImportMethod::Copy;
@@ -116,8 +142,10 @@ impl SeededStoreInstall {
             ("package.json", br#"{"name":"seeded","version":"1.0.0"}"#.as_slice()),
             ("index.js", b"module.exports = true\n".as_slice()),
         ] {
-            let (blob, digest) =
-                config.store_dir.write_cas_file(content, false).expect("write package file");
+            let pnpm_store_dir::WrittenFile { file: blob, hash: digest, .. } = config
+                .store_dir
+                .write_cas_file(content, false)
+                .expect("write package file");
             if path == "index.js" {
                 body_blob = Some(blob);
             }
@@ -132,8 +160,8 @@ impl SeededStoreInstall {
             );
         }
         let side_effects = build_output.map(|content| {
-            let (_, digest) =
-                config.store_dir.write_cas_file(content, false).expect("write build output");
+            let digest =
+                config.store_dir.write_cas_file(content, false).expect("write build output").hash;
             let added = HashMap::from([(
                 "build/output.js".to_string(),
                 CafsFileInfo {
@@ -160,6 +188,7 @@ impl SeededStoreInstall {
                     files,
                     side_effects,
                     remote_side_effects_quarantine: None,
+                    tar_integrity: None,
                 },
             )
             .expect("seed store index");
@@ -174,7 +203,7 @@ impl SeededStoreInstall {
                 metadata_with_integrity(DUMMY_SHA512),
             )]),
             package_key,
-            body_blob: body_blob.expect("index.js blob"),
+            body_blob: body_blob.expect("index.js blob").path,
         }
     }
 
@@ -214,8 +243,19 @@ impl SeededStoreInstall {
                 skipped: &skipped,
                 include_optional: true,
                 supported_architectures: None,
+                platform_lockfile: None,
+                known_requires_build: None,
+                known_bins: None,
             },
             ctx: &crate::InstallContext {
+                caches: crate::InstallCaches {
+                    logged_methods: &logged_methods,
+                    swap_lock: None,
+                    git_source_cache: &pnpm_git_fetcher::GitSourceCache::default(),
+                    materialized_graph: std::sync::Arc::default(),
+                    dir_clone_cache: None,
+                },
+
                 linker: crate::ModuleLinkerContext {
                     layout: &layout,
                     kind: NodeLinker::Isolated,
@@ -226,9 +266,6 @@ impl SeededStoreInstall {
                 requester: &requester,
 
                 allow_build_policy: &allow_build_policy,
-
-                logged_methods: &logged_methods,
-                git_source_cache: &pnpm_git_fetcher::GitSourceCache::default(),
             },
 
             entries: LockfileEntries {
@@ -236,6 +273,7 @@ impl SeededStoreInstall {
                 snapshots: Some(&self.snapshots),
             },
             current_entries: LockfileEntries::default(),
+            importers: &HashMap::new(),
 
             dir_clone_cache: None,
 
@@ -337,7 +375,7 @@ fn gvs_layout(
 ) -> crate::VirtualStoreLayout {
     let mut config = pnpm_config::Config::new();
     config.enable_global_virtual_store = true;
-    config.virtual_store_dir = std::path::PathBuf::from("/tmp/proj/node_modules/.pnpm");
+    config.install_state_dir = std::path::PathBuf::from("/tmp/proj/node_modules/.pnpm");
     config.global_virtual_store_dir = std::path::PathBuf::from("/tmp/store/links");
     let config = config.leak();
     crate::VirtualStoreLayout::new(
@@ -372,11 +410,17 @@ fn directory_metadata(directory: &str) -> PackageMetadata {
 fn slot_link<'a>(
     snapshot_key: &'a PackageKey,
     snapshot: &'a SnapshotEntry,
-    cas_paths: &'a HashMap<String, std::path::PathBuf>,
+    cas_paths: &'a pnpm_fs::CasPaths,
     removed_aliases: &'a [PkgName],
 ) -> crate::create_virtual_store::slot_linking::SlotLink<'a> {
     crate::create_virtual_store::slot_linking::SlotLink {
-        source: crate::SlotImportSource { is_mutable: true, force: false, build_marker: None },
+        source: crate::SlotImportSource {
+            is_mutable: true,
+            source_exists: true,
+            force: false,
+            build_marker: None,
+            needs_build: false,
+        },
         snapshot_key,
         snapshot,
         cas_paths,

@@ -1,7 +1,13 @@
-pub(crate) use configuration::{apply_install_cli_config, derive_config_root};
-pub(crate) use install::InstallPipeline;
+pub(crate) use configuration::{
+    apply_install_cli_config, derive_config_root, record_no_runtime_flag, warn_about_config_root,
+};
+pub(in crate::cli_args) use install::run_dedicated_lockfile_workspace_install;
+pub(crate) use install::{InstallPipeline, ensure_project_manifest};
 pub(crate) use maintenance::{DedupePipeline, PrunePipeline};
 pub(crate) use mutation::{AddPipeline, DeployPipeline, RemovePipeline, UpdatePipeline};
+pub(crate) use selection::{WorkspaceScope, select_workspace_projects};
+
+use selection::{InstallFamily, select_install_family, select_install_family_plan};
 
 use super::{
     add::AddArgs,
@@ -10,10 +16,7 @@ use super::{
     install::{InstallArgs, resolve_bool_override},
     package_manager::read_manifest_json,
     prune::PruneArgs,
-    recursive::{
-        AutoExcludeRoot, discover_workspace_projects, filtered_projects_dependencies,
-        select_recursive_projects,
-    },
+    recursive::{discover_workspace_projects, filtered_projects_dependencies},
     remove::RemoveArgs,
     update::UpdateArgs,
     update_changeset::UpdateChangesetContext,
@@ -25,12 +28,11 @@ use crate::{
         legacy_pnpm_field::warn_ignored_pnpm_manifest_fields,
         override_version_references::warn_deprecated_override_version_references,
         reporter::{ReporterType, reporter_emit},
-        yarn_workspaces_field::warn_unsupported_workspaces_field,
     },
     config_deps, ecosystem_add, ecosystem_install,
+    package_specifier::EcosystemPackageSpecifier,
+    state::check_root_project_engine,
 };
-use configuration::apply_runtime_on_fail;
-
 use indexmap::IndexMap;
 
 use install::init_shared_state;
@@ -38,15 +40,14 @@ use install::init_shared_state;
 use miette::Context;
 
 use pnpm_config::{Config, Host};
+use pnpm_injected_deps_syncer::{
+    CopyFiles, injected_source_dirs, sync_injected_deps_of_modules_dir,
+};
 use pnpm_network::ThrottledClient;
 use pnpm_package_manager::{PathNode, graph_sequencer};
-use pnpm_reporter::{LogEvent, LogLevel, Reporter, ScopeLog};
-use pnpm_workspace_task_scheduler::{
-    ScheduleGraphAsyncOptions, TaskCompletion, schedule_graph_async,
-};
+use pnpm_reporter::Reporter;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    future::Future,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -95,7 +96,34 @@ pub(crate) enum InstallFamilyPlan {
     /// each installed independently against its own `pnpm-lock.yaml`,
     /// `node_modules`, and virtual store. Dependency-ready projects run under
     /// the workspace-concurrency limit.
-    PerProject(DedicatedProjects),
+    PerProject(Box<DedicatedProjects>),
+}
+
+#[derive(Clone, Copy)]
+enum RuntimePolicy {
+    Config(bool),
+}
+
+async fn prepare_root_config<Reporter>(
+    (manifest_path, config, config_root): (&Path, &mut Config, &Path),
+    (frozen_lockfile, runtime_policy): (bool, RuntimePolicy),
+) -> miette::Result<()>
+where
+    Reporter: self::Reporter,
+{
+    if matches!(runtime_policy, RuntimePolicy::Config(true)) {
+        configuration::record_no_runtime_flag(config);
+    }
+    let may_update_config = config_deps::may_update_config(config, config_root);
+    let has_config_dependencies = config.config_dependencies
+        .as_ref()
+        .is_some_and(|dependencies| !dependencies.is_empty());
+    if !may_update_config && !has_config_dependencies && config.engine_strict {
+        check_root_project_engine(manifest_path, config, Reporter::emit)?;
+    }
+    config_deps::prepare::<Reporter>(config, config_root, frozen_lockfile).await?;
+    check_root_project_engine(manifest_path, config, Reporter::emit)?;
+    Ok(())
 }
 
 /// The projects of a `sharedWorkspaceLockfile: false` workspace that a
@@ -107,17 +135,60 @@ pub(crate) struct DedicatedProjects {
     /// from the manifests the selection already parsed. Empty when the
     /// setting is unset, which is the only thing the names feed.
     names: HashMap<PathBuf, String>,
+    /// Whether the selection is every workspace project, so that the run
+    /// leaves no project's lockfile behind its manifest.
+    covers_workspace: bool,
+    /// The sources whose injected copies are synced once every project ran
+    /// its lifecycle scripts, taken from the manifests read before they ran.
+    injected_source_dirs: HashSet<PathBuf>,
+    /// The projects a pipelined run may start ahead of the workspace
+    /// projects they depend on. See [`pipelined_runs::early_starts`].
+    early_starts: HashSet<PathBuf>,
+    /// Every workspace project, as the command discovered them.
+    workspace: pnpm_package_manager::DiscoveredWorkspace,
 }
 
 impl DedicatedProjects {
     fn new(config: &Config, selection: InstallFamilySelection) -> Self {
         let names = project_names(config, &selection.projects);
-        DedicatedProjects { dependencies: selection.project_dependencies, names }
+        let normalized_root = pnpm_fs::lexical_normalize(&selection.workspace_root);
+        let root_is_project =
+            pnpm_package_manifest::project_manifest_path(&normalized_root).is_file();
+        let covers_workspace = selection.projects
+            .iter()
+            .all(|project| selection.selected_dirs.contains(&project.root_dir))
+            && (!root_is_project
+                || selection.selected_dirs
+                    .iter()
+                    .any(|dir| pnpm_fs::lexical_normalize(dir) == normalized_root));
+        let injected_source_dirs = injected_source_dirs(
+            selection.projects
+                .iter()
+                .filter(|project| selection.project_dependencies.contains_key(&project.root_dir))
+                .map(|project| (project.root_dir.as_path(), Some(project.manifest.value()))),
+        );
+        let early_starts = pipelined_runs::early_starts(config, &selection.projects);
+        DedicatedProjects {
+            dependencies: selection.project_dependencies,
+            names,
+            covers_workspace,
+            injected_source_dirs,
+            early_starts,
+            workspace: pnpm_package_manager::DiscoveredWorkspace::new(selection.projects),
+        }
     }
 
     fn is_empty(&self) -> bool {
         self.dependencies.is_empty()
     }
+}
+
+/// The declared `"name"` of a workspace project, when it is a string.
+pub(crate) fn project_manifest_name(project: &pnpm_workspace::Project) -> Option<&str> {
+    project.manifest
+        .value()
+        .get("name")?
+        .as_str()
 }
 
 /// The declared name of every project that declares one, keyed by its
@@ -133,10 +204,7 @@ pub(crate) fn project_names(
     projects
         .iter()
         .filter_map(|project| {
-            let name = project.manifest
-                .value()
-                .get("name")?
-                .as_str()?;
+            let name = project_manifest_name(project)?;
             Some((project.root_dir.clone(), name.to_string()))
         })
         .collect()
@@ -155,171 +223,72 @@ struct DedicatedProjectRuns<'a> {
     projects: DedicatedProjects,
     require_lockfile: bool,
     http_client: Option<Arc<ThrottledClient>>,
+    /// Whether the command may write the workspace manifest, so that the
+    /// exclude-list prune each project's install skipped runs once all of
+    /// them succeeded and they cover the workspace. See
+    /// [`prune_after_dedicated_installs`].
+    prune_excludes: bool,
+    /// Whether the command installs the projects' dependencies, so that
+    /// their injected copies are synced once all of them ran. See
+    /// [`sync_dedicated_injected_deps`].
+    sync_injected_deps: bool,
+    /// Whether the projects run pipelined: each resolves and materializes
+    /// without waiting for the workspace projects it depends on, and waits
+    /// for them only before it links its dependencies and runs its scripts.
+    /// Only an install, which changes no manifest, runs pipelined, so its
+    /// projects also read [`DedicatedProjects::workspace`] instead
+    /// of walking the workspace each.
+    pipelined: bool,
 }
 
-impl DedicatedProjectRuns<'_> {
-    async fn run<Runner, RunFuture>(self, run: Runner) -> miette::Result<()>
-    where
-        Runner: Fn(State) -> RunFuture + Sync,
-        RunFuture: Future<Output = miette::Result<()>> + Send,
-    {
-        let first_error: std::sync::Mutex<Option<miette::Report>> = std::sync::Mutex::new(None);
-        let config = self.config;
-        let require_lockfile = self.require_lockfile;
-        let http_client = self.http_client;
-        let names = &self.projects.names;
-        let run = &run;
-        let run_node = |project_dir: PathBuf| {
-            let first_error = &first_error;
-            let http_client = http_client.as_ref().map(Arc::clone);
-            async move {
-                let result = match init_dedicated_project_state(
-                    config,
-                    &project_dir,
-                    names.get(&project_dir).map(String::as_str),
-                    require_lockfile,
-                    http_client,
-                ) {
-                    Ok(state) => run(state).await,
-                    Err(error) => Err(error),
-                };
-                record_dedicated_result(first_error, result)
-            }
-        };
-        let on_node_skipped: fn(&PathBuf) = |_| {};
-        schedule_graph_async(
-            &self.projects.dependencies,
-            &ScheduleGraphAsyncOptions::new(
-                usize::try_from(self.config.workspace_concurrency).unwrap_or(usize::MAX).max(1),
-                self.config.bail,
-                &run_node,
-                &on_node_skipped,
-            )
-            .continue_on_failure(!self.config.bail),
-        )
-        .await;
-        first_error
-            .into_inner()
-            .expect("dedicated install error lock is not poisoned")
-            .map_or(Ok(()), Err)
-    }
-}
-
-fn select_install_family_plan<Reporter: self::Reporter>(
-    cfg: &Config,
-    prefix: &Path,
-    manifest_path: &Path,
-    recursive_sort: bool,
-    auto_exclude_root: bool,
-    precompute_workspace_cycles: bool,
-) -> miette::Result<InstallFamilyPlan> {
-    let Some(selection) = select_workspace_projects_with_cycles(
-        cfg,
-        prefix,
-        manifest_path,
-        recursive_sort,
-        auto_exclude_root,
-        precompute_workspace_cycles,
-    )?
-    else {
-        return Ok(InstallFamilyPlan::Single);
+/// The `minimumReleaseAgeExcludePrune` / `trustPolicyExcludePrune` pass
+/// of a `sharedWorkspaceLockfile: false` workspace. Each project's install
+/// skips it because its own lockfile cannot prove what a sibling resolves,
+/// so it runs once here, after a run that installed every project. A
+/// filtered run skips it: an unselected project's lockfile may lag behind
+/// its manifest.
+fn prune_after_dedicated_installs(config: &Config) -> miette::Result<()> {
+    let Some(workspace_dir) = config.workspace_dir.as_deref() else {
+        return Ok(());
     };
-    // Report what the `--filter` / `-r` selection resolved to, so the user
-    // can confirm it before the install acts on it. Emitted once here for
-    // every plan shape below — a `PerProject` plan installs each selected
-    // project separately, and those child installs must not each report
-    // the workspace again. The unnarrowed install reports its own scope
-    // from inside the installer, where the workspace walk it already does
-    // supplies the count.
-    Reporter::emit(&LogEvent::Scope(ScopeLog {
-        level: LogLevel::Debug,
-        selected: selection.selected_dirs.len(),
-        total: Some(selection.projects.len()),
-        workspace_prefix: Some(selection.workspace_root.to_string_lossy().into_owned()),
-    }));
-    if !cfg.shares_one_lockfile() {
-        return Ok(InstallFamilyPlan::PerProject(DedicatedProjects::new(cfg, selection)));
-    }
-    Ok(InstallFamilyPlan::Shared(Box::new(selection)))
+    pnpm_package_manager::prune_against_project_lockfiles(config, workspace_dir)
+        .wrap_err("prune the workspace manifest")
 }
 
-pub(crate) fn select_workspace_projects(
-    cfg: &Config,
-    prefix: &Path,
-    manifest_path: &Path,
-    recursive_sort: bool,
-    auto_exclude_root: bool,
-) -> miette::Result<Option<InstallFamilySelection>> {
-    select_workspace_projects_with_cycles(
-        cfg,
-        prefix,
-        manifest_path,
-        recursive_sort,
-        auto_exclude_root,
-        false,
-    )
-}
-
-fn select_workspace_projects_with_cycles(
-    cfg: &Config,
-    prefix: &Path,
-    manifest_path: &Path,
-    recursive_sort: bool,
-    auto_exclude_root: bool,
-    precompute_workspace_cycles: bool,
-) -> miette::Result<Option<InstallFamilySelection>> {
-    if !cfg.recursive {
-        return Ok(None);
+/// With a shared lockfile, an injected workspace project is synced into its
+/// copies after its own lifecycle scripts run. With a lockfile per project,
+/// every project is installed on its own, so the copies that `project_dirs`
+/// hold of each other are synced once all of them ran their scripts.
+fn sync_dedicated_injected_deps(
+    config: &Config,
+    project_dirs: &[PathBuf],
+    sync: &DedicatedSync<'_>,
+) -> miette::Result<()> {
+    if config.ignore_scripts || config.virtual_store_only {
+        return Ok(());
     }
-
-    let workspace_root = cfg.workspace_dir.clone().unwrap_or_else(|| prefix.to_path_buf());
-    let (mut projects, workspace_patterns) = discover_workspace_projects(&workspace_root, cfg)?;
-    apply_runtime_on_fail(cfg, &mut projects);
-    let (project_dependencies, ordered_dirs, selected_dirs, workspace_cycles) = {
-        let selection = select_recursive_projects(
-            &projects,
-            cfg,
-            prefix,
-            if auto_exclude_root {
-                AutoExcludeRoot::Enabled { workspace_patterns: workspace_patterns.as_deref() }
-            } else {
-                AutoExcludeRoot::Disabled
-            },
+    for project_dir in project_dirs {
+        let modules_dir = config.project_modules_dir(
+            project_dir,
+            sync.names.get(project_dir).map(String::as_str),
+        );
+        sync_injected_deps_of_modules_dir(
+            project_dir,
+            &modules_dir,
+            sync.source_dirs,
+            CopyFiles::from_deploy_all_files(config.deploy_all_files),
         )?;
-        let workspace_cycles =
-            precomputed_workspace_cycles(&selection, cfg, precompute_workspace_cycles);
-        let project_dependencies = project_dependencies(&selection, recursive_sort);
-        let ordered_dirs = sequence_project_dependencies(&project_dependencies);
-        let selected_dirs = selected_project_dirs(&selection);
-        (project_dependencies, ordered_dirs, selected_dirs, workspace_cycles)
-    };
-
-    let active_dir = manifest_path.parent().expect("manifest path always has a parent dir");
-    let active_manifest_is_standin =
-        configuration::active_manifest_is_standin(active_dir, &projects)?;
-    let install_dirs = install_dirs(&selected_dirs, &projects, &workspace_root);
-
-    Ok(Some(InstallFamilySelection {
-        workspace_root,
-        projects,
-        project_dependencies,
-        ordered_dirs,
-        selected_dirs,
-        install_dirs: Arc::new(install_dirs),
-        active_manifest_is_standin,
-        workspace_cycles,
-    }))
+    }
+    Ok(())
 }
 
-fn selected_project_dirs(
-    selection: &crate::cli_args::recursive::RecursiveSelection<'_>,
-) -> Arc<HashSet<PathBuf>> {
-    Arc::new(
-        selection.selected
-            .keys()
-            .cloned()
-            .collect(),
-    )
+/// What [`sync_dedicated_injected_deps`] needs to know about the projects
+/// beyond their directories.
+struct DedicatedSync<'a> {
+    /// See [`DedicatedProjects::names`].
+    names: &'a HashMap<PathBuf, String>,
+    /// See [`injected_source_dirs`].
+    source_dirs: &'a HashSet<PathBuf>,
 }
 
 /// The selection in build order. Sequenced over borrowed paths: cloning a
@@ -351,24 +320,6 @@ fn sequence_project_dependencies(
     .collect()
 }
 
-/// The selected projects plus the workspace root project, when the
-/// workspace root is a project.
-fn install_dirs(
-    selected_dirs: &HashSet<PathBuf>,
-    projects: &[pnpm_workspace::Project],
-    workspace_root: &Path,
-) -> HashSet<PathBuf> {
-    let normalized_workspace_root = pnpm_fs::lexical_normalize(workspace_root);
-    let mut install_dirs = selected_dirs.clone();
-    if let Some(workspace_root_project) = projects
-        .iter()
-        .find(|project| pnpm_fs::lexical_normalize(&project.root_dir) == normalized_workspace_root)
-    {
-        install_dirs.insert(workspace_root_project.root_dir.clone());
-    }
-    install_dirs
-}
-
 /// The edges the sequencer orders the selection by. Without `--sort`
 /// there are none, and the projects run in directory order.
 fn project_dependencies(
@@ -393,40 +344,7 @@ fn project_dependencies(
         .collect()
 }
 
-/// Build the project-anchored `State` for one project of a
-/// `sharedWorkspaceLockfile: false` workspace: clone `cfg`, re-anchor its
-/// output paths and per-project settings under `project_dir` via
-/// [`Config::anchor_dedicated_project`], and initialize the state. The
-/// clone is leaked because [`State::init`] needs a `&'static Config`; see
-/// [`run_dedicated_lockfile_workspace_install`](install::run_dedicated_lockfile_workspace_install) for why the bounded leak
-/// is acceptable.
-fn init_dedicated_project_state(
-    cfg: &Config,
-    project_dir: &Path,
-    project_name: Option<&str>,
-    require_lockfile: bool,
-    http_client: Option<Arc<ThrottledClient>>,
-) -> miette::Result<State> {
-    let mut project_config = cfg.clone();
-    project_config.anchor_dedicated_project(project_dir, project_name);
-    let project_config = Config::leak(project_config);
-    let manifest_path = project_dir.join("package.json");
-    match http_client {
-        Some(http_client) => {
-            let lockfile = State::lazy_lockfile(project_config, &manifest_path, require_lockfile);
-            State::init_with_lockfile_and_http_client(
-                manifest_path,
-                project_config,
-                lockfile,
-                http_client,
-            )
-        }
-        None => State::init(manifest_path, project_config, require_lockfile),
-    }
-    .wrap_err_with(|| format!("initialize the state for {}", project_dir.display()))
-}
-
-fn anchor_active_project(cfg: &mut Config, manifest_path: &Path) {
+pub(in crate::cli_args) fn anchor_active_project(cfg: &mut Config, manifest_path: &Path) {
     let manifest_dir = manifest_path
         .parent()
         .expect("manifest path always has a parent dir")
@@ -435,20 +353,24 @@ fn anchor_active_project(cfg: &mut Config, manifest_path: &Path) {
     cfg.anchor_dedicated_project(&manifest_dir, name.as_deref());
 }
 
-fn record_dedicated_result(
-    first_error: &std::sync::Mutex<Option<miette::Report>>,
-    result: miette::Result<()>,
-) -> TaskCompletion {
-    match result {
-        Ok(()) => TaskCompletion::Passed,
-        Err(error) => {
-            first_error
-                .lock()
-                .expect("dedicated install error lock is not poisoned")
-                .get_or_insert(error);
-            TaskCompletion::Failed
-        }
+/// The config through which a command finds the installed packages of the
+/// active project. In a workspace whose projects keep their own lockfiles,
+/// those are in the active project's modules directory, not the workspace
+/// root's.
+pub(in crate::cli_args) fn installed_project_config(
+    config: &'static Config,
+    manifest_path: &Path,
+) -> &'static Config {
+    if !keeps_project_lockfiles(config) {
+        return config;
     }
+    let mut config = config.clone();
+    anchor_active_project(&mut config, manifest_path);
+    Config::leak(config)
+}
+
+pub(in crate::cli_args) fn keeps_project_lockfiles(config: &Config) -> bool {
+    !config.shares_one_lockfile() && config.workspace_dir.is_some()
 }
 
 fn precomputed_workspace_cycles(
@@ -461,7 +383,11 @@ fn precomputed_workspace_cycles(
     )
 }
 
+mod dedicated_runs;
 mod install;
+mod nested_workspace_manifests;
+mod pipelined_runs;
+mod selection;
 
 mod mutation;
 

@@ -1,6 +1,6 @@
-pub use workspace::{
-    CatalogMode, LinkWorkspacePackages, PackageImportMethod, ResolutionMode, SaveWorkspaceProtocol,
-};
+pub use workspace::{CatalogMode, PackageImportMethod, ResolutionMode};
+
+pub use pnpm_resolving_resolver_base::{LinkWorkspacePackages, SaveWorkspaceProtocol, TrustPolicy};
 
 use super::{Deserialize, Serialize};
 
@@ -12,6 +12,27 @@ pub enum ColorMode {
     #[default]
     Auto,
     Never,
+}
+
+/// Accepted values of pnpm's `loglevel` setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LogLevel {
+    Silent,
+    Error,
+    Warn,
+    Info,
+    Debug,
+}
+
+/// Accepted values of pnpm's `reporter` setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReporterType {
+    Default,
+    AppendOnly,
+    Ndjson,
+    Silent,
 }
 
 impl<'de> Deserialize<'de> for ColorMode {
@@ -90,6 +111,40 @@ pub enum NodeLinker {
     /// Yarn Berry. It is recommended to also set symlink setting to false when using pnp as
     /// your linker.
     Pnp,
+    Loaded,
+}
+
+/// What an install does with `node_modules/.package-map.json`
+/// (`nodePackageMap.mode`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NodePackageMapMode {
+    /// No map is written, and an install removes one an earlier install left.
+    #[default]
+    Off,
+    /// The map is written for other tools; Node does not load it.
+    WriteOnly,
+    /// The map is written and Node loads it in pnpm-managed scripts through
+    /// `--experimental-package-map`.
+    Load,
+}
+
+impl NodePackageMapMode {
+    /// The mode the deprecated boolean `nodeExperimentalPackageMap` selects.
+    #[must_use]
+    pub fn from_experimental_flag(enabled: bool) -> Self {
+        if enabled { Self::Load } else { Self::Off }
+    }
+
+    #[must_use]
+    pub fn writes(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    #[must_use]
+    pub fn loads(self) -> bool {
+        matches!(self, Self::Load)
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,17 +159,13 @@ pub enum NodePackageMapType {
 /// `nodeLinker: hoisted`, mirroring yarn's `nmHoistingLimits`.
 ///
 /// Given workspace package `A` → `B` → `C`:
-/// - [`HoistingLimits::None`] (default): hoist as far as possible
+/// - [`HoistingLimits::None`]: hoist as far as possible
 ///   (`/node_modules/B`, `/node_modules/C`).
 /// - [`HoistingLimits::Workspaces`]: hoist only as far as each
 ///   workspace package (`/packages/A/node_modules/{B,C}`).
 /// - [`HoistingLimits::Dependencies`]: hoist only up to each
 ///   workspace package's direct dependencies
 ///   (`/packages/A/node_modules/B/node_modules/C`).
-///
-/// No effect under `nodeLinker: isolated`. The user-facing mode is
-/// translated into the per-locator border map the hoister consumes
-/// by `crate::get_hoisting_limits` in `pnpm-package-manager`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HoistingLimits {
@@ -124,31 +175,12 @@ pub enum HoistingLimits {
     Dependencies,
 }
 
-/// Supply-chain trust policy applied to lockfile entries.
-///
-/// The setting is `'no-downgrade' | 'off'` and drives the
-/// `pnpm-resolving-npm-resolver` verifier: under
-/// [`TrustPolicy::NoDowngrade`] the verifier rejects any version
-/// whose trust evidence (`_npmUser.trustedPublisher` or
-/// `dist.attestations.provenance`) is weaker than an earlier-published
-/// version's. Defaults to [`TrustPolicy::Off`] so installs without an
-/// explicit policy don't change behavior.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum TrustPolicy {
-    #[default]
-    Off,
-    NoDowngrade,
-}
-
 /// What to do when the project's `packageManager` /
 /// `devEngines.packageManager` field doesn't match the running pnpm.
 ///
 /// The setting is `'download' | 'error' | 'warn' | 'ignore'`. `download`
 /// switches to the pinned version, `error` aborts, `warn` prints a
-/// warning, and `ignore` skips the check entirely. The documented
-/// default is `download`, so [`Config::pm_on_fail`](crate::settings::Config::pm_on_fail) stays optional and the
-/// package-manager check applies the fallback when the setting is unset.
+/// warning, and `ignore` skips the check entirely.
 ///
 /// `pnpm with current <cmd>` runs `<cmd>` with `pmOnFail` forced to
 /// [`PmOnFail::Ignore`] via the `pnpm_config_pm_on_fail` env var.
@@ -215,8 +247,7 @@ impl RuntimeOnFail {
 /// What `pnpm run` / `pnpm exec` do when `node_modules` is out of sync
 /// with the lockfile before running a script.
 ///
-/// The setting is `'install' | 'warn' | 'error' | 'prompt' | false`
-/// (default `'install'`, pnpm's `'verify-deps-before-run': 'install'`).
+/// The setting is `'install' | 'warn' | 'error' | 'prompt' | false`.
 /// pnpm's rc type also admits a bare boolean: `true` runs the check but
 /// takes none of the four actions on an out-of-sync verdict, so it is
 /// modeled explicitly rather than mapped to an action.
@@ -328,75 +359,6 @@ pub struct AuditConfig {
     /// GHSA identifiers that `pnpm audit` should suppress in the rendered
     /// report.
     pub ignore_ghsas: Vec<String>,
-}
-
-/// Tri-state mirror of `pnpm_executor::ScriptsPrependNodePath`
-/// with serde wiring. The executor crate keeps its own enum free of
-/// serde so config concerns don't leak into the spawn-path. Converted
-/// at the `BuildModules` call site (see `install_frozen_lockfile.rs`)
-/// via an explicit `match`; no `From` impl exists because neither
-/// crate depends on the other, and adding such a dep just for the
-/// conversion would invert the layering. Both enums share the same
-/// three variants so the match is exhaustive and one-line per arm.
-///
-/// Deserializes the `scriptsPrependNodePath: boolean | 'warn-only'`
-/// yaml shape.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum ScriptsPrependNodePath {
-    /// `scriptsPrependNodePath: true` — always prepend.
-    Always,
-    /// `scriptsPrependNodePath: false` (or absent) — never prepend.
-    #[default]
-    Never,
-    /// `scriptsPrependNodePath: 'warn-only'` — emit a warning if the
-    /// node in PATH differs from the running interpreter, do not
-    /// prepend.
-    WarnOnly,
-}
-
-impl serde::Serialize for ScriptsPrependNodePath {
-    fn serialize<Ser: serde::Serializer>(&self, serializer: Ser) -> Result<Ser::Ok, Ser::Error> {
-        match self {
-            ScriptsPrependNodePath::Always => serializer.serialize_bool(true),
-            ScriptsPrependNodePath::Never => serializer.serialize_bool(false),
-            ScriptsPrependNodePath::WarnOnly => serializer.serialize_str("warn-only"),
-        }
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for ScriptsPrependNodePath {
-    fn deserialize<De>(deserializer: De) -> Result<Self, De::Error>
-    where
-        De: serde::Deserializer<'de>,
-    {
-        use serde::de::{self, Visitor};
-        use std::fmt;
-
-        struct V;
-        impl Visitor<'_> for V {
-            type Value = ScriptsPrependNodePath;
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str(r#"a boolean or the string "warn-only""#)
-            }
-            fn visit_bool<DeError: de::Error>(self, value: bool) -> Result<Self::Value, DeError> {
-                Ok(if value {
-                    ScriptsPrependNodePath::Always
-                } else {
-                    ScriptsPrependNodePath::Never
-                })
-            }
-            fn visit_str<DeError: de::Error>(self, value: &str) -> Result<Self::Value, DeError> {
-                match value {
-                    "warn-only" => Ok(ScriptsPrependNodePath::WarnOnly),
-                    other => Err(DeError::invalid_value(
-                        de::Unexpected::Str(other),
-                        &r#"true, false, or "warn-only""#,
-                    )),
-                }
-            }
-        }
-        deserializer.deserialize_any(V)
-    }
 }
 
 mod workspace;

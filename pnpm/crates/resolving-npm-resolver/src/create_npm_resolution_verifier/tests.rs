@@ -10,22 +10,6 @@ mod behavior;
 
 mod artifact_binding;
 
-use std::{collections::HashMap, sync::Arc};
-
-use chrono::{DateTime, Utc};
-use pnpm_config::{TrustPolicy, version_policy::create_package_version_policy};
-use pnpm_lockfile::{
-    LockfileResolution, PkgName, RegistryResolution, TarballResolution, TarballRevision,
-};
-use pnpm_network::{
-    AuthHeaders, MetadataCacheScope, RetryOpts, ThrottledClient, UpstreamRouteHook,
-};
-use pnpm_registry::Package;
-use pnpm_resolving_resolver_base::{ResolutionVerification, VerifyCtx};
-use pretty_assertions::assert_eq;
-use ssri::Integrity;
-use tempfile::TempDir;
-
 use super::{
     CreateNpmResolutionVerifierOptions, create_npm_resolution_verifier, observed_dist_stats_sink,
 };
@@ -33,6 +17,21 @@ use crate::{
     mirror::{ABBREVIATED_META_DIR, get_pkg_mirror_path, load_meta},
     persist_meta_to_mirror,
 };
+use chrono::{DateTime, Utc};
+use pnpm_lockfile::{
+    LockfileResolution, PkgName, PlatformAssetResolution, RegistryResolution, TarballResolution,
+    TarballRevision, VariationsResolution,
+};
+use pnpm_network::{
+    AuthHeaders, MetadataCacheScope, RetryOpts, ThrottledClient, UpstreamRouteHook,
+};
+use pnpm_registry::Package;
+use pnpm_resolving_resolver_base::{ResolutionVerification, TrustPolicy, VerifyCtx};
+use pnpm_version_policy::create_package_version_policy;
+use pretty_assertions::assert_eq;
+use ssri::Integrity;
+use std::{collections::HashMap, sync::Arc};
+use tempfile::TempDir;
 
 const FAKE_INTEGRITY: &str = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
 
@@ -70,6 +69,7 @@ fn default_opts(registry_url: &str) -> CreateNpmResolutionVerifierOptions {
     CreateNpmResolutionVerifierOptions {
         registries: registries_with_default(registry_url),
         registries_by_prefix: HashMap::new(),
+        registry_options_by_url: None,
         now: None,
         release_age: crate::VerificationReleaseAgeOptions {
             minimum_minutes: None,
@@ -95,7 +95,11 @@ fn default_opts(registry_url: &str) -> CreateNpmResolutionVerifierOptions {
             // backoff (10 s + 60 s) on every run.
             retry_opts: RetryOpts { retries: 0, ..RetryOpts::default() },
         },
-        artifacts: crate::VerificationArtifacts { observed_stats: None, canonical_fetches: None },
+        artifacts: crate::VerificationArtifacts {
+            observed_stats: None,
+            canonical_fetches: None,
+            lookups: None,
+        },
     }
 }
 
@@ -217,6 +221,8 @@ fn ctx<'a>(name: &'a PkgName, version: &'a str) -> VerifyCtx<'a> {
     VerifyCtx { name, version, registry_name: None }
 }
 
+const REVISION_ZERO_DIGEST: &str =
+    "H0D8ktokFpR1CXnubPWC8tXX0o4YM13gWrxU0FYOD1MChgxlK_CNVgJSql50IQVG82n7u86MEs_HlXsmUv6adQ";
 const REVISION_ONE_DIGEST: &str =
     "Umd2iCLuYk1I_OFexcp5y9YCy39MIVelFlVpkfIu-Me173sY0f9BxZNw77CFhlHUSpNsEbexRMSP4E3zxqPo2g";
 const REVISION_TWO_DIGEST: &str =

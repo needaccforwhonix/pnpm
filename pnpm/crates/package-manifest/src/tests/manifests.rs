@@ -28,6 +28,41 @@ fn save_preserves_the_existing_package_json_permissions() {
     assert_eq!(mode, 0o640);
 }
 
+#[cfg(unix)]
+#[test]
+fn new_manifests_use_normal_file_creation_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    if std::env::var_os("PNPM_TEST_MANIFEST_CREATION_UMASK").is_none() {
+        check_manifest_creation_with_controlled_umask();
+        return;
+    }
+    let dir = tempdir().unwrap();
+    for basename in ["package.json", "package.yaml"] {
+        let path = dir.path().join(basename);
+        PackageManifest::init(&path, InitOptions::default()).unwrap();
+        let actual = std::fs::metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(actual, 0o644, "{basename}");
+    }
+}
+
+#[cfg(unix)]
+fn check_manifest_creation_with_controlled_umask() {
+    let output = std::process::Command::new("sh")
+        .args(["-c", r#"umask 022; exec "$@""#, "manifest-permissions-test"])
+        .arg(std::env::current_exe().unwrap())
+        .args(["--exact", "tests::manifests::new_manifests_use_normal_file_creation_permissions"])
+        .env("PNPM_TEST_MANIFEST_CREATION_UMASK", "022")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("1 passed;"), "{stdout}");
+}
+
 #[test]
 fn test_init_package_json_content() {
     let manifest = PackageManifest::create_init_package_json("test", InitOptions::default());
@@ -39,6 +74,7 @@ fn init_package_json_content_with_every_init_option() {
     let manifest = PackageManifest::create_init_package_json(
         "test",
         InitOptions {
+            bare: false,
             es_module: true,
             pinned_pnpm_version: Some("11.22.0"),
             author: InitAuthor {
@@ -51,6 +87,41 @@ fn init_package_json_content_with_every_init_option() {
         },
     );
     assert_snapshot!(serde_json::to_string_pretty(&manifest).unwrap());
+}
+
+#[test]
+fn test_init_package_json_content_bare() {
+    let manifest = PackageManifest::create_init_package_json(
+        "test",
+        InitOptions {
+            bare: true,
+            es_module: true,
+            pinned_pnpm_version: Some("12.6.0"),
+            ..InitOptions::default()
+        },
+    );
+    assert_eq!(
+        manifest,
+        json!({
+            "devEngines": {
+                "packageManager": {
+                    "name": "pnpm",
+                    "version": "12.6.0",
+                    "onFail": "download",
+                },
+            },
+            "packageManager": "pnpm@12.6.0",
+            "type": "module",
+        }),
+    );
+    assert_eq!(manifest.get("name"), None);
+    assert_eq!(manifest.get("version"), None);
+    assert_eq!(manifest.get("description"), None);
+    assert_eq!(manifest.get("main"), None);
+    assert_eq!(manifest.get("scripts"), None);
+    assert_eq!(manifest.get("keywords"), None);
+    assert_eq!(manifest.get("author"), None);
+    assert_eq!(manifest.get("license"), None);
 }
 
 #[test]

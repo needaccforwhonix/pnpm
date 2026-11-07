@@ -1,8 +1,8 @@
 use super::{
     JsonValue, LockfileResolution, RegistryArtifact, RegistryArtifactHistory,
     ResolutionVerification, TARBALL_REVISION_MISMATCH_VIOLATION_CODE,
-    TARBALL_URL_MISMATCH_VIOLATION_CODE, TarballRevision,
-    is_integrity_addressed_registry_tarball_url,
+    TARBALL_URL_MISMATCH_VIOLATION_CODE, TarballRevision, has_complete_sha512_digest,
+    is_revision_registry_tarball_url,
 };
 
 pub(super) fn same_tarball_url(left: &str, right: &str) -> bool {
@@ -49,11 +49,17 @@ pub(super) fn tarball_url_violation(
     }
 }
 
-/// The revision the registry currently serves; an absent one is revision 0.
+/// The revision the registry currently serves. A version without one is
+/// outside the revision protocol and cannot vouch for a lockfile revision.
 pub(super) fn current_revision_number(
     artifact: &RegistryArtifactHistory,
 ) -> Result<u64, ResolutionVerification> {
-    let Some(raw_revision) = artifact.current.revision.as_ref() else { return Ok(0) };
+    let Some(raw_revision) = artifact.current.revision.as_ref() else {
+        return Err(ResolutionVerification::Err {
+            code: TARBALL_REVISION_MISMATCH_VIOLATION_CODE,
+            reason: "registry metadata has no current revision".to_string(),
+        });
+    };
     let revision = raw_revision
         .as_u64()
         .and_then(|revision| TarballRevision::try_from(revision).ok())
@@ -64,16 +70,24 @@ pub(super) fn current_revision_number(
     })
 }
 
-/// The current revision must appear exactly once in the published history,
-/// with the same integrity and tarball the current record carries, and be
-/// addressed by that integrity.
+/// The published history must hold revision 0, and the current revision
+/// must appear in it exactly once, with the same integrity and tarball the
+/// current record carries, and be addressed by its revision URL and sha512 integrity.
 pub(super) fn current_history_violation(
     artifact: &RegistryArtifactHistory,
+    name: &str,
+    version: &str,
     current_revision: u64,
     registry: &str,
 ) -> Option<ResolutionVerification> {
-    if current_revision == 0 {
-        return None;
+    let has_original = artifact.revisions
+        .iter()
+        .any(|candidate| candidate.revision.as_ref().and_then(JsonValue::as_u64) == Some(0));
+    if !has_original {
+        return Some(ResolutionVerification::Err {
+            code: TARBALL_REVISION_MISMATCH_VIOLATION_CODE,
+            reason: "registry metadata has no revision 0 in its history".to_string(),
+        });
     }
     let current_history: Vec<_> = artifact.revisions
         .iter()
@@ -81,12 +95,14 @@ pub(super) fn current_history_violation(
             candidate.revision.as_ref().and_then(JsonValue::as_u64) == Some(current_revision)
         })
         .collect();
+    let revision = TarballRevision::try_from(current_revision).ok();
     let consistent = current_history.len() == 1
         && current_history[0].integrity == artifact.current.integrity
         && matches!(
-            (artifact.current.tarball.as_deref(), artifact.current.integrity.as_ref()),
-            (Some(tarball), Some(integrity))
-                if is_integrity_addressed_registry_tarball_url(tarball, integrity, registry),
+            (artifact.current.tarball.as_deref(), artifact.current.integrity.as_ref(), revision),
+            (Some(tarball), Some(integrity), Some(revision))
+                if has_complete_sha512_digest(integrity)
+                    && is_revision_registry_tarball_url(tarball, name, version, revision, registry),
         )
         && matches!(
             (current_history[0].tarball.as_deref(), artifact.current.tarball.as_deref()),
@@ -160,8 +176,7 @@ pub(super) fn lockfile_revision(resolution: &LockfileResolution) -> Option<u64> 
 /// encoding difference between the lockfile URL and the registry
 /// metadata isn't read as tampering.
 pub(super) fn canonical_tarball_url(url: &str) -> String {
-    let normalized = reqwest::Url::parse(url)
-        .map_or_else(|_error| url.to_string(), |parsed| parsed.to_string())
+    let normalized = crate::normalize_tarball_url(url)
         // `%2f` may survive re-serialization in either case; normalize both.
         .replace("%2F", "/")
         .replace("%2f", "/");

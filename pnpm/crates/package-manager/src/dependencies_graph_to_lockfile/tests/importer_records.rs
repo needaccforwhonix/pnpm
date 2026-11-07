@@ -1,18 +1,16 @@
 use super::{
     super::{DependenciesGraphToLockfileError, GraphToLockfileOptions, ImporterLockfileInput},
     EMPTY_CATALOGS, EMPTY_NAMED_REGISTRIES, EMPTY_REGISTRY_OPTIONS, GIT_TARBALL_URL,
-    dependencies_graph_to_lockfile, error_from_single_node_graph, git_hosted_node,
+    NPM_REGISTRIES, dependencies_graph_to_lockfile, error_from_single_node_graph, git_hosted_node,
     injected_link_fixture, make_link_node, make_node, make_node_with_optional,
-    previous_importers_with_link, single_importer_opts, write_manifest,
+    single_importer_opts, write_manifest,
 };
 use pnpm_deps_path::DepPath;
 use pnpm_lockfile::{
     GitResolution, ImporterDepVersion, LockfileResolution, PackageKey, PkgName, SnapshotDepRef,
     VariationsResolution,
 };
-use pnpm_resolving_deps_resolver::{
-    DependenciesGraph, DependenciesGraphNode, PeerDep, UpdateReuseScope,
-};
+use pnpm_resolving_deps_resolver::{DependenciesGraph, DependenciesGraphNode, PeerDep};
 use pnpm_resolving_resolver_base::{PkgResolutionId, ResolveResult};
 use rustc_hash::FxHashSet as HashSet;
 use serde_json::json;
@@ -105,7 +103,10 @@ fn runtime_dependency_strips_importer_prefix_and_records_package_version() {
     let dep_path = DepPath::from("node@runtime:26.3.0".to_string());
     let resolve_result = ResolveResult {
         id: PkgResolutionId::from("node@runtime:26.3.0"),
-        resolution: LockfileResolution::Variations(VariationsResolution { variants: vec![] }),
+        resolution: LockfileResolution::Variations(VariationsResolution {
+            variants: vec![],
+            revision: None,
+        }),
         resolved_via: "node-runtime".to_string(),
         normalized_bare_specifier: None,
         alias: Some("node".to_string()),
@@ -119,6 +120,7 @@ fn runtime_dependency_strips_importer_prefix_and_records_package_version() {
                 "version": "26.3.0",
                 "bin": { "node": "bin/node" },
             }))),
+            non_deprecated_alternative: None,
         },
     };
     let node = DependenciesGraphNode {
@@ -126,13 +128,12 @@ fn runtime_dependency_strips_importer_prefix_and_records_package_version() {
         resolved_package_id: "node@runtime:26.3.0".to_string(),
         resolve_result: std::sync::Arc::new(resolve_result),
         depth: 1,
-        installable: true,
         is_pure: true,
         optional: false,
         edges: pnpm_resolving_deps_resolver::ResolvedDependencyEdges {
             children: BTreeMap::new(),
             optional_children: HashSet::default(),
-            peer_dependencies: BTreeMap::new(),
+            peer_set: pnpm_resolving_deps_resolver::PeerSet::default(),
             transitive_peer_dependencies: HashSet::default(),
             resolved_peer_names: HashSet::default(),
         },
@@ -293,6 +294,7 @@ fn non_host_git_dependency_records_bare_git_url_in_importer() {
             latest: None,
             published_at: None,
             manifest: Some(Arc::new(json!({ "name": "is-negative", "version": "1.0.0" }))),
+            non_deprecated_alternative: None,
         },
     };
     let node = DependenciesGraphNode {
@@ -300,13 +302,12 @@ fn non_host_git_dependency_records_bare_git_url_in_importer() {
         resolved_package_id: dep_path.to_string(),
         resolve_result: Arc::new(resolve_result),
         depth: 1,
-        installable: true,
         is_pure: true,
         optional: false,
         edges: pnpm_resolving_deps_resolver::ResolvedDependencyEdges {
             children: BTreeMap::new(),
             optional_children: HashSet::default(),
-            peer_dependencies: BTreeMap::new(),
+            peer_set: pnpm_resolving_deps_resolver::PeerSet::default(),
             transitive_peer_dependencies: HashSet::default(),
             resolved_peer_names: HashSet::default(),
         },
@@ -530,27 +531,28 @@ fn multi_importer_pruner_marks_shared_dep_non_optional_when_any_importer_reaches
             auto_install_peers: false,
             dedupe_peers: None,
             exclude_links_from_lockfile: false,
+            add_missing_peer_types: None,
+            project_scoped_optional_peers: None,
             inject_workspace_packages: false,
             peers_suffix_max_length: None,
+            integrity_target: None,
+            resolution: pnpm_lockfile::ResolutionSettings::default(),
         },
         metadata_sources: crate::PackageMetadataSources {
             registries_by_prefix: &EMPTY_NAMED_REGISTRIES,
             registry_options_by_url: &EMPTY_REGISTRY_OPTIONS,
-            registry: "https://registry.npmjs.org",
+            registries: &NPM_REGISTRIES,
             lockfile_include_tarball_url: false,
             previous_packages: None,
         },
         manifest_settings: crate::LockfileManifestSettings {
+            include_peer_dependencies: false,
             overrides: None,
             ignored_optional_dependencies: None,
             patched_dependencies: None,
             package_extensions_checksum: None,
             pnpmfile_checksum: None,
-        },
-        reuse: crate::LockfileImporterReuse {
-            previous_importers: None,
-            scope: UpdateReuseScope::All,
-            scopes_by_importer: BTreeMap::new(),
+            untracked_pnpmfile_read_package_hook: None,
         },
     });
 
@@ -619,27 +621,28 @@ fn workspace_sibling_link_renders_per_importer_with_link_ref() {
             auto_install_peers: false,
             dedupe_peers: None,
             exclude_links_from_lockfile: false,
+            add_missing_peer_types: None,
+            project_scoped_optional_peers: None,
             inject_workspace_packages: false,
             peers_suffix_max_length: None,
+            integrity_target: None,
+            resolution: pnpm_lockfile::ResolutionSettings::default(),
         },
         metadata_sources: crate::PackageMetadataSources {
             registries_by_prefix: &EMPTY_NAMED_REGISTRIES,
             registry_options_by_url: &EMPTY_REGISTRY_OPTIONS,
-            registry: "https://registry.npmjs.org",
+            registries: &NPM_REGISTRIES,
             lockfile_include_tarball_url: false,
             previous_packages: None,
         },
         manifest_settings: crate::LockfileManifestSettings {
+            include_peer_dependencies: false,
             overrides: None,
             ignored_optional_dependencies: None,
             patched_dependencies: None,
             package_extensions_checksum: None,
             pnpmfile_checksum: None,
-        },
-        reuse: crate::LockfileImporterReuse {
-            previous_importers: None,
-            scope: UpdateReuseScope::All,
-            scopes_by_importer: BTreeMap::new(),
+            untracked_pnpmfile_read_package_hook: None,
         },
     });
 
@@ -751,38 +754,10 @@ fn importer_records_a_peer_only_alias_only_under_auto_install_peers() {
         .expect("auto-installed peer entry");
     assert_eq!(entry.specifier, "^1.0.0");
 }
-// pnpm/pnpm#10433: a plain install (UpdateReuseScope::All) that does not
-// target a workspace dependency must keep its prior `link:` importer
-// entry, even though the fresh resolution landed on a divergent `file:`.
+// An injected workspace dependency whose peers diverge from its project's
+// records the `file:` resolution.
 #[test]
-fn injected_workspace_dep_keeps_prior_link_on_untargeted_install() {
-    let (_tmp, manifest, graph, direct) = injected_link_fixture();
-    let previous = previous_importers_with_link("n", "workspace:*", "../n");
-
-    let lockfile = dependencies_graph_to_lockfile({
-        let mut base_options =
-            single_importer_opts(&manifest, &graph, direct, false, false, None, None);
-        base_options.metadata_sources.registries_by_prefix = &EMPTY_NAMED_REGISTRIES;
-        base_options.metadata_sources.registry_options_by_url = &EMPTY_REGISTRY_OPTIONS;
-        base_options.reuse.previous_importers = Some(&previous);
-        base_options.reuse.scope = UpdateReuseScope::All;
-        base_options
-    });
-
-    let importer = lockfile.root_project().expect("root importer");
-    let entry = importer.dependencies
-        .as_ref()
-        .and_then(|deps| deps.get(&PkgName::parse("n").unwrap()))
-        .expect("n entry");
-    match &entry.version {
-        ImporterDepVersion::Link(target) => assert_eq!(target, "../n"),
-        other => panic!("expected the prior Link(..) to be preserved, got {other:?}"),
-    }
-}
-// Without a previous `link:` to preserve (a first install), the divergent
-// `file:` resolution stands — the guard only preserves, never invents.
-#[test]
-fn injected_workspace_dep_renders_file_without_prior_link() {
+fn injected_workspace_dep_renders_its_divergent_file_resolution() {
     let (_tmp, manifest, graph, direct) = injected_link_fixture();
 
     let lockfile = dependencies_graph_to_lockfile({
@@ -791,8 +766,6 @@ fn injected_workspace_dep_renders_file_without_prior_link() {
         base_options.metadata_sources.registries_by_prefix = &EMPTY_NAMED_REGISTRIES;
         base_options.metadata_sources.registry_options_by_url = &EMPTY_REGISTRY_OPTIONS;
         base_options.metadata_sources.previous_packages = None;
-        base_options.reuse.previous_importers = None;
-        base_options.reuse.scope = UpdateReuseScope::All;
         base_options
     });
 
@@ -803,7 +776,7 @@ fn injected_workspace_dep_renders_file_without_prior_link() {
         .expect("n entry");
     assert!(
         matches!(&entry.version, ImporterDepVersion::File(_)),
-        "expected File(..) with no prior link to preserve, got {:?}",
+        "expected File(..), got {:?}",
         entry.version,
     );
 }

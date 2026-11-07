@@ -1,7 +1,8 @@
 //! Environment-variable substitution for pnpm-style `${VAR}` placeholders.
 //!
-//! Occurrences of `${VAR}` (with optional `${VAR:-default}` fallback) are
-//! replaced with the value the [`EnvVar`] capability returns for `VAR`.
+//! Occurrences of `${VAR}` (with optional `${VAR-default}` or `${VAR:-default}` fallback,
+//! or npm's `${VAR?}`, which falls back to `""`) are replaced with the value the
+//! [`EnvVar`] capability returns for `VAR`.
 //! Backslashes immediately preceding the `$` escape the placeholder so
 //! it is left as-is.
 //!
@@ -14,11 +15,6 @@
 //! [pnpm/pacquet#339](https://github.com/pnpm/pacquet/issues/339).
 
 /// Capability: read a process environment variable as a UTF-8 string.
-///
-/// `${VAR}` placeholders inside `.npmrc` are resolved against the
-/// process environment; the lookup is routed through this trait so unit
-/// tests can drive every branch (set, unset, empty) with local fakes
-/// instead of mutating the real process environment.
 pub trait EnvVar {
     /// Return the value of the named environment variable, or `None`
     /// when it is unset. Implementations should treat invalid UTF-8
@@ -41,10 +37,6 @@ pub trait EnvVar {
 
 /// Production [`EnvVar`] provider: reads the real process environment via
 /// [`std::env::var`].
-///
-/// Consumers that don't have their own capability provider thread this
-/// through the turbofish slot (e.g. `env_replace_lossy::<SystemEnv>(raw)`).
-/// `pnpm-config` threads its own multi-capability `Host` instead.
 pub struct SystemEnv;
 
 impl EnvVar for SystemEnv {
@@ -63,11 +55,12 @@ impl EnvVar for SystemEnv {
     }
 }
 
-/// Replace every `${VAR}` (or `${VAR:-default}`) placeholder in `text` with
+/// Replace `${VAR}`, `${VAR-default}`, and `${VAR:-default}` placeholders with
 /// the value [`Sys::var`] returns. Placeholders that have no value and no
 /// default become `""` (the literal `${...}` never reaches the caller) and
 /// are recorded in the returned `Vec` so the caller can surface each one as
-/// a warning.
+/// a warning. npm's optional `${VAR?}` form defaults to `""`, so it is never
+/// recorded.
 ///
 /// Recording each unresolved placeholder matters because leaving an
 /// unresolved `${VAR}` in an auth value would later be sent as a literal
@@ -107,6 +100,31 @@ pub fn env_replace_lossy<Sys: EnvVar>(text: &str) -> (String, Vec<String>) {
     (output, unresolved)
 }
 
+/// The `${...}` placeholders of `text`, as byte ranges, leaving out the ones
+/// a backslash escapes.
+///
+/// A caller that resolves placeholders itself, rather than taking the whole
+/// substituted string, reads them from here so it agrees with
+/// [`env_replace_lossy`] about what a placeholder is — an unfinished `${`
+/// among them, which is text rather than the opening of one.
+#[must_use]
+pub fn placeholder_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    let bytes = text.as_bytes();
+    let mut ranges = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        let Some(placeholder) = placeholder_at(bytes, index) else {
+            index += 1;
+            continue;
+        };
+        if placeholder.backslashes % 2 == 0 {
+            ranges.push(index..placeholder.end + 1);
+        }
+        index = placeholder.end + 1;
+    }
+    ranges
+}
+
 /// A `${...}` placeholder, and the backslashes written before it.
 struct Placeholder {
     /// Index of the closing `}`.
@@ -132,7 +150,7 @@ fn placeholder_at(bytes: &[u8], index: usize) -> Option<Placeholder> {
     Some(Placeholder { end, backslashes })
 }
 
-/// Substitute one `${NAME}` or `${NAME:-default}`, recording a name that
+/// Substitute one environment placeholder, recording a name that
 /// neither the environment nor a default resolves.
 fn expand_placeholder<Sys: EnvVar>(
     placeholder: &str,
@@ -140,16 +158,31 @@ fn expand_placeholder<Sys: EnvVar>(
     unresolved: &mut Vec<String>,
 ) {
     let inside = &placeholder[2..placeholder.len() - 1];
-    let (var_name, default) = match inside.find(":-") {
-        Some(separator) => (&inside[..separator], Some(&inside[separator + 2..])),
-        None => (inside, None),
+    let (var_name, default, default_on_empty) = match inside.split_once('-') {
+        Some((name, default)) => match name.strip_suffix(':') {
+            Some(name) => (name, Some(default), true),
+            None => (name, Some(default), false),
+        },
+        None => match optional_var_name(inside) {
+            Some(var_name) => (var_name, Some(""), false),
+            None => (inside, None, false),
+        },
     };
-    let value = Sys::var(var_name).filter(|value| !value.is_empty());
+    let value = Sys::var(var_name)
+        .filter(|value| !value.is_empty() || (default.is_some() && !default_on_empty));
     match (value, default) {
         (Some(value), _) => output.push_str(&value),
         (None, Some(default)) => output.push_str(default),
         (None, None) => unresolved.push(placeholder.to_owned()),
     }
+}
+
+/// The `NAME` of an npm-style optional `${NAME?}` placeholder. Suffixes
+/// ending in `-` are excluded so `${NAME-?}` is handled as a dash default.
+fn optional_var_name(inside: &str) -> Option<&str> {
+    inside
+        .strip_suffix('?')
+        .filter(|name| !name.is_empty() && !name.contains('?') && !name.ends_with('-'))
 }
 
 /// Return the index of the closing `}` for a `${...}` starting at `start`.

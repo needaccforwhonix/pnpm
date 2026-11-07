@@ -3,9 +3,15 @@
 //! are still on disk and still match the recorded digests. This module
 //! implements that check — with a fast path that skips filesystem work
 //! entirely when the caller opted out of integrity verification.
+pub use package_dir_matches_index::package_dir_matches_index;
 
-use crate::{CafsFileInfo, PackageFilesIndex, SideEffectsDiff, StoreDir};
-use dashmap::DashSet;
+pub use pending_files_check::{PendingFilesCheck, files_maps};
+
+use crate::{
+    CafsFileInfo, PackageFilesIndex, SideEffectsDiff, SideEffectsOverlay, StoreDir,
+    symlinks::{read_recorded_symlink_target, writes_below_a_symlink},
+};
+use dashmap::DashMap;
 use sha2::{Digest, Sha512};
 use std::{
     collections::HashMap,
@@ -113,18 +119,19 @@ impl VerifiedFileIntegrity {
     }
 }
 
-/// Set of CAFS paths whose on-disk integrity has already been verified
-/// during the current install. The caller threads one cache through
+/// CAFS paths whose on-disk integrity has already been verified during
+/// the current install, with the mode the check read (`None` where the
+/// platform has no POSIX mode). The caller threads one cache through
 /// every [`check_pkg_files_integrity`] invocation so a CAFS blob that
 /// has already been verified by package A doesn't get stat'd /
 /// re-hashed again by package B.
 ///
 /// Concurrent: the install fans [`check_pkg_files_integrity`] calls out
 /// across tokio's blocking pool, so the cache must tolerate parallel
-/// readers and writers. `DashSet` gives us that without any external
+/// readers and writers. `DashMap` gives us that without any external
 /// locking. Race-window duplicate verifies are benign (the `verify_file`
 /// path is idempotent) and rare in practice.
-pub type VerifiedFilesCache = DashSet<PathBuf>;
+pub type VerifiedFilesCache = DashMap<PathBuf, Option<u32>>;
 
 /// Shared handle to a [`VerifiedFilesCache`] — what every install-scope
 /// caller passes around. `Arc` so the same cache survives across the
@@ -134,9 +141,8 @@ pub type VerifiedFilesCache = DashSet<PathBuf>;
 /// dispatches into.
 pub type SharedVerifiedFilesCache = Arc<VerifiedFilesCache>;
 
-/// `in-tarball filename` → `CAFS path`. Return value of the two verify
-/// entry points below.
-pub type FilesMap = HashMap<String, PathBuf>;
+/// `in-tarball filename` → `CAFS path`.
+pub type FilesMap = pnpm_fs::CasPaths;
 
 /// Result of a `PackageFilesIndex`-row verification pass.
 ///
@@ -160,7 +166,7 @@ pub type FilesMap = HashMap<String, PathBuf>;
 pub struct VerifyResult {
     pub passed: bool,
     pub files_map: FilesMap,
-    pub side_effects_maps: Option<HashMap<String, FilesMap>>,
+    pub side_effects_maps: Option<HashMap<String, SideEffectsOverlay>>,
     pub side_effects: Option<HashMap<String, SideEffectsDiff>>,
     pub remote_side_effects_quarantine: Option<HashMap<String, Vec<String>>>,
 }
@@ -187,7 +193,10 @@ pub fn check_pkg_files_integrity(
     verified_files_cache: &VerifiedFilesCache,
 ) -> VerifyResult {
     let (mut result, pending) = defer_pkg_files_integrity(store_dir, entry);
-    result.passed = pending.verify(store_dir, verified_files_cache) && result.passed;
+    let maps = files_maps(&result.files_map, result.side_effects_maps.as_ref());
+    if !pending.verify(store_dir, verified_files_cache, &maps) {
+        result.passed = false;
+    }
     result
 }
 
@@ -224,7 +233,7 @@ pub fn defer_pkg_files_integrity(
             passed = false;
             continue;
         };
-        files_map.insert(filename.clone(), path);
+        files_map.insert(filename.clone(), pnpm_fs::StoreFile::new(path));
     }
     let side_effects_maps = build_side_effects_maps(store_dir, side_effects.as_ref(), &files_map);
     let result = VerifyResult {
@@ -237,45 +246,7 @@ pub fn defer_pkg_files_integrity(
     (result, PendingFilesCheck { files, algo })
 }
 
-/// The on-disk check of one store-index row's files, split off its
-/// map building by [`defer_pkg_files_integrity`].
-#[derive(Debug)]
-pub struct PendingFilesCheck {
-    files: HashMap<String, CafsFileInfo>,
-    algo: String,
-}
-
-impl PendingFilesCheck {
-    /// Whether every file the row records is still on disk with its
-    /// recorded content. A file already in `verified_files_cache` is
-    /// trusted without a stat; one that passes here is added to it.
-    #[must_use]
-    pub fn verify(self, store_dir: &StoreDir, verified_files_cache: &VerifiedFilesCache) -> bool {
-        let mut all_verified = true;
-        for (filename, info) in &self.files {
-            // A malformed digest already failed the row's maps.
-            let Some(path) = store_dir.cas_file_path_by_mode(&info.digest, info.mode) else {
-                all_verified = false;
-                continue;
-            };
-            if verified_files_cache.contains(&path) {
-                continue;
-            }
-            if verify_file(&path, filename, info, &self.algo) {
-                // Concurrency note: another thread may verify the same
-                // path between the `contains` check and our `insert`,
-                // doing the stat twice. That's benign — `verify_file`
-                // is idempotent and the cache converges to the same
-                // state either way. Pnpm's worker_threads cache has
-                // the same race-window for the same reason.
-                verified_files_cache.insert(path);
-            } else {
-                all_verified = false;
-            }
-        }
-        all_verified
-    }
-}
+mod pending_files_check;
 
 /// Materialize the per-cache-key overlaid [`FilesMap`]s from a
 /// `PackageFilesIndex.side_effects` entry. The content of `added`
@@ -286,25 +257,27 @@ fn build_side_effects_maps(
     store_dir: &StoreDir,
     side_effects: Option<&HashMap<String, SideEffectsDiff>>,
     base_files: &FilesMap,
-) -> Option<HashMap<String, FilesMap>> {
+) -> Option<HashMap<String, SideEffectsOverlay>> {
     let raw = side_effects?;
-    let mut out: HashMap<String, FilesMap> = HashMap::with_capacity(raw.len());
+    let mut out: HashMap<String, SideEffectsOverlay> = HashMap::with_capacity(raw.len());
     for (cache_key, diff) in raw {
-        if let Some(overlay) = overlay_for(store_dir, cache_key, diff, base_files) {
+        if let Some(overlay) = side_effects_overlay(store_dir, cache_key, diff, base_files) {
             out.insert(cache_key.clone(), overlay);
         }
     }
     Some(out)
 }
 
-/// One cache key's overlaid [`FilesMap`], or `None` when an entry has to be
-/// dropped so the importer falls back to rebuilding it.
-fn overlay_for(
+/// One cache key's overlay of `diff` over `base_files`, or `None` when the
+/// entry has to be dropped so the importer falls back to rebuilding it.
+/// `cache_key` names the entry in the log of that decision.
+#[must_use]
+pub fn side_effects_overlay(
     store_dir: &StoreDir,
     cache_key: &str,
     diff: &SideEffectsDiff,
     base_files: &FilesMap,
-) -> Option<FilesMap> {
+) -> Option<SideEffectsOverlay> {
     if diff.is_empty() {
         tracing::debug!(
             target: "pacquet::store_index",
@@ -314,9 +287,15 @@ fn overlay_for(
         return None;
     }
     let SideEffectsDiff { added, deleted, .. } = diff;
-    let mut overlay: FilesMap = HashMap::with_capacity(base_files.len());
+    let mut files: FilesMap = HashMap::with_capacity(base_files.len());
+    let mut symlinks = HashMap::new();
     for (filename, info) in added.iter().flatten() {
-        overlay.insert(filename.clone(), overlay_path(store_dir, cache_key, filename, info)?);
+        let path = overlay_path(store_dir, cache_key, filename, info)?;
+        if info.is_symlink() {
+            symlinks.insert(filename.clone(), overlay_symlink_target(cache_key, filename, &path)?);
+        } else {
+            files.insert(filename.clone(), pnpm_fs::StoreFile::new(path));
+        }
     }
     // Promote `deleted` to a `HashSet` once per cache key so
     // the `base_files` walk stays linear in `|base|` instead of
@@ -326,12 +305,49 @@ fn overlay_for(
         .flatten()
         .cloned()
         .collect();
-    for (filename, path) in base_files {
-        if !deleted_set.contains(filename) && !overlay.contains_key(filename) {
-            overlay.insert(filename.clone(), path.clone());
+    for (filename, file) in base_files {
+        if !deleted_set.contains(filename)
+            && !files.contains_key(filename)
+            && !symlinks.contains_key(filename)
+        {
+            files.insert(filename.clone(), file.clone());
         }
     }
-    Some(overlay)
+    restorable_overlay(cache_key, SideEffectsOverlay { files: Arc::new(files), symlinks })
+}
+
+/// `overlay`, or `None` when its symlinks cannot be restored on this host
+/// or restoring them would let a write follow one of them.
+fn restorable_overlay(cache_key: &str, overlay: SideEffectsOverlay) -> Option<SideEffectsOverlay> {
+    if overlay.symlinks.is_empty()
+        || !(cfg!(windows) || writes_below_a_symlink(&overlay.symlinks, overlay.files.keys()))
+    {
+        return Some(overlay);
+    }
+    tracing::debug!(
+        target: "pacquet::store_index",
+        cache_key,
+        "side-effects symlinks cannot be restored here; dropping this cache_key entry entirely so the importer falls back to rebuild",
+    );
+    None
+}
+
+/// The target of one recorded symlink, or `None` when the entry cannot be
+/// restored and its whole cache key must be dropped.
+fn overlay_symlink_target(cache_key: &str, filename: &str, cas_path: &Path) -> Option<String> {
+    let target = read_recorded_symlink_target(filename, cas_path).unwrap_or_else(|error| {
+        tracing::debug!(target: "pacquet::store_index", ?error, ?cas_path, "failed to read a side-effects symlink target");
+        None
+    });
+    if target.is_none() {
+        tracing::debug!(
+            target: "pacquet::store_index",
+            ?filename,
+            cache_key,
+            "unrestorable symlink in side-effects `added` overlay; dropping this cache_key entry entirely so the importer falls back to rebuild",
+        );
+    }
+    target
 }
 
 /// The CAS path one `added` entry points at, or `None` when the entry
@@ -389,9 +405,9 @@ fn is_safe_overlay_path(filename: &str) -> bool {
         .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
 }
 
-/// `true` when the on-disk file is either unmodified since the last
+/// `Some` when the on-disk file is either unmodified since the last
 /// verified check or modified but still content-hashes to the stored
-/// digest.
+/// digest, carrying the mode the check read (`None` off Unix).
 ///
 /// `filename` is the in-tarball path the caller is trying to reuse; it
 /// doesn't affect behaviour, only the `debug!` log when verification
@@ -416,32 +432,33 @@ fn is_safe_overlay_path(filename: &str) -> bool {
 /// is exactly why a failed verification must never unlink a file:
 /// another *process* sharing the store may be importing from it — see
 /// [`scrub_directory_at_cafs_path`].
-fn verify_file(path: &Path, filename: &str, info: &CafsFileInfo, algo: &str) -> bool {
-    // Lock-free fast path. `check_file` is read-only and only touches
-    // the file's metadata; no risk of clobbering a writer's state.
-    let Some((is_modified, _)) = check_file(path, info.checked_at) else {
+fn verify_file(
+    path: &Path,
+    filename: &str,
+    info: &CafsFileInfo,
+    algo: &str,
+) -> Option<Option<u32>> {
+    let Some((is_modified, metadata)) = check_file(path, info.checked_at) else {
         tracing::debug!(
             target: "pacquet::store_index",
             ?filename,
             ?path,
             "CAFS file missing or unreadable; re-fetching",
         );
-        return false;
+        return None;
     };
     if !is_modified {
-        return true;
+        return Some(pnpm_fs::file_mode::metadata_mode(&metadata));
     }
-
     verify_modified_file(path, filename, info, algo)
 }
 
-fn verify_modified_file(path: &Path, filename: &str, info: &CafsFileInfo, algo: &str) -> bool {
-    // Slow path: the file's mtime indicates a recent change. Acquire
-    // the per-path lock and re-check so a concurrent writer's
-    // `write_all` lands before we decide whether to delete. The
-    // common case (unmodified file from a prior install) never gets
-    // here — the lock cost only applies to files actually being
-    // re-verified, which is rare.
+fn verify_modified_file(
+    path: &Path,
+    filename: &str,
+    info: &CafsFileInfo,
+    algo: &str,
+) -> Option<Option<u32>> {
     let lock = pnpm_fs::cas_write_lock(path);
     let _guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
@@ -451,22 +468,22 @@ fn verify_modified_file(path: &Path, filename: &str, info: &CafsFileInfo, algo: 
     // (concurrent prune or a sibling verifier that beat us in)
     // surfaces as ENOENT here and we propagate the cache miss
     // without trying to delete a path that's already gone.
-    let Some((is_modified, size)) = check_file(path, info.checked_at) else {
+    let Some((is_modified, metadata)) = check_file(path, info.checked_at) else {
         tracing::debug!(
             target: "pacquet::store_index",
             ?filename,
             ?path,
             "CAFS file disappeared between fast-path stat and lock acquisition; re-fetching",
         );
-        return false;
+        return None;
     };
     if !is_modified {
         // Writer completed and the result happens to match
         // `checked_at` (uncommon but possible if `checked_at` was
         // updated very recently). Trust the cache, no further work.
-        return true;
+        return Some(pnpm_fs::file_mode::metadata_mode(&metadata));
     }
-    if size != info.size {
+    if metadata.len() != info.size {
         // Wrong size → content definitely changed. Report the miss so
         // the caller re-fetches; see `scrub_directory_at_cafs_path` for
         // why nothing but a directory is removed here.
@@ -475,23 +492,23 @@ fn verify_modified_file(path: &Path, filename: &str, info: &CafsFileInfo, algo: 
             ?filename,
             ?path,
             expected_size = info.size,
-            actual_size = size,
+            actual_size = metadata.len(),
             "CAFS file size mismatch; re-fetching",
         );
         scrub_directory_at_cafs_path(path);
-        return false;
+        return None;
     }
-    let passed = verify_file_integrity(path, &info.digest, algo);
-    if !passed {
-        tracing::debug!(
-            target: "pacquet::store_index",
-            ?filename,
-            ?path,
-            "CAFS file digest mismatch, read failure, or unknown algo; re-fetching",
-        );
-        scrub_directory_at_cafs_path(path);
+    if verify_file_integrity(path, &info.digest, algo) {
+        return Some(pnpm_fs::file_mode::metadata_mode(&metadata));
     }
-    passed
+    tracing::debug!(
+        target: "pacquet::store_index",
+        ?filename,
+        ?path,
+        "CAFS file digest mismatch, read failure, or unknown algo; re-fetching",
+    );
+    scrub_directory_at_cafs_path(path);
+    None
 }
 
 /// Remove a *directory* squatting at a CAFS blob path so the
@@ -527,7 +544,7 @@ fn scrub_directory_at_cafs_path(path: &Path) {
     let mut scrub_path = path.as_os_str().to_owned();
     scrub_path.push(format!(
         ".pacquet-scrub-{}-{}",
-        std::process::id(),
+        pnpm_fs::process_id(),
         SCRUB_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     ));
     let scrub_path = Path::new(&scrub_path);
@@ -556,7 +573,7 @@ fn scrub_directory_at_cafs_path(path: &Path) {
     }
 }
 
-/// `Some((is_modified, size))` for a file we can read metadata for;
+/// `Some((is_modified, metadata))` for a file we can read metadata for;
 /// `None` otherwise.
 ///
 /// Pnpm rethrows non-`ENOENT` metadata errors and only treats `ENOENT`
@@ -566,8 +583,7 @@ fn scrub_directory_at_cafs_path(path: &Path) {
 /// re-fetch". That's a safer default for a cache-hint path — we don't
 /// want a transient `EACCES` on a CAS blob to panic the install — and
 /// the content-hash check in [`verify_file_integrity`] still catches
-/// actual corruption. If we ever want pnpm-strict error propagation,
-/// changing the return type to `Result<Option<…>>` is the right shape.
+/// actual corruption.
 ///
 /// 100 ms of slack on the mtime comparison matches pnpm's threshold —
 /// accounts for coarse mtime resolution on some filesystems plus the
@@ -575,7 +591,7 @@ fn scrub_directory_at_cafs_path(path: &Path) {
 /// actually stamped the inode. A missing `checked_at` deserializes as
 /// `Option<u64>::None` and is treated as `0`, which forces a re-hash the
 /// first time an old-format row is read (as pnpm also does).
-fn check_file(path: &Path, checked_at: Option<u64>) -> Option<(bool, u64)> {
+fn check_file(path: &Path, checked_at: Option<u64>) -> Option<(bool, fs::Metadata)> {
     let meta = fs::metadata(path).ok()?;
     let mtime_ms = meta
         .modified()
@@ -586,45 +602,7 @@ fn check_file(path: &Path, checked_at: Option<u64>) -> Option<(bool, u64)> {
         .min(u128::from(u64::MAX)) as u64;
     let baseline = checked_at.unwrap_or(0);
     let is_modified = mtime_ms.saturating_sub(baseline) > 100;
-    Some((is_modified, meta.len()))
-}
-
-/// Whether the materialized package under `dir` still matches the store
-/// row it was expanded from.
-///
-/// This is pnpm's `dint.check`, and answers what `pnpm store status`
-/// asks: has anything edited the package after it was linked out of the
-/// store. Only the files the row records are checked — a file *added*
-/// under `dir` afterwards is not a change to what the store holds — and
-/// a missing, unreadable, or re-hashed file all read as mutated.
-#[must_use]
-pub fn package_dir_matches_index(dir: &Path, index: &PackageFilesIndex) -> bool {
-    index.files
-        .iter()
-        .all(|(path, file)| {
-            join_inside(dir, path)
-                .is_some_and(|path| verify_file_integrity(&path, &file.digest, &index.algo))
-        })
-}
-
-/// `dir` joined with a recorded in-package path, or `None` if that path is
-/// anything other than a sequence of plain names.
-///
-/// The recorded paths come from archive entries. Extraction rejects a
-/// leading separator and `..`, but not a Windows drive prefix — and
-/// [`Path::join`] discards its base when the argument has one, which would
-/// point the hash at a file outside the package. Rejecting here keeps that
-/// decision local to the one caller that joins index keys onto a
-/// directory rather than reading them out of the CAS.
-fn join_inside(dir: &Path, relative: &str) -> Option<PathBuf> {
-    let mut joined = dir.to_path_buf();
-    for component in Path::new(relative).components() {
-        match component {
-            std::path::Component::Normal(segment) => joined.push(segment),
-            _ => return None,
-        }
-    }
-    Some(joined)
+    Some((is_modified, meta))
 }
 
 /// Streams the file through the hasher in 64 KiB chunks and compares
@@ -642,7 +620,17 @@ fn join_inside(dir: &Path, relative: &str) -> Option<PathBuf> {
 /// unknown-algo behaviour. An I/O error mid-read also falls through to
 /// `false` so the caller re-fetches rather than deciding on a partial
 /// hash.
-fn verify_file_integrity(path: &Path, digest: &str, algo: &str) -> bool {
+pub(super) fn file_content_matches_digest(path: &Path, digest: &str, algo: &str) -> bool {
+    if algo != "sha512" {
+        return false;
+    }
+    let Ok(file) = fs::File::open(path) else {
+        return false;
+    };
+    hash_matches(file, digest)
+}
+
+pub(super) fn verify_file_integrity(path: &Path, digest: &str, algo: &str) -> bool {
     if algo != "sha512" {
         return false;
     }
@@ -679,6 +667,8 @@ fn hash_matches(file: fs::File, digest: &str) -> bool {
     }
     format!("{:x}", hasher.finalize()) == digest
 }
+
+mod package_dir_matches_index;
 
 #[cfg(test)]
 mod tests;

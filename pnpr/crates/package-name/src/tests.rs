@@ -11,19 +11,22 @@ fn canonicalizes_each_ecosystem() {
         CanonicalPackageName::parse("Demo.Package_name", Ecosystem::Pypi).unwrap().as_str(),
         "demo-package-name",
     );
+    let stored = CanonicalPackageName::from_stored("acme/app", Ecosystem::Oci);
+    assert_eq!(stored.as_str(), "acme/app");
+    assert_eq!(stored.ecosystem(), Ecosystem::Oci);
 }
 
 #[test]
 fn reports_ecosystem_specific_name_errors() {
     let cargo_error = CanonicalPackageName::parse("9lives", Ecosystem::Cargo).unwrap_err();
     assert_eq!(
-        cargo_error.public_message(),
+        cargo_error.to_string(),
         r#"Package name "9lives" is not valid for cargo: crate name "9lives" must start with a letter or `_`"#,
     );
 
     let python_error = CanonicalPackageName::parse("demo package", Ecosystem::Pypi).unwrap_err();
     assert_eq!(
-        python_error.public_message(),
+        python_error.to_string(),
         r#"Package name "demo package" is not valid for pypi: "demo package" is not a valid Python project name"#,
     );
 }
@@ -147,7 +150,50 @@ fn image_names_may_outrun_the_npm_length_limit() {
 fn reports_image_name_errors() {
     let error = CanonicalPackageName::parse("acme//app", Ecosystem::Oci).unwrap_err();
     assert_eq!(
-        error.public_message(),
+        error.to_string(),
         r#"Package name "acme//app" is not valid for oci: image name "acme//app" has an empty path component"#,
     );
+}
+
+#[test]
+fn accepts_sigstore_names() {
+    let unscoped = CanonicalPackageName::parse("foo", Ecosystem::Npm).unwrap();
+    assert_eq!(unscoped.sigstore_name_for_version("1.0.0"), "foo-1.0.0.sigstore");
+    assert_eq!(
+        unscoped.parse_sigstore_name("foo-1.0.0.sigstore").unwrap(),
+        ("foo-1.0.0.sigstore".to_string(), "1.0.0".to_string()),
+    );
+    assert_eq!(
+        unscoped.parse_sigstore_name("foo-1.0.0.sigstore.json").unwrap(),
+        ("foo-1.0.0.sigstore".to_string(), "1.0.0".to_string()),
+    );
+
+    let scoped = CanonicalPackageName::parse("@scope/bar", Ecosystem::Npm).unwrap();
+    assert_eq!(scoped.sigstore_name_for_version("2.1.0"), "bar-2.1.0.sigstore");
+    assert_eq!(
+        scoped.parse_sigstore_name("@scope/bar-2.1.0.sigstore").unwrap(),
+        ("bar-2.1.0.sigstore".to_string(), "2.1.0".to_string()),
+    );
+    assert_eq!(
+        scoped.parse_sigstore_name("bar-2.1.0.sigstore").unwrap(),
+        ("bar-2.1.0.sigstore".to_string(), "2.1.0".to_string()),
+    );
+
+    assert!(unscoped.parse_sigstore_name("bar-1.0.0.sigstore").is_err());
+    assert!(unscoped.parse_sigstore_name("foo-1.0.0.tgz").is_err());
+    assert!(unscoped.parse_sigstore_name("../foo-1.0.0.sigstore").is_err());
+}
+
+#[test]
+fn publishing_rejects_names_that_reads_accept() {
+    for name in ["Upper", "a~b", "_pkg", "pkg@x", "@scope/pkg@x", "café", "http"] {
+        let parsed = CanonicalPackageName::parse(name, Ecosystem::Npm).unwrap();
+        assert!(parsed.validate_npm_publish().is_err(), "{name}");
+    }
+    for name in ["pkg", "@scope/pkg", "pkg_name", "@scope/_pkg"] {
+        CanonicalPackageName::parse(name, Ecosystem::Npm)
+            .unwrap()
+            .validate_npm_publish()
+            .unwrap();
+    }
 }

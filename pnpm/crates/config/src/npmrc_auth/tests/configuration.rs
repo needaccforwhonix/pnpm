@@ -13,42 +13,21 @@ fn scope_is_ignored_in_npmrc() {
     assert_eq!(config.scope, None);
 }
 
+/// <https://github.com/pnpm/pnpm/issues/17762>
 #[test]
-fn project_ini_ignores_env_placeholders_in_registry_urls() {
+fn project_ini_records_env_placeholders_in_registry_urls() {
     static_env!(EnvWithSecret, &[("SECRET", "leaked")]);
 
-    let auth = NpmrcAuth::from_project_ini::<EnvWithSecret>(
-        "registry=https://registry.example.com/${SECRET}/\n",
-        Path::new(""),
-    );
+    for key in ["registry", "@scope:registry"] {
+        let auth = NpmrcAuth::from_project_ini::<EnvWithSecret>(
+            &format!("{key}=https://registry.example.com/${{SECRET}}/\n"),
+            Path::new(""),
+        );
 
-    assert_eq!(auth.routes.default, None);
-    assert!(
-        auth.warnings
-            .iter()
-            .any(|warning| warning.contains("registry")),
-    );
-
-    let mut config = Config::new();
-    auth.apply_to::<EnvWithSecret>(&mut config);
-    assert!(!config.registry.contains("leaked"));
-}
-
-#[test]
-fn project_ini_ignores_env_placeholders_in_scoped_registry_urls() {
-    static_env!(EnvWithSecret, &[("SECRET", "leaked")]);
-
-    let auth = NpmrcAuth::from_project_ini::<EnvWithSecret>(
-        "@scope:registry=https://registry.example.com/${SECRET}/\n",
-        Path::new(""),
-    );
-
-    assert!(auth.routes.scoped.is_empty());
-    assert!(
-        auth.warnings
-            .iter()
-            .any(|warning| warning.contains("@scope:registry")),
-    );
+        assert_eq!(auth.routes.default, None);
+        assert!(auth.routes.scoped.is_empty());
+        assert_eq!(auth.unexpanded_registry.as_deref(), Some(key));
+    }
 }
 
 #[test]
@@ -273,6 +252,40 @@ fn url_scoped_env_pnpm_prefix_wins_over_npm() {
 }
 
 #[test]
+fn url_scoped_env_canonical_registry_wins_over_alias_fallback() {
+    static_env_with_vars!(
+        Env,
+        &[
+            ("npm_config_//registry.npmjs.org/:_authToken", "canonical-token"),
+            ("npm_config_//registry.npmjs.com/:_authToken", "npm-alias-token"),
+            ("pnpm_config_//registry.npmjs.com/:_authToken", "pnpm-alias-token"),
+            ("pnpm_config_//registry.npmjs.org/:@org:_authToken", "canonical-scoped-token"),
+            ("pnpm_config_//registry.npmjs.com/:@org:_authToken", "alias-scoped-token"),
+        ]
+    );
+    for _ in 0..64 {
+        let auth = NpmrcAuth::from_url_scoped_env::<Env>();
+        let mut config = Config::new();
+        auth.apply_to::<NoEnv>(&mut config);
+        assert_eq!(
+            config.auth_headers.for_url("https://registry.npmjs.org/"),
+            Some("Bearer canonical-token".to_owned()),
+        );
+        assert_eq!(
+            config.auth_headers.for_url("https://registry.npmjs.com/custom/pkg.tgz"),
+            Some("Bearer pnpm-alias-token".to_owned()),
+        );
+        assert_eq!(
+            config.auth_headers.for_url_with_package(
+                "https://registry.npmjs.org/",
+                Some("@org/pkg"),
+            ),
+            Some("Bearer canonical-scoped-token".to_owned()),
+        );
+    }
+}
+
+#[test]
 fn url_scoped_env_ignores_non_url_and_empty_values() {
     static_env_with_vars!(
         Env,
@@ -445,9 +458,49 @@ fn json_env_rejects_non_http_scheme() {
 fn json_env_rejects_invalid_scope_name() {
     static_env!(
         Env,
-        &[("pnpm_config__auth", r#"{"https://registry.example":{"org":{"authToken":"tok"}}}"#)]
+        &[(
+            "pnpm_config__auth",
+            r#"{"https://registry.example":{"@org/pkg":{"authToken":"tok"}}}"#
+        )]
     );
     assert!(NpmrcAuth::from_json_sources::<Env>(None).is_err());
+}
+
+/// A key shaped like a scope entry but missing its `@` is a typo, not a field
+/// a later pnpm defines: dropping it would drop the scope's route.
+#[test]
+fn json_env_rejects_a_scope_missing_its_at() {
+    static_env!(
+        Env,
+        &[("pnpm_config__auth", r#"{"https://registry.example":{"org":{"authToken":"tok"}}}"#)]
+    );
+    let error = NpmrcAuth::from_json_sources::<Env>(None).unwrap_err().to_string();
+    assert!(error.contains(r#"did you mean "@org"?"#), "{error}");
+}
+
+/// The global config is shared by every pnpm on the machine, so a field a
+/// later version defines under a registry URL must not stop this one. A key
+/// that starts with `@` is a scope, and stays strict.
+#[test]
+fn json_auth_skips_unknown_fields_under_a_registry() {
+    static_env!(Env, &[]);
+    let global = serde_json::json!({
+        "https://registry.example": {
+            "authToken": "credential-only",
+            "laterSetting": { "enabled": true },
+            "@": { "authToken": "registry-token" },
+        },
+    });
+    let auth =
+        NpmrcAuth::from_json_sources::<Env>(Some(&global)).expect("unknown fields are skipped");
+    assert_eq!(default_auth_token(&auth, "//registry.example/"), Some(Some("registry-token")));
+    assert_eq!(
+        auth.warnings,
+        vec![
+            r#"Ignoring the unknown field "authToken" under https://registry.example/ in _auth"#,
+            r#"Ignoring the unknown field "laterSetting" under https://registry.example/ in _auth"#,
+        ],
+    );
 }
 
 #[test]

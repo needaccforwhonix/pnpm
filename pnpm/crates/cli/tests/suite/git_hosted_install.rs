@@ -79,6 +79,14 @@ fn write_dependencies(project: &Path, deps: &[(&str, &str)]) {
     );
 }
 
+fn add_submodule(repository: &Path, url: &str, path: &str) {
+    Command::new("git")
+        .current_dir(repository)
+        .args(["-c", "protocol.file.allow=always", "submodule", "add", "--", url, path])
+        .assert()
+        .success();
+}
+
 /// The lone `packages:` entry whose key names `name`, as a
 /// `(package_key, metadata)` pair.
 fn sole_package<'a>(
@@ -139,6 +147,121 @@ fn install_from_a_git_repo() {
     // ref in the importer, not `is-negative@git+...` — byte-for-byte what
     // pnpm 11 writes.
     assert_eq!(importer_version(&lockfile, ".", "is-negative"), repo.git_url_at(&commit));
+
+    drop((root, npmrc_info));
+}
+
+#[test]
+fn install_from_a_git_repo_with_submodules() {
+    let CommandTempCwd {
+        mut pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let module = GitRepoFixture::init(root.path(), "native");
+    module.write_file("answer.js", "module.exports = 42\n");
+    let _module_commit = module.commit("init");
+    let (repository, _initial_commit) = simple_repo(root.path(), "with-submodule", "1.0.0");
+    add_submodule(&root.path().join("with-submodule-src"), &module.file_url(), "native");
+    let commit = repository.commit("add submodule");
+    write_dependencies(&workspace, &[("with-submodule", &repository.git_url_at(&commit))]);
+
+    pacquet.env("GIT_CONFIG_COUNT", "1");
+    pacquet.env("GIT_CONFIG_KEY_0", "protocol.file.allow");
+    pacquet.env("GIT_CONFIG_VALUE_0", "always");
+    pacquet
+        .with_args(["install"])
+        .assert()
+        .success();
+
+    assert_eq!(
+        fs::read_to_string(workspace.join("node_modules/with-submodule/native/answer.js"))
+            .unwrap()
+            .trim(),
+        "module.exports = 42",
+    );
+
+    drop((root, npmrc_info));
+}
+
+#[test]
+fn install_from_a_git_repo_with_nested_submodules() {
+    let CommandTempCwd {
+        mut pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let inner = GitRepoFixture::init(root.path(), "inner");
+    inner.write_file("inner.js", "module.exports = 'inner'\n");
+    let _inner_commit = inner.commit("init inner");
+
+    let middle = GitRepoFixture::init(root.path(), "middle");
+    middle.write_file("middle.js", "module.exports = 'middle'\n");
+    let _middle_init = middle.commit("init middle");
+    add_submodule(&root.path().join("middle-src"), &inner.file_url(), "inner");
+    let _middle_commit = middle.commit("add inner submodule");
+
+    let (repository, _initial_commit) = simple_repo(root.path(), "with-nested-submodule", "1.0.0");
+    add_submodule(&root.path().join("with-nested-submodule-src"), &middle.file_url(), "middle");
+    let commit = repository.commit("add middle submodule");
+    write_dependencies(&workspace, &[("with-nested-submodule", &repository.git_url_at(&commit))]);
+
+    pacquet.env("GIT_CONFIG_COUNT", "1");
+    pacquet.env("GIT_CONFIG_KEY_0", "protocol.file.allow");
+    pacquet.env("GIT_CONFIG_VALUE_0", "always");
+    pacquet
+        .with_args(["install"])
+        .assert()
+        .success();
+
+    assert_eq!(
+        fs::read_to_string(workspace.join(
+            "node_modules/with-nested-submodule/middle/inner/inner.js"
+        ))
+        .unwrap()
+        .trim(),
+        "module.exports = 'inner'",
+    );
+
+    drop((root, npmrc_info));
+}
+
+#[test]
+fn lockfile_only_from_a_git_repo_with_submodules_does_not_fetch_submodules() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let (_module, module_commit) = simple_repo(root.path(), "submodule-target", "1.0.0");
+    let (repository, _initial_commit) = simple_repo(root.path(), "with-broken-submodule", "1.0.0");
+    let work = root.path().join("with-broken-submodule-src");
+    repository.write_file(
+        ".gitmodules",
+        "[submodule \"native\"]\npath = native\nurl = file:///nonexistent/submodule.git\n",
+    );
+    Command::new("git")
+        .current_dir(&work)
+        .args(["update-index", "--add", "--cacheinfo", "160000", &module_commit, "native"])
+        .assert()
+        .success();
+    let commit = repository.commit("add broken submodule");
+    write_dependencies(&workspace, &[("with-broken-submodule", &repository.git_url_at(&commit))]);
+
+    pacquet
+        .with_args(["install", "--lockfile-only"])
+        .assert()
+        .success();
+
+    let lockfile = read_lockfile(&workspace.join("pnpm-lock.yaml"));
+    let resolution = git_resolution(&lockfile, "with-broken-submodule");
+    assert_eq!(resolution.commit, commit);
 
     drop((root, npmrc_info));
 }
@@ -982,6 +1105,64 @@ fn assert_packages_prepared_from_their_own_checkout(workspace: &Path, commit: &s
                 .unwrap();
         assert_eq!(result, json!({"name": name, "commit": commit}));
     }
+}
+
+/// <https://github.com/pnpm/pnpm/issues/16899>
+#[cfg(unix)]
+#[test]
+fn a_tag_shared_by_many_workspace_projects_is_looked_up_once() {
+    use pnpm_testing_utils::git_repo::GitCommandLog;
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let (repo, commit) = simple_repo(root.path(), "tagged", "1.0.0");
+    repo.tag("v1.0.0");
+    let projects = ["a", "b", "c"];
+    let workspace_yaml = workspace.join("pnpm-workspace.yaml");
+    let yaml = fs::read_to_string(&workspace_yaml).unwrap();
+    fs::write(
+        &workspace_yaml,
+        format!(
+            "{yaml}packages:\n  - projects/*\nlinkWorkspacePackages: true\ncatalog:\n  tagged: '{}'\n",
+            repo.git_url_at("v1.0.0"),
+        ),
+    )
+    .unwrap();
+    write_manifest_value(&workspace, &json!({ "name": "root", "private": true }));
+    for project in projects {
+        let dir = workspace.join("projects").join(project);
+        fs::create_dir_all(&dir).unwrap();
+        write_manifest_value(
+            &dir,
+            &json!({ "name": project, "version": "1.0.0", "dependencies": { "tagged": "catalog:" } }),
+        );
+    }
+    pnpm_at(&workspace)
+        .arg("install")
+        .assert()
+        .success();
+    // A pnpmfile the lockfile has not recorded makes the next install
+    // resolve every project again.
+    fs::write(workspace.join(".pnpmfile.cjs"), "module.exports = { hooks: {} }\n").unwrap();
+    let log = GitCommandLog::new(root.path());
+
+    pnpm_at(&workspace)
+        .env("PATH", prepend_to_path(log.bin.parent().unwrap()))
+        .arg("install")
+        .assert()
+        .success();
+
+    assert_eq!(log.ls_remote_calls().len(), 1, "{:?}", log.ls_remote_calls());
+    let lockfile = read_lockfile(&workspace.join("pnpm-lock.yaml"));
+    assert_eq!(git_resolution(&lockfile, "tagged").commit, commit);
+    for project in projects {
+        let installed = workspace
+            .join("projects")
+            .join(project)
+            .join("node_modules/tagged");
+        assert_eq!(read_manifest(&installed)["name"], "tagged");
+    }
+
+    drop((root, npmrc_info));
 }
 
 mod builds;

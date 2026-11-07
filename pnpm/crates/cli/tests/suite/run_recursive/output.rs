@@ -1,8 +1,10 @@
 use super::{
     CommandExtra, CommandTempCwd, Value, build_writes_marker, echoes_ok, fs, json, sorted_lines,
-    summary_statuses, write_workspace,
+    summary_statuses, write_marker_script, write_workspace,
 };
+use crate::_utils::{has_pnpm_error_log, ndjson_records, without_colors};
 use assert_cmd::assert::OutputAssertExt;
+use std::process::Output;
 
 /// `pacquet -r run` with no script name surfaces the
 /// `ERR_PNPM_SCRIPT_NAME_IS_REQUIRED` typed error variant.
@@ -46,7 +48,7 @@ fn test_pattern_from_workspace_yaml_is_respected_by_the_test_script() {
             "name": name,
             "version": "1.0.0",
             "dependencies": dependencies,
-            "scripts": { "test": "touch tested.txt" },
+            "scripts": { "test": write_marker_script("tested.txt") },
         })
     };
     write_workspace(
@@ -82,6 +84,7 @@ fn test_pattern_from_workspace_yaml_is_respected_by_the_test_script() {
     git(&["init", "--initial-branch=main"]);
     git(&["config", "user.email", "x@y.z"]);
     git(&["config", "user.name", "xyz"]);
+    git(&["config", "--local", "core.quotePath", "true"]);
     git(&["init", "--bare", &remote.to_string_lossy()]);
     git(&["add", "."]);
     git(&["commit", "-m", "init", "--no-gpg-sign"]);
@@ -89,9 +92,11 @@ fn test_pattern_from_workspace_yaml_is_respected_by_the_test_script() {
     git(&["push", "-u", "origin", "main"]);
 
     fs::write(workspace.join("project-2").join("file.js"), "").expect("write changed file");
+    fs::write(workspace.join("project-2").join("\u{d55c}\u{ae00}.js"), "")
+        .expect("write changed Unicode test file");
     fs::write(workspace.join("project-4").join("different-pattern.js"), "")
         .expect("write changed file");
-    let workspace_yaml = "packages:\n  - project-1\n  - project-2\n  - project-3\n  - project-4\ntestPattern:\n  - '*/file.js'\n";
+    let workspace_yaml = "packages:\n  - project-1\n  - project-2\n  - project-3\n  - project-4\ntestPattern:\n  - '*/file.js'\n  - '*/\u{d55c}\u{ae00}.js'\n";
     fs::write(workspace.join("pnpm-workspace.yaml"), workspace_yaml)
         .expect("write pnpm-workspace.yaml");
     git(&["add", "."]);
@@ -140,9 +145,9 @@ fn recursive_run_executes_every_script_matching_a_regexp_selector() {
                     "name": "both",
                     "version": "1.0.0",
                     "scripts": {
-                        "build:backend": "touch backend.txt",
-                        "build:frontend": "touch frontend.txt",
-                        "test": "touch test.txt",
+                        "build:backend": write_marker_script("backend.txt"),
+                        "build:frontend": write_marker_script("frontend.txt"),
+                        "test": write_marker_script("test.txt"),
                     },
                 }),
             ),
@@ -151,7 +156,7 @@ fn recursive_run_executes_every_script_matching_a_regexp_selector() {
                 json!({
                     "name": "neither",
                     "version": "1.0.0",
-                    "scripts": { "test": "touch test.txt" },
+                    "scripts": { "test": write_marker_script("test.txt") },
                 }),
             ),
         ],
@@ -217,6 +222,127 @@ fn stream_prefixes_recursive_script_output_with_the_project() {
     );
 
     drop(root);
+}
+
+/// A streamed script's output is piped, so pnpm asks it to keep its colors
+/// whenever pnpm's own output is in color.
+#[test]
+fn streamed_scripts_get_force_color_when_pnpm_output_is_colored() {
+    for (color, expected) in [("always", "1"), ("never", "undefined")] {
+        let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+        let prints_force_color = |name: &str| {
+            json!({
+                "name": name,
+                "version": "1.0.0",
+                "scripts": { "test": r#"node -e "console.log(process.env.FORCE_COLOR)""# },
+            })
+        };
+        write_workspace(
+            &workspace,
+            &[
+                ("project-1", prints_force_color("project-1")),
+                ("project-2", prints_force_color("project-2")),
+            ],
+        );
+
+        let output = without_colors(pacquet)
+            .with_args([
+                &format!("--color={color}"),
+                "--stream",
+                "--reporter-hide-prefix",
+                "--config.verify-deps-before-run=false",
+                "-r",
+                "run",
+                "test",
+            ])
+            .output()
+            .expect("run test");
+        assert!(output.status.success(), "streamed run failed: {output:?}");
+        let printed: Vec<String> = sorted_lines(&output.stdout)
+            .into_iter()
+            .filter(|line| !line.contains("project-") && !line.starts_with("Scope:"))
+            .collect();
+        assert_eq!(printed, [expected, expected], "with --color={color}");
+
+        drop(root);
+    }
+}
+
+/// `pnpm -r run build` with `args` ahead of the command, over a project
+/// whose build exits with code 3 and one that builds.
+fn run_failing_build(args: &[&str]) -> Output {
+    let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+    let fails = json!({
+        "name": "project-1",
+        "version": "1.0.0",
+        "scripts": { "build": r#"node -e "process.exit(3)""# },
+    });
+    write_workspace(
+        &workspace,
+        &[("project-1", fails), ("project-2", build_writes_marker("project-2"))],
+    );
+
+    let output = pacquet
+        .with_args(args)
+        .with_args(["--config.verify-deps-before-run=false", "-r", "run", "build"])
+        .output()
+        .expect("run build");
+    assert!(!output.status.success(), "the failing script must fail the run");
+    drop(root);
+    output
+}
+
+/// A streamed run's lifecycle failure goes through the reporter, so a frame
+/// it redraws in place accounts for the line.
+#[test]
+fn streamed_lifecycle_failure_is_reported_through_the_reporter() {
+    let output = run_failing_build(&["--stream"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.contains("[ELIFECYCLE] Command failed with exit code 3."), "stdout:\n{stdout}");
+    assert!(!stderr.contains("[ELIFECYCLE]"), "stderr:\n{stderr}");
+}
+
+/// Whether the script output is streamed or inherited, the silent reporter
+/// prints no lifecycle failure.
+#[test]
+fn silent_reporter_hides_recursive_lifecycle_failure() {
+    for output_flag in ["--stream", "--workspace-concurrency=1"] {
+        let output = run_failing_build(&["--reporter=silent", output_flag]);
+        let printed = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(!printed.contains("[ELIFECYCLE]"), "with {output_flag}:\n{printed}");
+    }
+}
+
+/// Whether the script output is streamed or inherited, the ndjson reporter
+/// writes the lifecycle failure as a record.
+#[test]
+fn ndjson_reporter_reports_recursive_lifecycle_failure_as_a_record() {
+    for output_flag in ["--stream", "--workspace-concurrency=1"] {
+        let output = run_failing_build(&["--reporter=ndjson", output_flag]);
+        let printed = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            !printed
+                .lines()
+                .any(|line| line.starts_with("[ELIFECYCLE]")),
+            "with {output_flag}:\n{printed}",
+        );
+        assert!(
+            has_pnpm_error_log(
+                &ndjson_records(&output),
+                "[ELIFECYCLE] Command failed with exit code 3.",
+            ),
+            "with {output_flag}:\n{printed}",
+        );
+    }
 }
 
 /// Port of upstream's `run --reporter-hide-prefix should hide prefix`
@@ -459,4 +585,101 @@ fn use_stderr_diverts_reporter_output() {
     );
 
     drop(root);
+}
+
+#[test]
+fn github_actions_groups_serial_scripts_even_after_failure() {
+    for flags in [vec!["--sequential"], vec!["--workspace-concurrency=1"]] {
+        let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+        write_workspace(
+            &workspace,
+            &[
+                (
+                    "project-1",
+                    json!({"name": "project-1", "version": "1.0.0",
+                "scripts": {"test": r#"node -e "console.log('first-output');process.exit(1)""#}}),
+                ),
+                (
+                    "project-2",
+                    json!({"name": "project-2", "version": "1.0.0",
+                "scripts": {"test": r#"node -e "console.log('second-output')""#}}),
+                ),
+            ],
+        );
+        let output = pacquet
+            .with_env("GITHUB_ACTIONS", "true")
+            .with_env("CI", "true")
+            .with_args(["-r", "--no-bail", "run"])
+            .with_args(flags)
+            .with_arg("test")
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let groups: Vec<_> = stdout
+            .split("::group::")
+            .skip(1)
+            .collect();
+        assert_eq!(groups.len(), 2, "{stdout}");
+        for (group, name, marker) in
+            [(groups[0], "project-1", "first-output"), (groups[1], "project-2", "second-output")]
+        {
+            assert!(group.starts_with(&format!("{name}@1.0.0 : test {name}")), "{group}");
+            let end = group.find("::endgroup::").expect("closed group");
+            assert!(
+                group
+                    .find(&format!("\n{marker}"))
+                    .expect("script output")
+                    < end,
+                "{group}",
+            );
+        }
+        drop(root);
+    }
+}
+
+#[test]
+fn github_actions_omits_groups_for_silent_or_concurrent_runs() {
+    for flags in
+        [vec!["--silent", "--sequential"], vec!["--workspace-concurrency=2"], vec!["--parallel"]]
+    {
+        let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+        write_workspace(&workspace, &[("project-1", echoes_ok("project-1"))]);
+        let output = pacquet
+            .with_env("GITHUB_ACTIONS", "true")
+            .with_env("CI", "true")
+            .with_args(["-r", "run"])
+            .with_args(flags)
+            .with_arg("test")
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(!stdout.contains("::group::"), "{stdout}");
+        assert!(!stdout.contains("::endgroup::"), "{stdout}");
+        drop(root);
+    }
+}
+
+#[test]
+fn serial_scripts_omit_groups_outside_github_actions() {
+    for (github_actions, ci) in [("false", "true"), ("true", "false")] {
+        let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+        write_workspace(&workspace, &[("project-1", echoes_ok("project-1"))]);
+        let output = pacquet
+            .with_env("GITHUB_ACTIONS", github_actions)
+            .with_env("CI", ci)
+            .with_args(["-r", "run", "--sequential", "test"])
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(!stdout.contains("::group::"), "{stdout}");
+        assert!(!stdout.contains("::endgroup::"), "{stdout}");
+        assert!(stdout.contains("OK"), "{stdout}");
+        drop(root);
+    }
 }

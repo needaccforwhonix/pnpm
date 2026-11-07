@@ -8,12 +8,12 @@
 
 use super::InstallWithFreshLockfileError;
 use crate::{PrefetchContext, PrefetchingResolver};
-use pnpm_config::Config;
+use pnpm_config::{Config, Tool};
 use pnpm_engine_pm_yarn_resolver::YarnResolver;
 use pnpm_engine_runtime_bun_resolver::BunResolver;
 use pnpm_engine_runtime_deno_resolver::DenoResolver;
 use pnpm_engine_runtime_node_resolver::NodeResolver;
-use pnpm_lockfile::{Lockfile, LockfileResolution};
+use pnpm_lockfile::DeclaredRegistryPrefixes;
 use pnpm_resolving_default_resolver::DefaultResolver;
 use pnpm_resolving_git_resolver::{GitFetchContext, GitResolver, RealGitProbe, RealGitRunner};
 use pnpm_resolving_local_resolver::{LocalPathResolver, LocalResolverContext, LocalSchemeResolver};
@@ -22,10 +22,9 @@ use pnpm_resolving_npm_resolver::{
     shared_packument_fetch_locker, shared_picked_manifest_cache,
 };
 use pnpm_resolving_resolver_base::Resolver;
-use pnpm_resolving_tarball_resolver::{PriorTarballEntry, TarballFetchContext, TarballResolver};
+use pnpm_resolving_tarball_resolver::{TarballFetchContext, TarballResolver};
 use pnpm_store_dir::{
     SharedReadonlyStoreIndex, SharedVerifiedFilesCache, StoreDir, StoreIndex, StoreIndexWriter,
-    store_index_key,
 };
 use pnpm_tarball::SharedReportedProgressKeys;
 use std::{collections::HashMap, path::Path, sync::Arc};
@@ -51,6 +50,22 @@ pub(super) struct StoreCaches {
     pub git_source_cache: Arc<pnpm_git_fetcher::GitSourceCache>,
 }
 
+impl StoreCaches {
+    /// The install's own progress keys, with the verified-files and
+    /// git-source caches of `shared` when it shares them.
+    pub(super) fn new(
+        progress_reported: Option<SharedReportedProgressKeys>,
+        shared: Option<&pnpm_deps_restorer::SharedFetchCaches>,
+    ) -> Self {
+        let shared = shared.cloned().unwrap_or_default();
+        Self {
+            verified_files: shared.verified_files,
+            progress_reported: progress_reported.unwrap_or_default(),
+            git_source_cache: shared.git_sources,
+        }
+    }
+}
+
 /// Open the read-only index and spawn the batched writer *before* the
 /// resolver chain is built: the [`TarballResolver`] (which fetches a
 /// remote tarball direct dep during resolution to learn its
@@ -65,10 +80,12 @@ pub(super) struct StoreCaches {
 pub(super) async fn open_store_index_handles(
     config: &Config,
     store_dir: &'static StoreDir,
+    caches: StoreCaches,
 ) -> StoreIndexHandles {
     let index = StoreIndex::open_shared(store_dir, config.frozen_store).await;
-    let (writer, writer_task) = StoreIndexWriter::spawn_for(store_dir, config.frozen_store);
-    StoreIndexHandles { index, writer, writer_task, caches: StoreCaches::default() }
+    let (writer, writer_task) =
+        StoreIndexWriter::spawn_for(store_dir, config.frozen_store, config.store_index_format);
+    StoreIndexHandles { index, writer, writer_task, caches }
 }
 
 #[derive(Default)]
@@ -78,6 +95,10 @@ pub(super) struct Registries {
     /// `pnpm-workspace.yaml#namedRegistries` folded together with
     /// pacquet's built-in aliases — today `gh:` → GitHub Packages.
     pub named: HashMap<String, String>,
+    /// See [`DeclaredRegistryPrefixes`].
+    pub declared: DeclaredRegistryPrefixes,
+    /// See [`pnpm_lockfile::RegistryContext::locked_registries`].
+    pub locked: Option<HashMap<String, String>>,
 }
 
 /// Resolve the registries every registry-touching resolver consults.
@@ -87,6 +108,7 @@ pub(super) struct Registries {
 /// downstream 404.
 pub(super) fn resolve_registries(
     config: &Config,
+    locked: Option<&std::collections::BTreeMap<String, String>>,
 ) -> Result<Registries, InstallWithFreshLockfileError> {
     let user_registries_by_prefix: HashMap<String, String> = config
         .registries_by_prefix
@@ -100,49 +122,14 @@ pub(super) fn resolve_registries(
             .collect(),
         named: merge_named_registries(&user_registries_by_prefix)
             .map_err(InstallWithFreshLockfileError::InvalidNamedRegistry)?,
-    })
-}
-
-/// Map every remote tarball the prior lockfile recorded (with an
-/// integrity) to its `<integrity>\t<pkg_id>` store-index key, keyed
-/// exactly as `snapshot_cache_key` / the install pass address the row,
-/// so the [`TarballResolver`] can reuse a warm store entry instead of
-/// re-downloading on re-resolution. Git-hosted tarballs are skipped
-/// (they key by `gitHostedStoreIndexKey`, not the integrity) and just
-/// re-fetch as before. Empty on a first install.
-///
-/// Keyed by `pkg_id` — the bare specifier — rather than
-/// `resolution.tarball`, because that is what the resolver looks a
-/// dependency up by. The two differ once an immutable response has
-/// redirected: the lockfile then records the post-redirect URL while the
-/// id stays the specifier the manifest asked for.
-pub(super) fn prior_tarball_entries(
-    wanted_lockfile: Option<&Lockfile>,
-) -> HashMap<String, PriorTarballEntry> {
-    wanted_lockfile
-        .and_then(|lockfile| lockfile.packages.as_ref())
-        .map(|packages| {
-            packages
+        declared: config.declared_registry_prefixes(),
+        locked: locked.map(|routes| {
+            routes
                 .iter()
-                .filter_map(|(key, metadata)| match &metadata.resolution {
-                    LockfileResolution::Tarball(tarball) if tarball.git_hosted != Some(true) => {
-                        let integrity = tarball.integrity.clone()?;
-                        let pkg_id = key.pkg_id();
-                        let store_index_key = store_index_key(&integrity.to_string(), &pkg_id);
-                        Some((
-                            pkg_id,
-                            PriorTarballEntry {
-                                integrity,
-                                store_index_key,
-                                tarball_url: tarball.tarball.clone(),
-                            },
-                        ))
-                    }
-                    _ => None,
-                })
+                .map(|(route, url)| (route.clone(), url.clone()))
                 .collect()
-        })
-        .unwrap_or_default()
+        }),
+    })
 }
 
 /// Everything [`build_resolver_chain`] needs. Borrowed for the duration
@@ -197,8 +184,8 @@ pub(super) async fn build_resolver_chain<Reporter: pnpm_reporter::Reporter + 'st
         load_pnpmfile(inputs.config, inputs.project.root, inputs.hooks.pnpmfile.take()).await?;
     let chain = inputs.chain(&npm_resolver, &pnpmfile.custom_resolvers, &caches);
     // The install pass later calls `IngestTarballToStore::run_with_mem_cache`
-    // for the same URLs and either picks up `CacheValue::Available`
-    // immediately or briefly blocks on the per-URL `Notify`. See
+    // for the same archives and either picks up `CacheValue::Available`
+    // immediately or briefly blocks on the slot's `Notify`. See
     // `prefetching_resolver.rs` for the full design rationale.
     let resolver: Box<dyn Resolver> = Box::new(PrefetchingResolver::<Reporter>::new(
         Box::new(DefaultResolver::new(chain)),
@@ -248,13 +235,13 @@ impl PackumentCaches {
 
 impl ResolverChainInputs<'_> {
     fn retry_opts(&self) -> pnpm_network::RetryOpts {
-        crate::retry_config::retry_opts_from_config(self.config)
+        self.config.retry_opts()
     }
 
     fn npm_resolver(&self, caches: &PackumentCaches) -> Arc<dyn Resolver> {
         Arc::new(NpmResolver {
             registries: self.registry.named.clone(),
-            registries_by_prefix: self.registry.by_prefix.clone(),
+            declared_prefixes: self.registry.declared.clone(),
             metadata: pnpm_resolving_npm_resolver::RegistryMetadataClient {
                 http_client: Arc::clone(self.fetching.http_client),
                 auth_headers: Arc::clone(self.fetching.auth_headers),
@@ -273,12 +260,16 @@ impl ResolverChainInputs<'_> {
                 full_metadata: self.registry.full_metadata,
                 needs_full_metadata_for: Some(Arc::clone(&self.registry.needs_full_metadata)),
                 filter_metadata: self.config.requires_filtered_full_metadata(),
+                registry_options_by_url: Arc::new(self.config.registry_options_by_url.clone()),
+                minimum_release_age: self.config.resolved_minimum_release_age(),
             },
             cache_policy: pnpm_resolving_npm_resolver::MetadataCachePolicy {
-                offline: self.config.offline,
-                prefer_offline: self.config.prefer_offline,
+                network: self.config.network_policy(),
                 ignore_missing_time_field: self.config.minimum_release_age_ignore_missing_time,
             },
+            store_view: self.store.index
+                .cloned()
+                .map(pnpm_resolving_npm_resolver::OfflineStoreView::new),
         })
     }
 
@@ -291,7 +282,9 @@ impl ResolverChainInputs<'_> {
     fn git_resolver(&self) -> GitResolver<RealGitProbe, RealGitRunner> {
         GitResolver::new(
             Arc::new(RealGitProbe::new(Arc::clone(self.fetching.http_client))),
-            Arc::new(RealGitRunner::new()),
+            Arc::new(
+                RealGitRunner::new().with_connect_guard(self.fetching.auth_headers.connect_guard()),
+            ),
         )
         .with_fetch_context(GitFetchContext {
             source_cache: Arc::clone(self.fetching.git_sources),
@@ -300,6 +293,7 @@ impl ResolverChainInputs<'_> {
             store_index_writer: Some(Arc::clone(self.store.index_writer)),
             auth_headers: Arc::clone(self.fetching.auth_headers),
             retry_opts: self.retry_opts(),
+            tar_limits: self.config.tar_limits(),
             git_shallow_hosts: self.config.git_shallow_hosts.clone(),
         })
     }
@@ -307,9 +301,9 @@ impl ResolverChainInputs<'_> {
     // A remote (non-registry) tarball *direct* dependency carries no
     // name/version/integrity at resolve time — they live in the
     // tarball's `package.json`. The resolver downloads + extracts it here
-    // (warming `tarball_mem_cache` keyed by URL) so the lockfile builder
-    // gets the manifest + integrity and the install pass reuses the
-    // extraction without a second download. Wired in both the
+    // (warming `tarball_mem_cache` under the hash it settles) so the
+    // lockfile builder gets the manifest + integrity and the install pass
+    // reuses the extraction without a second download. Wired in both the
     // materializing and `--lockfile-only` paths: the lockfile needs the
     // integrity regardless of whether `node_modules` is built.
     fn tarball_resolver(&self) -> TarballResolver {
@@ -319,7 +313,13 @@ impl ResolverChainInputs<'_> {
                 mem_cache: Some(Arc::clone(self.fetching.tarballs)),
                 auth_headers: Arc::clone(self.fetching.auth_headers),
                 retry_opts: self.retry_opts(),
-                prior_tarball_entries: Arc::new(prior_tarball_entries(self.project.lockfile)),
+                tar_limits: self.config.tar_limits(),
+                prior_tarball_entries: Arc::new(prior_tarball_entries(
+                    self.project.lockfile,
+                    self.config.lockfile_integrity_target,
+                )),
+                cache_dir: Some(self.config.cache_dir.clone()),
+                integrity_target: self.config.lockfile_integrity_target,
                 store: pnpm_tarball::ArchiveStoreContext {
                     strict_pkg_content_check: false,
                     prefetched_cas_paths: None,
@@ -339,6 +339,8 @@ impl ResolverChainInputs<'_> {
             Arc::clone(self.fetching.auth_headers),
         );
         node_resolver.node_download_mirrors.clone_from(&self.config.node_download_mirrors);
+        node_resolver.mirror = self.config.tool_mirror(Tool::Node).map(ToString::to_string);
+        node_resolver.channel_mirrors = self.config.tool_channel_mirrors(Tool::Node);
         node_resolver.offline = self.config.offline;
         node_resolver.cache_dir = Some(self.config.cache_dir.clone());
         node_resolver
@@ -354,6 +356,8 @@ impl ResolverChainInputs<'_> {
                 .keys()
                 .cloned()
                 .collect(),
+            registries: self.registry.named.clone(),
+            declared_prefixes: self.registry.declared.clone(),
             metadata: pnpm_resolving_npm_resolver::RegistryMetadataClient {
                 http_client: Arc::clone(self.fetching.http_client),
                 auth_headers: Arc::clone(self.fetching.auth_headers),
@@ -368,12 +372,16 @@ impl ResolverChainInputs<'_> {
                 full_metadata: self.registry.full_metadata,
                 needs_full_metadata_for: Some(Arc::clone(&self.registry.needs_full_metadata)),
                 filter_metadata: self.config.requires_filtered_full_metadata(),
+                registry_options_by_url: Arc::new(self.config.registry_options_by_url.clone()),
+                minimum_release_age: self.config.resolved_minimum_release_age(),
             },
             cache_policy: pnpm_resolving_npm_resolver::MetadataCachePolicy {
-                offline: self.config.offline,
-                prefer_offline: self.config.prefer_offline,
+                network: self.config.network_policy(),
                 ignore_missing_time_field: self.config.minimum_release_age_ignore_missing_time,
             },
+            store_view: self.store.index
+                .cloned()
+                .map(pnpm_resolving_npm_resolver::OfflineStoreView::new),
         }
     }
 
@@ -396,7 +404,10 @@ impl ResolverChainInputs<'_> {
         );
         // Pacquet doesn't expose `preserveAbsolutePaths` yet, so absolute
         // `file:` / `link:` specs resolve as though it were off.
-        let local_ctx = LocalResolverContext { preserve_absolute_paths: false };
+        let local_ctx = LocalResolverContext {
+            preserve_absolute_paths: false,
+            integrity_target: self.config.lockfile_integrity_target,
+        };
         chain.extend([
             Box::new(Arc::clone(npm_resolver)) as Box<dyn Resolver>,
             Box::new(self.git_resolver()),
@@ -407,10 +418,10 @@ impl ResolverChainInputs<'_> {
                 Arc::clone(self.fetching.http_client),
                 Arc::clone(npm_resolver),
             )),
-            Box::new(BunResolver::new(
-                Arc::clone(self.fetching.http_client),
-                Arc::clone(npm_resolver),
-            )),
+            Box::new(
+                BunResolver::new(Arc::clone(self.fetching.http_client), Arc::clone(npm_resolver))
+                    .with_mirror(self.config.tool_mirror(Tool::Bun)),
+            ),
             Box::new(YarnResolver::new(
                 Arc::clone(self.fetching.http_client),
                 self.config.tls.strict_ssl.unwrap_or(true),
@@ -440,6 +451,7 @@ impl ResolverChainInputs<'_> {
             policy: crate::PrefetchPolicy {
                 downloads: self.fetching.prefetch && custom_fetcher_session.is_none(),
                 custom_session: custom_fetcher_session,
+                tracked: self.fetching.tracked,
             },
         }
     }
@@ -467,7 +479,7 @@ async fn load_pnpmfile(
     let hook = match hook_override {
         Some(hook) => Some(hook),
         None if config.ignore_pnpmfile => None,
-        None => pnpm_hooks::finder::load_pnpmfiles(lockfile_dir, crate::pnpmfile_selection(config))
+        None => crate::load_install_pnpmfiles(config, lockfile_dir)
             .map_err(InstallWithFreshLockfileError::MissingPnpmfile)?,
     };
     let Some(hook) = hook else {
@@ -497,11 +509,23 @@ async fn load_pnpmfile(
             );
             InstallWithFreshLockfileError::CustomFetcherHook(err)
         })?;
-    Ok(PnpmfileLoad {
-        hook: Some(hook),
-        custom_resolvers,
-        custom_fetcher_session: (!fetchers.is_empty()).then(|| {
-            Arc::new(pnpm_deps_restorer::CustomFetcherSession::new(fetchers))
-        }),
-    })
+    let custom_fetcher_session = custom_fetcher_session(fetchers, config)?;
+    Ok(PnpmfileLoad { hook: Some(hook), custom_resolvers, custom_fetcher_session })
 }
+
+fn custom_fetcher_session(
+    fetchers: Vec<Arc<dyn pnpm_hooks::CustomFetcher>>,
+    config: &Config,
+) -> Result<Option<Arc<pnpm_deps_restorer::CustomFetcherSession>>, InstallWithFreshLockfileError> {
+    if fetchers.is_empty() {
+        return Ok(None);
+    }
+    pnpm_deps_restorer::CustomFetcherSession::with_config(fetchers, config)
+        .map(Arc::new)
+        .map(Some)
+        .map_err(InstallWithFreshLockfileError::AllowBuildsPolicy)
+}
+
+mod prior_tarballs;
+
+use prior_tarballs::prior_tarball_entries;

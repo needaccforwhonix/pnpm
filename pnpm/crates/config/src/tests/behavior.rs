@@ -1,55 +1,16 @@
 use super::{
     Config, EnvVar, EnvVarOs, GLOBAL_LAYOUT_VERSION, GetCurrentDir, GetHomeDir, Host, HostNoHome,
-    LinkProbe, NPM_DEFAULT_REGISTRY, NodeLinker, NodePackageMapType, OsString, PackageImportMethod,
-    Path, PathBuf, assert_eq, config_from_workspace_yaml, default_ci, default_state_dir,
+    LinkProbe, NPM_DEFAULT_REGISTRY, NodeLinker, NodePackageMapMode, NodePackageMapType, OsString,
+    PackageImportMethod, Path, PathBuf, assert_eq, config_from_workspace_yaml, default_state_dir,
     default_store_dir, fs, io, load_with_project_and_user, repo_on_branch, safe_host_var, tempdir,
     write_file,
 };
 
 #[test]
-fn ci_false_disables_github_actions_detection() {
-    struct GithubActionsWithCiFalse;
-
-    impl EnvVar for GithubActionsWithCiFalse {
-        fn var(name: &str) -> Option<String> {
-            match name {
-                "CI" => Some("false".to_string()),
-                "GITHUB_ACTIONS" => Some("true".to_string()),
-                _ => None,
-            }
-        }
-
-        fn vars() -> Vec<(String, String)> {
-            Vec::new()
-        }
-    }
-
-    assert!(!default_ci::<GithubActionsWithCiFalse>(|| true));
-}
-
-#[test]
-fn ci_detection_uses_injected_detector() {
-    struct InjectedCi;
-
-    impl EnvVar for InjectedCi {
-        fn var(_: &str) -> Option<String> {
-            None
-        }
-
-        fn vars() -> Vec<(String, String)> {
-            Vec::new()
-        }
-    }
-
-    assert!(default_ci::<InjectedCi>(|| true));
-    assert!(!default_ci::<InjectedCi>(|| false));
-}
-
-#[test]
 pub fn have_default_values() {
     let value = Config::new();
     assert_eq!(value.node_linker, NodeLinker::default());
-    assert!(!value.node_experimental_package_map);
+    assert_eq!(value.node_package_map_mode, NodePackageMapMode::Off);
     assert_eq!(value.node_package_map_type, NodePackageMapType::Standard);
     assert_eq!(value.package_import_method, PackageImportMethod::default());
     assert!(value.prefer_frozen_lockfile);
@@ -70,7 +31,7 @@ pub fn have_default_values() {
 }
 
 #[test]
-pub fn global_dirs_expand_a_leading_tilde() {
+pub fn global_config_paths_expand_a_leading_tilde() {
     let home = tempdir().expect("home tempdir");
     static HOME_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     HOME_PATH
@@ -78,8 +39,15 @@ pub fn global_dirs_expand_a_leading_tilde() {
         .expect("set once");
     let config_dir = home.path().join("xdg").join("pnpm");
     fs::create_dir_all(&config_dir).expect("create config dir");
-    fs::write(config_dir.join("config.yaml"), "globalDir: ~/global\nglobalBinDir: ~/bin\n")
-        .expect("write global config.yaml");
+    let absolute_dir = home.path().join("absolute");
+    fs::write(
+        config_dir.join("config.yaml"),
+        format!(
+            "globalDir: ~/global\nglobalBinDir: ~/bin\nstoreDir: ~/store\nsymlinkedLockfileTargetDirs:\n  - ~/src\n  - relative\n  - '{}'\n",
+            absolute_dir.display(),
+        ),
+    )
+    .expect("write global config.yaml");
 
     struct HostWithHome;
     impl EnvVar for HostWithHome {
@@ -123,6 +91,54 @@ pub fn global_dirs_expand_a_leading_tilde() {
         ),
     );
     assert_eq!(config.global_bin, Some(home.path().join("bin")));
+    assert_eq!(config.store_dir.root(), home.path().join("store").join("v11"));
+    // A relative entry is dropped, not resolved against the working directory.
+    assert_eq!(config.symlinked_lockfile_target_dirs, [home.path().join("src"), absolute_dir]);
+}
+
+#[test]
+pub fn pnpm_config_store_dir_expands_a_leading_tilde() {
+    let home = tempdir().expect("home tempdir");
+    static HOME_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    HOME_PATH
+        .set(home.path().to_path_buf())
+        .expect("set once");
+
+    struct HostWithHome;
+    impl EnvVar for HostWithHome {
+        fn var(name: &str) -> Option<String> {
+            match name {
+                "PNPM_CONFIG_STORE_DIR" => Some("~/store".to_string()),
+                "XDG_CONFIG_HOME" => Some(
+                    HOME_PATH
+                        .get()
+                        .expect("home path")
+                        .join("xdg")
+                        .to_str()
+                        .expect("utf-8 home path")
+                        .to_string(),
+                ),
+                _ => safe_host_var(name),
+            }
+        }
+    }
+    impl EnvVarOs for HostWithHome {
+        fn var_os(_: &str) -> Option<OsString> {
+            None
+        }
+    }
+    impl GetHomeDir for HostWithHome {
+        fn home_dir() -> Option<PathBuf> {
+            HOME_PATH.get().cloned()
+        }
+    }
+    inert_link_probe!(HostWithHome);
+    host_current_dir!(HostWithHome);
+
+    let project = tempdir().expect("project tempdir");
+    let config =
+        Config::new().current::<HostWithHome>(project.path()).expect("PNPM_CONFIG_STORE_DIR loads");
+    assert_eq!(config.store_dir.root(), home.path().join("store").join("v11"));
 }
 
 #[test]
@@ -248,7 +264,7 @@ pub fn gvs_disabled_keeps_project_local_virtual_store() {
         .expect("write to pnpm-workspace.yaml");
     let config = Config::new().current::<HostNoHome>(tmp.path()).expect("yaml is valid");
     assert!(!config.enable_global_virtual_store);
-    assert_eq!(config.virtual_store_dir, tmp.path().join("node_modules/.pnpm"));
+    assert_eq!(config.install_state_dir, tmp.path().join("node_modules/.pnpm"));
     assert_eq!(config.global_virtual_store_dir, config.store_dir.links());
 }
 
@@ -261,10 +277,18 @@ pub fn gvs_user_pinned_virtual_store_routes_into_global_virtual_store_dir() {
         format!("enableGlobalVirtualStore: true\nvirtualStoreDir: {}\n", user_path.display()),
     )
     .expect("write to pnpm-workspace.yaml");
-    let config = Config::new().current::<HostNoHome>(tmp.path()).expect("yaml is valid");
+    let mut config = Config::new().current::<HostNoHome>(tmp.path()).expect("yaml is valid");
     assert!(config.enable_global_virtual_store);
-    assert_eq!(config.virtual_store_dir, user_path);
+    assert_eq!(config.install_state_dir, tmp.path().join("node_modules/.pnpm"));
     assert_eq!(config.global_virtual_store_dir, user_path);
+
+    config.apply_global_virtual_store_derivation(true, false);
+    assert_eq!(config.global_virtual_store_dir, user_path);
+    assert_eq!(config.virtual_store_dir(), user_path);
+
+    config.enable_global_virtual_store = false;
+    config.apply_global_virtual_store_derivation(true, false);
+    assert_eq!(config.install_state_dir, user_path);
 }
 
 /// A single-project install (no `pnpm-workspace.yaml` anywhere)
@@ -279,7 +303,7 @@ pub fn single_project_anchors_modules_at_cwd() {
     let tmp = tempdir().unwrap();
     let config = Config::new().current::<HostNoHome>(tmp.path()).expect("config loads");
     assert_eq!(config.modules_dir, tmp.path().join("node_modules"));
-    assert_eq!(config.virtual_store_dir, tmp.path().join("node_modules/.pnpm"));
+    assert_eq!(config.install_state_dir, tmp.path().join("node_modules/.pnpm"));
 }
 
 /// `scriptShell` is path-resolved only when it comes from the workspace
@@ -418,4 +442,55 @@ pub fn the_branch_pattern_leaves_an_unmatched_branch_alone() {
 
     let config = Config::new().current::<HostOnDevelop>(repo.path()).expect("yaml is valid");
     assert!(!config.merge_git_branch_lockfiles);
+}
+
+#[test]
+pub fn skip_store_dir_resolution_avoids_link_probe() {
+    let home = tempdir().expect("home tempdir");
+    static HOME_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    HOME_PATH
+        .set(home.path().to_path_buf())
+        .expect("set once");
+
+    struct PanickingLinkProbeHost;
+    impl EnvVar for PanickingLinkProbeHost {
+        fn var(name: &str) -> Option<String> {
+            safe_host_var(name)
+        }
+    }
+    impl EnvVarOs for PanickingLinkProbeHost {
+        fn var_os(_: &str) -> Option<OsString> {
+            None
+        }
+    }
+    impl GetHomeDir for PanickingLinkProbeHost {
+        fn home_dir() -> Option<PathBuf> {
+            HOME_PATH.get().cloned()
+        }
+    }
+    impl LinkProbe for PanickingLinkProbeHost {
+        fn can_link_between_dirs(_: &Path, _: &Path) -> bool {
+            panic!(
+                "can_link_between_dirs should not be called when skip_store_dir_resolution is true",
+            );
+        }
+    }
+    host_current_dir!(PanickingLinkProbeHost);
+
+    let project = tempdir().expect("project tempdir");
+    let mut config = Config::new();
+    config.skip_store_dir_resolution = true;
+    let loaded = config
+        .current::<PanickingLinkProbeHost>(project.path())
+        .expect("config loads without probing store dir");
+    assert!(loaded.skip_store_dir_resolution);
+    assert!(loaded.store_dir_placement_skipped);
+
+    let pinned = tempdir().expect("pinned project tempdir");
+    fs::write(pinned.path().join("pnpm-workspace.yaml"), "storeDir: ''\n")
+        .expect("write pnpm-workspace.yaml");
+    let loaded = loaded
+        .current::<PanickingLinkProbeHost>(pinned.path())
+        .expect("config loads with a pinned store dir");
+    assert!(!loaded.store_dir_placement_skipped);
 }

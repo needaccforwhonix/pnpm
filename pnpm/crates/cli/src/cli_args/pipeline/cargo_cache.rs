@@ -2,6 +2,7 @@ mod restore;
 use restore::{clone_file, invalidate_fingerprints};
 
 use super::paths::{check_ancestors, validate_relative_path};
+use crate::process::Command;
 use pnpm_crypto_hash::{create_hex_hash, create_hex_hash_from_file};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -10,7 +11,6 @@ use std::{
     fs::{File, OpenOptions},
     io,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 const INPUT_RECORD: &str = ".pnpm-cargo-inputs-v1";
@@ -47,17 +47,17 @@ impl CargoCache {
                 "Cargo target directory must be ignored by Git: {directory}",
             )));
         }
+        let project = dunce::canonicalize(project)?;
         let target = project.join(relative);
-        check_ancestors(project, relative)?;
+        check_ancestors(&project, relative)?;
         let parent = target.parent().expect("relative target has a parent");
         fs::create_dir_all(parent)?;
-        let common = command_output(
-            "git",
+        let common = canonical_git_path(
             &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-            project,
+            &project,
             &BTreeMap::new(),
         )?;
-        let locks = Path::new(common.trim()).join("pnpm-cargo-locks");
+        let locks = common.join("pnpm-cargo-locks");
         fs::create_dir_all(&locks)?;
         let lock = OpenOptions::new()
             .read(true)
@@ -66,7 +66,7 @@ impl CargoCache {
             .truncate(false)
             .open(locks.join(create_hex_hash(&target.to_string_lossy())))?;
         lock.lock()?;
-        check_ancestors(project, relative)?;
+        check_ancestors(&project, relative)?;
         Ok(Self { target, _lock: lock })
     }
 
@@ -202,29 +202,27 @@ pub(super) fn snapshot_entry(
     task_key: &str,
     environment: &BTreeMap<String, String>,
 ) -> io::Result<(PathBuf, String, Vec<String>)> {
-    let repo = PathBuf::from(
-        command_output("git", &["rev-parse", "--show-toplevel"], project, environment)?.trim(),
-    );
-    let common = command_output(
-        "git",
+    let cache_dir = pnpm_fs::realpath_missing(cache_dir)?;
+    let project = dunce::canonicalize(project)?;
+    let repo = canonical_git_path(&["rev-parse", "--show-toplevel"], &project, environment)?;
+    let common = canonical_git_path(
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-        project,
+        &project,
         environment,
     )?;
-    let common = dunce::canonicalize(common.trim())?;
     let mut inputs = vec!["pnpm-cargo-state:v1".to_string(), task_key.to_string()];
-    inputs.push(command_output("rustc", &["-vV"], project, environment)?);
-    inputs.push(command_output("cargo", &["-vV"], project, environment)?);
+    inputs.push(command_output("rustc", &["-vV"], &project, environment)?);
+    inputs.push(command_output("cargo", &["-vV"], &project, environment)?);
     let metadata: serde_json::Value = serde_json::from_str(&command_output(
         "cargo",
         &["metadata", "--format-version=1", "--locked", "--offline"],
-        project,
+        &project,
         environment,
     )?)?;
     let local_packages = local_packages_in_repo(&metadata, &repo)?;
     inputs.push(serde_json::to_string(environment)?);
     add_repository_inputs(&repo, environment, &mut inputs)?;
-    add_config_inputs(project, environment, &mut inputs)?;
+    add_config_inputs(&project, environment, &mut inputs)?;
     let key = create_hex_hash(&serde_json::to_string(&inputs)?);
     let scope = create_hex_hash(&common.to_string_lossy());
     Ok((
@@ -275,7 +273,7 @@ fn add_config_inputs(
     let cargo_home = environment
         .get("CARGO_HOME")
         .map(PathBuf::from)
-        .or_else(|| home::home_dir().map(|home| home.join(".cargo")));
+        .or_else(|| pnpm_config::home_dir().map(|home| home.join(".cargo")));
     if let Some(cargo_home) = cargo_home {
         for name in ["config", "config.toml"] {
             add_config(&cargo_home.join(name), project, inputs)?;
@@ -316,7 +314,7 @@ fn local_packages_in_repo(metadata: &serde_json::Value, repo: &Path) -> io::Resu
 }
 
 /// Add one tracked file's contents to the cache key. A path git lists
-/// but that is gone is simply not an input; anything that is not a
+/// but that is gone is not an input; anything that is not a
 /// regular file is one the hash cannot describe.
 fn add_tracked_file_input(repo: &Path, path: &str, inputs: &mut Vec<String>) -> io::Result<()> {
     check_ancestors(repo, Path::new(path))?;
@@ -335,16 +333,37 @@ fn add_tracked_file_input(repo: &Path, path: &str, inputs: &mut Vec<String>) -> 
     }
 }
 
+/// Put `dir` first on the `PATH` of `environment`.
+pub(super) fn prepend_path(environment: &mut BTreeMap<String, String>, dir: PathBuf) {
+    let path = environment
+        .get("PATH")
+        .map(String::as_str)
+        .unwrap_or_default();
+    let dirs = std::iter::once(dir).chain(env::split_paths(path));
+    if let Some(joined) = env::join_paths(dirs)
+        .ok()
+        .and_then(|joined| joined.into_string().ok())
+    {
+        environment.insert("PATH".to_string(), joined);
+    }
+}
+
 pub(super) fn cache_environment(
     extra: &std::collections::HashMap<String, String>,
     declared: &[String],
 ) -> BTreeMap<String, String> {
+    let declared: Vec<String> = declared
+        .iter()
+        .cloned()
+        .map(env_key)
+        .collect();
     env::vars()
         .chain(
             extra
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone())),
         )
+        .map(|(key, value)| (env_key(key), value))
         .filter(|(key, _)| {
             key.starts_with("CARGO_")
                 || key.starts_with("RUST")
@@ -364,6 +383,15 @@ pub(super) fn cache_environment(
         .collect()
 }
 
+/// The name under which the platform matches an environment variable.
+/// Windows matches names without regard to case, so a build environment
+/// that spells a variable two ways across runs still hashes the same.
+/// POSIX names are case-sensitive, where folding the case would merge
+/// variables a build keeps apart.
+fn env_key(key: String) -> String {
+    if cfg!(windows) { key.to_ascii_uppercase() } else { key }
+}
+
 fn add_config(path: &Path, project: &Path, inputs: &mut Vec<String>) -> io::Result<()> {
     match create_hex_hash_from_file(path) {
         Ok(hash) => {
@@ -375,6 +403,14 @@ fn add_config(path: &Path, project: &Path, inputs: &mut Vec<String>) -> io::Resu
         Err(error) => return Err(error),
     }
     Ok(())
+}
+
+fn canonical_git_path(
+    args: &[&str],
+    project: &Path,
+    environment: &BTreeMap<String, String>,
+) -> io::Result<PathBuf> {
+    dunce::canonicalize(command_output("git", args, project, environment)?.trim())
 }
 
 fn command_output(

@@ -1,12 +1,10 @@
 use super::{
-    super::{
-        Install, InstallError, ProjectMutation, UpToDateFastPathCheck, install_already_up_to_date,
-    },
+    super::{Install, InstallError, ProjectMutation},
     InstallDirs, PARTIAL_INSTALL_LOCKFILE, assert_package_absent, assert_package_present,
     fresh_lockfile_only_with_overrides, install_then_go_offline, install_with_pnpmfile,
     touch_manifest,
 };
-use crate::PolicyExcludes;
+use crate::{PolicyExcludes, UpToDateFastPathCheck, install_already_up_to_date};
 use pnpm_config::Config;
 use pnpm_lockfile::{Lockfile, MaybeLazyLockfile};
 use pnpm_modules_yaml::{Host, LayoutVersion, Modules, NodeLinker, write_modules_manifest};
@@ -21,7 +19,7 @@ use tempfile::tempdir;
 /// from it; no `--frozen-lockfile` flag. The freshness gate inside the
 /// auto-frozen branch must fail, and the dispatch must fall through
 /// to the fresh-resolve path instead of surfacing `OutdatedLockfile`
-/// the way state 1 would. We assert via the same "unreachable
+/// the way state 1 would. We assert via the same "failing
 /// registry" sentinel as the previous test.
 #[tokio::test]
 async fn stale_lockfile_under_no_flag_falls_through_to_fresh_resolve() {
@@ -36,12 +34,25 @@ async fn stale_lockfile_under_no_flag_falls_through_to_fresh_resolve() {
         .unwrap();
     manifest.save().unwrap();
 
+    let mut registry = mockito::Server::new_async().await;
+    let failed_request = registry
+        .mock("GET", "/@pnpm.e2e%2Fhello-world-js-bin")
+        .with_status(503)
+        .expect(3)
+        .create_async()
+        .await;
     let mut config = Config::new();
-    config.registry = "http://invalid.local/".to_string();
+    config.registry = format!("{}/", registry.url());
+    config.fetch_retry_mintimeout = 1;
+    config.fetch_retry_maxtimeout = 1;
+    // The default cache dir is shared by every test. Another test's mock can
+    // get the same port and leave this package's metadata there, and an
+    // exact version found in cached metadata never reaches the registry.
+    config.cache_dir = dirs.path().join("cache");
     config.enable_global_virtual_store = false;
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
     let config = config.leak();
 
     let lockfile: Lockfile = serde_saphyr::from_str(PARTIAL_INSTALL_LOCKFILE)
@@ -92,13 +103,16 @@ async fn stale_lockfile_under_no_flag_falls_through_to_fresh_resolve() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
     .await;
 
+    failed_request.assert_async().await;
     let err = result.expect_err(
-        "fresh-resolve dispatch must consult the unreachable registry and fail; \
+        "fresh-resolve dispatch must consult the failing registry and fail; \
          a success would mean the dispatch silently took the auto-frozen path",
     );
     assert!(
@@ -116,6 +130,10 @@ fn sync_fast_path_reads_the_workspace_root_wanted_lockfile_from_a_member() {
     std::fs::create_dir_all(&project_root).expect("create workspace member");
     std::fs::create_dir_all(project_root.join("node_modules"))
         .expect("create member modules directory");
+    // The member's `link:` dependency is linked on every install, so the
+    // recorded state has to see the entry.
+    std::fs::create_dir_all(project_root.join("node_modules").join("sibling"))
+        .expect("create the member's link entry");
     std::fs::create_dir_all(&virtual_store_dir).expect("create virtual store");
     std::fs::write(workspace_root.join("pnpm-workspace.yaml"), "packages:\n  - packages/*\n")
         .expect("write workspace manifest");
@@ -144,7 +162,7 @@ fn sync_fast_path_reads_the_workspace_root_wanted_lockfile_from_a_member() {
     config.workspace_dir = Some(workspace_root.clone());
     config.store_dir = dir.path().join("pacquet-store").into();
     config.modules_dir = modules_dir;
-    config.virtual_store_dir = virtual_store_dir;
+    config.install_state_dir = virtual_store_dir;
     let config = config.leak();
     let included = pnpm_modules_yaml::IncludedDependencies {
         dependencies: true,
@@ -157,6 +175,7 @@ fn sync_fast_path_reads_the_workspace_root_wanted_lockfile_from_a_member() {
         workspace_state::ProjectEntry {
             name: Some("workspace-root".to_string()),
             version: Some("1.0.0".to_string()),
+            has_modules_dir: false,
         },
     );
     projects.insert(
@@ -164,6 +183,7 @@ fn sync_fast_path_reads_the_workspace_root_wanted_lockfile_from_a_member() {
         workspace_state::ProjectEntry {
             name: Some("app".to_string()),
             version: Some("1.0.0".to_string()),
+            has_modules_dir: false,
         },
     );
     let validated_at = 0;
@@ -175,7 +195,8 @@ fn sync_fast_path_reads_the_workspace_root_wanted_lockfile_from_a_member() {
             pnpmfiles: Vec::new(),
             filtered_install: false,
             config_dependencies: None,
-            settings: crate::optimistic_repeat_install::settings::current_settings(
+            validation: None,
+            settings: crate::install_state::settings::current_settings(
                 config,
                 pnpm_config::NodeLinker::Isolated,
                 included,
@@ -198,7 +219,7 @@ fn sync_fast_path_reads_the_workspace_root_wanted_lockfile_from_a_member() {
 
     assert_eq!(
         install_already_up_to_date(&check).map(|up_to_date| up_to_date.root).as_deref(),
-        Some(&*workspace_root),
+        Ok(&*workspace_root),
     );
     assert_eq!(std::fs::read_to_string(&wanted_path).expect("reread wanted lockfile"), current);
 
@@ -221,7 +242,7 @@ fn sync_fast_path_reads_the_workspace_root_wanted_lockfile_from_a_member() {
 
     assert_eq!(
         install_already_up_to_date(&per_project_check).map(|up_to_date| up_to_date.root).as_deref(),
-        Some(&*workspace_root),
+        Ok(&*workspace_root),
     );
 }
 /// Regression: a single-project install with NO lockfile anywhere —
@@ -270,7 +291,7 @@ pub(super) async fn optimistic_repeat_install_does_not_short_circuit_when_lockfi
     config.lockfile = false;
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
     let config = config.leak();
 
     let included = pnpm_modules_yaml::IncludedDependencies {
@@ -290,7 +311,7 @@ pub(super) async fn optimistic_repeat_install_does_not_short_circuit_when_lockfi
         public_hoist_pattern: config.public_hoist_pattern.clone(),
         store_dir: config.store_dir.display().to_string(),
         virtual_store_dir: config
-            .effective_virtual_store_dir()
+            .virtual_store_dir()
             .to_string_lossy()
             .into_owned(),
         virtual_store_dir_max_length: config.virtual_store_dir_max_length,
@@ -304,9 +325,10 @@ pub(super) async fn optimistic_repeat_install_does_not_short_circuit_when_lockfi
         workspace_state::ProjectEntry {
             name: Some("project".to_string()),
             version: Some("1.0.0".to_string()),
+            has_modules_dir: false,
         },
     );
-    let settings = crate::optimistic_repeat_install::settings::current_settings(
+    let settings = crate::install_state::settings::current_settings(
         config,
         pnpm_config::NodeLinker::Isolated,
         included,
@@ -322,6 +344,7 @@ pub(super) async fn optimistic_repeat_install_does_not_short_circuit_when_lockfi
             pnpmfiles: Vec::new(),
             filtered_install: false,
             config_dependencies: None,
+            validation: None,
             settings,
         },
     )
@@ -377,6 +400,8 @@ pub(super) async fn optimistic_repeat_install_does_not_short_circuit_when_lockfi
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<RecordingReporter>()
@@ -422,8 +447,8 @@ async fn fresh_install_records_lockfile_verification_for_mtime_bypassed_noop() {
     config.cache_dir = cache_dir.clone();
     config.store_dir = store_dir.clone().into();
     config.modules_dir = modules_dir.clone();
-    config.virtual_store_dir = virtual_store_dir.clone();
-    config.registry = mock_instance.url();
+    config.install_state_dir = virtual_store_dir.clone();
+    config.registry = mock_instance.url().to_string();
     let config = config.leak();
 
     Install {
@@ -471,6 +496,8 @@ async fn fresh_install_records_lockfile_verification_for_mtime_bypassed_noop() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -505,7 +532,7 @@ async fn fresh_install_records_lockfile_verification_for_mtime_bypassed_noop() {
     second_config.cache_dir = cache_dir;
     second_config.store_dir = store_dir.into();
     second_config.modules_dir = modules_dir;
-    second_config.virtual_store_dir = virtual_store_dir;
+    second_config.install_state_dir = virtual_store_dir;
     second_config.registry = "http://127.0.0.1:9/".to_string();
     second_config.optimistic_repeat_install = false;
     let second_config = second_config.leak();
@@ -555,6 +582,8 @@ async fn fresh_install_records_lockfile_verification_for_mtime_bypassed_noop() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<RecordingReporter>()
@@ -588,7 +617,7 @@ async fn fresh_install_records_lockfile_verification_for_mtime_bypassed_noop() {
 }
 /// A repeat install with `pnpm-lock.yaml` deleted but `node_modules`
 /// intact must short-circuit offline by treating the current lockfile
-/// (`<virtual_store_dir>/lock.yaml`) as the wanted one, and must
+/// (`<install_state_dir>/lock.yaml`) as the wanted one, and must
 /// restore `pnpm-lock.yaml` byte-identically. Guards the
 /// current-as-wanted fallback end-to-end: a regression into the full
 /// pipeline (resolution or the verification fan-out against an empty
@@ -665,6 +694,8 @@ async fn optimistic_repeat_install_restores_missing_lockfile_offline() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<RecordingReporter>()

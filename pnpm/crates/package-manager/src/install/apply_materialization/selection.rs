@@ -7,9 +7,8 @@ pub(super) struct SelectMaterializedStateInputs<'a> {
     pub(crate) lockfiles: crate::install::state_options::SelectedLockfiles<'a>,
     pub(crate) projects: crate::install::state_options::SelectedImporters<'a>,
     pub(super) workspace_root: &'a Path,
-    pub(super) included: IncludedDependencies,
+    pub(super) groups: crate::GroupSelection,
     pub(super) install_skipped: &'a crate::SkippedSnapshots,
-    pub(super) node_linker: NodeLinker,
     pub(super) is_inconsistent: bool,
 }
 pub(super) struct MaterializedState<'a> {
@@ -28,7 +27,7 @@ pub(super) fn select_materialized_state<'a>(
                 wanted,
                 inputs.workspace_root,
                 requested,
-                inputs.included,
+                &inputs.groups,
                 inputs.install_skipped,
             )
             .lockfile
@@ -58,53 +57,58 @@ pub(super) fn project_anchor_importers(
     inputs: &SelectMaterializedStateInputs<'_>,
     wanted_lockfile: Option<&Lockfile>,
 ) -> HashSet<String> {
-    match inputs.projects.requested_ids {
-        Some(requested) if matches!(inputs.node_linker, NodeLinker::Hoisted) => requested.clone(),
-        Some(requested) => wanted_lockfile.map_or_else(
-            || requested.clone(),
-            |wanted| {
-                crate::materialization_closure(
-                    wanted,
-                    inputs.workspace_root,
-                    requested,
-                    inputs.included,
-                    inputs.install_skipped,
-                )
-                .importer_ids
-            },
-        ),
-        None => inputs.projects.real_ids.clone(),
+    match (inputs.projects.requested_ids, wanted_lockfile) {
+        (Some(requested), Some(wanted)) => {
+            crate::materialization_closure(
+                wanted,
+                inputs.workspace_root,
+                requested,
+                &crate::GroupSelection::following_every_edge(inputs.groups.included)
+                    .linking_as(&inputs.groups),
+                inputs.install_skipped,
+            )
+            .importer_ids
+        }
+        (Some(requested), None) => requested.clone(),
+        (None, _) => inputs.projects.real_ids.clone(),
     }
 }
 pub(super) fn materialized_current_lockfile(
     inputs: &SelectMaterializedStateInputs<'_>,
     wanted: &Lockfile,
 ) -> Lockfile {
-    if inputs.projects.requested_ids.is_some() && matches!(inputs.node_linker, NodeLinker::Hoisted)
-    {
-        crate::filter_lockfile_for_current(wanted, inputs.included, inputs.install_skipped)
-    } else if let Some(requested_importer_ids) = inputs.projects.requested_ids {
+    if inputs.projects.requested_ids.is_none() && inputs.projects.ignore_manifest_check {
+        crate::filter_lockfile_for_current(wanted, &inputs.groups, inputs.install_skipped)
+    } else {
         crate::merge_filtered_current_lockfile(
-            (!inputs.is_inconsistent).then_some(inputs.lockfiles.current).flatten(),
+            (inputs.projects.requested_ids.is_some() && !inputs.is_inconsistent)
+                .then_some(inputs.lockfiles.current)
+                .flatten(),
             wanted,
-            requested_importer_ids,
-            inputs.included,
+            inputs.projects.requested_ids.unwrap_or(inputs.projects.real_ids),
+            &inputs.groups,
             inputs.install_skipped,
             inputs.workspace_root,
         )
-    } else {
-        crate::filter_lockfile_for_current(wanted, inputs.included, inputs.install_skipped)
     }
 }
 pub(super) struct LinkMaterializedProjectsInputs<'a> {
     pub(super) filtered_install: bool,
     pub(super) node_linker: NodeLinker,
     pub(super) config: &'static Config,
-    pub(super) current_lockfile: Option<&'a Lockfile>,
-    pub(super) wanted_lockfile: Option<&'a Lockfile>,
+    pub(super) lockfiles: LinkMaterializedLockfiles<'a>,
     pub(super) workspace_root: &'a Path,
-    pub(super) project_manifests: &'a [(PathBuf, &'a PackageManifest)],
+    pub(super) manifest_links: LinkMaterializedManifestLinks<'a>,
     pub(super) materialized_project_manifests: &'a [(PathBuf, &'a PackageManifest)],
+}
+pub(super) struct LinkMaterializedManifestLinks<'a> {
+    pub(super) workspace_links: Option<crate::WorkspaceLinks<'a>>,
+    pub(super) included: IncludedDependencies,
+    pub(super) project_manifests: &'a [(PathBuf, &'a PackageManifest)],
+}
+pub(super) struct LinkMaterializedLockfiles<'a> {
+    pub(super) current: Option<&'a Lockfile>,
+    pub(super) wanted: Option<&'a Lockfile>,
 }
 pub(super) async fn link_materialized_projects<Reporter: self::Reporter + 'static>(
     inputs: LinkMaterializedProjectsInputs<'_>,
@@ -112,31 +116,22 @@ pub(super) async fn link_materialized_projects<Reporter: self::Reporter + 'stati
     if inputs.filtered_install
         && !matches!(inputs.node_linker, NodeLinker::Hoisted)
         && crate::should_write_package_map(inputs.config, inputs.node_linker)
-        && let Some(current) = inputs.current_lockfile.as_ref()
+        && let Some(current) = inputs.lockfiles.current.as_ref()
     {
         write_filtered_package_map(&inputs, current).await?;
     }
 
-    // Materialize `link:` direct deps straight from the in-memory
-    // project manifests. `excludeLinksFromLockfile` keeps them out
-    // of the lockfile importers, so the lockfile-driven symlink
-    // passes cannot see them. Aliases the wanted lockfile *does*
-    // track are skipped — those belong to the lockfile passes (and
-    // their dedupe decisions). See [`crate::link_manifest_link_deps`].
-    // These are importer symlinks like any other, so
-    // `virtualStoreOnly` skips them too.
+    // These are importer symlinks, so `virtualStoreOnly` skips them too.
     if !inputs.config.virtual_store_only {
         crate::link_manifest_link_deps::<Reporter>(
             inputs.workspace_root,
             inputs.materialized_project_manifests,
-            inputs.wanted_lockfile.and_then(|lockfile| {
+            inputs.lockfiles.wanted.and_then(|lockfile| {
                 (!lockfile.importers.is_empty()).then_some(&lockfile.importers)
             }),
-            // Honor a `modulesDir` override the same way the
-            // lockfile-driven symlink pass does.
-            inputs.config.modules_dir
-                .file_name()
-                .unwrap_or_else(|| std::ffi::OsStr::new("node_modules")),
+            inputs.manifest_links.workspace_links,
+            inputs.manifest_links.included,
+            inputs.config.modules_dir_name(),
             &crate::shim_link_options(inputs.config, inputs.node_linker),
         )
         .map_err(InstallError::LinkManifestLinkDeps)?;
@@ -167,7 +162,7 @@ pub(super) async fn write_filtered_package_map(
             modules_dir: &inputs.config.modules_dir,
             package_map_type: inputs.config.node_package_map_type,
             layout: &layout,
-            project_manifests: inputs.project_manifests,
+            project_manifests: inputs.manifest_links.project_manifests,
         },
     )
     .map_err(InstallError::WritePackageMap)?;
@@ -177,8 +172,7 @@ pub(super) async fn package_map_engine_name(
     config: &'static Config,
     current: &Lockfile,
 ) -> Option<String> {
-    let runtime_major =
-        crate::install_frozen_lockfile::find_runtime_node_major(current.snapshots.as_ref());
+    let runtime_major = crate::install_frozen_lockfile::find_runtime_node_major(&current.importers);
     let configured_major = config.node_version
         .as_deref()
         .and_then(crate::install_frozen_lockfile::parse_major_from_version);

@@ -5,19 +5,23 @@ use super::{
 };
 use pnpm_lockfile::{
     BundledDependencies, LockfileFormError, LockfileFormOptions, LockfileResolution, PackageKey,
-    PackageMetadata, PeerDependencyMeta, PkgName, PkgNameVerPeer, PkgVerPeer, RegistryOptions,
-    SnapshotDepRef, SnapshotEntry, registry_server_type,
+    PackageMetadata, PkgName, PkgNameVerPeer, PkgVerPeer, RegistryOptions, SnapshotDepRef,
+    SnapshotEntry, registry_for_package, registry_server_type,
 };
 use pnpm_resolving_deps_resolver::{DepPath, DependenciesGraph, DependenciesGraphNode};
 use rayon::prelude::*;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 
+mod variant_snapshots;
+
 pub(super) type PackagesAndSnapshots =
     (HashMap<PackageKey, PackageMetadata>, HashMap<PackageKey, SnapshotEntry>);
 /// Registry configuration and prior package records used to serialize package metadata.
 pub struct PackageMetadataSources<'a> {
-    pub registry: &'a str,
+    /// Registry routes keyed by `@scope`, plus `default`, as
+    /// [`registry_for_package`] takes them.
+    pub registries: &'a HashMap<String, String>,
     pub registries_by_prefix: &'a HashMap<String, String>,
     pub registry_options_by_url: &'a BTreeMap<String, RegistryOptions>,
     pub lockfile_include_tarball_url: bool,
@@ -53,9 +57,18 @@ pub(super) fn build_packages_and_snapshots(
     let mut packages: HashMap<PackageKey, PackageMetadata> = HashMap::new();
     let mut snapshots: HashMap<PackageKey, SnapshotEntry> = HashMap::new();
     for built_node in built {
-        let Some(BuiltNode { node, snapshot_key, snapshot }) = built_node? else { continue };
+        let Some(BuiltNode {
+            node,
+            snapshot_key,
+            snapshot,
+            variant_snapshots,
+        }) = built_node?
+        else {
+            continue;
+        };
         insert_package_metadata(&mut packages, node, snapshot_key.without_peer(), sources)?;
         snapshots.insert(snapshot_key, snapshot);
+        snapshots.extend(variant_snapshots);
     }
 
     Ok((packages, snapshots))
@@ -64,6 +77,9 @@ pub(super) struct BuiltNode<'graph> {
     node: &'graph pnpm_resolving_deps_resolver::DependenciesGraphNode,
     snapshot_key: PackageKey,
     snapshot: SnapshotEntry,
+    /// The snapshots of the platform variants whose dependencies differ
+    /// from the version's (see [`variant_snapshots`]).
+    variant_snapshots: Vec<(PackageKey, SnapshotEntry)>,
 }
 /// A node's snapshot row under its key; `None` for a workspace link, which
 /// has no row of its own.
@@ -85,7 +101,12 @@ pub(super) fn build_node<'graph>(
         }),
     }?;
     let snapshot = build_snapshot_entry(node, graph, optional_overrides);
-    Ok(Some(BuiltNode { node, snapshot_key, snapshot }))
+    let (snapshot, variant_snapshots) = variant_snapshots::split_variant_snapshots(
+        &snapshot_key,
+        node.resolve_result.package.manifest.as_deref(),
+        snapshot,
+    );
+    Ok(Some(BuiltNode { node, snapshot_key, snapshot, variant_snapshots }))
 }
 /// Record a package's metadata under its peer-stripped key, once: the first
 /// node of a key in graph order wins.
@@ -116,46 +137,49 @@ pub(super) fn insert_package_metadata(
 /// The registry a package's metadata is written against, and whether its
 /// tarball URL has to be written out.
 ///
-/// A registry-qualified key names its registry; that registry — not the
-/// scope-routed default — decides whether the tarball URL is canonical and can
-/// be dropped from the entry.
+/// That registry decides whether the tarball URL is canonical and can be
+/// dropped from the entry, so it must be the one an install rebuilds the URL
+/// from:
+///
+/// - a registry-qualified key: the registry it names;
+/// - any other key: the registry its scope routes to.
 ///
 /// Fails closed on an alias that cannot be resolved: testing the URL for
-/// canonicality against the *default* registry could drop a URL that only the
-/// named registry can rebuild, leaving a `work:` entry that no install can
+/// canonicality against the scope-routed registry could drop a URL that only
+/// the named registry can rebuild, leaving a `work:` entry that no install can
 /// fetch. Keeping the URL is always recoverable, so an unknown alias forces it
 /// to be written.
 pub(super) fn metadata_registry<'a>(
     key: &PackageKey,
     sources: &PackageMetadataSources<'a>,
 ) -> (&'a str, bool) {
+    let routed_registry = registry_for_package(sources.registries, &key.name.to_string(), None);
     let Some((registry_name, _)) = key.suffix.registry_qualified() else {
-        return (sources.registry, sources.lockfile_include_tarball_url);
+        return (routed_registry, sources.lockfile_include_tarball_url);
     };
     match sources.registries_by_prefix.get(registry_name) {
         Some(named_registry) => (named_registry.as_str(), sources.lockfile_include_tarball_url),
-        None => (sources.registry, true),
+        None => (routed_registry, true),
     }
 }
-/// `deprecated` is the only registry-mutable field of a published version; an
-/// unchanged resolution must not lose a recorded deprecation to a registry
-/// serving it inconsistently (pnpm/pnpm#13846).
+/// `deprecated` is the only registry-mutable field of a published version. An
+/// unchanged resolution keeps its recorded deprecation, so neither a registry
+/// serving it inconsistently (pnpm/pnpm#13846) nor a stale metadata cache
+/// (pnpm/pnpm#5772) can rewrite it.
 pub(super) fn carry_previous_deprecation(
     metadata: &mut PackageMetadata,
     key: &PackageKey,
     sources: &PackageMetadataSources<'_>,
 ) {
-    if metadata.deprecated.is_none()
-        && let Some(previous) = sources.previous_packages.and_then(|prev| prev.get(key))
+    if let Some(previous) = sources.previous_packages.and_then(|prev| prev.get(key))
+        && previous.deprecated.is_some()
         && previous.resolution == metadata.resolution
     {
         metadata.deprecated.clone_from(&previous.deprecated);
     }
 }
 /// Build the per-`(name, version)` [`PackageMetadata`] block for the
-/// lockfile's `packages:` map. Pulls `engines` / `cpu` / `os` / `libc` /
-/// `deprecated` / `hasBin` / `bundledDependencies` / `peerDependencies`
-/// off the resolver's manifest fragment when present.
+/// lockfile's `packages:` map.
 ///
 /// Covers the per-package half only — the per-snapshot fields
 /// `dependencies` / `optionalDependencies` / `transitivePeerDependencies` /
@@ -166,7 +190,8 @@ pub(super) fn build_package_metadata(
     lockfile_form: LockfileFormOptions<'_>,
 ) -> Result<PackageMetadata, LockfileFormError> {
     let manifest = node.resolve_result.package.manifest.as_deref();
-    let (peer_dependencies, peer_dependencies_meta) = build_peer_dep_blocks(node);
+    let (peer_dependencies, peer_dependencies_meta) =
+        pnpm_resolving_deps_resolver::lockfile_peer_blocks(node.edges.peer_set.declared());
     let resolution_version = match metadata_key.suffix.registry_qualified() {
         Some((_, version)) => version.to_string(),
         None => metadata_key.suffix.version().to_string(),
@@ -196,34 +221,19 @@ pub(super) fn build_package_metadata(
     })
 }
 /// The manifest's `engines`, without the ranges that constrain nothing.
+/// The legacy array form, such as `["node >= 0.8"]`, is not checked for
+/// installability, so it is not recorded either.
 pub(super) fn read_engines(manifest: Option<&Value>) -> Option<HashMap<String, String>> {
-    manifest
-        .and_then(|manifest| manifest.get("engines"))
-        .and_then(|value| match value {
-            Value::Object(map) => Some(
-                map.iter()
-                    .filter_map(|(name, value)| Some((name.clone(), value.as_str()?)))
-                    .collect::<Vec<(String, &str)>>(),
-            ),
-            // Array-form `engines` (e.g. `["node >= 0.2.0"]`) records
-            // index-keyed entries.
-            Value::Array(items) => Some(
-                items
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, value)| Some((index.to_string(), value.as_str()?)))
-                    .collect(),
-            ),
-            _ => None,
+    let engines: HashMap<String, String> = manifest?
+        .get("engines")?
+        .as_object()?
+        .iter()
+        .filter_map(|(name, value)| {
+            let range = value.as_str()?;
+            (range != "*").then(|| (name.clone(), range.to_string()))
         })
-        .map(|entries| {
-            entries
-                .into_iter()
-                .filter(|(_, range)| *range != "*")
-                .map(|(name, range)| (name, range.to_string()))
-                .collect::<HashMap<String, String>>()
-        })
-        .filter(|map| !map.is_empty())
+        .collect();
+    (!engines.is_empty()).then_some(engines)
 }
 /// Record `version` only for non-registry packages (depPath carries
 /// a `:`), and only when the manifest declares one and the resolution
@@ -245,6 +255,7 @@ pub(super) fn explicit_version(
         manifest
             .and_then(|manifest| manifest.get("version"))
             .and_then(Value::as_str)
+            .filter(|version| pnpm_package_name::is_valid_package_version(version))
             .map(ToString::to_string)
     })
     .flatten()
@@ -279,7 +290,7 @@ pub(super) fn read_string_or_list(
 }
 /// `Some(true)` when the manifest declares executable files, recorded as
 /// the `hasBin: true` signal; the field is dropped entirely when absent.
-pub(crate) fn manifest_has_bin(manifest: Option<&Value>) -> Option<bool> {
+pub fn manifest_has_bin(manifest: Option<&Value>) -> Option<bool> {
     let manifest = manifest?;
     let has_bin = manifest
         .get("bin")
@@ -298,29 +309,6 @@ pub(crate) fn manifest_has_bin(manifest: Option<&Value>) -> Option<bool> {
                 .is_some_and(|path| !path.is_empty())
         });
     (has_bin || has_bin_directory).then_some(true)
-}
-/// Returned `Option`-pair from [`build_peer_dep_blocks`]: the
-/// `peerDependencies` map (name → range) and the
-/// `peerDependenciesMeta` map (name → `{ optional: true }`).
-pub(super) type PeerDepBlocks =
-    (Option<HashMap<String, String>>, Option<HashMap<String, PeerDependencyMeta>>);
-/// Split the resolver's `peer_dependencies` into the
-/// `peerDependencies` (name → range) and `peerDependenciesMeta`
-/// (name → `{ optional: true }`) blocks written onto `packages:`.
-pub(super) fn build_peer_dep_blocks(node: &DependenciesGraphNode) -> PeerDepBlocks {
-    if node.edges.peer_dependencies.is_empty() {
-        return (None, None);
-    }
-    let mut peers: HashMap<String, String> = HashMap::new();
-    let mut peers_meta: HashMap<String, PeerDependencyMeta> = HashMap::new();
-    for (name, peer) in &node.edges.peer_dependencies {
-        peers.insert(name.clone(), peer.version.clone());
-        if peer.optional {
-            peers_meta.insert(name.clone(), PeerDependencyMeta { optional: true });
-        }
-    }
-    let peers_meta = (!peers_meta.is_empty()).then_some(peers_meta);
-    (Some(peers), peers_meta)
 }
 /// Build the per-snapshot [`SnapshotEntry`] for this depPath: the
 /// `dependencies` / `optionalDependencies` partition follows the

@@ -3,6 +3,8 @@ use super::{
     cargo_config, common, crate_archive, find_file, header, json, metadata, publish_body,
     publish_request, router_with_auth, sha256_hex,
 };
+use crate::tokens::issue_token;
+use pnpr_storage::layout::blob_segment;
 
 #[tokio::test]
 async fn config_json_points_downloads_and_the_api_back_at_the_registry() {
@@ -40,7 +42,7 @@ async fn config_json_points_downloads_and_the_api_back_at_the_registry() {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK, "{registry}");
-        assert_eq!(response.headers()[header::CACHE_CONTROL], "private, no-store");
+        assert!(!response.headers().contains_key(header::CACHE_CONTROL), "{registry}");
         let config: Value =
             serde_json::from_slice(&body_bytes(response.into_body()).await).unwrap();
         assert_eq!(config["api"], format!("http://pnpr.test/cargo/~{registry}"));
@@ -73,7 +75,7 @@ async fn search_hides_a_private_registry_from_an_anonymous_caller() {
     for url in ["/cargo/api/v1/crates?q=demo", "/cargo/api/v1/crates?browse=true"] {
         let tmp = TempDir::new().unwrap();
         let auth = AuthState::in_memory();
-        let token = auth.tokens.issue("alice").await.unwrap();
+        let token = issue_token(&auth, "alice").await;
         let app = router_with_auth(
             cargo_config(tmp.path().to_path_buf(), "http://upstream.invalid/", "$authenticated"),
             auth,
@@ -120,7 +122,7 @@ async fn search_hides_a_private_registry_from_an_anonymous_caller() {
 async fn crate_names_are_case_insensitive_in_the_index_path() {
     let tmp = TempDir::new().unwrap();
     let auth = AuthState::in_memory();
-    let token = auth.tokens.issue("alice").await.unwrap();
+    let token = issue_token(&auth, "alice").await;
     let app = router_with_auth(
         cargo_config(tmp.path().to_path_buf(), "http://upstream.invalid/", "$all"),
         auth,
@@ -170,7 +172,7 @@ async fn crate_names_are_case_insensitive_in_the_index_path() {
 async fn private_hosted_registry_advertises_auth_required_and_masks_anonymous_reads() {
     let tmp = TempDir::new().unwrap();
     let auth = AuthState::in_memory();
-    let token = auth.tokens.issue("alice").await.unwrap();
+    let token = issue_token(&auth, "alice").await;
     let app = router_with_auth(
         cargo_config(tmp.path().to_path_buf(), "http://upstream.invalid/", "$authenticated"),
         auth,
@@ -308,7 +310,10 @@ async fn proxies_the_sparse_index_and_verified_downloads_through_an_upstream() {
     index_mock.assert_async().await;
     download_mock.assert_async().await;
     let cache = tmp.path().join(".pnpr-cache");
-    assert!(find_file(&cache, "serde-1.0.0.crate").is_some(), "download is cached");
+    assert!(
+        find_file(&cache, &blob_segment("serde", "serde-1.0.0.crate")).is_some(),
+        "download is cached",
+    );
 
     // An unknown crate is a definitive 404, and the cache holds nothing for it.
     let missing = upstream
@@ -373,7 +378,10 @@ async fn a_download_that_fails_the_index_checksum_is_never_cached() {
         .await
         .unwrap();
     assert!(axum::body::to_bytes(response.into_body(), usize::MAX).await.is_err());
-    assert!(find_file(&tmp.path().join(".pnpr-cache"), "serde-1.0.0.crate").is_none());
+    assert!(
+        find_file(&tmp.path().join(".pnpr-cache"), &blob_segment("serde", "serde-1.0.0.crate"))
+            .is_none(),
+    );
 }
 
 #[tokio::test]
@@ -442,7 +450,7 @@ async fn upstream_sparse_index_rejects_invalid_utf8_before_serving_or_downloadin
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(body_bytes(response.into_body()).await, valid_index.as_bytes());
-    let cached_index = find_file(&tmp.path().join(".pnpr-cache"), "package.json").unwrap();
+    let cached_index = find_file(&tmp.path().join(".pnpr-cache"), "document.json").unwrap();
     tokio::fs::write(cached_index, [0xff]).await.unwrap();
     let response = app
         .oneshot(

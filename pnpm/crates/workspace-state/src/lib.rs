@@ -21,7 +21,6 @@ use std::{
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
-use tempfile::NamedTempFile;
 
 /// Basename of the workspace-state file, written inside `node_modules/`.
 pub const WORKSPACE_STATE_FILENAME: &str = ".pnpm-workspace-state-v1.json";
@@ -40,6 +39,14 @@ pub struct ProjectEntry {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// Whether a hoisted install left the project with its own modules
+    /// directory. The hoisted linker creates one only for dependencies it
+    /// nests under the project, so a project with dependencies may have
+    /// none; this records which ones must still have it. Never set under
+    /// the isolated linker, which needs a modules directory for every
+    /// project with dependencies.
+    #[serde(default, rename = "hasModulesDir", skip_serializing_if = "std::ops::Not::not")]
+    pub has_modules_dir: bool,
 }
 
 /// A single `configDependencies` value — either a `VersionWithIntegrity`
@@ -77,6 +84,139 @@ pub struct WorkspaceState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_dependencies: Option<BTreeMap<String, ConfigDependency>>,
     pub settings: WorkspaceStateSettings,
+    /// What the last validation proved about each project. `None` when it
+    /// recorded nothing, which leaves every project to be proven from the
+    /// lockfiles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation: Option<Validation>,
+}
+
+/// The inputs each project was last proven installed against.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Validation {
+    /// Filesystem time, in nanoseconds since the Unix epoch, by which every
+    /// entry of [`Self::files`] was stat'd. A file whose mtime is this close to
+    /// it may have been rewritten without its mtime moving.
+    pub recorded_at_ns: i64,
+    /// The content digest of each input file the projects share (the
+    /// lockfile, patches, pnpmfiles), keyed by path, with the stat it was
+    /// read at.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub files: BTreeMap<String, FileSignature>,
+    /// The digest of the lockfile the projects were proven against, unless
+    /// [`Self::lockfiles`] names another one. `None` when there was none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lockfile: Option<String>,
+    /// The digest of the manifest each project was proven installed with,
+    /// keyed by importer id. A project without an entry is not proven
+    /// installed.
+    pub manifests: BTreeMap<String, String>,
+    /// The digest of the lockfile a project was proven against, keyed by
+    /// importer id, where it is not [`Self::lockfile`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub lockfiles: BTreeMap<String, Option<String>>,
+    /// The digest of every workspace package's bin declarations, keyed by the
+    /// importer id of each project that was proven installed with them. Only
+    /// the root and the projects with dependencies link workspace bins, so
+    /// only they have an entry.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub workspace_bins: BTreeMap<String, String>,
+    /// The local dependencies each recorded lockfile resolves, keyed by the
+    /// lockfile's digest. Their contents can change with no manifest or
+    /// lockfile moving. Each tarball's signature is in [`Self::files`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub local_dependencies: BTreeMap<String, LocalDependencies>,
+    /// The manifest file of each project in [`Self::manifests`], keyed by
+    /// importer id, as stat'd when its digest was confirmed. A project
+    /// without an entry has its manifest read and hashed by the next check.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub manifest_files: BTreeMap<String, ManifestFile>,
+}
+
+/// A project manifest's stat when the validation confirmed its digest, and
+/// the fields the next check reads from it. While the stat is unchanged and
+/// trusted the way a [`FileSignature`] is, the fields stand for the file.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManifestFile {
+    /// The manifest's file name in the project directory, such as
+    /// `package.json`.
+    pub file_name: String,
+    pub mtime_ns: i64,
+    /// See [`FileSignature::ctime_ns`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ctime_ns: Option<i64>,
+    pub size: u64,
+    /// The manifest's top-level fields that the repeat-install check reads,
+    /// by name. A field the manifest lacks is absent. `None` in a record
+    /// without them, which cannot stand in for the manifest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fields: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Which list of fields `fields` holds. A record of another revision
+    /// may lack a field the check reads, so it cannot stand in for the
+    /// manifest. `0` in a record written before revisions were recorded.
+    #[serde(default)]
+    pub fields_revision: u32,
+}
+
+/// The local dependencies one lockfile resolves, as absolute paths.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalDependencies {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tarballs: Vec<String>,
+    /// The directories that are not workspace projects.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub directories: Vec<String>,
+}
+
+impl Validation {
+    /// What the project with `importer_id` was proven installed with.
+    #[must_use]
+    pub fn project(&self, importer_id: &str) -> Option<ProjectValidation<'_>> {
+        let manifest = self.manifests.get(importer_id)?;
+        let lockfile = self.lockfiles.get(importer_id).unwrap_or(&self.lockfile);
+        Some(ProjectValidation { manifest, lockfile: lockfile.as_deref() })
+    }
+
+    /// Record that the project with `importer_id` was proven installed with
+    /// `manifest` and `lockfile`.
+    pub fn insert_project(
+        &mut self,
+        importer_id: String,
+        manifest: String,
+        lockfile: Option<&str>,
+    ) {
+        if lockfile == self.lockfile.as_deref() {
+            self.lockfiles.remove(&importer_id);
+        } else {
+            self.lockfiles.insert(importer_id.clone(), lockfile.map(str::to_string));
+        }
+        self.manifests.insert(importer_id, manifest);
+    }
+}
+
+/// The content digests a project was proven installed against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProjectValidation<'a> {
+    /// The digest of the project's manifest.
+    pub manifest: &'a str,
+    /// The digest of the lockfile, or `None` when there was none.
+    pub lockfile: Option<&'a str>,
+}
+
+/// A file's content digest and the stat it was read at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileSignature {
+    pub mtime_ns: i64,
+    /// The inode change time, which no tool that restores an mtime can set
+    /// back. `None` where the platform does not report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ctime_ns: Option<i64>,
+    pub size: u64,
+    pub digest: String,
 }
 
 /// Subset of pnpm's config keys that its deps-status check compares to
@@ -100,18 +240,37 @@ pub struct WorkspaceState {
 pub struct WorkspaceStateSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_builds: Option<BTreeMap<String, serde_json::Value>>,
+    /// The `skills` decisions of `permissions`, recorded only when there
+    /// are any. pnpm v11 has no such setting. A decision is a boolean, or
+    /// the skills the package may link when the entry names them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_skills: Option<BTreeMap<String, serde_json::Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_install_peers: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalogs: Option<serde_json::Value>,
+    /// `dangerouslyAllowAllBuilds`. An unset value reads as `false`. Turned
+    /// on, it allows builds the last install ignored, so the next install has
+    /// to run them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dangerously_allow_all_builds: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dedupe_direct_deps: Option<bool>,
+    /// The default registry, as `normalized_registry_key` spells it, recorded
+    /// with [`Self::registry_prefixes`]. Its packages keep plain keys whatever
+    /// prefix names it, so a state verified under another default registry,
+    /// or by a pnpm that keyed them by prefix, proves nothing about the
+    /// lockfile's keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_registry: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dedupe_injected_deps: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dedupe_peer_dependents: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dedupe_peers: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_dedupe: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dev: Option<bool>,
     /// `None` and `Some(false)` both mean "global virtual store off" —
@@ -123,16 +282,40 @@ pub struct WorkspaceStateSettings {
     pub enable_global_virtual_store: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exclude_links_from_lockfile: Option<bool>,
+    /// `extendNodePath`, recorded only while it is off. It decides the
+    /// `NODE_PATH` the bin shims set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extend_node_path: Option<bool>,
+    /// The directory a configured `globalVirtualStoreDir` resolves to,
+    /// recorded only when set, for the reason given on [`Self::store_dir`].
+    /// pnpm v11 has no such setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub global_virtual_store_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hoist_pattern: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hoist_workspace_packages: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ignored_optional_dependencies: Option<Vec<String>>,
+    /// `addMissingPeerTypes`, recorded only while it is on. pnpm v11 has no
+    /// such setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub add_missing_peer_types: Option<bool>,
+    /// `projectScopedOptionalPeers`, recorded only while it is on. pnpm v11
+    /// has no such setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_scoped_optional_peers: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inject_workspace_packages: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link_workspace_packages: Option<serde_json::Value>,
+    /// `lockfile.includeResolutionSettings`, recorded only while it is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lockfile_include_resolution_settings: Option<bool>,
+    /// `lockfile.integrityTarget`, recorded only while it is not the
+    /// default. pnpm v11 has no such setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lockfile_integrity_target: Option<String>,
     /// Minutes a published version must age before it may be installed.
     /// pnpm resolves this to a concrete `24 * 60` default, so it must be
     /// recorded for pnpm's all-key freshness check to stay on the fast
@@ -154,6 +337,8 @@ pub struct WorkspaceStateSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_linker: Option<NodeLinker>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_linker_excluded: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub optional: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overrides: Option<BTreeMap<String, String>>,
@@ -169,12 +354,58 @@ pub struct WorkspaceStateSettings {
     pub production: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_hoist_pattern: Option<Vec<String>>,
+    /// What decides the lockfile keys of registry packages: each prefix
+    /// `registries` and `namedRegistries` declare, mapped to its URL.
+    /// Recorded only when a prefix is declared, and only by an install that
+    /// verified the lockfile's keys, so a state written under other
+    /// registries, or by a pnpm that did not key by them, proves nothing about
+    /// the lockfile's keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_prefixes: Option<BTreeMap<String, String>>,
+    /// The registries the lockfile's plain `packages:` keys resolved from:
+    /// each scope route (`@<scope>`) in force when an install last resolved
+    /// them, mapped to its URL. A plain key names no registry, so this record
+    /// is what tells a key's package came from a registry its scope no
+    /// longer routes to. An install that resolves the whole lockfile records
+    /// the routes it ran under; one that keeps part of the lockfile as
+    /// recorded, a frozen or a filtered install, keeps the previous record
+    /// while a plain key still sits under a moved route. `None` when written
+    /// by a pnpm that did not record them.
+    ///
+    /// The default registry is not recorded: switching it is routinely a
+    /// switch between mirrors of one registry, and tracking it would resolve
+    /// every unscoped package again on each switch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_routes: Option<BTreeMap<String, String>>,
+    /// `runtime`, recorded only while it is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<bool>,
+    /// `skills.dirs`, recorded only when set. pnpm v11 has no such setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills_dirs: Option<Vec<String>>,
+    /// The store directory a configured `storeDir` resolves to, recorded
+    /// only when set. The modules directory is linked from the store it was
+    /// installed with, so a change must reach the install that recreates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_dir: Option<String>,
     /// The `supportedArchitectures` the install ran with, as pnpm's
     /// config JSON (`{ os, cpu, libc }`). A change must invalidate the
     /// repeat-install fast path so previously skipped platform packages
     /// are re-evaluated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supported_architectures: Option<serde_json::Value>,
+    /// The platform the install linked packages with platform variants
+    /// for: its `os`, `cpu`, and C library, and the versions its floors and
+    /// ABI were matched against when the lockfile has a variant that states
+    /// one. A different value, such as from a `node_modules` mounted into a
+    /// musl container, must invalidate the repeat-install fast path so the
+    /// install links the variant the platform now selects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked_platform: Option<String>,
+    /// `trustLockfile`, recorded only while it is on. Turned off, the lockfile
+    /// that no install verified has to be verified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_lockfile: Option<bool>,
     /// The lockfile-verification cache is keyed by the trust-policy
     /// settings, like the `minimumReleaseAge*` family: a policy turned
     /// on or an exclude list shrunk must make the workspace state look
@@ -185,8 +416,19 @@ pub struct WorkspaceStateSettings {
     pub trust_policy: Option<TrustPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_policy_exclude: Option<Vec<String>>,
+    /// Which global-virtual-store slots are project-scoped depends on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side_effects_cache_exclude: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_policy_ignore_after: Option<u64>,
+    /// The directory a configured `virtualStoreDir` resolves to, recorded
+    /// only when set, for the reason given on [`Self::store_dir`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub virtual_store_dir: Option<String>,
+    /// `virtualStoreDirMaxLength`. An unset value reads as the default. The
+    /// virtual store's slot names are cut to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub virtual_store_dir_max_length: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_package_patterns: Option<Vec<String>>,
 }
@@ -211,6 +453,7 @@ pub enum NodeLinker {
     Hoisted,
     Isolated,
     Pnp,
+    Loaded,
 }
 
 /// Error returned by [`update_workspace_state`].
@@ -235,7 +478,10 @@ pub enum UpdateWorkspaceStateError {
 /// Writes to a temporary file in the same directory, then atomically
 /// renames it into place, so a concurrent reader — pnpm or pacquet —
 /// never observes a half-written file
-/// ([#12020](https://github.com/pnpm/pnpm/issues/12020)).
+/// ([#12020](https://github.com/pnpm/pnpm/issues/12020)). Two pnpm
+/// processes installing one workspace at once both write it, so the
+/// rename retries the transient lock errors Windows raises for the other
+/// writer's handle.
 ///
 /// The serialized bytes are `JSON.stringify(state, undefined, 2) + '\n'`:
 /// `serde_json`'s pretty printer uses the same 2-space indent and `": "`
@@ -245,9 +491,17 @@ pub fn update_workspace_state(
     workspace_dir: &Path,
     state: &WorkspaceState,
 ) -> Result<(), UpdateWorkspaceStateError> {
-    let file_path = get_file_path(workspace_dir);
+    update_workspace_state_in_modules(&workspace_dir.join("node_modules"), state)
+}
+
+/// Atomically write workspace state inside the selected installation directory.
+pub fn update_workspace_state_in_modules(
+    modules_dir: &Path,
+    state: &WorkspaceState,
+) -> Result<(), UpdateWorkspaceStateError> {
+    let file_path = modules_dir.join(WORKSPACE_STATE_FILENAME);
     let parent = file_path.parent().expect("workspace-state path always has a parent");
-    fs::create_dir_all(parent)
+    pnpm_fs::create_dir_all_with_retry(parent)
         .map_err(|source| UpdateWorkspaceStateError::CreateDir {
             path: parent.to_path_buf(),
             source,
@@ -255,22 +509,11 @@ pub fn update_workspace_state(
     let mut serialized =
         serde_json::to_string_pretty(state).map_err(UpdateWorkspaceStateError::SerializeJson)?;
     serialized.push('\n');
-    let mut temp = NamedTempFile::new_in(parent)
-        .map_err(|source| UpdateWorkspaceStateError::WriteFile {
-            path: file_path.clone(),
-            source,
-        })?;
-    temp.write_all(serialized.as_bytes())
-        .map_err(|source| UpdateWorkspaceStateError::WriteFile {
-            path: file_path.clone(),
-            source,
-        })?;
-    temp.persist(&file_path)
-        .map_err(|error| UpdateWorkspaceStateError::WriteFile {
-            path: file_path,
-            source: error.error,
-        })?;
-    Ok(())
+    let write = |source| UpdateWorkspaceStateError::WriteFile { path: file_path.clone(), source };
+    let mut temp = pnpm_fs::umask_named_tempfile_in(parent).map_err(write)?;
+    temp.write_all(serialized.as_bytes()).map_err(write)?;
+    let temp = temp.into_temp_path();
+    pnpm_fs::rename_with_retry(&temp, &file_path).map_err(write)
 }
 
 /// Read the workspace state file at `<workspace_dir>/node_modules/.pnpm-workspace-state-v1.json`.
@@ -279,7 +522,14 @@ pub fn update_workspace_state(
 pub fn load_workspace_state(
     workspace_dir: &Path,
 ) -> Result<Option<WorkspaceState>, LoadWorkspaceStateError> {
-    let file_path = get_file_path(workspace_dir);
+    load_workspace_state_in_modules(&workspace_dir.join("node_modules"))
+}
+
+/// Read workspace state inside the selected installation directory.
+pub fn load_workspace_state_in_modules(
+    modules_dir: &Path,
+) -> Result<Option<WorkspaceState>, LoadWorkspaceStateError> {
+    let file_path = modules_dir.join(WORKSPACE_STATE_FILENAME);
     let text = match fs::read_to_string(&file_path) {
         Ok(text) => text,
         Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),

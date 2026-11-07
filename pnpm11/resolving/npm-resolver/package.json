@@ -1,6 +1,6 @@
 {
   "name": "@pnpm/resolving.npm-resolver",
-  "version": "1104.1.2",
+  "version": "1104.2.9",
   "description": "Resolver for npm-hosted packages",
   "keywords": [
     "pnpm",
@@ -33,6 +33,8 @@
     ".test": "cross-env NODE_OPTIONS=\"$NODE_OPTIONS --experimental-vm-modules --disable-warning=ExperimentalWarning --disable-warning=DEP0169\" jest"
   },
   "dependencies": {
+    "@pnpm/catalogs.resolver": "workspace:*",
+    "@pnpm/catalogs.types": "workspace:*",
     "@pnpm/config.normalize-registries": "workspace:*",
     "@pnpm/config.pick-registry-for-package": "workspace:*",
     "@pnpm/config.version-policy": "workspace:*",
@@ -58,7 +60,6 @@
     "lru-cache": "catalog:",
     "normalize-path": "catalog:",
     "p-limit": "catalog:",
-    "parse-npm-tarball-url": "catalog:",
     "path-temp": "catalog:",
     "ramda": "catalog:",
     "rename-overwrite": "catalog:",

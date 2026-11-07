@@ -4,11 +4,11 @@
 //! Mirrors `unknownSettings.ts` in pnpm's `config.reader`: the lists below
 //! are copies of its lists, so the two stacks agree on which keys get the
 //! "not recognized by this version of pnpm" treatment. The pacquet-only
-//! settings (e.g. `globalShims`) enter through [`WorkspaceSettings`]'s own
-//! field names instead.
+//! settings (e.g. `globalShims`) enter through the field names of
+//! [`WorkspaceSettings`] and [`MachineSettings`] instead.
 
 use crate::{
-    WorkspaceSettings,
+    MachineSettings, WorkspaceSettings,
     config_types::is_type_key,
     naming_cases::{to_camel_case, to_kebab_case},
 };
@@ -25,13 +25,16 @@ const TYPED_WORKSPACE_MANIFEST_KEYS: &[&str] = &[
     "allowedDeprecatedVersions",
     "audit",
     "auditConfig",
+    "autoInstallPeersFromHighestMatch",
     "catalog",
     "catalogs",
     "configDependencies",
     "enableGlobalVirtualStore",
+    "externalDependencies",
     "httpProxy",
     "httpsProxy",
     "ignoredOptionalDependencies",
+    "localAddress",
     "namedRegistries",
     "nodeDownloadMirrors",
     "noProxy",
@@ -46,7 +49,9 @@ const TYPED_WORKSPACE_MANIFEST_KEYS: &[&str] = &[
     "remoteSideEffectsCache",
     "requiredScripts",
     "sideEffectsCache",
+    "strictSsl",
     "supportedArchitectures",
+    "tasks",
     "update",
     "updateConfig",
     "versioning",
@@ -73,6 +78,7 @@ const CONFIG_ONLY_SETTING_KEYS: &[&str] = &[
     "ignoreCurrentSpecifiers",
     "maxSockets",
     "minimumReleaseAgeExcludePrune",
+    "modulesDirsByProjectName",
     "packageConfigs",
     "packageManagerNetworkConfig",
     "packageManagerRegistries",
@@ -113,13 +119,7 @@ const SETTINGS_OF_OTHER_PNPM_VERSIONS: &[(&str, &str)] = &[("confirmModulesPurge
 /// serialization so the set cannot drift from the struct.
 fn settings_field_keys() -> &'static HashSet<String> {
     static SET: OnceLock<HashSet<String>> = OnceLock::new();
-    SET.get_or_init(|| match serde_json::to_value(WorkspaceSettings::default()) {
-        Ok(serde_json::Value::Object(fields)) => fields
-            .into_iter()
-            .map(|(key, _)| key)
-            .collect(),
-        _ => HashSet::new(),
-    })
+    SET.get_or_init(|| crate::workspace_yaml::serialized_field_keys(&WorkspaceSettings::default()))
 }
 
 fn known_setting_keys() -> &'static HashSet<String> {
@@ -131,6 +131,7 @@ fn known_setting_keys() -> &'static HashSet<String> {
             .chain(UNTYPED_WORKSPACE_SETTING_KEYS)
             .map(|key| (*key).to_string())
             .chain(settings_field_keys().iter().cloned())
+            .chain(MachineSettings::keys().iter().cloned())
             .collect()
     })
 }

@@ -1,10 +1,11 @@
 use super::{
+    super::{clean::run as clean_builtin, dispatch_script, script_override},
     BinArgs, BugsArgs, CacheCommand, CatFileArgs, CatIndexArgs, CleanArgs, CommandFuture, Config,
-    ConfigArgs, ConfigGetAliasArgs, ConfigSetAliasArgs, ConfigSubcommand, DefaultReporter,
-    DocsArgs, DoctorArgs, DoctorOutcome, FindHashArgs, IgnoredBuildsArgs, NdjsonReporter,
-    NotImplementedError, PrefixArgs, RepoArgs, ReporterType, RootArgs, RunCtx, SelfUpdateArgs,
-    SetupArgs, ShimArgs, SilentReporter, StoreCommand, WithArgs,
+    ConfigArgs, ConfigGetAliasArgs, ConfigSetAliasArgs, ConfigSubcommand, DocsArgs, DoctorArgs,
+    DoctorOutcome, FindHashArgs, IgnoredBuildsArgs, NotImplementedError, PrefixArgs, RepoArgs,
+    RootArgs, RunCtx, SelfUpdateArgs, SetupArgs, ShimArgs, StoreCommand, TasksArgs, WithArgs,
 };
+use crate::cli_args::reporter::CliReporter;
 
 // `doctor` reports on the installation and its environment, so it needs config
 // resolved but no lockfile or install pipeline. It returns the rendered report
@@ -18,13 +19,10 @@ pub(in super::super) fn doctor<'a>(
     let cfg: &Config = (ctx.loaders.config)()?;
     Ok(Box::pin(async move {
         let result = args.run(cfg).await?;
-        println!("{}", result.output);
+        pnpm_diagnostics::println!("{}", result.output);
         if result.outcome == DoctorOutcome::Unhealthy {
-            #[expect(
-                clippy::exit,
-                reason = "`doctor` exits non-zero when a check fails, mirroring pnpm"
-            )]
-            std::process::exit(1);
+            // `doctor` exits non-zero when a check fails, mirroring pnpm.
+            pnpm_executor::exit(1);
         }
         Ok(())
     }))
@@ -40,10 +38,14 @@ pub(in super::super) fn bin<'a>(
 
 pub(in super::super) fn clean<'a>(
     ctx: &RunCtx<'a>,
-    args: CleanArgs,
+    CleanArgs { lockfile }: CleanArgs,
     command_name: &'a str,
 ) -> miette::Result<CommandFuture<'a>> {
-    args.run(ctx, command_name)?;
+    let config = (ctx.loaders.config)()?;
+    if let Some(run_args) = script_override::resolve(ctx, config, command_name, Vec::new())? {
+        return dispatch_script::run(ctx, run_args);
+    }
+    clean_builtin(ctx, config, lockfile)?;
     Ok(Box::pin(std::future::ready(Ok(()))))
 }
 
@@ -63,6 +65,18 @@ pub(in super::super) fn prefix<'a>(
     Ok(Box::pin(std::future::ready(Ok(()))))
 }
 
+pub(in super::super) fn tasks<'a>(
+    ctx: &RunCtx<'a>,
+    args: TasksArgs,
+) -> miette::Result<CommandFuture<'a>> {
+    let config = (ctx.loaders.config)()?;
+    if let Some(run_args) = script_override::resolve(ctx, config, "tasks", args.script_args())? {
+        return dispatch_script::run(ctx, run_args);
+    }
+    args.run(config)?;
+    Ok(Box::pin(std::future::ready(Ok(()))))
+}
+
 pub(in super::super) fn shim<'a>(
     ctx: &RunCtx<'a>,
     args: ShimArgs,
@@ -72,7 +86,7 @@ pub(in super::super) fn shim<'a>(
     // command happens to run in does not get to steer either.
     let config = (ctx.loaders.global_config)()?;
     Ok(Box::pin(async move {
-        print!("{}", args.run(config).await?);
+        pnpm_diagnostics::print!("{}", args.run(config).await?);
         Ok(())
     }))
 }
@@ -81,7 +95,12 @@ pub(in super::super) fn config<'a>(
     ctx: &RunCtx<'a>,
     args: ConfigArgs,
 ) -> miette::Result<CommandFuture<'a>> {
-    args.run((ctx.loaders.config)()?, ctx.locations.dir)?;
+    let config = if args.reads_global_config() {
+        (ctx.loaders.global_config)()?
+    } else {
+        (ctx.loaders.config)()?
+    };
+    args.run(config, ctx.locations.dir)?;
     Ok(Box::pin(std::future::ready(Ok(()))))
 }
 
@@ -114,17 +133,9 @@ pub(in super::super) fn repo<'a>(
 ) -> miette::Result<CommandFuture<'a>> {
     let cfg = (ctx.loaders.config)()?;
     let dir = ctx.locations.dir;
-    Ok(match ctx.reporter {
-        ReporterType::Default | ReporterType::AppendOnly => Box::pin(async move {
-            args.run::<pnpm_network_web_auth::Host, DefaultReporter>(cfg, dir).await
-        }),
-        ReporterType::Ndjson => Box::pin(async move {
-            args.run::<pnpm_network_web_auth::Host, NdjsonReporter>(cfg, dir).await
-        }),
-        ReporterType::Silent => Box::pin(async move {
-            args.run::<pnpm_network_web_auth::Host, SilentReporter>(cfg, dir).await
-        }),
-    })
+    Ok(Box::pin(
+        async move { args.run::<pnpm_network_web_auth::Host, CliReporter>(cfg, dir).await },
+    ))
 }
 
 pub(in super::super) fn docs<'a>(
@@ -140,60 +151,39 @@ pub(in super::super) fn with<'a>(
     args: WithArgs,
 ) -> miette::Result<CommandFuture<'a>> {
     let config = (ctx.loaders.config)()?;
-    macro_rules! run_with {
-        ($reporter:ty) => {
-            Box::pin(args.run::<$reporter>(config))
-        };
-    }
-    Ok(match ctx.reporter {
-        ReporterType::Default | ReporterType::AppendOnly => run_with!(DefaultReporter),
-        ReporterType::Ndjson => run_with!(NdjsonReporter),
-        ReporterType::Silent => run_with!(SilentReporter),
-    })
+    Ok(Box::pin(args.run::<CliReporter>(config)))
 }
 
 pub(in super::super) fn self_update<'a>(
     ctx: &RunCtx<'a>,
     args: SelfUpdateArgs,
 ) -> miette::Result<CommandFuture<'a>> {
-    // Refuse corepack before loading project config, so a broken `.npmrc`
-    // / workspace config can't mask the corepack refusal.
-    super::super::self_update::reject_if_corepack()?;
-    let config = (ctx.loaders.config_self_update)()?;
     let dir = ctx.locations.dir;
-    macro_rules! run_self_update {
-        ($reporter:ty) => {
-            Box::pin(args.run::<$reporter>(config, dir))
-        };
-    }
-    Ok(match ctx.reporter {
-        ReporterType::Default | ReporterType::AppendOnly => run_self_update!(DefaultReporter),
-        ReporterType::Ndjson => run_self_update!(NdjsonReporter),
-        ReporterType::Silent => run_self_update!(SilentReporter),
-    })
+    let external_manager = super::super::self_update::find_external_manager()?;
+    let config = (ctx.loaders.config_self_update)()?;
+    Ok(Box::pin(args.run::<CliReporter>(config, dir, external_manager)))
 }
 
 // `setup` makes pnpm available globally: it installs the CLI into the
 // global packages dir, writes the alias scripts, and persists `PNPM_HOME` /
 // PATH into the user's shell rc file (POSIX) or registry (Windows). It needs
 // a reporter for the "Installing pnpm CLI globally" log but no project
-// config or lockfile, so it dispatches off `ctx.locations.dir` like the other
-// reporter-typed commands.
+// config or lockfile, so it dispatches off `ctx.locations.dir`.
 pub(in super::super) fn setup<'a>(
     ctx: &RunCtx<'a>,
     args: SetupArgs,
 ) -> miette::Result<CommandFuture<'a>> {
-    let dir = ctx.locations.dir;
-    macro_rules! run_setup {
-        ($reporter:ty) => {
-            Box::pin(args.run::<$reporter>(dir))
-        };
+    // The `pm` check is repeated ahead of `resolve` so that forcing the
+    // built-in needs no project configuration: `pnpm pm setup` has to
+    // install the CLI even where that configuration cannot be read.
+    if !ctx.builtin_command_forced
+        && let Some(run_args) =
+            script_override::resolve(ctx, (ctx.loaders.config)()?, "setup", Vec::new())?
+    {
+        return dispatch_script::run(ctx, run_args);
     }
-    Ok(match ctx.reporter {
-        ReporterType::Default | ReporterType::AppendOnly => run_setup!(DefaultReporter),
-        ReporterType::Ndjson => run_setup!(NdjsonReporter),
-        ReporterType::Silent => run_setup!(SilentReporter),
-    })
+    let dir = ctx.locations.dir;
+    Ok(Box::pin(args.run::<CliReporter>(dir)))
 }
 
 pub(in super::super) fn store<'a>(
@@ -202,13 +192,7 @@ pub(in super::super) fn store<'a>(
 ) -> miette::Result<CommandFuture<'a>> {
     let config: &Config = (ctx.loaders.config)()?;
     let dir = ctx.locations.dir;
-    Ok(match ctx.reporter {
-        ReporterType::Default | ReporterType::AppendOnly => {
-            Box::pin(command.run::<DefaultReporter>(config, dir))
-        }
-        ReporterType::Ndjson => Box::pin(command.run::<NdjsonReporter>(config, dir)),
-        ReporterType::Silent => Box::pin(command.run::<SilentReporter>(config, dir)),
-    })
+    Ok(Box::pin(command.run::<CliReporter>(config, dir)))
 }
 
 pub(in super::super) fn cache<'a>(
@@ -243,9 +227,12 @@ pub(in super::super) fn ignored_builds<'a>(
     ctx: &RunCtx<'a>,
     _args: IgnoredBuildsArgs,
 ) -> miette::Result<CommandFuture<'a>> {
-    let output =
-        super::super::ignored_builds::render_ignored_builds((ctx.loaders.config)()?)?;
-    print!("{output}");
+    let config = super::super::pipelines::installed_project_config(
+        (ctx.loaders.config)()?,
+        ctx.locations.manifest_path,
+    );
+    let output = super::super::ignored_builds::render_ignored_builds(config)?;
+    pnpm_diagnostics::print!("{output}");
     Ok(Box::pin(std::future::ready(Ok(()))))
 }
 

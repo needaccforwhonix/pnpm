@@ -1,4 +1,5 @@
 use super::{Config, Path, ResolutionMode, WorkspaceSettings, assert_eq};
+use pnpm_store_dir::StoreIndexFormat;
 
 /// `resolutionMode` accepts the three upstream string values; an
 /// absent key leaves the [`ResolutionMode::Highest`] default in place.
@@ -16,7 +17,8 @@ fn resolution_mode_yaml_values_round_trip() {
         assert_eq!(config.resolution_mode, expected);
     }
 
-    let settings: WorkspaceSettings = serde_saphyr::from_str("").unwrap();
+    let settings: WorkspaceSettings =
+        serde_saphyr::from_str::<Option<WorkspaceSettings>>("").unwrap().unwrap_or_default();
     assert!(settings.resolution_mode.is_none());
     let mut config = Config::new();
     settings.apply_to(&mut config, Path::new("/irrelevant"));
@@ -71,4 +73,18 @@ fn parses_frozen_lockfile_from_yaml_and_applies() {
     let mut global: WorkspaceSettings = serde_saphyr::from_str("frozenLockfile: true").unwrap();
     global.clear_workspace_only_fields();
     assert_eq!(global.frozen_lockfile, None);
+}
+
+#[test]
+fn parses_store_index_format_from_yaml_and_applies() {
+    let absent: WorkspaceSettings = serde_saphyr::from_str("hoist: true").unwrap();
+    let mut config = Config::new();
+    absent.apply_to(&mut config, Path::new("/irrelevant"));
+    assert_eq!(config.store_index_format, StoreIndexFormat::Sqlite);
+
+    let files: WorkspaceSettings = serde_saphyr::from_str("storeIndexFormat: files").unwrap();
+    assert_eq!(files.store_index_format, Some(StoreIndexFormat::Files));
+    let mut config = Config::new();
+    files.apply_to(&mut config, Path::new("/irrelevant"));
+    assert_eq!(config.store_index_format, StoreIndexFormat::Files);
 }

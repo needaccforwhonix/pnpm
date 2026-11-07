@@ -10,7 +10,9 @@
 
 pub use pnpm_lockfile::pick_registry_for_package;
 
-pub use pnpm_config::BUILTIN_REGISTRIES_BY_PREFIX;
+pub use pnpm_resolving_resolver_base::BUILTIN_REGISTRIES_BY_PREFIX;
+
+use pnpm_lockfile::normalized_registry_key;
 
 use std::collections::HashMap;
 
@@ -73,7 +75,7 @@ pub fn merge_named_registries(
     user_defined: &HashMap<String, String>,
 ) -> Result<HashMap<String, String>, MergeNamedRegistriesError> {
     for (alias, url) in user_defined {
-        if pnpm_deps_path::is_reserved_version_prefix(alias) {
+        if pnpm_deps_path::shadows_reserved_version_prefix(alias) {
             return Err(MergeNamedRegistriesError::ReservedAlias { alias: alias.clone() });
         }
         if !pnpm_deps_path::is_well_formed_registry_name(alias) {
@@ -109,14 +111,7 @@ pub fn named_registry_tarball_prefixes(
 ) -> Vec<String> {
     let mut prefixes: Vec<String> = registries_by_prefix
         .values()
-        .filter_map(|url| Url::parse(url).ok())
-        .map(|parsed| {
-            let mut pathname = parsed.path().to_string();
-            if !pathname.ends_with('/') {
-                pathname.push('/');
-            }
-            format!("{}{}", parsed.origin().ascii_serialization(), pathname)
-        })
+        .filter_map(|url| normalized_registry_key(url))
         .collect();
     prefixes.sort_by(|a, b| {
         b.len()

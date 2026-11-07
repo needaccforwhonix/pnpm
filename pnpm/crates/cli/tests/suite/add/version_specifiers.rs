@@ -3,6 +3,7 @@ use super::{
     add_with_settings, assert_eq, bravo_dep_mature_up_to_1_0_1_minimum_release_age,
     exec_pacquet_in_temp_cwd, prod_spec, set_minimum_release_age,
 };
+use crate::_utils::pacquet_in;
 use assert_cmd::assert::OutputAssertExt;
 
 #[test]
@@ -21,6 +22,28 @@ fn save_prefix_tilde_writes_tilde_range() {
     let spec = prod_spec(&dir, "@pnpm.e2e/hello-world-js-bin");
     eprintln!("SPEC: {spec}");
     assert_eq!(spec, "~1.0.0");
+    drop((root, anchor)); // cleanup
+}
+
+#[test]
+fn tilde_flag_writes_tilde_range() {
+    let (root, dir, anchor) =
+        exec_pacquet_in_temp_cwd(["add", "@pnpm.e2e/hello-world-js-bin", "--tilde"]);
+    let spec = prod_spec(&dir, "@pnpm.e2e/hello-world-js-bin");
+    assert_eq!(spec, "~1.0.0");
+    drop((root, anchor)); // cleanup
+}
+
+#[test]
+fn save_prefix_after_tilde_wins() {
+    let (root, dir, anchor) = exec_pacquet_in_temp_cwd([
+        "add",
+        "@pnpm.e2e/hello-world-js-bin",
+        "--tilde",
+        "--save-prefix=^",
+    ]);
+    let spec = prod_spec(&dir, "@pnpm.e2e/hello-world-js-bin");
+    assert_eq!(spec, "^1.0.0");
     drop((root, anchor)); // cleanup
 }
 
@@ -44,6 +67,19 @@ fn save_exact_overrides_save_prefix() {
     ]);
     let spec = prod_spec(&dir, "@pnpm.e2e/hello-world-js-bin");
     eprintln!("SPEC: {spec}");
+    assert_eq!(spec, "1.0.0");
+    drop((root, anchor)); // cleanup
+}
+
+#[test]
+fn save_exact_overrides_tilde() {
+    let (root, dir, anchor) = exec_pacquet_in_temp_cwd([
+        "add",
+        "@pnpm.e2e/hello-world-js-bin",
+        "--tilde",
+        "--save-exact",
+    ]);
+    let spec = prod_spec(&dir, "@pnpm.e2e/hello-world-js-bin");
     assert_eq!(spec, "1.0.0");
     drop((root, anchor)); // cleanup
 }
@@ -166,6 +202,311 @@ fn add_explicit_dist_tag_resolves_with_caret() {
     drop((root, anchor)); // cleanup
 }
 
+/// The tag's version is locked even though the saved `^100.0.0` admits the
+/// newer `100.1.0`.
+#[test]
+fn add_dist_tag_locks_the_tagged_version() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry_with_own_storage();
+    let name = "@pnpm.e2e/dep-of-pkg-with-1-dep";
+    npmrc_info.set_dist_tag(name, "100.0.0", "dev");
+
+    pacquet_in(&workspace)
+        .with_args(["add", &format!("{name}@dev"), "--lockfile-only"])
+        .assert()
+        .success();
+
+    assert_eq!(prod_spec(&workspace, name), "^100.0.0");
+    assert_eq!(locked_version(&workspace, name), "100.0.0");
+    drop((root, npmrc_info)); // cleanup
+}
+
+#[test]
+fn add_bounded_range_locks_a_version_inside_it() {
+    let (root, dir, anchor) = exec_pacquet_in_temp_cwd([
+        "add",
+        "@pnpm.e2e/dep-of-pkg-with-1-dep@>=100.0.0 <100.1.0",
+        "--lockfile-only",
+    ]);
+    assert_eq!(prod_spec(&dir, "@pnpm.e2e/dep-of-pkg-with-1-dep"), "^100.0.0");
+    assert_eq!(locked_version(&dir, "@pnpm.e2e/dep-of-pkg-with-1-dep"), "100.0.0");
+    drop((root, anchor)); // cleanup
+}
+
+/// The specifier the add saves is the one already declared, so only the
+/// picked version can move the lockfile off `100.1.0`.
+#[test]
+fn readd_moves_the_lockfile_to_the_picked_version() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let name = "@pnpm.e2e/dep-of-pkg-with-1-dep";
+    std::fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({ "dependencies": { (name): "^100.0.0" } }).to_string(),
+    )
+    .expect("write package.json");
+    pacquet
+        .with_arg("install")
+        .with_arg("--lockfile-only")
+        .assert()
+        .success();
+    assert_eq!(locked_version(&workspace, name), "100.1.0");
+
+    pacquet_in(&workspace)
+        .with_args(["add", &format!("{name}@>=100.0.0 <100.1.0"), "--lockfile-only"])
+        .assert()
+        .success();
+
+    assert_eq!(prod_spec(&workspace, name), "^100.0.0");
+    assert_eq!(locked_version(&workspace, name), "100.0.0");
+    drop((root, npmrc_info)); // cleanup
+}
+
+/// `@pnpm.e2e/pkg-with-1-dep` locks `100.1.0` transitively, which the saved
+/// `^100.0.0` also admits.
+#[test]
+fn add_locks_the_picked_version_over_a_transitive_lock() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let name = "@pnpm.e2e/dep-of-pkg-with-1-dep";
+    std::fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({ "dependencies": { "@pnpm.e2e/pkg-with-1-dep": "100.0.0" } }).to_string(
+        ),
+    )
+    .expect("write package.json");
+    pacquet
+        .with_arg("install")
+        .with_arg("--lockfile-only")
+        .assert()
+        .success();
+
+    pacquet_in(&workspace)
+        .with_args(["add", &format!("{name}@>=100.0.0 <100.1.0"), "--lockfile-only"])
+        .assert()
+        .success();
+
+    assert_eq!(prod_spec(&workspace, name), "^100.0.0");
+    assert_eq!(locked_version(&workspace, name), "100.0.0");
+    drop((root, npmrc_info)); // cleanup
+}
+
+#[test]
+fn filtered_add_locks_the_picked_version_over_a_transitive_lock() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let name = "@pnpm.e2e/dep-of-pkg-with-1-dep";
+    let workspace_yaml = workspace.join("pnpm-workspace.yaml");
+    let settings = std::fs::read_to_string(&workspace_yaml).expect("read pnpm-workspace.yaml");
+    std::fs::write(&workspace_yaml, format!("{settings}\npackages:\n  - app\n"))
+        .expect("write pnpm-workspace.yaml");
+    std::fs::write(workspace.join("package.json"), r#"{ "name": "root" }"#)
+        .expect("write root package.json");
+    let app = workspace.join("app");
+    std::fs::create_dir(&app).expect("create app");
+    std::fs::write(
+        app.join("package.json"),
+        serde_json::json!({ "name": "app", "dependencies": { "@pnpm.e2e/pkg-with-1-dep": "100.0.0" } })
+            .to_string(),
+    )
+    .expect("write app/package.json");
+    pacquet_in(&workspace)
+        .with_args(["install", "--lockfile-only"])
+        .assert()
+        .success();
+
+    pacquet_in(&workspace)
+        .with_args([
+            "--filter",
+            "app",
+            "add",
+            &format!("{name}@>=100.0.0 <100.1.0"),
+            "--lockfile-only",
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(prod_spec(&app, name), "^100.0.0");
+    let lockfile = crate::_utils::read_lockfile(&workspace.join("pnpm-lock.yaml"));
+    assert_eq!(crate::_utils::importer_version(&lockfile, "app", name), "100.0.0");
+    drop((root, npmrc_info)); // cleanup
+}
+
+/// The direct edge already locks the picked `100.0.0`, but the add changes
+/// its specifier, which the fast lockfile update would retarget to the
+/// `100.1.0` the alias locks.
+#[test]
+fn readd_with_a_new_specifier_keeps_the_picked_version() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let name = "@pnpm.e2e/dep-of-pkg-with-1-dep";
+    std::fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({
+            "dependencies": {
+                (name): ">=100.0.0 <100.1.0",
+                "newer": format!("npm:{name}@100.1.0"),
+            }
+        })
+        .to_string(),
+    )
+    .expect("write package.json");
+    pacquet
+        .with_arg("install")
+        .with_arg("--lockfile-only")
+        .assert()
+        .success();
+    assert_eq!(locked_version(&workspace, name), "100.0.0");
+
+    pacquet_in(&workspace)
+        .with_args(["add", &format!("{name}@<100.1.0")])
+        .assert()
+        .success();
+
+    assert_eq!(prod_spec(&workspace, name), "^100.0.0");
+    assert_eq!(locked_version(&workspace, name), "100.0.0");
+    drop((root, npmrc_info)); // cleanup
+}
+
+/// The `tag` setting names the dist-tag a version-less `add` resolves.
+#[test]
+fn add_without_a_version_resolves_the_configured_tag() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry_with_own_storage();
+    let name = "@pnpm.e2e/dep-of-pkg-with-1-dep";
+    npmrc_info.set_dist_tag(name, "100.0.0", "dev");
+    crate::_utils::append_workspace_yaml_key(&workspace, "tag", "dev");
+
+    pacquet_in(&workspace)
+        .with_args(["add", name, "--lockfile-only"])
+        .assert()
+        .success();
+
+    assert_eq!(prod_spec(&workspace, name), "^100.0.0");
+    assert_eq!(locked_version(&workspace, name), "100.0.0");
+    drop((root, npmrc_info)); // cleanup
+}
+
+#[test]
+fn add_without_a_version_resolves_the_tag_from_a_config_override() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry_with_own_storage();
+    let name = "@pnpm.e2e/dep-of-pkg-with-1-dep";
+    npmrc_info.set_dist_tag(name, "100.0.0", "dev");
+
+    pacquet_in(&workspace)
+        .with_args(["add", name, "--lockfile-only", "--config.tag=dev"])
+        .assert()
+        .success();
+
+    assert_eq!(prod_spec(&workspace, name), "^100.0.0");
+    assert_eq!(locked_version(&workspace, name), "100.0.0");
+    drop((root, npmrc_info)); // cleanup
+}
+
+/// An `npm:` alias with no version resolves the `tag` setting too.
+#[test]
+fn install_resolves_a_versionless_npm_alias_to_the_configured_tag() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry_with_own_storage();
+    let name = "@pnpm.e2e/dep-of-pkg-with-1-dep";
+    npmrc_info.set_dist_tag(name, "100.0.0", "dev");
+    crate::_utils::append_workspace_yaml_key(&workspace, "tag", "dev");
+    std::fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({ "dependencies": { "alias": format!("npm:{name}") } }).to_string(),
+    )
+    .expect("write package.json");
+
+    pacquet_in(&workspace)
+        .with_args(["install", "--lockfile-only"])
+        .assert()
+        .success();
+
+    assert_eq!(locked_version(&workspace, "alias"), format!("{name}@100.0.0"));
+    drop((root, npmrc_info)); // cleanup
+}
+
+/// pnpm reads `<pkg>@` as `<pkg>`, so the empty version resolves the tag.
+#[test]
+fn add_with_an_empty_version_resolves_the_configured_tag() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry_with_own_storage();
+    let name = "@pnpm.e2e/dep-of-pkg-with-1-dep";
+    npmrc_info.set_dist_tag(name, "100.0.0", "dev");
+    crate::_utils::append_workspace_yaml_key(&workspace, "tag", "dev");
+
+    pacquet_in(&workspace)
+        .with_args(["add", &format!("{name}@"), "--lockfile-only"])
+        .assert()
+        .success();
+
+    assert_eq!(prod_spec(&workspace, name), "^100.0.0");
+    assert_eq!(locked_version(&workspace, name), "100.0.0");
+    drop((root, npmrc_info)); // cleanup
+}
+
+/// An empty specifier in the manifest resolves the tag, as in pnpm.
+#[test]
+fn install_resolves_an_empty_specifier_to_the_configured_tag() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry_with_own_storage();
+    let name = "@pnpm.e2e/dep-of-pkg-with-1-dep";
+    npmrc_info.set_dist_tag(name, "100.0.0", "dev");
+    crate::_utils::append_workspace_yaml_key(&workspace, "tag", "dev");
+    std::fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({ "dependencies": { (name): "" } }).to_string(),
+    )
+    .expect("write package.json");
+
+    pacquet_in(&workspace)
+        .with_args(["install", "--lockfile-only"])
+        .assert()
+        .success();
+
+    assert_eq!(locked_version(&workspace, name), "100.0.0");
+    drop((root, npmrc_info)); // cleanup
+}
+
+#[test]
+fn add_without_a_version_resolves_the_tag_from_the_environment() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry_with_own_storage();
+    let name = "@pnpm.e2e/dep-of-pkg-with-1-dep";
+    npmrc_info.set_dist_tag(name, "100.0.0", "dev");
+
+    pacquet_in(&workspace)
+        .with_env("PNPM_CONFIG_TAG", "dev")
+        .with_args(["add", name, "--lockfile-only"])
+        .assert()
+        .success();
+
+    assert_eq!(prod_spec(&workspace, name), "^100.0.0");
+    assert_eq!(locked_version(&workspace, name), "100.0.0");
+    drop((root, npmrc_info)); // cleanup
+}
+
+fn locked_version(workspace: &std::path::Path, name: &str) -> String {
+    let lockfile = crate::_utils::read_lockfile(&workspace.join("pnpm-lock.yaml"));
+    crate::_utils::importer_version(&lockfile, ".", name)
+}
+
 #[test]
 fn readding_a_dev_dependency_at_a_dist_tag_keeps_its_group() {
     let CommandTempCwd {
@@ -204,13 +545,8 @@ fn readding_a_dev_dependency_at_a_dist_tag_keeps_its_group() {
     drop((root, npmrc_info));
 }
 
-/// On a re-add with an explicit version, the existing entry biases the pick
-/// (it is a preferred version): re-adding `~100.0.0` with `@^100.0.0` keeps
-/// the existing `100.0.0` rather than bumping to the highest in range
-/// (`100.1.0`), and the existing operator wins over the spec's — matching
-/// pnpm, which dedups to and keeps the already-declared version.
 #[test]
-fn add_explicit_range_respects_existing_operator() {
+fn add_explicit_range_honors_requested_operator() {
     let CommandTempCwd {
         pacquet,
         root,
@@ -229,20 +565,20 @@ fn add_explicit_range_respects_existing_operator() {
         .assert()
         .success();
 
-    assert_eq!(prod_spec(&workspace, "@pnpm.e2e/dep-of-pkg-with-1-dep"), "~100.0.0");
+    assert_eq!(prod_spec(&workspace, "@pnpm.e2e/dep-of-pkg-with-1-dep"), "^100.0.0");
     drop((root, npmrc_info)); // cleanup
 }
 
-/// An `npm:` alias specifier is written verbatim — never resolved (which
-/// would risk dropping the aliased target name).
+/// An `npm:` alias keeps its target name and records the resolved range,
+/// as a plain registry specifier does.
 #[test]
-fn add_npm_alias_spec_is_kept_verbatim() {
+fn add_npm_alias_spec_records_the_resolved_range() {
     let (root, dir, anchor) = exec_pacquet_in_temp_cwd([
         "add",
         "my-alias@npm:@pnpm.e2e/dep-of-pkg-with-1-dep@^100.0.0",
         "--lockfile-only",
     ]);
-    assert_eq!(prod_spec(&dir, "my-alias"), "npm:@pnpm.e2e/dep-of-pkg-with-1-dep@^100.0.0");
+    assert_eq!(prod_spec(&dir, "my-alias"), "npm:@pnpm.e2e/dep-of-pkg-with-1-dep@^100.1.0");
     drop((root, anchor)); // cleanup
 }
 
@@ -376,5 +712,20 @@ fn save_exact_and_equals_prefix_settings_drive_add() {
     let spec = prod_spec(&workspace, "@pnpm.e2e/hello-world-js-bin");
     eprintln!("SPEC: {spec}");
     assert_eq!(spec, "=1.0.0", "a savePrefix of = must keep the explicit operator");
+    drop((root, mock_instance));
+}
+
+#[test]
+fn save_style_flags_overrule_save_exact_setting() {
+    let (root, workspace, mock_instance) =
+        add_with_settings("saveExact: true\n", &["add", "--tilde"]);
+    let spec = prod_spec(&workspace, "@pnpm.e2e/hello-world-js-bin");
+    assert_eq!(spec, "~1.0.0", "--tilde must overrule saveExact");
+    drop((root, mock_instance));
+
+    let (root, workspace, mock_instance) =
+        add_with_settings("saveExact: true\n", &["add", "--save-prefix=^"]);
+    let spec = prod_spec(&workspace, "@pnpm.e2e/hello-world-js-bin");
+    assert_eq!(spec, "^1.0.0", "--save-prefix must overrule saveExact");
     drop((root, mock_instance));
 }

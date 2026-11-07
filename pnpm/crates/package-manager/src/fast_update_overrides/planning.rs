@@ -90,12 +90,18 @@ pub(super) fn fast_override(
     old_value: Option<&String>,
 ) -> Option<FastOverride> {
     if parsed.target_pkg.bare_specifier.is_some()
+        || parsed.target_pkg.dep_type.is_some()
+        || parsed.target_pkg.name.contains('*')
+        || parsed.parent_pkg
+            .as_ref()
+            .is_some_and(|parent| parent.name.contains('*'))
         || parsed.converge
         || parsed_overrides
             .iter()
             .any(|candidate| {
                 candidate.selector != parsed.selector
-                    && candidate.target_pkg.name == parsed.target_pkg.name
+                    && pnpm_matcher::WildcardMatcher::new(&candidate.target_pkg.name)
+                        .matches(&parsed.target_pkg.name)
             })
     {
         return None;
@@ -239,7 +245,7 @@ pub(super) fn override_replacement(
         .ok()?;
     Some(PkgNameVerPeer::new(alias.clone(), new_suffix))
 }
-pub(super) fn get_peer_names(lockfile: &Lockfile) -> HashSet<PkgName> {
+pub(crate) fn get_peer_names(lockfile: &Lockfile) -> HashSet<PkgName> {
     let mut result = HashSet::new();
     for metadata in lockfile.packages
         .as_ref()

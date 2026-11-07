@@ -22,6 +22,7 @@ pnpm-cmd-shim = { workspace = true }
 pnpm-crypto-hash = { workspace = true }
 pnpm-deps-path = { workspace = true }
 pnpm-deps-restorer = { workspace = true }
+pnpm-tool-protocol = { workspace = true }
 pnpm-workspace-projects-graph = { workspace = true }
 pnpm-directory-fetcher = { workspace = true }
 pnpm-engine-pm-yarn-resolver = { workspace = true }
@@ -29,18 +30,22 @@ pnpm-engine-runtime-bun-resolver = { workspace = true }
 pnpm-engine-runtime-deno-resolver = { workspace = true }
 pnpm-engine-runtime-node-resolver = { workspace = true }
 pnpm-executor = { workspace = true }
+pnpm-process = { path = "../process" }
 pnpm-fs = { workspace = true }
 pnpm-git-fetcher = { workspace = true }
 pnpm-lockfile = { workspace = true }
+pnpm-platform-variants = { workspace = true }
 pnpm-lockfile-preferred-versions = { workspace = true }
 pnpm-lockfile-verification = { workspace = true }
 pnpm-modules-yaml = { workspace = true }
 pnpm-network = { workspace = true }
 pnpm-config = { workspace = true }
 pnpm-config-parse-overrides = { workspace = true }
+pnpm-local-spec = { workspace = true }
 pnpm-deps-inspection-peers = { workspace = true }
 pnpm-graph-hasher = { workspace = true }
 pnpm-hooks = { workspace = true }
+pnpm-injected-deps-syncer = { workspace = true }
 pnpm-package-manifest = { workspace = true }
 pnpm-package-is-installable = { workspace = true }
 pnpm-patching = { workspace = true }
@@ -56,6 +61,7 @@ pnpm-resolving-npm-resolver = { workspace = true }
 pnpm-resolving-parse-wanted-dependency = { workspace = true }
 pnpm-resolving-resolver-base = { workspace = true }
 pnpm-resolving-tarball-resolver = { workspace = true }
+pnpm-semver-include-prerelease = { workspace = true }
 pnpm-store-dir = { workspace = true }
 pnpm-tarball = { workspace = true }
 pnpm-workspace = { workspace = true }
@@ -64,9 +70,12 @@ pnpm-workspace-range-resolver = { workspace = true }
 pnpm-workspace-spec = { workspace = true }
 pnpm-workspace-state = { workspace = true }
 pnpm-workspace-task-scheduler = { workspace = true }
+pnpm-text-sanitize = { workspace = true }
+pnpm-text-section = { workspace = true }
 
 async-recursion = { workspace = true }
 chrono = { workspace = true }
+console = { workspace = true }
 dashmap = { workspace = true }
 derive_more = { workspace = true }
 dialoguer = { workspace = true }
@@ -74,7 +83,6 @@ dunce = { workspace = true }
 futures-util = { workspace = true }
 httpdate = { workspace = true }
 indexmap = { workspace = true }
-is_ci = { workspace = true }
 node-semver = { workspace = true }
 pathdiff = { workspace = true }
 pipe-trait = { workspace = true }
@@ -82,6 +90,7 @@ rayon = { workspace = true }
 reflink-copy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 ssri = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
@@ -89,6 +98,7 @@ tracing = { workspace = true }
 miette = { workspace = true }
 
 [dev-dependencies]
+proptest = { workspace = true }
 pnpm-testing-utils = { workspace = true }
 
 async-trait = { workspace = true }
@@ -99,11 +109,23 @@ node-semver = { workspace = true }
 pathdiff = { workspace = true }
 pretty_assertions = { workspace = true }
 serde-saphyr = { workspace = true }
-sha2 = { workspace = true }
 ssri = { workspace = true }
 tar = { workspace = true }
 text-block-macros = { workspace = true }
 walkdir = { workspace = true }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+home = { workspace = true }
+tokio = { workspace = true, features = ["net", "signal", "time"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+# Without it a contended shard lock panics on wasm instead of parking.
+# See <https://github.com/pnpm/pnpm/pull/16951>.
+dashmap = { workspace = true, features = ["nightly"] }
+pnpm-wasm-host = { path = "../wasm-host" }
 
 [lints]
 workspace = true

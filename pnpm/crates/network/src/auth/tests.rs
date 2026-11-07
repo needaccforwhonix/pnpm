@@ -1,7 +1,7 @@
 use super::{
     AuthHeaders, DEFAULT_REGISTRY_SCOPE, UpstreamRouteHook, base64_encode, hide_auth_information,
-    nerf_dart, redact_and_sanitize, redact_and_sanitize_multiline, redact_url_credentials,
-    redact_url_for_display,
+    nerf_dart, redact_and_sanitize, redact_and_sanitize_multiline, redact_npm_auth_key,
+    redact_url_credentials, redact_url_for_display,
 };
 use crate::TokenHelperOutput;
 use pretty_assertions::assert_eq;
@@ -14,6 +14,27 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+#[test]
+fn registry_alias_does_not_change_outbound_credential_scope() {
+    let mut headers = AuthHeaders::from_map(HashMap::from([(
+        "//registry.npmjs.org/".to_string(),
+        "Bearer canonical-secret".to_string(),
+    )]));
+    for url in ["https://registry.npmjs.com", "https://registry.npmjs.com/"] {
+        assert_eq!(headers.for_url(url), None);
+        assert_eq!(headers.for_url_with_package(url, Some("@org/pkg")), None);
+    }
+    headers.insert_url_header("https://registry.npmjs.com", "Bearer alias-secret".to_string());
+    assert_eq!(
+        headers.for_url("https://registry.npmjs.com/"),
+        Some("Bearer alias-secret".to_string()),
+    );
+    assert_eq!(
+        headers.for_url("https://registry.npmjs.org/"),
+        Some("Bearer canonical-secret".to_string()),
+    );
+}
 
 #[test]
 fn secure_transport_restricts_all_credential_lookups_and_survives_cloning() {
@@ -276,6 +297,38 @@ fn redact_and_sanitize_strips_credentials_and_control_chars() {
     // A control character inside the userinfo must not break the redaction:
     // controls are stripped first, then credentials are redacted.
     assert_eq!(redact_and_sanitize("https://user:pass\r@host/x"), "https://host/x");
+}
+
+#[test]
+fn redact_npm_auth_key_hides_protocol_relative_userinfo() {
+    assert_eq!(
+        redact_npm_auth_key("//user:password@registry.example/:_authToken"),
+        "//registry.example/:_authToken",
+    );
+    let malformed = redact_npm_auth_key("//user:pa/ss@registry.example/:_authToken");
+    assert_eq!(malformed, "[hidden]");
+    assert_eq!(
+        redact_npm_auth_key("//registry.example/:_authToken"),
+        "//registry.example/:_authToken",
+    );
+    assert_eq!(
+        redact_npm_auth_key("//registry.example/npm/@org:_authToken"),
+        "//registry.example/npm/@org:_authToken",
+    );
+    assert_eq!(
+        redact_npm_auth_key("//registry.example/:@org:_authToken"),
+        "//registry.example/:@org:_authToken",
+    );
+    assert_eq!(
+        redact_npm_auth_key("//localhost:4873/@org:_authToken"),
+        "//localhost:4873/@org:_authToken",
+    );
+    let malformed_scoped = redact_npm_auth_key("//user:pa/ss/@registry.example/:_authToken");
+    assert_eq!(malformed_scoped, "[hidden]");
+    assert_eq!(redact_npm_auth_key("//user:pa/ss/:@org:_authToken"), "[hidden]");
+    let malformed_later_userinfo =
+        redact_npm_auth_key("//registry.example/:@scope/user:password@evil:_authToken");
+    assert_eq!(malformed_later_userinfo, "[hidden]");
 }
 
 #[test]
@@ -646,11 +699,7 @@ fn classifies_urls_that_are_secure_for_credentials() {
 /// [`AuthHeaders::for_url`]: the URL ends without a `/` *and*
 /// names a path segment (`/scope`). Without the append,
 /// [`nerf_dart`] would drop the segment and miss the token; with
-/// it, the lookup walks `//reg.com/scope/`. Removing the append
-/// branch makes this test fail. Kept as a focused single-assertion
-/// case for the slash-append branch even though
-/// [`registry_with_pathname_matches_metadata_and_tarballs`]'s first
-/// assertion (`https://npm.pkg.github.com/pnpm`) also exercises it.
+/// it, the lookup walks `//reg.com/scope/`.
 #[test]
 fn slash_append_branch_lets_path_segment_match() {
     let headers = build(&[("//reg.com/scope/", "Bearer scoped")]);

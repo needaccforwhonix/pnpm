@@ -1,14 +1,15 @@
 use super::{
-    AuditLevel, BTreeMap, Config, IndexMap, NodeLinker, Path, PathBuf, PmOnFail, ProjectConfig,
-    RemoteSideEffectsCacheSettings, RuntimeOnFail, SupportedArchitectures, UNREPORTED_SETTINGS,
-    UpdateConfig, WorkspaceSettings, assert_eq,
+    AuditLevel, BTreeMap, Config, IndexMap, LogLevel, NodeLinker, Path, PathBuf, PmOnFail,
+    ProjectConfig, RemoteSideEffectsCacheSettings, ReporterType, RuntimeOnFail,
+    SupportedArchitectures, UNREPORTED_SETTINGS, UpdateConfig, WorkspaceSettings, assert_eq,
 };
 
 /// Every setting must report its resolved value, so that a hook reading the
 /// configuration sees what the install runs with. A key absent from the
 /// projection reads as `null`, which is indistinguishable from "explicitly
-/// unset" — so adding a setting to [`WorkspaceSettings`] without teaching
-/// [`WorkspaceSettings::from_resolved`] about it fails here.
+/// unset" — so adding a setting to [`WorkspaceSettings`] or
+/// [`MachineSettings`](crate::MachineSettings) without teaching its
+/// `from_resolved` about it fails here.
 ///
 /// Settings that are genuinely `Option` on [`Config`] are exempt: a `None`
 /// there is pnpm's own "unset", not a gap in the projection. The fixture
@@ -20,22 +21,33 @@ fn from_resolved_reports_every_setting() {
         scope: Some("@acme".to_string()),
         pnpr_server: Some("https://pnpr.example".to_string()),
         frozen_lockfile: Some(true),
+        provenance: Some(false),
         reporter_hide_prefix: Some(true),
+        loglevel: Some(LogLevel::Error),
+        reporter: Some(ReporterType::Silent),
         prefer_symlinked_executables: Some(true),
         max_sockets: Some(4),
         node_version: Some("24.0.0".to_string()),
+        publish_branch: Some("production".to_string()),
         script_shell: Some("/bin/bash".to_string()),
         node_options: Some("--max-old-space-size=8192".to_string()),
         patches_dir: Some("patches".to_string()),
         save_prefix: Some("~".to_string()),
+        tag_version_prefix: "release-".to_string(),
         save_catalog_name: Some("default".to_string()),
+        tag: Some("next".to_string()),
         pipeline_base: Some("origin/main".to_string()),
+        remote_cache: Some(Box::default()),
         init_author_name: Some("Example".to_string()),
         init_author_email: Some("example@example.com".to_string()),
         init_author_url: Some("https://example.com".to_string()),
         init_license: Some("MIT".to_string()),
         init_version: Some("1.0.0".to_string()),
         minimum_release_age_strict: Some(true),
+        boot_config: Some(Box::new(crate::BootConfig {
+            minimum_release_age: Some(0),
+            ..crate::BootConfig::default()
+        })),
         minimum_release_age_exclude: Some(vec!["is-positive".to_string()]),
         trust_policy_exclude: Some(vec!["is-negative".to_string()]),
         trust_policy_ignore_after: Some(1),
@@ -69,6 +81,11 @@ fn from_resolved_reports_every_setting() {
             http_proxy: Some("http://proxy.example".to_string()),
             no_proxy: Some(pnpm_network::NoProxySetting::List(vec!["example.com".to_string()])),
         },
+        tls: pnpm_network::TlsConfig {
+            strict_ssl: Some(false),
+            local_address: Some([127, 0, 0, 2].into()),
+            ..pnpm_network::TlsConfig::default()
+        },
         update_config: UpdateConfig { changeset: Some(true), ..UpdateConfig::default() },
         // The settings that report as written, rather than as resolved.
         explicit_settings: [
@@ -90,6 +107,7 @@ fn from_resolved_reports_every_setting() {
                 "mergeGitBranchLockfiles",
                 "optimisticRepeatInstall",
                 "preferSymlinkedExecutables",
+                "runtime",
             ]
             .into_iter()
             .map(|key| (key.to_string(), serde_json::Value::Bool(true))),
@@ -102,8 +120,8 @@ fn from_resolved_reports_every_setting() {
         ..Config::default()
     };
 
-    let projected = WorkspaceSettings::from_resolved(&config);
-    let Ok(serde_json::Value::Object(map)) = serde_json::to_value(&projected) else {
+    let projected = crate::TrustedSettings::from_resolved(&config);
+    let Ok(serde_json::Value::Object(map)) = projected.to_json() else {
         panic!("the projected settings serialize to a JSON object");
     };
 
@@ -131,7 +149,7 @@ fn from_resolved_reports_every_setting() {
 fn reset_setting_to_default_covers_every_setting() {
     let defaults = Config::default();
     let Ok(serde_json::Value::Object(map)) =
-        serde_json::to_value(WorkspaceSettings::from_resolved(&defaults))
+        crate::TrustedSettings::from_resolved(&defaults).to_json()
     else {
         panic!("the projected settings serialize to a JSON object");
     };

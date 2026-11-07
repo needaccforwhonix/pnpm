@@ -1,6 +1,6 @@
 //! Hoisted-linker. Produces the on-disk `node_modules/` tree
-//! described by Slice 4's [`crate::LockfileToDepGraphResult`]:
-//! removes orphaned directories from the previous install,
+//! described by [`crate::LockfileToDepGraphResult`]:
+//! removes orphaned directories the new plan doesn't place,
 //! imports each graph node into its computed directory via
 //! [`crate::import_indexed_dir()`], and links bins under every
 //! parent's `node_modules/.bin`.
@@ -9,30 +9,41 @@
 //! paths via `cas_paths_by_pkg_id`. It decouples downloading from
 //! linking because pacquet's existing tarball / store-dir /
 //! package-fetch machinery is reused verbatim by the install
-//! pipeline (Slice 6) before the linker runs. The linker is the
-//! final composition step — given a graph and a fully-populated
-//! CAS index for every package, it materializes the tree.
+//! pipeline before the linker runs.
 //!
 //! Concurrency uses [`rayon`]: the hierarchy walk parallelizes
 //! at each level, and `import_indexed_dir` itself is internally
 //! rayon-parallel over CAS entries.
 
+pub(crate) use bins::HoistedBinLinkOutput;
+pub use bins::HoistedBinSources;
+pub use dir_clone::HoistedDirCloneCache;
+
+mod bins;
+
+mod dir_clone;
+
+mod orphans;
+
 use crate::{
     DepHierarchy, DependenciesGraph, DependenciesGraphNode, ImportIndexedDirError,
-    ImportIndexedDirOpts, import_indexed_dir, link_direct_dep_bins,
+    ImportIndexedDirOpts, import_indexed_dir,
 };
+use bins::{link_bundled_bins, link_hierarchy_bins};
 use derive_more::{Display, Error};
 use miette::Diagnostic;
-use pnpm_cmd_shim::{Host, LinkBinsError, LinkBinsOptions, link_bins};
+use orphans::remove_orphans;
+use pnpm_cmd_shim::{LinkBinsError, LinkBinsOptions};
 use pnpm_lockfile::PkgIdWithPatchHash;
 use pnpm_reporter::{
     LogEvent, LogLevel, ProgressLog, ProgressMessage, Reporter, StatsLog, StatsMessage,
 };
 use rayon::prelude::*;
 use std::{
-    collections::HashMap,
-    fs, io,
+    collections::{BTreeSet, HashMap},
+    io,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 /// Per-package CAS index. Keyed by [`crate::HoistedPackageMetadata::pkg_id_with_patch_hash`],
@@ -46,7 +57,47 @@ use std::{
 /// directories (version conflict → some dirs nest under siblings)
 /// and the CAS contents are the same regardless of where they're
 /// extracted to.
-pub type CasPathsByPkgId = HashMap<PkgIdWithPatchHash, HashMap<String, PathBuf>>;
+pub type CasPathsByPkgId = HashMap<PkgIdWithPatchHash, HoistedPackageFiles>;
+
+/// One package's entry in [`CasPathsByPkgId`].
+#[derive(Debug, Clone)]
+pub struct HoistedPackageFiles {
+    pub cas_paths: Arc<pnpm_fs::CasPaths>,
+    /// Whether [`Self::cas_paths`] points at mutable local source, taken
+    /// from the fetch's effective resolution. See
+    /// [`crate::SlotImportSource::is_mutable`].
+    pub source_is_mutable: bool,
+    /// Whether the mutable source was there to read from. See
+    /// [`crate::SlotImportSource::source_exists`].
+    pub source_exists: bool,
+    /// Whether a build or a patch will write to the imported files. See
+    /// [`crate::SlotImportSource::needs_build`].
+    pub needs_build: bool,
+}
+
+impl HoistedPackageFiles {
+    /// Whether a package already installed from these files has to be
+    /// imported again. A mutable source can change without the lockfile
+    /// changing. A missing one has only an empty file map to offer, which
+    /// would replace the installed copy with nothing.
+    #[must_use]
+    pub fn refreshes_installed_copy(&self) -> bool {
+        self.source_is_mutable && self.source_exists
+    }
+}
+
+impl From<Arc<pnpm_fs::CasPaths>> for HoistedPackageFiles {
+    /// Content-addressed files, which are never mutable, of a package
+    /// nothing will write to.
+    fn from(cas_paths: Arc<pnpm_fs::CasPaths>) -> Self {
+        HoistedPackageFiles {
+            cas_paths,
+            source_is_mutable: false,
+            source_exists: true,
+            needs_build: false,
+        }
+    }
+}
 
 /// Inputs the linker reads from. Borrows everything so callers
 /// can keep ownership of the graph / CAS state — the linker
@@ -54,23 +105,27 @@ pub type CasPathsByPkgId = HashMap<PkgIdWithPatchHash, HashMap<String, PathBuf>>
 #[derive(Debug)]
 pub struct LinkHoistedModulesOpts<'a> {
     pub import: crate::PackageImportOptions<'a>,
+    pub dir_clone_cache: Option<&'a HoistedDirCloneCache<'a>>,
     pub graph: &'a DependenciesGraph,
-    /// Diffed against `graph` to compute orphans. `None` for a
-    /// fresh install (no prior lockfile) — no orphans to remove.
-    pub prev_graph: Option<&'a DependenciesGraph>,
+    /// The package directories the previous install placed. Each one
+    /// `graph` does not place is removed. Empty for a fresh install; the
+    /// on-disk scan still runs, since that is exactly the state an
+    /// interrupted install leaves behind.
+    pub previous_dirs: &'a BTreeSet<PathBuf>,
     /// Per-importer directory hierarchies, keyed by importer
     /// root. Single-importer installs have one entry keyed by
-    /// `lockfile_dir`; workspace support will add more.
+    /// `lockfile_dir`.
     pub hierarchy: &'a std::collections::BTreeMap<PathBuf, DepHierarchy>,
+    /// Where each importer root of [`hierarchy`](Self::hierarchy) keeps
+    /// its dependencies. Its lockfile directory is the containment root
+    /// for orphan removal: an orphan directory that does not sit
+    /// lexically inside it is skipped, never deleted. The walker builds
+    /// every graph dir through `safe_join_modules_dir`, so a confined
+    /// path is the invariant. This keeps the deletion site from
+    /// depending on the constructor's discipline.
+    pub modules_dirs: &'a crate::ImporterModulesDirs,
     /// Pre-fetched CAS file index per package.
     pub cas_paths_by_pkg_id: &'a CasPathsByPkgId,
-    /// Containment root for orphan removal: an orphan directory that
-    /// does not sit lexically inside this root is skipped, never
-    /// deleted. The walker builds every graph dir through
-    /// `safe_join_modules_dir`, so a confined path is the invariant —
-    /// this keeps the deletion site from depending on the
-    /// constructor's discipline.
-    pub confine_root: &'a Path,
     /// Options for every bin this pass links — the
     /// [`crate::shim_link_options`] output for the hoisted linker
     /// (no `extraNodePaths`; hoisted-tree shims never carry
@@ -79,9 +134,8 @@ pub struct LinkHoistedModulesOpts<'a> {
 }
 
 /// Failure modes of [`link_hoisted_modules`]. Marked
-/// `#[non_exhaustive]` so adding variants in later sub-slices
-/// (e.g. side-effects cache, store-controller integration)
-/// isn't a breaking API change.
+/// `#[non_exhaustive]` so adding variants isn't a breaking API
+/// change.
 #[derive(Debug, Display, Error, Diagnostic)]
 #[non_exhaustive]
 pub enum LinkHoistedModulesError {
@@ -92,7 +146,7 @@ pub enum LinkHoistedModulesError {
     MissingCasPaths { pkg_id_with_patch_hash: PkgIdWithPatchHash, dir: PathBuf },
 
     /// A hierarchy entry referenced a directory that has no
-    /// corresponding entry in `graph`. Slice 4's walker inserts
+    /// corresponding entry in `graph`. The walker inserts
     /// a graph node every time it inserts a hierarchy entry, so
     /// this shouldn't fire from a real walker result — but
     /// surfacing the inconsistency fails the install fast rather
@@ -101,6 +155,16 @@ pub enum LinkHoistedModulesError {
     #[diagnostic(code(ERR_PNPM_LINK_HOISTED_MISSING_GRAPH_NODE))]
     MissingGraphNode { dir: PathBuf },
 
+    /// An importer's `node_modules`, or one entry in it, could not be
+    /// inspected for the orphan scan. Removal failures are tolerated,
+    /// but a path we cannot even read would silently leave orphans
+    /// behind — the same distinction pnpm draws between
+    /// `readModulesDir`, which only swallows a missing directory, and
+    /// `tryRemoveDir`, which swallows everything.
+    #[display("Failed to read {path:?} while scanning for orphaned directories")]
+    #[diagnostic(code(ERR_PNPM_LINK_HOISTED_READ_MODULES_DIR))]
+    ReadModulesDir { path: PathBuf, source: io::Error },
+
     #[diagnostic(transparent)]
     ImportIndexedDir(#[error(source)] ImportIndexedDirError),
 
@@ -108,13 +172,15 @@ pub enum LinkHoistedModulesError {
     LinkBins(#[error(source)] LinkBinsError),
 }
 
-/// Produce the on-disk hoisted tree from a Slice 4 walk result.
+/// Produce the on-disk hoisted tree from a walk result.
 ///
-/// 1. **Orphan removal.** Every directory in `prev_graph` but
-///    not in `graph` is silently `rimraf`'d. Removal happens
-///    *before* any insert so the linker doesn't race against
-///    itself when a directory name is reused for a different
-///    package version.
+/// 1. **Orphan removal.** Every directory the previous install
+///    placed but the new plan doesn't, plus every package
+///    directory found in an importer's `node_modules` that the
+///    new plan doesn't place, is silently `rimraf`'d. Removal
+///    happens *before* any insert so the linker doesn't race
+///    against itself when a directory name is reused for a
+///    different package version.
 /// 2. **Per-node import.** The hierarchy is walked top-down,
 ///    parallel at each level. For every node the previous install did
 ///    not already leave in place ([`DependenciesGraphNode::present`])
@@ -123,23 +189,35 @@ pub enum LinkHoistedModulesError {
 /// 3. **Per-`node_modules` bin link.** After a level's children
 ///    are all done, `<parent>/node_modules/.bin` is populated
 ///    from the just-imported direct children's `package.json`.
+///
+/// Returns the nested `node_modules` directories whose `.bin` held back a bin,
+/// for the build phase to link again.
 pub fn link_hoisted_modules<Reporter: self::Reporter>(
     opts: &LinkHoistedModulesOpts<'_>,
-) -> Result<(), LinkHoistedModulesError> {
-    let removed = remove_orphans(opts.graph, opts.prev_graph, opts.confine_root);
+) -> Result<Vec<HeldBackBinsDir>, LinkHoistedModulesError> {
+    link_hoisted_modules_with_sources::<Reporter>(opts).map(|bins| bins.held_back_bins_dirs)
+}
+
+pub(crate) fn link_hoisted_modules_with_sources<Reporter: self::Reporter>(
+    opts: &LinkHoistedModulesOpts<'_>,
+) -> Result<HoistedBinLinkOutput, LinkHoistedModulesError> {
+    let removed = remove_orphans(opts)?;
 
     // Drive each importer's hierarchy in parallel — workspace
-    // installs (Slice 9) will have multiple importers; the
+    // installs have multiple importers; the
     // single-importer case has one and rayon's overhead is
     // negligible.
-    let added: u64 = opts.hierarchy
-        .par_iter()
-        .map(|(parent_dir, deps_hierarchy)| {
-            link_all_pkgs_in_order::<Reporter>(deps_hierarchy, parent_dir, opts)
-        })
-        .collect::<Result<Vec<u64>, _>>()?
-        .into_iter()
-        .sum();
+    let LinkedLevel { imported: added, bins } = crate::link_pool::in_link_pool(|| {
+        opts.hierarchy
+            .par_iter()
+            .map(|(project_dir, deps_hierarchy)| {
+                let modules_dir = opts.modules_dirs.of(project_dir);
+                link_all_pkgs_in_order::<Reporter>(deps_hierarchy, &modules_dir, true, opts)
+            })
+            .collect::<Result<Vec<LinkedLevel>, _>>()
+    })?
+    .into_iter()
+    .fold(LinkedLevel::default(), LinkedLevel::merge);
 
     // The hoisted linker owns both of the install's `pnpm:stats`
     // emissions: pnpm emits `removed` from `linkHoistedModules` and the
@@ -158,58 +236,16 @@ pub fn link_hoisted_modules<Reporter: self::Reporter>(
         message: StatsMessage::Removed { prefix: opts.import.requester.to_owned(), removed },
     }));
 
-    Ok(())
+    Ok(bins)
 }
 
-/// Phase 1: rimraf every directory that was in the previous
-/// install's graph but isn't in the new one. Errors are swallowed
-/// silently with the same `EPERM`/`EBUSY` tolerance — a directory
-/// we can't remove right now is no worse than leaving a stale
-/// entry, and the next install will retry. Returns the orphan count
-/// (attempted, not necessarily removed — the same number pnpm's
-/// `dirsToRemove.length` reports).
-fn remove_orphans(
-    graph: &DependenciesGraph,
-    prev_graph: Option<&DependenciesGraph>,
-    confine_root: &Path,
-) -> u64 {
-    let Some(prev) = prev_graph else { return 0 };
-    let orphan_dirs: Vec<&PathBuf> = prev
-        .keys()
-        .filter(|dir| !graph.contains_key(*dir))
-        .filter(|dir| {
-            let confined = dir.starts_with(confine_root)
-                && dir
-                    .components()
-                    .all(|part| !matches!(part, std::path::Component::ParentDir));
-            if !confined {
-                tracing::warn!(
-                    ?dir,
-                    ?confine_root,
-                    "refusing to remove an orphan directory outside the install root",
-                );
-            }
-            confined
-        })
-        .collect();
-    orphan_dirs
-        .par_iter()
-        .for_each(|dir| {
-            let _ = try_remove_dir(dir);
-        });
-    orphan_dirs.len() as u64
-}
-
-/// Single-directory rimraf with error-swallowing semantics.
-/// `NotFound` is a no-op (someone else already removed it);
-/// everything else (`PermissionDenied`, `Other`) is silently
-/// dropped — a stale directory is less bad than a panicked install.
-fn try_remove_dir(dir: &Path) -> io::Result<()> {
-    match fs::remove_dir_all(dir) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(_) => Ok(()),
-    }
+/// The modules directory physically containing a scoped or unscoped package.
+pub(crate) fn containing_modules_dir(pkg_dir: &Path) -> Option<&Path> {
+    let parent = pkg_dir.parent()?;
+    let is_scope = parent
+        .file_name()
+        .is_some_and(|name| name.as_encoded_bytes().starts_with(b"@"));
+    if is_scope { parent.parent() } else { Some(parent) }
 }
 
 /// Phase 2 + 3: recursively import packages then link bins for
@@ -226,64 +262,66 @@ fn try_remove_dir(dir: &Path) -> io::Result<()> {
 /// [`IntoParallelRefIterator::par_iter`]: rayon::iter::IntoParallelRefIterator::par_iter
 fn link_all_pkgs_in_order<Reporter: self::Reporter>(
     hierarchy: &DepHierarchy,
-    parent_dir: &Path,
+    modules_dir: &Path,
+    is_project_root: bool,
     opts: &LinkHoistedModulesOpts<'_>,
-) -> Result<u64, LinkHoistedModulesError> {
+) -> Result<LinkedLevel, LinkHoistedModulesError> {
     // Phase 2: import this level's packages + recurse into each
     // one's children. `par_iter` is sufficient — the side effects
-    // are on disk and target disjoint directories. Returns how many
-    // packages this subtree imported.
-    let imported: u64 = hierarchy.0
+    // are on disk and target disjoint directories.
+    let mut linked = hierarchy.0
         .par_iter()
         .map(|(dir, sub_hierarchy)| {
             let node = opts.graph
                 .get(dir)
                 .ok_or_else(|| LinkHoistedModulesError::MissingGraphNode { dir: dir.clone() })?;
             let here = u64::from(import_node::<Reporter>(node, opts)?);
-            Ok(here + link_all_pkgs_in_order::<Reporter>(sub_hierarchy, dir, opts)?)
+            let below = link_all_pkgs_in_order::<Reporter>(
+                sub_hierarchy,
+                &dir.join("node_modules"),
+                false,
+                opts,
+            )?;
+            Ok(LinkedLevel { imported: here, ..LinkedLevel::default() }.merge(below))
         })
-        .collect::<Result<Vec<u64>, LinkHoistedModulesError>>()?
+        .collect::<Result<Vec<LinkedLevel>, LinkHoistedModulesError>>()?
         .into_iter()
-        .sum();
+        .fold(LinkedLevel::default(), LinkedLevel::merge);
 
-    link_hierarchy_bins(hierarchy, parent_dir, opts)?;
+    let mut bins = link_hierarchy_bins(hierarchy, modules_dir, opts)?;
+    // A project's `.bin` is linked again after the builds anyway.
+    if is_project_root {
+        bins.held_back_bins_dirs.clear();
+    }
+    linked.bins.merge(bins);
+    linked.bins.merge(link_bundled_bins(hierarchy, opts)?);
 
-    Ok(imported)
+    Ok(linked)
 }
 
-// Bundled packages are absent from the graph, so their bins need a separate filesystem pass.
-fn link_hierarchy_bins(
-    hierarchy: &DepHierarchy,
-    parent_dir: &Path,
-    opts: &LinkHoistedModulesOpts<'_>,
-) -> Result<(), LinkHoistedModulesError> {
-    let modules_dir = parent_dir.join("node_modules");
-    let dep_names: Vec<String> = hierarchy.0
-        .keys()
-        .filter_map(|child_dir| opts.graph.get(child_dir))
-        .filter_map(|node| node.alias.clone())
-        .collect();
-    if !dep_names.is_empty() {
-        link_direct_dep_bins(&modules_dir, &dep_names, opts.link_options)
-            .map_err(LinkHoistedModulesError::LinkBins)?;
-    }
+/// A nested `node_modules` whose `.bin` held back a bin while the builds that
+/// may create its target were pending. The build phase links the bins of its
+/// `dep_names` again once they ran.
+#[derive(Debug, Clone)]
+pub struct HeldBackBinsDir {
+    pub modules_dir: PathBuf,
+    pub dep_names: Vec<String>,
+}
 
-    // Packages the tarball ships in its own `node_modules` are not graph
-    // nodes, so the pass above never sees them; their bins are reachable
-    // only from inside the bundling package.
-    for child_dir in hierarchy.0.keys() {
-        let bundles =
-            opts.graph.get(child_dir).is_some_and(|node| node.package.has_bundled_dependencies);
-        if !bundles {
-            continue;
-        }
-        let bundled_modules_dir = child_dir.join("node_modules");
-        let bins_dir = bundled_modules_dir.join(".bin");
-        link_bins::<Host>(&bundled_modules_dir, &bins_dir, opts.link_options)
-            .map_err(LinkHoistedModulesError::LinkBins)?;
-    }
+/// What a subtree of [`link_all_pkgs_in_order`] did: how many packages it
+/// imported, and its nested `.bin` directories that held back a bin.
+#[derive(Default)]
+struct LinkedLevel {
+    imported: u64,
+    bins: HoistedBinLinkOutput,
+}
 
-    Ok(())
+impl LinkedLevel {
+    fn merge(mut self, other: LinkedLevel) -> LinkedLevel {
+        self.imported += other.imported;
+        self.bins.merge(other.bins);
+        self
+    }
 }
 
 /// Import one graph node into its target `dir`. `Ok(false)` when
@@ -299,7 +337,7 @@ fn import_node<Reporter: self::Reporter>(
     if node.present {
         return Ok(false);
     }
-    let Some(cas_paths) = opts.cas_paths_by_pkg_id.get(&node.package.pkg_id_with_patch_hash) else {
+    let Some(files) = opts.cas_paths_by_pkg_id.get(&node.package.pkg_id_with_patch_hash) else {
         if node.optional {
             return Ok(false);
         }
@@ -309,18 +347,22 @@ fn import_node<Reporter: self::Reporter>(
         });
     };
 
-    import_indexed_dir::<Reporter>(
-        opts.import.logged_methods,
-        opts.import.method,
-        &node.dir,
-        cas_paths,
-        ImportIndexedDirOpts {
-            force: true,
-            keep_modules_dir: true,
-            ..ImportIndexedDirOpts::default()
-        },
-    )
-    .map_err(LinkHoistedModulesError::ImportIndexedDir)?;
+    let cas_paths = &*files.cas_paths;
+    let import_method = opts.import.method_for(files.source_is_mutable, files.needs_build);
+    if files.source_is_mutable
+        || !opts.dir_clone_cache.is_some_and(|cache| {
+            cache.try_import::<Reporter>(node, opts.import, cas_paths)
+        })
+    {
+        import_indexed_dir::<Reporter>(
+            opts.import.logged_methods,
+            import_method,
+            &node.dir,
+            cas_paths,
+            hoisted_import_opts(files, opts.import.swap_lock),
+        )
+        .map_err(LinkHoistedModulesError::ImportIndexedDir)?;
+    }
 
     // `pnpm:progress imported` — see the matching emit in
     // `create_virtual_dir_by_snapshot::run` for the rationale on the
@@ -330,13 +372,30 @@ fn import_node<Reporter: self::Reporter>(
     Reporter::emit(&LogEvent::Progress(ProgressLog {
         level: LogLevel::Debug,
         message: ProgressMessage::Imported {
-            method: crate::optimistic_wire_method(opts.import.method),
+            method: crate::optimistic_wire_method(import_method),
             requester: opts.import.requester.to_owned(),
             to: node.dir.to_string_lossy().into_owned(),
         },
     }));
 
     Ok(true)
+}
+
+/// A hoisted package replaces whatever is at its directory but keeps the
+/// nested `node_modules` other nodes were hoisted into. A directory
+/// dependency keeps its own symlinks. A missing mutable source leaves an
+/// existing directory alone, as it does for a virtual-store slot.
+fn hoisted_import_opts<'a>(
+    files: &HoistedPackageFiles,
+    swap_lock: Option<&'a crate::ModulesSwapLock>,
+) -> ImportIndexedDirOpts<'a> {
+    ImportIndexedDirOpts {
+        force: files.source_exists || !files.source_is_mutable,
+        keep_modules_dir: true,
+        symlink_targets: files.source_is_mutable.then_some(crate::SymlinkTargets::Imported),
+        swap_lock,
+        ..ImportIndexedDirOpts::default()
+    }
 }
 
 #[cfg(test)]

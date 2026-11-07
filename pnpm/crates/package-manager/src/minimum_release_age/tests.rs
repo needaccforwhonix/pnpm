@@ -178,6 +178,7 @@ async fn non_interactive_strict_mode_reports_every_immature_pick() {
     let mut prompt = FakePrompt::default();
     let violations = vec![
         violation("zeta", "2.0.0", "MINIMUM_RELEASE_AGE_VIOLATION"),
+        violation("zeta", "2.0.0", "MINIMUM_RELEASE_AGE_VIOLATION"),
         violation("alpha", "1.0.0", "MINIMUM_RELEASE_AGE_VIOLATION"),
         violation("ignored", "3.0.0", "TRUST_DOWNGRADE"),
     ];
@@ -218,6 +219,8 @@ async fn approval_persists_canonical_excludes_and_brackets_the_prompt() {
     let violations = vec![
         violation("foo", "2.0.0", "MINIMUM_RELEASE_AGE_VIOLATION"),
         violation("bar", "3.0.0", "MINIMUM_RELEASE_AGE_VIOLATION"),
+        violation("foo", "1.0.0", "MINIMUM_RELEASE_AGE_VIOLATION"),
+        violation("foo", "2.0.0", "MINIMUM_RELEASE_AGE_VIOLATION"),
     ];
 
     handle_minimum_release_age_violations_with::<RecordingReporter, _>(
@@ -232,7 +235,10 @@ async fn approval_persists_canonical_excludes_and_brackets_the_prompt() {
     .expect("approval should continue");
 
     assert_eq!(prompt.messages.len(), 1);
-    assert!(prompt.messages[0].contains("bar@3.0.0\n  foo@2.0.0"));
+    assert_eq!(
+        prompt.messages[0],
+        "3 versions do not meet the minimumReleaseAge constraint:\n  bar@3.0.0\n  foo@1.0.0\n  foo@2.0.0\nAdd to minimumReleaseAgeExclude in pnpm-workspace.yaml and proceed with the install?",
+    );
     let workspace = fs::read_to_string(dir.path().join("pnpm-workspace.yaml"))
         .expect("read workspace manifest");
     assert!(workspace.contains("packages:\n  - packages/*"));
@@ -323,6 +329,37 @@ async fn global_excludes_are_not_persisted_to_the_workspace_manifest() {
         fs::read_to_string(dir.path().join("pnpm-workspace.yaml"))
             .expect("read workspace manifest"),
         "minimumReleaseAgeExclude:\n  - local@1.0.0 || 2.0.0\n",
+    );
+}
+
+#[tokio::test]
+async fn excludes_match_double_quote_style_of_workspace_manifest() {
+    let dir = tempdir().expect("temp dir");
+    fs::write(
+        dir.path().join("pnpm-workspace.yaml"),
+        "packages:\n  - \"packages/*\"\ntrustPolicy: \"no-downgrade\"\n",
+    )
+    .expect("write workspace manifest");
+    let mut config = Config::new();
+    config.minimum_release_age = Some(60);
+    let mut prompt = FakePrompt::default();
+
+    handle_minimum_release_age_violations_with::<SilentReporter, _>(
+        &config,
+        dir.path(),
+        &[violation("@better-auth/core", "1.7.3", "MINIMUM_RELEASE_AGE_VIOLATION")],
+        true,
+        PolicyExcludes::Persist,
+        &mut prompt,
+    )
+    .await
+    .expect("loose mode proceeds");
+
+    let content = fs::read_to_string(dir.path().join("pnpm-workspace.yaml"))
+        .expect("read workspace manifest");
+    assert!(
+        content.contains(r#"- "@better-auth/core@1.7.3""#),
+        "expected double quoted entry, got:\n{content}",
     );
 }
 
@@ -437,4 +474,39 @@ async fn prompt_input_error_releases_the_reporter() {
 
     assert!(matches!(error, MinimumReleaseAgeError::Prompt(_)));
     assert_eq!(prompt_actions(), [PromptAction::Start, PromptAction::End]);
+}
+
+#[tokio::test]
+async fn target_workspace_dir_receives_excludes_when_configured() {
+    let target_dir = tempdir().expect("target temp dir");
+    let target_path = target_dir.path().join("pnpm-workspace.yaml");
+    fs::write(&target_path, "packages:\n  - packages/*\n").expect("write target manifest");
+
+    let install_dir = tempdir().expect("install temp dir");
+
+    let mut config = Config::new();
+    config.minimum_release_age_strict = Some(true);
+    config.target_workspace_dir = Some(target_dir.path().to_path_buf());
+    let mut prompt = FakePrompt { answer: true, ..Default::default() };
+
+    handle_minimum_release_age_violations_with::<SilentReporter, _>(
+        &config,
+        install_dir.path(),
+        &[violation("foo", "1.0.0", "MINIMUM_RELEASE_AGE_VIOLATION")],
+        true,
+        PolicyExcludes::Persist,
+        &mut prompt,
+    )
+    .await
+    .expect("approved exclusions succeed");
+
+    assert!(
+        !install_dir
+            .path()
+            .join("pnpm-workspace.yaml")
+            .exists(),
+    );
+    let target_manifest = fs::read_to_string(&target_path).expect("read updated target manifest");
+    assert!(target_manifest.contains("minimumReleaseAgeExclude:"));
+    assert!(target_manifest.contains("foo@1.0.0"));
 }

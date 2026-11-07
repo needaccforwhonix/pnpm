@@ -1,8 +1,9 @@
 use super::{
     Arc, AuthHeaders, BTreeMap, Config, DEFAULT_REGISTRY, DEFAULT_REGISTRY_SCOPE, HashMap,
-    LoadWorkspaceYamlError, NpmrcAuth, base64_encode, base64_encode_bytes, normalize_registry_url,
-    parse_token_helper_field, split_scope_from_uri,
+    LoadWorkspaceYamlError, NpmrcAuth, base64_encode_bytes, parse_token_helper_field,
+    split_scope_from_uri,
 };
+use pnpm_network::{canonicalize_npm_registry_url, normalize_registry_url};
 
 /// Raw (unparsed) credential fields for a given registry URI.
 /// Each `Option` stores the post-`${VAR}`-substitution value when set.
@@ -19,10 +20,7 @@ pub(crate) struct RawCreds {
     /// `tokenHelper=` value: the raw command line naming an executable
     /// pnpm runs to obtain the registry token. Kept as the raw string
     /// here; validated (reserved characters) and split into a command
-    /// at [`NpmrcAuth::build_auth_headers`] time. Only honored from a
-    /// trusted, non-repo source (see the trust guard in
-    /// [`crate::Config::current`]); a project/workspace `.npmrc`
-    /// carrying one is rejected.
+    /// at [`NpmrcAuth::build_auth_headers`] time.
     pub token_helper: Option<String>,
 }
 
@@ -142,10 +140,8 @@ impl RegistryCreds {
 }
 
 /// The `username:password` pair `raw` carries, from a base64 `_auth` or
-/// from `username` plus a base64 `_password`, read the way
-/// [`creds_to_header`] reads them: a `_password` that is not base64 is the
-/// password as written, since that is what the header carries. `None` when
-/// `raw` names no complete pair or `_auth` does not decode.
+/// from `username` plus a base64 `_password`. `None` when `raw` names no
+/// complete pair, or when `_auth` or `_password` does not decode to text.
 fn decode_basic_auth(raw: &RawCreds) -> Option<BasicAuth> {
     if let Some(pair) = raw.auth_pair_base64
         .as_deref()
@@ -161,7 +157,7 @@ fn decode_basic_auth(raw: &RawCreds) -> Option<BasicAuth> {
     let password_b64 = raw.password
         .as_ref()
         .filter(|password| !password.is_empty())?;
-    let password = base64_decode(password_b64).unwrap_or_else(|| password_b64.clone());
+    let password = base64_decode(password_b64)?;
     Some(BasicAuth { username, password })
 }
 
@@ -171,7 +167,7 @@ fn pinned_registry(declared: &str) -> String {
     if declared.is_empty() {
         return DEFAULT_REGISTRY.to_owned();
     }
-    normalize_registry_url(declared)
+    normalize_registry_url(declared).into_owned()
 }
 
 /// The raw `_authToken` of a default-scope credential, kept alongside the
@@ -243,12 +239,19 @@ fn creds_to_header(creds: &RawCreds) -> Result<Option<String>, LoadWorkspaceYaml
         }
         return Ok(Some(format!("Basic {}", base64_encode_bytes(&decoded))));
     }
-    if let (Some(user), Some(pass_b64)) = (&creds.username, &creds.password) {
-        // npm encodes `_password` as base64 of the raw password. The
-        // header itself is `Basic base64(user:password)`, so we decode
-        // the password back and re-encode the pair.
-        let password = base64_decode(pass_b64).unwrap_or_else(|| pass_b64.clone());
-        return Ok(Some(format!("Basic {}", base64_encode(&format!("{user}:{password}")))));
+    // Like an empty `_auth`, an empty half of the pair names no credential.
+    let username = creds.username
+        .as_deref()
+        .filter(|username| !username.is_empty());
+    let password_b64 = creds.password
+        .as_deref()
+        .filter(|password| !password.is_empty());
+    if let (Some(user), Some(pass_b64)) = (username, password_b64) {
+        let password = base64_decode_bytes(pass_b64)
+            .ok_or(LoadWorkspaceYamlError::AuthInvalidBase64 { key: "_password" })?;
+        let mut pair = format!("{user}:").into_bytes();
+        pair.extend_from_slice(&password);
+        return Ok(Some(format!("Basic {}", base64_encode_bytes(&pair))));
     }
     Ok(None)
 }
@@ -287,9 +290,8 @@ fn base64_decode_bytes(input: &str) -> Option<Vec<u8>> {
     base64::Engine::decode(&CREDENTIAL_BASE64, &cleaned[..=last]).ok()
 }
 
-/// [`base64_decode_bytes`] for the `_password` field, whose decoded form
-/// is read as text. `None` — so the caller can keep the raw value
-/// verbatim — when the input is not base64 or not UTF-8.
+/// [`base64_decode_bytes`] for a credential whose decoded form is read as
+/// text. `None` when the input is not base64 or not UTF-8.
 pub(super) fn base64_decode(input: &str) -> Option<String> {
     String::from_utf8(base64_decode_bytes(input)?).ok()
 }
@@ -298,8 +300,7 @@ pub(super) fn apply_creds_field(creds: &mut RawCreds, field: &str, value: String
     // The catch-all swallows arbitrary `.npmrc` keys that don't map to
     // a credential field. Examples: a top-level `store-dir=` line, or
     // a `//host/:registry=` per-registry override that we don't honour
-    // yet. Only the four recognised fields contribute to `RawCreds`;
-    // everything else is silently dropped.
+    // yet.
     match field {
         "_authToken" => creds.auth_token = Some(value),
         "_auth" => creds.auth_pair_base64 = Some(value),
@@ -458,12 +459,18 @@ impl NpmrcAuth {
             .collect()
     }
 
-    pub(super) fn creds_entry_mut(&mut self, uri: &str) -> &mut RawCreds {
+    pub(super) fn apply_uri_creds_field(&mut self, uri: &str, field: &str, value: &str) {
         let (registry_uri, scope) = split_scope_from_uri(uri);
-        self.creds_by_scope_by_uri
-            .entry(registry_uri)
-            .or_default()
-            .entry(scope.unwrap_or_else(|| DEFAULT_REGISTRY_SCOPE.to_owned()))
-            .or_default()
+        let canonical_uri = canonicalize_npm_registry_url(&registry_uri);
+        let scope = scope.unwrap_or_else(|| DEFAULT_REGISTRY_SCOPE.to_owned());
+        let alias = (canonical_uri != registry_uri).then_some(canonical_uri.as_ref());
+        for registry_uri in std::iter::once(registry_uri.as_str()).chain(alias) {
+            let entry = self.creds_by_scope_by_uri
+                .entry(registry_uri.to_owned())
+                .or_default()
+                .entry(scope.clone())
+                .or_default();
+            apply_creds_field(entry, field, value.to_owned());
+        }
     }
 }

@@ -49,7 +49,7 @@ beforeEach(() => {
   mockGlobalWarn.mockClear()
 })
 
-const REGISTRY = `http://localhost:${REGISTRY_MOCK_PORT}/`
+const REGISTRY = `http://localhost:${REGISTRY_MOCK_PORT}/npm/`
 const pnpmBin = path.join(import.meta.dirname, '../../../../pnpm/bin/pnpm.mjs')
 
 async function execPnpmInstall (opts?: { enableGlobalVirtualStore?: boolean }): Promise<void> {
@@ -68,7 +68,7 @@ async function getApproveBuildsConfig () {
   const cliOptions = {
     argv: [],
     dir: process.cwd(),
-    registry: `http://localhost:${REGISTRY_MOCK_PORT}`,
+    registry: `http://localhost:${REGISTRY_MOCK_PORT}/npm/`,
   }
   const { config, context } = await getConfig({
     cliOptions,
@@ -137,7 +137,6 @@ test('approve no builds', async () => {
   await approveNoBuilds()
 
   const manifest = readYamlFileSync<any>(path.resolve('pnpm-workspace.yaml')) // eslint-disable-line
-  // allowBuilds is now the unified setting
   expect(Object.keys(manifest.allowBuilds ?? {}).sort()).toStrictEqual([
     '@pnpm.e2e/install-script-example',
     '@pnpm.e2e/pre-and-postinstall-scripts-example',
@@ -162,8 +161,7 @@ test("works when root project manifest doesn't exist in a workspace", async () =
   })
 
   // Install before writing the workspace manifest so the CLI doesn't
-  // detect a workspace (matching the old install.handler() behaviour
-  // where getConfig() didn't read allowBuilds from the manifest).
+  // detect a workspace.
   process.chdir('workspace/packages/project')
   await execPnpmInstall()
 
@@ -495,8 +493,7 @@ test('should retain existing allowBuilds entries when approving builds', async (
   })
 
   // Install before writing the workspace manifest with allowBuilds so the
-  // CLI ignores all builds (matching the old install.handler() behaviour
-  // where getConfig() didn't read allowBuilds from the manifest).
+  // CLI ignores all builds.
   await execPnpmInstall()
 
   const workspaceManifestFile = path.join(temp, 'pnpm-workspace.yaml')

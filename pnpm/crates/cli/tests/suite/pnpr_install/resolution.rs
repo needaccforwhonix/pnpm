@@ -1,7 +1,8 @@
 use super::{
-    AddMockedRegistry, CommandExtra, CommandTempCwd, IS_POSITIVE_PATCH, Path, configure_pnpr_auth,
-    fs, get_all_files, is_symlink_or_junction, pacquet_at, point_npmrc_registry_at,
-    read_workspace_lockfile, start_pnpr, text_block_fnl, workspace_importer_version,
+    AddMockedRegistry, CONFLICTED_DEPENDENCY, CommandExtra, CommandTempCwd, IS_POSITIVE_PATCH,
+    Path, assert_merged_conflicted_lockfile, configure_pnpr_auth, fs, get_all_files,
+    is_symlink_or_junction, pacquet_at, point_npmrc_registry_at, read_workspace_lockfile,
+    start_pnpr, start_pnpr_for, workspace_importer_version, write_conflicted_lockfile_fixture,
 };
 use assert_cmd::assert::OutputAssertExt;
 
@@ -21,7 +22,7 @@ fn install_via_pnpr_links_node_modules() {
         ..
     } = npmrc_info;
 
-    let (pnpr_url, token) = start_pnpr(&mock_instance.url());
+    let (pnpr_url, token) = start_pnpr(mock_instance.url());
     configure_pnpr_auth(&npmrc_path, &pnpr_url, &token);
 
     let manifest_path = workspace.join("package.json");
@@ -50,16 +51,11 @@ fn install_via_pnpr_links_node_modules() {
     drop((root, mock_instance));
 }
 
+/// A project that only declares `peerDependencies` gets them auto-installed,
+/// so the importer the server resolves has to carry them too
+/// ([pnpm/pnpm#14833](https://github.com/pnpm/pnpm/issues/14833)).
 #[test]
-fn install_via_pnpr_replaces_a_conflicted_lockfile() {
-    const CONFLICTED_LOCKFILE: &str = text_block_fnl! {
-        "<<<<<<< HEAD"
-        "lockfileVersion: '9.0'"
-        "======="
-        "lockfileVersion: '9.0'"
-        ">>>>>>> branch"
-    };
-
+fn install_via_pnpr_auto_installs_the_peers_of_a_peer_only_project() {
     let CommandTempCwd {
         pacquet,
         root,
@@ -68,16 +64,14 @@ fn install_via_pnpr_replaces_a_conflicted_lockfile() {
         ..
     } = CommandTempCwd::init().add_mocked_registry();
     let AddMockedRegistry { npmrc_path, mock_instance, .. } = npmrc_info;
-    let (pnpr_url, token) = start_pnpr(&mock_instance.url());
+    let (pnpr_url, token) = start_pnpr(mock_instance.url());
     configure_pnpr_auth(&npmrc_path, &pnpr_url, &token);
 
     fs::write(
         workspace.join("package.json"),
-        serde_json::json!({ "dependencies": { "@foo/no-deps": "1.0.0" } }).to_string(),
+        serde_json::json!({ "peerDependencies": { "@foo/no-deps": "^1.0.0" } }).to_string(),
     )
     .expect("write package.json");
-    fs::write(workspace.join("pnpm-lock.yaml"), CONFLICTED_LOCKFILE)
-        .expect("write conflicted lockfile");
 
     pacquet
         .with_env("PNPM_CONFIG_REGISTRY", mock_instance.url())
@@ -85,19 +79,54 @@ fn install_via_pnpr_replaces_a_conflicted_lockfile() {
         .assert()
         .success();
 
-    let lockfile = read_workspace_lockfile(&workspace);
-    assert_eq!(workspace_importer_version(&lockfile, ".", "@foo/no-deps"), "1.0.0");
     assert!(is_symlink_or_junction(&workspace.join("node_modules/@foo/no-deps")).unwrap());
+    assert_eq!(
+        workspace_importer_version(&read_workspace_lockfile(&workspace), ".", "@foo/no-deps"),
+        "1.0.0",
+    );
 
-    fs::write(workspace.join("pnpm-lock.yaml"), CONFLICTED_LOCKFILE)
-        .expect("rewrite conflicted lockfile");
-    pacquet_at(&workspace)
+    drop((root, mock_instance));
+}
+
+#[test]
+fn install_via_pnpr_merges_a_conflicted_lockfile() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { npmrc_path, mock_instance, .. } = npmrc_info;
+    let (pnpr_url, token) = start_pnpr(mock_instance.url());
+    configure_pnpr_auth(&npmrc_path, &pnpr_url, &token);
+
+    let conflicted = write_conflicted_lockfile_fixture(&workspace);
+
+    let install = pacquet
+        .with_env("PNPM_CONFIG_REGISTRY", mock_instance.url())
+        .with_args(["install", "--pnpr-server", &pnpr_url])
+        .assert()
+        .success();
+    assert_merged_conflicted_lockfile(
+        &workspace,
+        &String::from_utf8_lossy(&install.get_output().stdout),
+    );
+    assert!(
+        is_symlink_or_junction(&workspace.join("node_modules").join(CONFLICTED_DEPENDENCY))
+            .unwrap(),
+    );
+
+    fs::write(workspace.join("pnpm-lock.yaml"), &conflicted).expect("rewrite conflicted lockfile");
+    let repair = pacquet_at(&workspace)
         .with_env("PNPM_CONFIG_REGISTRY", mock_instance.url())
         .with_args(["install", "--fix-lockfile", "--pnpr-server", &pnpr_url])
         .assert()
         .success();
-    let repaired = read_workspace_lockfile(&workspace);
-    assert_eq!(workspace_importer_version(&repaired, ".", "@foo/no-deps"), "1.0.0");
+    assert_merged_conflicted_lockfile(
+        &workspace,
+        &String::from_utf8_lossy(&repair.get_output().stdout),
+    );
 
     drop((root, mock_instance));
 }
@@ -112,7 +141,7 @@ fn patched_dependencies_resolve_via_pnpr() {
         ..
     } = CommandTempCwd::init().add_mocked_registry();
     let AddMockedRegistry { npmrc_path, mock_instance, .. } = npmrc_info;
-    let (pnpr_url, token) = start_pnpr(&mock_instance.url());
+    let (pnpr_url, token) = start_pnpr(mock_instance.url());
     configure_pnpr_auth(&npmrc_path, &pnpr_url, &token);
 
     fs::write(
@@ -157,7 +186,7 @@ fn package_extensions_resolve_via_pnpr() {
         ..
     } = CommandTempCwd::init().add_mocked_registry();
     let AddMockedRegistry { npmrc_path, mock_instance, .. } = npmrc_info;
-    let (pnpr_url, token) = start_pnpr(&mock_instance.url());
+    let (pnpr_url, token) = start_pnpr(mock_instance.url());
     configure_pnpr_auth(&npmrc_path, &pnpr_url, &token);
 
     fs::write(
@@ -188,6 +217,93 @@ fn package_extensions_resolve_via_pnpr() {
     drop((root, mock_instance));
 }
 
+/// The server applies `addMissingPeerTypes` and records it, so the client's
+/// check that the server honoured the setting passes.
+#[test]
+fn add_missing_peer_types_resolves_via_pnpr() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { npmrc_path, mock_instance, .. } = npmrc_info;
+    let (pnpr_url, token) = start_pnpr(mock_instance.url());
+    configure_pnpr_auth(&npmrc_path, &pnpr_url, &token);
+
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({ "dependencies": {
+            "@pnpm.e2e/abc-optional-peers": "1.0.0",
+            "@pnpm.e2e/peer-a": "1.0.0",
+            "@types/pnpm.e2e__peer-a": "1.0.0",
+        } })
+        .to_string(),
+    )
+    .expect("write package.json");
+    crate::_utils::append_workspace_yaml_key(&workspace, "addMissingPeerTypes", "true");
+
+    pacquet
+        .with_env("PNPM_CONFIG_REGISTRY", mock_instance.url())
+        .with_args(["install", "--pnpr-server", &pnpr_url])
+        .assert()
+        .success();
+
+    let lockfile = fs::read_to_string(workspace.join("pnpm-lock.yaml")).expect("read lockfile");
+    eprintln!("LOCKFILE:\n{lockfile}\n");
+    assert!(lockfile.contains("addMissingPeerTypes: true"));
+    assert!(lockfile.contains("(@types/pnpm.e2e__peer-a@1.0.0)"));
+
+    drop((root, mock_instance));
+}
+
+/// A server that predates `addMissingPeerTypes` drops it from the request
+/// and returns a lockfile resolved without it, which the client must not save.
+#[test]
+fn install_via_pnpr_rejects_a_lockfile_resolved_without_add_missing_peer_types() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    let mut older_server = mockito::Server::new();
+    let done = serde_json::json!({
+        "type": "done",
+        "lockfile": { "lockfileVersion": "9.0", "importers": { ".": {} } },
+    });
+    let resolve_mock = older_server
+        .mock("POST", "/-/pnpr/v0/resolve")
+        .with_header("content-type", "application/x-ndjson")
+        .with_body(format!("{done}\n"))
+        .expect(1)
+        .create();
+
+    fs::write(workspace.join("package.json"), "{}").expect("write package.json");
+    crate::_utils::append_workspace_yaml_key(&workspace, "addMissingPeerTypes", "true");
+
+    let output = pacquet
+        .with_env("PNPM_CONFIG_REGISTRY", mock_instance.url())
+        .with_args(["install", "--pnpr-server", &older_server.url()])
+        .output()
+        .expect("run pnpm install");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    eprintln!("stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(!output.status.success());
+    assert!(format!("{stdout}{stderr}").contains(
+        "ERR_PNPM_PNPR_SERVER_IGNORED_ADD_MISSING_PEER_TYPES"
+    ),);
+    assert!(!workspace.join("pnpm-lock.yaml").exists());
+    resolve_mock.assert();
+
+    drop((root, mock_instance));
+}
+
 /// A pnpr-resolved lockfile is rewritten wholesale from the server's
 /// answer, so `time:` has to survive the round trip the same way a
 /// locally resolved install preserves it.
@@ -197,7 +313,7 @@ fn install_via_pnpr_preserves_the_lockfiles_time_section() {
         CommandTempCwd::init().add_mocked_registry();
     let AddMockedRegistry { npmrc_path, mock_instance, .. } = npmrc_info;
 
-    let (pnpr_url, token) = start_pnpr(&mock_instance.url());
+    let (pnpr_url, token) = start_pnpr(mock_instance.url());
     configure_pnpr_auth(&npmrc_path, &pnpr_url, &token);
 
     let manifest_path = workspace.join("package.json");
@@ -262,7 +378,7 @@ fn frozen_install_via_pnpr_verifies_the_local_lockfile_without_resolving_or_redo
         ..
     } = npmrc_info;
 
-    let (pnpr_url, token) = start_pnpr(&mock_instance.url());
+    let (pnpr_url, token) = start_pnpr(mock_instance.url());
     configure_pnpr_auth(&npmrc_path, &pnpr_url, &token);
 
     let manifest_path = workspace.join("package.json");
@@ -332,7 +448,7 @@ fn repeat_install_via_pnpr_short_circuits_without_contacting_the_server() {
     } = CommandTempCwd::init().add_mocked_registry();
     let AddMockedRegistry { npmrc_path, mock_instance, .. } = npmrc_info;
 
-    let (pnpr_url, token) = start_pnpr(&mock_instance.url());
+    let (pnpr_url, token) = start_pnpr(mock_instance.url());
     configure_pnpr_auth(&npmrc_path, &pnpr_url, &token);
 
     let manifest_path = workspace.join("package.json");
@@ -386,7 +502,7 @@ fn install_via_pnpr_skips_the_server_when_the_lockfile_satisfies_the_manifest() 
     } = CommandTempCwd::init().add_mocked_registry();
     let AddMockedRegistry { npmrc_path, mock_instance, .. } = npmrc_info;
 
-    let (pnpr_url, token) = start_pnpr(&mock_instance.url());
+    let (pnpr_url, token) = start_pnpr(mock_instance.url());
     configure_pnpr_auth(&npmrc_path, &pnpr_url, &token);
 
     let manifest_path = workspace.join("package.json");
@@ -450,7 +566,7 @@ fn satisfied_install_via_pnpr_delegates_verification_when_the_cache_is_cold() {
         ..
     } = npmrc_info;
 
-    let (pnpr_url, token) = start_pnpr(&mock_instance.url());
+    let (pnpr_url, token) = start_pnpr(mock_instance.url());
     configure_pnpr_auth(&npmrc_path, &pnpr_url, &token);
 
     let manifest_path = workspace.join("package.json");
@@ -514,7 +630,7 @@ fn install_via_pnpr_lockfile_only_writes_lockfile_without_linking() {
         ..
     } = npmrc_info;
 
-    let (pnpr_url, token) = start_pnpr(&mock_instance.url());
+    let (pnpr_url, token) = start_pnpr(mock_instance.url());
     configure_pnpr_auth(&npmrc_path, &pnpr_url, &token);
 
     let manifest_path = workspace.join("package.json");
@@ -561,7 +677,7 @@ fn import_ignores_the_pnpr_server_and_resolves_locally() {
         ..
     } = npmrc_info;
 
-    let (pnpr_url, token) = start_pnpr(&mock_instance.url());
+    let (pnpr_url, token) = start_pnpr(mock_instance.url());
     configure_pnpr_auth(&npmrc_path, &pnpr_url, &token);
 
     let manifest_path = workspace.join("package.json");
@@ -610,5 +726,181 @@ fn import_ignores_the_pnpr_server_and_resolves_locally() {
         .collect();
     assert!(cas_blobs.is_empty(), "import must not fetch package content: {cas_blobs:?}");
 
+    drop((root, mock_instance));
+}
+
+/// `registry` under another host name, which pnpm counts as another
+/// registry: the default registry's packages keep plain keys whatever prefix
+/// names it.
+fn other_host(registry: &str) -> String {
+    registry.replace("127.0.0.1", "localhost")
+}
+
+#[test]
+fn delegated_install_resolves_a_secondary_registry_alias() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { npmrc_path, mock_instance, .. } = npmrc_info;
+    let (pnpr_url, token) =
+        start_pnpr_for(&[mock_instance.url(), &other_host(mock_instance.url())]);
+    configure_pnpr_auth(&npmrc_path, &pnpr_url, &token);
+    fs::write(workspace.join("package.json"), r#"{"dependencies":{"@foo/no-deps":"zeta:1.0.0"}}"#)
+        .unwrap();
+    fs::write(
+        workspace.join("pnpm-workspace.yaml"),
+        format!(
+            "registry: {default}\nnamedRegistries:\n  zeta: {registry}\n  work: {registry}\n",
+            default = other_host(mock_instance.url()),
+            registry = mock_instance.url(),
+        ),
+    )
+    .unwrap();
+    pacquet
+        .with_arg("install")
+        .with_arg("--pnpr-server")
+        .with_arg(&pnpr_url)
+        .assert()
+        .success();
+    let lockfile = read_workspace_lockfile(&workspace);
+    assert_eq!(workspace_importer_version(&lockfile, ".", "@foo/no-deps"), "work:1.0.0");
+    assert_eq!(
+        lockfile.packages
+            .as_ref()
+            .unwrap()
+            .keys()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["@foo/no-deps@work:1.0.0"],
+    );
+    assert_eq!(
+        lockfile.snapshots
+            .as_ref()
+            .unwrap()
+            .keys()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["@foo/no-deps@work:1.0.0"],
+    );
+    assert!(workspace.join("node_modules/@foo/no-deps/package.json").exists());
+    drop((root, mock_instance));
+}
+
+/// <https://github.com/pnpm/pnpm/issues/17575>
+#[test]
+fn delegated_install_keeps_plain_keys_for_a_prefix_of_the_default_registry() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { npmrc_path, mock_instance, .. } = npmrc_info;
+    let (pnpr_url, token) = start_pnpr(mock_instance.url());
+    configure_pnpr_auth(&npmrc_path, &pnpr_url, &token);
+    fs::write(
+        workspace.join("package.json"),
+        r#"{"dependencies":{"@foo/no-deps":"zeta:1.0.0","@pnpm.e2e/foo":"100.0.0"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("pnpm-workspace.yaml"),
+        format!("namedRegistries:\n  zeta: {}\n", mock_instance.url()),
+    )
+    .unwrap();
+    pacquet
+        .with_arg("install")
+        .with_arg("--pnpr-server")
+        .with_arg(&pnpr_url)
+        .assert()
+        .success();
+    let lockfile = read_workspace_lockfile(&workspace);
+    assert_eq!(workspace_importer_version(&lockfile, ".", "@foo/no-deps"), "1.0.0");
+    let mut keys: Vec<String> = lockfile.packages
+        .as_ref()
+        .unwrap()
+        .keys()
+        .map(ToString::to_string)
+        .collect();
+    keys.sort();
+    assert_eq!(keys, ["@foo/no-deps@1.0.0", "@pnpm.e2e/foo@100.0.0"]);
+    drop((root, mock_instance));
+}
+
+#[test]
+fn delegated_install_rekeys_an_existing_secondary_registry_alias() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { npmrc_path, mock_instance, .. } = npmrc_info;
+    let (pnpr_url, token) =
+        start_pnpr_for(&[mock_instance.url(), &other_host(mock_instance.url())]);
+    configure_pnpr_auth(&npmrc_path, &pnpr_url, &token);
+    fs::write(workspace.join("package.json"), r#"{"dependencies":{"@foo/no-deps":"zeta:1.0.0"}}"#)
+        .unwrap();
+    fs::write(
+        workspace.join("pnpm-workspace.yaml"),
+        format!(
+            "registry: {}\nnamedRegistries:\n  zeta: {}\n",
+            other_host(mock_instance.url()),
+            mock_instance.url(),
+        ),
+    )
+    .unwrap();
+    pacquet
+        .with_arg("install")
+        .assert()
+        .success();
+    assert_eq!(
+        workspace_importer_version(&read_workspace_lockfile(&workspace), ".", "@foo/no-deps"),
+        "zeta:1.0.0",
+    );
+    fs::remove_dir_all(workspace.join("node_modules")).unwrap();
+    fs::write(
+        workspace.join("pnpm-workspace.yaml"),
+        format!(
+            "registry: {default}\nnamedRegistries:\n  zeta: {registry}\n  work: {registry}\n",
+            default = other_host(mock_instance.url()),
+            registry = mock_instance.url(),
+        ),
+    )
+    .unwrap();
+    pacquet_at(&workspace)
+        .with_arg("install")
+        .with_arg("--no-frozen-lockfile")
+        .with_arg("--pnpr-server")
+        .with_arg(&pnpr_url)
+        .assert()
+        .success();
+    let lockfile = read_workspace_lockfile(&workspace);
+    assert_eq!(workspace_importer_version(&lockfile, ".", "@foo/no-deps"), "work:1.0.0");
+    assert_eq!(
+        lockfile.packages
+            .as_ref()
+            .unwrap()
+            .keys()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["@foo/no-deps@work:1.0.0"],
+    );
+    assert_eq!(
+        lockfile.snapshots
+            .as_ref()
+            .unwrap()
+            .keys()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["@foo/no-deps@work:1.0.0"],
+    );
+    assert!(workspace.join("node_modules/@foo/no-deps/package.json").exists());
     drop((root, mock_instance));
 }

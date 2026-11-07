@@ -8,19 +8,25 @@
 //! client-supplied registry. The client then links `node_modules` from the
 //! server-produced lockfile.
 
-use crate::cargo_install::crate_archive;
+use crate::{
+    _utils::{
+        CONFLICTED_DEPENDENCY, assert_merged_conflicted_lockfile, write_conflicted_lockfile_fixture,
+    },
+    cargo_install::crate_archive,
+};
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
-use pnpm_crypto_hash::integrity_addressed_tarball_path;
 use pnpm_lockfile::{Lockfile, PkgName, ProjectSnapshot, SnapshotEntry};
 use pnpm_testing_utils::{
     bin::{AddMockedRegistry, CommandTempCwd},
     fs::{get_all_files, is_symlink_or_junction},
 };
-use pnpr::{Ecosystem, Registries, Registry, TokenBackend, UpstreamConfig};
+use pnpr::{Ecosystem, Registries, Registry, TokenBackend, UpstreamConfig, UserBackend};
+use pnpr_fixtures::MockConfigPresets;
 use reqwest::header::HeaderMap;
 use sha2::{Digest, Sha256};
 use std::{
+    fmt::Write as _,
     fs,
     io::Write as _,
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
@@ -29,7 +35,6 @@ use std::{
     thread,
     time::Duration,
 };
-use text_block_macros::text_block_fnl;
 
 const IS_POSITIVE_PATCH: &str = include_str!(
     "../../../../../pnpm11/installing/deps-installer/test/fixtures/patch-pkg/is-positive@1.0.0.patch"
@@ -38,26 +43,44 @@ const IS_POSITIVE_PATCH: &str = include_str!(
 /// Start an in-process pnpr with the fast-path endpoints on a detached
 /// thread, allowlisting `registry_url` as a public route so the client may
 /// resolve against it (off-allowlist registries are rejected at the request
-/// boundary); returns its base URL and a pre-seeded bearer token.
+/// boundary); returns its base URL and a pre-seeded bearer token, whose
+/// owner is a pre-seeded account because pnpr honors only such tokens.
 fn start_pnpr(registry_url: &str) -> (String, String) {
-    let registry_url = registry_url.to_string();
+    start_pnpr_for(&[registry_url])
+}
+
+/// [`start_pnpr`] resolving from each of `registry_urls`.
+fn start_pnpr_for(registry_urls: &[&str]) -> (String, String) {
+    let registry_urls: Vec<String> = registry_urls
+        .iter()
+        .map(ToString::to_string)
+        .collect();
     let server = PnprServer::bind("pnpr");
     let tokens_path = server.storage.join("tokens.db");
+    let htpasswd_path = server.storage.join("htpasswd");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("token setup runtime");
     let token = runtime.block_on(async {
+        let users = pnpr::UserStore::open(htpasswd_path.clone(), pnpr::MaxUsers::Disabled)
+            .expect("open user store");
+        users.create_user("pacquet-test", "password").await.expect("store pnpr test account");
         let tokens = pnpr::TokenStore::open(tokens_path.clone()).expect("open token store");
         tokens.issue("pacquet-test").await.expect("issue pnpr test token")
     });
 
     let addr = server.serve(move |config| {
+        config.identity.auth.htpasswd.file = Some(htpasswd_path);
         config.identity.auth.tokens.file = Some(tokens_path);
-        config.routing.route_policy.public.push(pnpr::PublicRoute {
-            registry: Some(registry_url),
-            package: None,
-        });
+        config.routing.route_policy.public.extend(
+            registry_urls
+                .into_iter()
+                .map(|registry_url| pnpr::PublicRoute {
+                    registry: Some(registry_url),
+                    package: None,
+                }),
+        );
     });
     (format!("http://{addr}/"), token)
 }
@@ -65,6 +88,15 @@ fn start_pnpr(registry_url: &str) -> (String, String) {
 /// Start an in-process pnpr that proxies one upstream registry of
 /// `ecosystem`, and return the base URL its clients address.
 fn start_pnpr_registry(upstream_url: &str, ecosystem: Ecosystem) -> String {
+    start_pnpr_registry_with(upstream_url, ecosystem, |_| {})
+}
+
+/// [`start_pnpr_registry`] with `configure` applied to the server's config.
+fn start_pnpr_registry_with(
+    upstream_url: &str,
+    ecosystem: Ecosystem,
+    configure: impl FnOnce(&mut pnpr::Config) + Send + 'static,
+) -> String {
     let upstream_url = upstream_url.to_string();
     let name = "upstream";
     let addr = PnprServer::bind("pnpr-registry")
@@ -81,19 +113,22 @@ fn start_pnpr_registry(upstream_url: &str, ecosystem: Ecosystem) -> String {
                 Some(name.to_string()),
             )
             .with_ecosystem(name, ecosystem);
+            configure(config);
         });
-    // The server's root is its npm alias; every other ecosystem is
-    // addressed under its own prefix.
-    if ecosystem == Ecosystem::Npm {
-        format!("http://{addr}")
-    } else {
-        format!("http://{addr}/{ecosystem}/")
-    }
+    format!("http://{addr}/{ecosystem}/")
 }
 
 /// A bound port and storage directory waiting for [`Self::serve`] to start
 /// pnpr on them. Binding first lets a caller seed storage — a token store,
 /// say — with the address the server will answer on already known.
+/// The test registries pnpr resolves from listen on loopback.
+fn loopback_networks() -> Vec<pnpr::IpNetwork> {
+    ["127.0.0.0/8", "::1"]
+        .into_iter()
+        .map(|network| pnpr::IpNetwork::parse(network).expect("loopback network parses"))
+        .collect()
+}
+
 struct PnprServer {
     name: &'static str,
     listener: TcpListener,
@@ -127,6 +162,7 @@ impl PnprServer {
                 runtime.block_on(async move {
                     let mut config = pnpr::Config::proxy(addr, storage);
                     config.http.public_url = format!("http://{addr}");
+                    config.routing.route_policy.allowed_private_networks = loopback_networks();
                     configure(&mut config);
                     let listener =
                         tokio::net::TcpListener::from_std(listener).expect("tokio listener");
@@ -174,7 +210,7 @@ fn point_npmrc_registry_at(npmrc_path: &Path, registry_url: &str) {
         .lines()
         .map(|line| {
             if line.starts_with("registry=") {
-                format!("registry={registry_url}/")
+                format!("registry={}/", registry_url.trim_end_matches('/'))
             } else {
                 line.to_string()
             }
@@ -207,21 +243,37 @@ fn revision_fixture_tarball_with_value(value: &str) -> Vec<u8> {
     gzip.finish().expect("finish package tarball")
 }
 
+/// The integrity a registry revision pins: the hash of the tar `tarball`
+/// decodes to.
+fn revision_integrity(tarball: &[u8]) -> ssri::Integrity {
+    let mut tar = Vec::new();
+    std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(tarball), &mut tar)
+        .expect("decode revision tarball");
+    ssri::IntegrityOpts::new()
+        .algorithm(ssri::Algorithm::Sha512)
+        .chain(&tar)
+        .result()
+}
+
+/// A revision-aware packument selecting `tarball` as `revision`. Its history
+/// holds an original revision 0, `history`, and the selected record.
 fn revision_packument(
     upstream: &mockito::Server,
     tarball: &[u8],
     revision: u64,
     history: &[(&ssri::Integrity, u64)],
 ) -> (ssri::Integrity, serde_json::Value) {
-    let integrity = ssri::IntegrityOpts::new()
-        .algorithm(ssri::Algorithm::Sha512)
-        .chain(tarball)
-        .result();
-    let revision_path = integrity_addressed_tarball_path(&integrity).unwrap();
-    let revisions = history
+    let integrity = revision_integrity(tarball);
+    let revision_path = format!("revision-pkg@1.0.0+r{revision}");
+    let original = revision_integrity(&revision_fixture_tarball_with_value("original"));
+    let revisions = std::iter::once((&original, 0))
+        .filter(|_| revision != 0)
+        .chain(history.iter().copied())
+        .collect::<Vec<_>>();
+    let revisions = revisions
         .iter()
         .map(|(integrity, revision)| {
-            let path = integrity_addressed_tarball_path(integrity).unwrap();
+            let path = format!("revision-pkg@1.0.0+r{revision}");
             serde_json::json!({
                 "revision": revision,
                 "integrity": integrity.to_string(),
@@ -259,6 +311,22 @@ const WORKSPACE_HELLO_PARENT: &str = "@pnpm.e2e/hello-world-js-bin-parent";
 const WORKSPACE_PARENT: &str = "@pnpm.e2e/pkg-with-1-dep";
 const WORKSPACE_ROOT_DEP: &str = "@foo/no-deps";
 const MISSING_PEERS_PARENT: &str = "@pnpm.e2e/abc-parent-with-missing-peers";
+
+/// Declare `registry_urls` as `serverType: pnpr`, so pnpm reads pnpr's own
+/// package document from them, as a project using pnpr's revisions does.
+fn declare_pnpr_registries(workspace: &Path, registry_urls: &[&str]) {
+    let path = workspace.join("pnpm-workspace.yaml");
+    let mut yaml = fs::read_to_string(&path).expect("read pnpm-workspace.yaml");
+    if !yaml.ends_with('\n') {
+        yaml.push('\n');
+    }
+    yaml.push_str("registries:\n");
+    for registry_url in registry_urls {
+        let registry_url = registry_url.trim_end_matches('/');
+        writeln!(yaml, "  '{registry_url}/':\n    serverType: pnpr").expect("write declaration");
+    }
+    fs::write(path, yaml).expect("write pnpm-workspace.yaml");
+}
 
 fn configure_workspace(workspace: &Path) {
     let path = workspace.join("pnpm-workspace.yaml");
@@ -366,7 +434,7 @@ fn assert_standard_workspace_pnpr_from(project: Option<&str>) {
     configure_workspace(&workspace);
     write_workspace_project(&workspace, "app", "app", (WORKSPACE_HELLO, "1.0.0"));
     write_workspace_project(&workspace, "lib", "lib", (WORKSPACE_PARENT, "100.0.0"));
-    let (pnpr_url, token) = start_pnpr(&mock_instance.url());
+    let (pnpr_url, token) = start_pnpr(mock_instance.url());
     configure_pnpr_auth(&npmrc_path, &pnpr_url, &token);
 
     let cwd = project.map_or_else(|| workspace.clone(), |project| workspace.join(project));
@@ -440,7 +508,7 @@ fn assert_filtered_workspace_pnpr(lockfile_only: bool) {
     if lockfile_only {
         fs::remove_dir_all(&store_dir).expect("remove baseline client store");
     }
-    let (pnpr_url, token) = start_pnpr(&mock_instance.url());
+    let (pnpr_url, token) = start_pnpr(mock_instance.url());
     configure_pnpr_auth(&npmrc_path, &pnpr_url, &token);
     let mut args = vec!["--filter", "selected", "install", "--pnpr-server", &pnpr_url];
     if lockfile_only {
@@ -600,7 +668,7 @@ fn cargo_install_uses_a_configured_pnpr_registry_and_accelerator() {
     fs::write(
         root.path().join("pnpm-workspace.yaml"),
         format!(
-            "cargo:\n  enabled: true\n  indexUrl: {registry_url}index/\npnprServer: {pnpr_url}\n",
+            "cargo:\n  enabled: true\nregistries:\n  {registry_url}index/:\n    ecosystem: cargo\npnprServer: {pnpr_url}\n",
         ),
     )
     .expect("configure pnpm");
@@ -621,7 +689,12 @@ fn cargo_install_uses_a_configured_pnpr_registry_and_accelerator() {
         .success();
 
     let lockfile = fs::read_to_string(root.path().join("Cargo.lock")).expect("read Cargo lockfile");
-    assert!(lockfile.contains(&format!(r#"source = "sparse+{registry_url}index/""#)), "{lockfile}");
+    // pnpm reaches the configured registry by replacing `[source.crates-io]`,
+    // so that is what the crates the server resolved are locked against.
+    assert!(
+        lockfile.contains(&format!(r#"source = "{}""#, pnpm_cargo_resolver::CRATES_IO_SOURCE)),
+        "{lockfile}",
+    );
     assert!(
         root.path()
             .join(".pnpm/crates/crates-io/demo-1.0.0/src/lib.rs")
@@ -640,16 +713,29 @@ fn cargo_install_uses_a_configured_pnpr_registry_and_accelerator() {
     );
     Command::new("cargo")
         .with_current_dir(root.path())
-        .with_args(["check", "--offline"])
+        .with_args(["check", "--locked", "--offline"])
         .assert()
         .success();
+    assert_eq!(fs::read_to_string(root.path().join("Cargo.lock")).unwrap(), lockfile);
 
     index_mock.assert();
     download_mock.assert();
 }
 
+mod batch_variants;
+mod hosted;
+mod optional_peers;
+mod publish_retry;
+mod supported_architectures_link;
+mod supported_architectures_variants;
 mod workspace;
 
 mod revisions;
 
+mod package_documents;
+
 mod resolution;
+
+mod pnpmfile;
+
+mod variants_only;

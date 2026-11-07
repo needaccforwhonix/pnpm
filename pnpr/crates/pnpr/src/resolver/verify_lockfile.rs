@@ -104,6 +104,7 @@ pub(super) async fn verify_input_lockfile(
         Some(Arc::clone(auth_headers)),
         Some(Arc::clone(&dist_stats)),
         None,
+        None,
     )
     .map_err(|err| {
         VerifyFailure::Internal(json_error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()))
@@ -128,7 +129,7 @@ pub(super) async fn verify_input_lockfile(
         .map_or_else(Vec::new, |index| osv_violations_for_lockfile(index, lockfile));
     if violations.is_empty() && osv_violations.is_empty() {
         if let Some(cache) = runtime.cache.verdicts.as_ref() {
-            cache.record(&hash, &merge_policies(&verifiers, runtime.osv_index.as_ref()));
+            cache.record(&hash, merge_policies(&verifiers, runtime.osv_index.as_ref()));
         }
         return Ok(Some(dist_stats));
     }

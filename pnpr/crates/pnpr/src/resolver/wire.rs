@@ -22,7 +22,9 @@ use pnpr_osv::{OsvIndex, format_advisory_ids};
 use pnpr_package_name::CanonicalPackageName;
 use pnpr_policy::Identity;
 use pnpr_route::{RouteClass, RouteContext, sanitize_registry_tarball_url, strip_url_credentials};
-use pnpr_upstream::tarball_basename;
+use pnpr_upstream::{
+    tarball_basename, tarball_basename_for_package, version_route_tarball_version,
+};
 
 /// NDJSON content type for the `/-/pnpr/v0/resolve` response. One JSON object
 /// per line; the client parses frames as they arrive. Excluded from the
@@ -88,6 +90,9 @@ pub(super) fn package_frame(
     {
         frame["revision"] = serde_json::Value::from(revision);
     }
+    if let Some(requires_build) = hint.requires_build {
+        frame["requiresBuild"] = serde_json::Value::from(requires_build);
+    }
     frame
 }
 
@@ -150,31 +155,30 @@ fn frozen_package_frame(
     }
     // The frame carries the integrity the client prefetches against;
     // an entry that pins none has no frame to announce.
-    let Ok((tarball_url, Some(integrity))) =
+    let Ok((upstream_tarball_url, Some(integrity))) =
         tarball_url_and_integrity(&inputs.snapshot.resolution, inputs.package_key, inputs.config)
     else {
         return None;
     };
     let name = inputs.package_key.name.to_string();
     let version = inputs.package_key.suffix.version().to_string();
-    let upstream_tarball_url = tarball_url;
     let tarball_url = inputs.router.route_url(&name, &version, &upstream_tarball_url);
     if !seen_urls.insert(tarball_url.clone()) {
         return None;
     }
     let id = format!("{name}@{version}");
-    let integrity = integrity.to_string();
     let revision =
         pnpr_served_revision(&inputs.snapshot.resolution, &tarball_url, &upstream_tarball_url);
-    let (unpacked_size, file_count) = frozen_dist_stats(inputs.dist_stats, &name, &version);
+    let stats = frozen_dist_stats(inputs.dist_stats, &name, &version);
     let frame = package_frame(
         inputs.router,
         &ResolvedPackageHint {
-            integrity: &integrity,
+            integrity: &integrity.to_string(),
             tarball_url: &tarball_url,
-            unpacked_size,
-            file_count,
+            unpacked_size: stats.unpacked_size,
+            file_count: stats.file_count,
             revision,
+            requires_build: stats.requires_build,
             // The URL is already routed (canonical → endpoint above), so
             // re-routing by registry would be redundant; route_url is a
             // no-op on an already-routed URL.
@@ -193,10 +197,10 @@ fn frozen_dist_stats(
     stats: &ObservedDistStats,
     name: &str,
     version: &str,
-) -> (Option<usize>, Option<usize>) {
+) -> pnpm_resolving_npm_resolver::DistStats {
     stats
         .get(&(name.to_string(), version.to_string()))
-        .map_or((None, None), |entry| (entry.unpacked_size, entry.file_count))
+        .map_or_else(pnpm_resolving_npm_resolver::DistStats::default, |entry| *entry)
 }
 
 /// The tarball revision a frame announces. Only a URL still pointing at the
@@ -219,13 +223,19 @@ fn pnpr_served_revision(
 
 /// Terminal `done` frame: the full resolved lockfile + stats. The client
 /// writes the lockfile and fetches every tarball itself.
-pub(super) fn done_frame(lockfile: &Lockfile) -> Vec<u8> {
+pub(super) fn done_frame(
+    lockfile: &Lockfile,
+    applied_policies: Option<&super::protocol::AppliedPolicies>,
+) -> Vec<u8> {
     let total_packages = lockfile.packages.as_ref().map_or(0, std::collections::HashMap::len);
-    let frame = serde_json::json!({
+    let mut frame = serde_json::json!({
         "type": "done",
         "lockfile": serde_json::to_value(lockfile).unwrap_or(serde_json::Value::Null),
         "stats": { "totalPackages": total_packages },
     });
+    if let Some(applied) = applied_policies {
+        frame["appliedPolicies"] = serde_json::to_value(applied).unwrap_or_default();
+    }
     ndjson_line(&frame)
         .unwrap_or_else(|_| {
             br#"{"type":"error","message":"failed to serialize lockfile"}"#.to_vec()
@@ -261,7 +271,15 @@ pub(super) fn pypi_done_frame(lockfile: &pnpm_python_resolver::Lockfile) -> Vec<
 /// after one or more `package` frames may already have been sent (so the
 /// HTTP status is locked at 200 — the failure has to ride in the body).
 pub(super) fn error_frame(message: &str) -> Vec<u8> {
-    let frame = serde_json::json!({ "type": "error", "message": message });
+    error_frame_with_code(message, None)
+}
+
+/// Terminal `error` frame with a structured error code.
+pub(super) fn error_frame_with_code(message: &str, code: Option<&str>) -> Vec<u8> {
+    let mut frame = serde_json::json!({ "type": "error", "message": message });
+    if let Some(code) = code {
+        frame["code"] = serde_json::Value::String(code.to_string());
+    }
     ndjson_line(&frame)
         .unwrap_or_else(|_| br#"{"type":"error","message":"resolution failed"}"#.to_vec())
 }
@@ -368,6 +386,11 @@ fn vulnerability_ids_for_entry(
 /// for non-standard naming so a legitimate custom registry isn't
 /// misjudged. Never parses the URL strictly — the lockfile is untrusted.
 pub(super) fn tarball_url_version<'a>(url: &'a str, name: &str) -> Option<&'a str> {
+    if let Ok(canonical) = CanonicalPackageName::parse(name, pnpr_package_name::Ecosystem::Npm)
+        && let Some(version) = version_route_tarball_version(url, &canonical)
+    {
+        return Some(version);
+    }
     let last = url.rsplit('/').next()?;
     let last = last
         .split(['?', '#'])
@@ -413,7 +436,7 @@ pub(super) fn is_osv_checkable_resolution(resolution: &LockfileResolution) -> bo
     }
 }
 
-/// Whether a tarball URL uses an http(s) scheme — the only schemes a
+/// Whether a tarball URL uses an HTTP or HTTPS scheme — the only schemes a
 /// registry artifact is served over. Case-insensitive (so a tampered
 /// uppercase scheme can't slip past) without allocating a lowercased copy.
 fn is_http_tarball_url(url: &str) -> bool {

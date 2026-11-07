@@ -1,35 +1,34 @@
 use super::{
-    AncestorIds, Arc, BTreeMap, ChildAliases, ChildEdge, ChildOutputs, ChildParentRefs,
-    DeferredChildContext, DeferredChildren, NodeId, NodeOutput, NodeWalkContext, ParentRefs,
-    PeersCacheItem, ResolvedPackage, SharedChain, TreeChildren, WalkResult, Walker,
+    Arc, BTreeMap, ChildEdge, ChildOutputs, ChildParentRefs, DeferredChildContext,
+    DeferredChildren, DepPathRecording, NodeId, NodeOutput, NodeWalkContext, ParentRefs,
+    PeerWalkMode, PeersCacheItem, ResolvedPackage, SharedChain, TreeChildren, WalkResult, Walker,
     insert_parent_ref,
 };
 
 impl Walker<'_> {}
 
 impl Walker<'_> {
-    /// The still-lazy children a discovery walk descends into directly, with
-    /// the ancestor chain they see. `None` outside discovery, or once the
-    /// node's children have been realized.
+    /// The still-lazy children a discovery walk descends into directly.
+    /// `None` outside discovery, or once the node's children have been
+    /// realized.
     pub(super) fn discovery_children(
         &self,
         node_id: &NodeId,
         pkg_id: &Arc<str>,
-    ) -> Option<(Arc<Vec<ChildEdge>>, AncestorIds)> {
-        if !self.traversal.discovery {
+    ) -> Option<Arc<Vec<ChildEdge>>> {
+        match self.traversal.mode {
+            PeerWalkMode::Final => return None,
+            PeerWalkMode::Discovery => {}
+        }
+        if !matches!(self.tree.dependencies_tree[node_id].children, TreeChildren::Lazy) {
             return None;
         }
-        let TreeChildren::Lazy { parent_ids } = &self.tree.dependencies_tree[node_id].children
-        else {
-            return None;
-        };
-        Some((
+        Some(
             self.tree.children_by_id
                 .get(&**pkg_id)
                 .cloned()
                 .unwrap_or_default(),
-            parent_ids.pushed(pkg_id.to_string()),
-        ))
+        )
     }
 
     pub(super) fn resolve_deferred_children(
@@ -40,12 +39,10 @@ impl Walker<'_> {
         let DeferredChildren {
             pkg_id,
             children,
-            parent_ids,
             provider_children,
             depth,
         } = deferred;
         let canonical_scc = self.canonical_scc();
-        let child_aliases = ChildAliases::Deferred(children);
         let mut child_outputs = ChildOutputs::default();
         for repeated in [true, false] {
             for edge in children {
@@ -55,9 +52,13 @@ impl Walker<'_> {
                     continue;
                 }
                 let child_node_id = self.child_node_id_for_edge(edge, Some(provider_children));
-                let child_output =
-                    self.resolve_deferred_edge(edge, child_node_id, parent_ids, depth, walk);
-                child_outputs.push(&edge.alias, child_output, &child_aliases, false);
+                let child_output = self.resolve_deferred_edge(edge, child_node_id, depth, walk);
+                child_outputs.push(
+                    &edge.alias,
+                    child_output,
+                    provider_children,
+                    DepPathRecording::Skip,
+                );
             }
         }
         child_outputs
@@ -67,7 +68,6 @@ impl Walker<'_> {
         &mut self,
         edge: &ChildEdge,
         child_node_id: NodeId,
-        parent_ids: &AncestorIds,
         parent_depth: i32,
         walk: &NodeWalkContext<'_>,
     ) -> NodeOutput {
@@ -77,7 +77,6 @@ impl Walker<'_> {
         self.resolve_deferred_child(&DeferredChildContext {
             edge,
             node_id: child_node_id,
-            parent_ids,
             walk,
             depth: parent_depth + 1,
         })
@@ -87,10 +86,10 @@ impl Walker<'_> {
         &mut self,
         pkg_id: &Arc<str>,
         children_map: &BTreeMap<String, NodeId>,
+        provider_children: &BTreeMap<String, NodeId>,
         walk: &NodeWalkContext<'_>,
     ) -> ChildOutputs {
         let canonical_scc = self.canonical_scc();
-        let child_aliases = ChildAliases::Realized(children_map);
         let mut child_outputs = ChildOutputs::default();
         for repeated in [true, false] {
             for (alias, child_node_id) in children_map {
@@ -113,7 +112,12 @@ impl Walker<'_> {
                     continue;
                 }
                 let child_output = self.resolve_node(child_node_id, walk);
-                child_outputs.push(alias, child_output, &child_aliases, !self.traversal.discovery);
+                child_outputs.push(
+                    alias,
+                    child_output,
+                    provider_children,
+                    self.traversal.mode.dep_path_recording(),
+                );
             }
         }
         child_outputs
@@ -132,24 +136,27 @@ impl Walker<'_> {
         pkg_id: &Arc<str>,
         result: &WalkResult<'_>,
     ) {
-        if !self.traversal.discovery {
-            self.nodes.external_peers.insert(
-                node_id.clone(),
-                Arc::clone(result.all_resolved_peers),
-            );
-            self.nodes.missing_peers.insert(node_id.clone(), Arc::clone(result.all_missing_peers));
-            self.nodes.children_missing_peers.insert(
-                node_id.clone(),
-                Arc::clone(result.missing_peers_of_children),
-            );
+        self.remember_provider_bindings(node_id, result.all_resolved_peers);
+        match self.traversal.mode {
+            PeerWalkMode::Final => {
+                self.nodes.missing_peers.insert(
+                    node_id.clone(),
+                    Arc::clone(result.all_missing_peers),
+                );
+                self.nodes.children_missing_peers.insert(
+                    node_id.clone(),
+                    Arc::clone(result.missing_peers_of_children),
+                );
+            }
+            PeerWalkMode::Discovery => {}
         }
         if result.is_pure {
-            self.caches.pure_pkgs.insert(pkg_id.to_string(), result.dep_path.clone());
+            self.caches.pure_pkgs.insert(Arc::clone(pkg_id), result.dep_path.clone());
             return;
         }
         self.caches.retained_peer_node_ids.extend(result.all_resolved_peers.values().cloned());
         self.caches.peers_cache
-            .entry(pkg_id.to_string())
+            .entry(Arc::clone(pkg_id))
             .or_default()
             .push(PeersCacheItem {
                 owner_node_id: node_id.clone(),
@@ -211,21 +218,14 @@ impl Walker<'_> {
             let Some(child_pkg) = self.tree.packages.get(&child_tree.resolved_package_id) else {
                 continue;
             };
-            insert_parent_ref(
-                &mut new_parent_refs,
-                alias,
-                child_node_id.clone(),
-                child_pkg,
-                child_tree.depth,
-            );
+            insert_parent_ref(&mut new_parent_refs, alias, child_node_id.clone(), child_pkg);
         }
         new_parent_refs
     }
 
     /// Overlay this node's own providers onto the inherited parent context.
     /// A name the inherited context already binds is only shadowed when the
-    /// two providers disagree, and the shadowing occurrence is bumped so the
-    /// two stay distinguishable.
+    /// two providers disagree.
     pub(super) fn apply_own_parent_refs(
         &self,
         refs: &mut ParentRefs,
@@ -235,7 +235,7 @@ impl Walker<'_> {
         // Built only when a name collision actually consults it — the
         // common no-collision node never pays for the extra map clone.
         let mut refs_with_new: Option<ParentRefs> = None;
-        for (name, mut new_parent_ref) in new_parent_refs.clone() {
+        for (name, new_parent_ref) in new_parent_refs.clone() {
             if let Some(existing) = refs.get(&name) {
                 let with_new = refs_with_new.get_or_insert_with(|| {
                     let mut with_new = refs.clone();
@@ -250,7 +250,6 @@ impl Walker<'_> {
                         node_id,
                     )
                 {
-                    new_parent_ref.occurrence = existing.occurrence + 1;
                     refs.insert(name, new_parent_ref);
                 }
             } else {

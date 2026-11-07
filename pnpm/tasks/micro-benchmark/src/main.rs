@@ -1,3 +1,7 @@
+#![expect(clippy::print_stdout, reason = "developer tool, not part of the pnpm binary")]
+
+mod trust_history;
+mod version_pick;
 mod workspace_resolution;
 mod workspace_sort;
 
@@ -32,6 +36,18 @@ struct CliArgs {
     /// no baseline: a regressed run can take minutes and several GiB.
     #[clap(long)]
     full_workspace_resolution: bool,
+
+    /// Measure compact and full trust-history scans over 1,000 releases.
+    #[clap(long, conflicts_with = "full_workspace_resolution")]
+    trust_history: bool,
+
+    /// Measure only the registry version-pick benchmarks.
+    #[clap(long, conflicts_with_all = ["full_workspace_resolution", "trust_history"])]
+    version_pick: bool,
+
+    /// Compare against a baseline saved by `--save-baseline` without overwriting it.
+    #[clap(long, conflicts_with_all = ["full_workspace_resolution", "save_baseline"])]
+    compare_baseline: Option<String>,
 }
 
 fn bench_tarball(criterion: &mut Criterion, server: &mut ServerGuard, fixtures_folder: &Path) {
@@ -59,6 +75,9 @@ fn bench_tarball(criterion: &mut Criterion, server: &mut ServerGuard, fixtures_f
         file_count: None,
     };
     group.throughput(Throughput::Bytes(file.len() as u64));
+    // An install builds one client per process, so its construction stays out
+    // of the measured download.
+    let http_client = ThrottledClient::new_for_installs();
     group.bench_function("download_dependency", |bencher| {
         bencher
             .to_async(&rt)
@@ -71,7 +90,6 @@ fn bench_tarball(criterion: &mut Criterion, server: &mut ServerGuard, fixtures_f
                     .pipe(StoreDir::from)
                     .pipe(Box::new)
                     .pipe(Box::leak);
-                let http_client = ThrottledClient::new_for_installs();
 
                 let cas_map = ingest_benchmark_package(&package, &http_client, store_dir)
                     .await
@@ -97,6 +115,7 @@ fn bench_concurrent_tarballs(criterion: &mut Criterion, server: &mut ServerGuard
         u64::try_from(BATCH_TARBALL_COUNT * BATCH_FILES_PER_TARBALL)
             .expect("benchmark file count fits u64"),
     ));
+    let http_client = ThrottledClient::new_for_installs();
     group.bench_function("cold_store_many_medium_tarballs", |bencher| {
         bencher
             .to_async(&rt)
@@ -108,7 +127,6 @@ fn bench_concurrent_tarballs(criterion: &mut Criterion, server: &mut ServerGuard
                     .pipe(StoreDir::from)
                     .pipe(Box::new)
                     .pipe(Box::leak);
-                let http_client = ThrottledClient::new_for_installs();
                 future::try_join_all(
                     packages
                         .iter()
@@ -151,7 +169,7 @@ async fn ingest_benchmark_package(
     package: &BatchPackage,
     http_client: &ThrottledClient,
     store_dir: &'static StoreDir,
-) -> Result<std::collections::HashMap<String, std::path::PathBuf>, pnpm_tarball::TarballError> {
+) -> Result<pnpm_store_dir::FilesMap, pnpm_tarball::TarballError> {
     let auth_headers = AuthHeaders::default();
     IngestTarballToStore {
         fetching: pnpm_tarball::ArchiveFetchOptions {
@@ -159,6 +177,7 @@ async fn ingest_benchmark_package(
             retry_opts: RetryOpts::default(),
             auth_headers: &auth_headers,
             offline: false,
+            tar_limits: pnpm_tarball::TarLimits::default(),
         },
         store: pnpm_tarball::ArchiveStoreContext {
             dir: store_dir,
@@ -170,6 +189,7 @@ async fn ingest_benchmark_package(
             prefetched_cas_paths: None,
         },
         package: pnpm_tarball::TarballPackage {
+            integrity_kind: pnpm_tarball::IntegrityKind::Resource,
             integrity: Some(&package.integrity),
             unpacked_size: Some(package.unpacked_size),
             file_count: package.file_count,
@@ -264,19 +284,27 @@ pub fn main() -> Result<(), String> {
     let CliArgs {
         save_baseline,
         full_workspace_resolution,
+        trust_history,
+        version_pick: version_pick_only,
+        compare_baseline,
     } = CliArgs::parse();
     if full_workspace_resolution {
         workspace_resolution::run_full_workspace_resolution();
         return Ok(());
     }
-    let mut server = mockito::Server::new();
-    let root = get_project_root().unwrap();
-    let fixtures_folder = root.join("pnpm/tasks/micro-benchmark/fixtures");
-
     let mut criterion = Criterion::default().without_plots();
+    if let Some(baseline) = compare_baseline {
+        criterion = criterion.retain_baseline(baseline, true);
+    }
     if let Some(baseline) = save_baseline {
         criterion = criterion.save_baseline(baseline);
     }
+    if run_selected_benchmark(&mut criterion, trust_history, version_pick_only) {
+        return Ok(());
+    }
+    let mut server = mockito::Server::new();
+    let root = get_project_root().unwrap();
+    let fixtures_folder = root.join("pnpm/tasks/micro-benchmark/fixtures");
 
     let packument = fixtures_folder
         .join("lodash.json")
@@ -288,8 +316,25 @@ pub fn main() -> Result<(), String> {
     bench_concurrent_tarballs(&mut criterion, &mut server);
     bench_packument(&mut criterion, &packument);
     bench_lockfile(&mut criterion, &lockfile_dir);
+    version_pick::bench_version_pick(&mut criterion);
     workspace_resolution::bench_workspace_resolution(&mut criterion);
     workspace_sort::bench_workspace_sort(&mut criterion);
 
     Ok(())
+}
+
+fn run_selected_benchmark(
+    criterion: &mut Criterion,
+    trust_history_only: bool,
+    version_pick_only: bool,
+) -> bool {
+    if trust_history_only {
+        trust_history::bench_trust_history(criterion);
+        return true;
+    }
+    if version_pick_only {
+        version_pick::bench_version_pick(criterion);
+        return true;
+    }
+    false
 }

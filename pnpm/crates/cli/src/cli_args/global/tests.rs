@@ -1,7 +1,7 @@
 use super::{
     FsGlobalRemoval, GlobalPackageBinSnapshot, activation::FsRename, check_virtual_shim_conflicts,
-    infer_local_package_alias, replacement_aliases, should_replace_existing_package,
-    snapshot_global_package, update_selectors,
+    global_group_config, infer_local_package_alias, replacement_aliases,
+    should_replace_existing_package, snapshot_global_package, update_selectors,
 };
 use crate::{
     cli_args::{
@@ -16,6 +16,7 @@ use crate::{
 };
 use miette::IntoDiagnostic;
 use pnpm_cmd_shim::{Host as CmdShimHost, PackageBinSource, remove_bin as remove_cmd_shim};
+use pnpm_config::Config;
 use pnpm_fs::{force_symlink_dir, remove_symlink_dir};
 use pnpm_global::GlobalPackageInfo;
 use serde_json::json;
@@ -203,7 +204,7 @@ fn detects_windows_drive_paths() {
 }
 
 #[test]
-fn latest_update_drops_the_spec_only_of_plain_version_dependencies() {
+fn latest_update_uses_the_latest_tag_only_for_plain_version_dependencies() {
     let dependencies = vec![
         ("private-linked-pkg".to_string(), "link:/home/user/private-linked-pkg".to_string()),
         ("local-tarball-pkg".to_string(), "file:/home/user/local-tarball-pkg.tgz".to_string()),
@@ -223,8 +224,8 @@ fn latest_update_drops_the_spec_only_of_plain_version_dependencies() {
             "remote-tarball-pkg@https://example.com/pkg.tgz",
             "aliased-pkg@npm:other-pkg@^2.0.0",
             "named-registry-pkg@gh:^3.0.0",
-            "foo",
-            "bar",
+            "foo@latest",
+            "bar@latest",
         ],
     );
     assert_eq!(
@@ -246,7 +247,10 @@ fn a_pinned_dependency_is_held_at_its_installed_version() {
     ];
     let pins = HashMap::from([("prerelease".to_string(), "2.0.0".to_string())]);
 
-    assert_eq!(update_selectors(&dependencies, true, &pins), vec!["prerelease@2.0.0", "stable"]);
+    assert_eq!(
+        update_selectors(&dependencies, true, &pins),
+        vec!["prerelease@2.0.0", "stable@latest"],
+    );
 }
 
 #[test]
@@ -371,6 +375,14 @@ fn ownership_snapshot_preserves_manifest_diagnostic_codes() {
         dependencies: vec![("dependency".to_string(), "1.0.0".to_string())],
     };
     let manifest_path = root.path().join("node_modules/dependency/package.json");
+
+    let empty =
+        snapshot_global_package(info.clone()).expect("a group without node_modules owns no bins");
+    assert!(empty.bin_names.is_empty());
+
+    // A dependency directory without its manifest still fails closed.
+    std::fs::create_dir_all(root.path().join("node_modules/dependency"))
+        .expect("create dependency directory");
 
     let missing = snapshot_global_package(info.clone())
         .err()
@@ -572,4 +584,45 @@ fn create_local_package(root: &Path, directory_name: &str, manifest: &str) -> Pa
     std::fs::write(package_dir.join("package.json"), manifest)
         .expect("write local package manifest");
     package_dir
+}
+
+#[test]
+fn a_group_config_carries_the_persisted_minimum_release_age_excludes() {
+    let dir = TempDir::new().expect("temp dir");
+    fs::write(dir.path().join("pnpm-workspace.yaml"), "minimumReleaseAgeExclude:\n  - foo@2.0.0\n")
+        .expect("write the group manifest");
+    let mut base = Config::new();
+    base.minimum_release_age_exclude = Some(vec!["bar@1.0.0".to_string()]);
+
+    let config =
+        global_group_config(&base, dir.path(), dir.path(), None).expect("build the group config");
+
+    assert_eq!(
+        config.minimum_release_age_exclude,
+        Some(vec!["bar@1.0.0".to_string(), "foo@2.0.0".to_string()]),
+    );
+}
+
+#[test]
+fn a_group_config_resolves_hoisted_dependencies_from_its_own_install_dir() {
+    let dir = TempDir::new().expect("temp dir");
+    let mut base = Config::new();
+    base.extra_env.insert("NODE_PATH".to_string(), "/caller/node_modules".to_string());
+
+    let config =
+        global_group_config(&base, dir.path(), dir.path(), None).expect("build the group config");
+
+    assert!(config.enable_global_virtual_store);
+    assert_eq!(config.global_virtual_store_dir, base.store_dir.links());
+    let node_path = config.extra_env.get("NODE_PATH").expect("NODE_PATH is set");
+    assert!(!node_path.contains("/caller/"), "{node_path}");
+    assert!(
+        node_path.contains(
+            &dir.path()
+                .join("node_modules")
+                .display()
+                .to_string()
+        ),
+        "{node_path}",
+    );
 }

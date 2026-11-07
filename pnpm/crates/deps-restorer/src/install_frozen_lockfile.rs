@@ -3,9 +3,9 @@ pub use build_phase::{
 };
 pub use hoisted::{
     HoistPlan, HoistedLinkerError, HoistedLinkerInputs, HoistedLinkerOutput,
-    collect_public_hoist_targets, compute_hoist_plan, find_own_runtime_node_major,
-    find_runtime_node_major, parse_major_from_version, run_hoisted_linker,
-    workspace_packages_for_hoist,
+    HoistedMaterialization, HoistedWorkspacePackages, collect_public_hoist_targets,
+    compute_hoist_plan, find_own_runtime_node_major, find_runtime_node_major,
+    parse_major_from_version, run_hoisted_linker, workspace_packages_for_hoist,
 };
 
 mod verification;
@@ -24,10 +24,9 @@ use crate::{
     AllowBuildPolicy, BuildModules, BuildModulesError, CreateVirtualStoreError,
     CreateVirtualStoreOutput, HoistedDepGraphError, LinkHoistedModulesError,
     LinkHoistedModulesOpts, LinkRootComponentMembersError, LinkVirtualStoreBinsError,
-    LockfileToHoistedDepGraphOptions, SkippedSnapshots, SymlinkDirectDependencies,
-    SymlinkDirectDependenciesError, SymlinkPackageError, VersionPolicyError,
-    build_direct_deps_by_importer, direct_dep_names_for_importer, get_hoisted_dependencies,
-    link_hoisted_modules, link_top_level_bins, lockfile_to_hoisted_dep_graph,
+    LockfileToHoistedDepGraphOptions, SkippedSnapshots, SymlinkDirectDependenciesError,
+    SymlinkPackageError, VersionPolicyError, build_direct_deps_by_importer,
+    direct_dep_names_for_importer, get_hoisted_dependencies, lockfile_to_hoisted_dep_graph,
     symlink_direct_dependencies::importer_root_dir,
 };
 
@@ -43,7 +42,6 @@ use pnpm_lockfile::{
 };
 use pnpm_lockfile_verification::VerifyError;
 use pnpm_matcher::create_matcher;
-use pnpm_modules_yaml::IncludedDependencies;
 use pnpm_package_manifest::DependencyGroup;
 use pnpm_patching::{
     ExtendedPatchInfo, PatchKeyConflictError, ResolvePatchedDependenciesError, get_patch_info,
@@ -154,23 +152,18 @@ pub enum InstallFrozenLockfileError {
     VersionPolicy(#[error(source)] VersionPolicyError),
 
     /// Wraps any error `compute_skipped_snapshots` surfaces from the
-    /// installability pass. Three sources, all reachable under
-    /// today's default config:
+    /// installability pass:
     ///
     /// - `InstallabilityError::InvalidNodeVersion` — the resolved
     ///   `current_node_version` isn't a parseable exact semver.
     ///   Pacquet falls back to a synthetic `99999.0.0` when
     ///   `node --version` fails, so this is currently unreachable
-    ///   from production — but a future `nodeVersion` config wiring
-    ///   (slice 2) will surface user-supplied bad values here as
-    ///   `ERR_PNPM_INVALID_NODE_VERSION`.
+    ///   from production.
     /// - `InstallabilityError::Engine` / `InstallabilityError::Platform`
     ///   from a non-optional incompatible snapshot with
     ///   `engine_strict = true`. Pacquet's default has
     ///   `engine_strict = false`, so this path is currently
-    ///   unreachable from production either — wired through so the
-    ///   slice that lands the config setting doesn't churn the
-    ///   error enum again.
+    ///   unreachable from production either.
     #[diagnostic(transparent)]
     Installability(#[error(source)] Box<pnpm_package_is_installable::InstallabilityError>),
 
@@ -190,6 +183,12 @@ pub enum InstallFrozenLockfileError {
     /// bin-link errors.
     #[diagnostic(transparent)]
     LinkHoistedModules(#[error(source)] LinkHoistedModulesError),
+
+    #[diagnostic(transparent)]
+    ReadModules(#[error(source)] pnpm_modules_yaml::ReadModulesError),
+
+    #[diagnostic(transparent)]
+    WriteModules(#[error(source)] pnpm_modules_yaml::WriteModulesError),
 
     #[display("failed to write package map: {_0}")]
     #[diagnostic(code(ERR_PNPM_PACKAGE_MANAGER_WRITE_PACKAGE_MAP))]
@@ -242,8 +241,23 @@ impl From<HoistedLinkerError> for InstallFrozenLockfileError {
             HoistedLinkerError::SymlinkDirectDependencies(error) => {
                 InstallFrozenLockfileError::SymlinkDirectDependencies(error)
             }
+            HoistedLinkerError::ReadModules(error) => {
+                InstallFrozenLockfileError::ReadModules(error)
+            }
+            HoistedLinkerError::WriteModules(error) => {
+                InstallFrozenLockfileError::WriteModules(error)
+            }
             HoistedLinkerError::WritePackageMap(error) => {
                 InstallFrozenLockfileError::WritePackageMap(error)
+            }
+            HoistedLinkerError::PruneStaleLinks(error) => {
+                InstallFrozenLockfileError::PruneStaleModules(error)
+            }
+            HoistedLinkerError::HoistSymlink(error) => {
+                InstallFrozenLockfileError::HoistSymlink(error)
+            }
+            HoistedLinkerError::HoistLinkBins(error) => {
+                InstallFrozenLockfileError::HoistLinkBins(error)
             }
         }
     }
@@ -258,6 +272,7 @@ fn build_extra_env(
     workspace_root: &std::path::Path,
 ) -> HashMap<String, String> {
     let mut extra_env = config.extra_env_with_node_options();
+    config.add_cas_loader_env(workspace_root, &mut extra_env);
     if matches!(node_linker, NodeLinker::Pnp) {
         let node_options = extra_env.get("NODE_OPTIONS").map(String::as_str);
         extra_env.insert(
@@ -268,7 +283,7 @@ fn build_extra_env(
             ),
         );
     }
-    if config.node_experimental_package_map && !matches!(node_linker, NodeLinker::Pnp) {
+    if config.node_package_map_mode.loads() && !matches!(node_linker, NodeLinker::Pnp) {
         let package_map_path = config.modules_dir.join(crate::package_map::PACKAGE_MAP_FILENAME);
         let node_options = extra_env.get("NODE_OPTIONS").map(String::as_str);
         extra_env.insert(
@@ -307,6 +322,7 @@ impl<'a> InstallFrozenLockfile<'a> {
             &allow_build_policy,
             owned.early_host_detection,
             owned.node_version,
+            owned.known_requires_build.as_ref(),
         )
         .await?;
 
@@ -315,8 +331,17 @@ impl<'a> InstallFrozenLockfile<'a> {
             plan,
             owned.skipped,
             owned.lockfile_verification_override,
+            owned.known_requires_build.as_ref(),
         )
         .await
+    }
+
+    fn linker_context<'p>(
+        &self,
+        layout: &'p crate::VirtualStoreLayout,
+        bin_options: &'p pnpm_cmd_shim::LinkBinsOptions,
+    ) -> crate::ModuleLinkerContext<'p> {
+        crate::ModuleLinkerContext { layout, kind: self.platform.node_linker, bin_options }
     }
 
     async fn run_plan<Reporter: self::Reporter>(
@@ -325,21 +350,24 @@ impl<'a> InstallFrozenLockfile<'a> {
         plan: MaterializationPlan<'_>,
         seed_skipped: Option<Vec<String>>,
         verification_override: Option<LockfileVerificationOverride<'_>>,
+        known_requires_build: Option<&crate::RequiresBuildBySnapshot>,
     ) -> Result<InstallFrozenLockfileOutput, InstallFrozenLockfileError> {
+        let swap_lock = crate::ModulesSwapLock::new(&self.drivers.config.modules_dir);
         let ctx = crate::InstallContext {
-            linker: crate::ModuleLinkerContext {
-                layout: &plan.layout,
-                kind: self.platform.node_linker,
-                bin_options: &plan.link_options,
+            caches: crate::InstallCaches {
+                logged_methods: self.logged_methods,
+                swap_lock: Some(&swap_lock),
+                git_source_cache: &plan.git_source_cache,
+                materialized_graph: std::sync::Arc::default(),
+                dir_clone_cache: plan.dir_clone_cache.as_ref(),
             },
+
+            linker: self.linker_context(&plan.layout, &plan.link_options),
             config: self.drivers.config,
             workspace_root: self.projects.workspace_root,
             requester: self.projects.requester,
 
             allow_build_policy,
-
-            logged_methods: self.logged_methods,
-            git_source_cache: &plan.git_source_cache,
         };
 
         // Spawn the batched store-index writer here so it lives
@@ -355,8 +383,7 @@ impl<'a> InstallFrozenLockfile<'a> {
         // Under `frozenStore` the store is opened read-only, so the
         // writer is replaced with a drain-and-drop stub that never opens
         // `index.db` (no WAL / SHM sidecar under the read-only root).
-        let (store_index_writer, writer_task) =
-            StoreIndexWriter::spawn_for(&ctx.config.store_dir, ctx.config.frozen_store);
+        let (store_index_writer, writer_task) = spawn_store_index_writer(ctx.config);
 
         let settled = self.settle_skip_set::<Reporter>(plan.host, seed_skipped).await?;
 
@@ -367,6 +394,7 @@ impl<'a> InstallFrozenLockfile<'a> {
                 dir_clone_cache: plan.dir_clone_cache.as_ref(),
                 store_index_writer: &store_index_writer,
                 skipped: &settled.skipped,
+                known_requires_build,
                 verification_override,
             },
         )
@@ -395,7 +423,12 @@ impl<'a> InstallFrozenLockfile<'a> {
     ) -> Result<InstallFrozenLockfileOutput, InstallFrozenLockfileError> {
         settled.skipped.add_fetch_failed_all(fetched.fetch_failed.drain());
 
-        let linked = self.link_fetched::<Reporter>(ctx, &mut fetched, &mut settled)?;
+        let (linked, injected_deps) =
+            self.link_fetched::<Reporter>(ctx, &mut fetched, &mut settled)?;
+        // Lifecycle scripts may start installs of their own in this project.
+        if let Some(swap_lock) = ctx.caches.swap_lock {
+            swap_lock.release();
+        }
 
         let phase_start = std::time::Instant::now();
         let built = self.build::<Reporter>(
@@ -426,21 +459,9 @@ impl<'a> InstallFrozenLockfile<'a> {
         // awaited by the install driver after its own tail writes.
         drop(store_index_writer);
 
-        // The injectedDeps payload for `.modules.yaml`: every `file:`
-        // snapshot is a materialized copy of an injected workspace
-        // project; record the copies per source project so post-install
-        // tooling (Bit's build-artifact linker) can reach all of them.
-        // Under the hoisted linker the copies live at the walker's
-        // hoisted locations rather than in a virtual store.
         Ok(InstallFrozenLockfileOutput {
             hoisted: crate::InstalledHoistedState {
-                injected_deps: crate::collect_injected_deps(
-                    ctx.linker.layout,
-                    ctx.workspace_root,
-                    LockfileEntries::from(self.lockfiles.wanted),
-                    &settled.skipped,
-                    ctx.is_hoisted().then_some(&linked.hoisted_locations),
-                ),
+                injected_deps,
                 dependencies: linked.hoisted_dependencies,
                 locations: linked.hoisted_locations,
             },
@@ -452,17 +473,37 @@ impl<'a> InstallFrozenLockfile<'a> {
         })
     }
 
+    /// The wanted lockfile narrowed to what this install keeps: the
+    /// module-resolution sidecars describe it, and the virtual-store
+    /// sweep leaves exactly its snapshots on disk.
+    fn current_lockfile(&self, skipped: &SkippedSnapshots) -> Lockfile {
+        crate::filter_lockfile_for_current(self.lockfiles.wanted, self.inputs().groups(), skipped)
+    }
+
+    /// The filtered lockfile that the sidecars and the `injectedDeps`
+    /// record share clones the whole graph, so it must not outlive this
+    /// call: the build phase that follows would hold it across every
+    /// lifecycle script it runs.
     fn link_fetched<Reporter: self::Reporter>(
         &self,
         ctx: &crate::InstallContext<'_>,
         fetched: &mut CreateVirtualStoreOutput,
         settled: &mut SkipSetPlan,
-    ) -> Result<crate::linking::LinkPhaseOutput, InstallFrozenLockfileError> {
+    ) -> Result<
+        (crate::linking::LinkPhaseOutput, BTreeMap<String, Vec<String>>),
+        InstallFrozenLockfileError,
+    > {
         let cas_paths_by_pkg_id = fetched.cas_paths_by_pkg_id.take();
         let phase_start = std::time::Instant::now();
+        let current_lockfile = self.current_lockfile(&settled.skipped);
         let linked = self.link::<Reporter>(
             ctx,
-            LinkInputs { fetched, cas_paths_by_pkg_id, host_node: settled.host_node.as_ref() },
+            LinkInputs {
+                fetched,
+                cas_paths_by_pkg_id,
+                host_node: settled.host_node.as_ref(),
+                current_lockfile: &current_lockfile,
+            },
             &mut settled.skipped,
         )?;
         tracing::info!(
@@ -471,6 +512,8 @@ impl<'a> InstallFrozenLockfile<'a> {
             elapsed_ms = phase_start.elapsed().as_millis() as u64,
             "phase complete",
         );
+        let injected_deps =
+            injected_deps(ctx, &current_lockfile, &settled.skipped, &linked.hoisted_locations);
 
         // `importing_done` fires once extraction and symlink linking
         // are complete, before any build phase. Reporters use it to
@@ -482,7 +525,7 @@ impl<'a> InstallFrozenLockfile<'a> {
             stage: Stage::ImportingDone,
         }));
 
-        Ok(linked)
+        Ok((linked, injected_deps))
     }
 
     /// The borrowed inputs as one `Copy` value. See [`FrozenInputs`].
@@ -501,4 +544,37 @@ impl<'a> InstallFrozenLockfile<'a> {
     fn take_owned(&mut self) -> crate::FrozenInstallSeed<'a> {
         std::mem::take(&mut self.seed)
     }
+}
+
+/// The injectedDeps payload for `.modules.yaml`: every `file:` snapshot
+/// is a materialized copy of an injected workspace project, recorded
+/// per source project so post-install tooling (Bit's build-artifact
+/// linker) can reach all of them. Under the hoisted linker the copies
+/// live at the walker's hoisted locations rather than in a virtual
+/// store.
+///
+/// `current_lockfile` is what this install keeps. A snapshot outside it
+/// is swept right after it is materialized, so recording it would point
+/// `syncInjectedDepsAfterScripts` at a directory that is gone.
+fn injected_deps(
+    ctx: &crate::InstallContext<'_>,
+    current_lockfile: &Lockfile,
+    skipped: &SkippedSnapshots,
+    hoisted_locations: &BTreeMap<String, Vec<String>>,
+) -> BTreeMap<String, Vec<String>> {
+    crate::collect_injected_deps(
+        ctx.linker.layout,
+        ctx.workspace_root,
+        LockfileEntries::from(current_lockfile),
+        skipped,
+        ctx.is_hoisted().then_some(hoisted_locations),
+    )
+}
+
+/// The store-index writer for `config`'s store, honouring `frozenStore` and
+/// `storeIndexFormat`.
+fn spawn_store_index_writer(
+    config: &Config,
+) -> (Arc<StoreIndexWriter>, tokio::task::JoinHandle<Result<(), StoreIndexError>>) {
+    StoreIndexWriter::spawn_for(&config.store_dir, config.frozen_store, config.store_index_format)
 }

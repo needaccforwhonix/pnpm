@@ -1,27 +1,38 @@
 mod install;
-use install::{
-    AddSeed, add_install, merged_catalogs_override, project_seed_policy, selected_add_seed,
-};
+use install::{add_install, selected_add_seed, single_add_seed};
 
 mod specifier;
-use specifier::{normalized_save_specifier, resolve_added_dependency, workspace_packages_for_add};
+use specifier::{normalized_save_specifier, resolve_added_dependency};
+
+mod alias;
+
+mod selector;
+
+mod protocol_selector;
+
+mod range_fallback;
+
+mod workspace_specifier;
+use workspace_specifier::workspace_projects_for_add;
 
 mod registry;
 
+mod types;
+
 mod aliasless;
 
+mod finish;
+use finish::{finish_selected_add, finish_single_add};
+
 mod manifest;
-use manifest::{
-    catalog_version_requests, finish_selected_add, persist_manifest, prepare_selected_add,
-    prepare_single_add,
-};
+use manifest::{prepare_selected_add, prepare_single_add};
+
+mod source;
 
 use crate::{
-    CatalogVersionMismatchError, InstallError, ResolvedPackages, SelectedProjects,
-    catalog_cleanup::{WriteWorkspaceCatalogsError, post_install_prune},
-    defer_ignored_builds,
-    resolve_latest::LatestPicker,
-    selected_project_indices,
+    CatalogVersionMismatchError, CommandLockfile, InstallError, ResolvedPackages, SelectedProjects,
+    catalog_cleanup::WriteWorkspaceCatalogsError, defer_ignored_builds,
+    resolve_latest::LatestPicker, selected_project_indices,
 };
 use derive_more::{Display, Error};
 use miette::Diagnostic;
@@ -30,7 +41,6 @@ use pnpm_catalogs_config::InvalidCatalogsConfigurationError;
 use pnpm_catalogs_types::Catalogs;
 use pnpm_config::Config;
 use pnpm_engine_runtime_node_resolver::NodeResolverError;
-use pnpm_lockfile::Lockfile;
 use pnpm_network::ThrottledClient;
 use pnpm_package_manifest::{DependencyGroup, PackageManifest, PackageManifestError};
 use pnpm_registry::RangeSpecStyle;
@@ -38,7 +48,8 @@ use pnpm_reporter::Reporter;
 use pnpm_resolving_jsr_specifier_parser::ParseJsrSpecifierError;
 use pnpm_resolving_local_resolver::ResolveLocalError;
 use pnpm_resolving_npm_resolver::{
-    InMemoryPackageMetaCache, PackumentFetchLocker, PickPackageError, shared_packument_fetch_locker,
+    InMemoryPackageMetaCache, OfflineStoreView, PackumentFetchLocker, PickPackageError,
+    shared_packument_fetch_locker,
 };
 use pnpm_resolving_resolver_base::{GitResolveError, WorkspacePackages};
 use pnpm_tarball::MemCache;
@@ -193,6 +204,7 @@ where
                 dependency_groups: self.resources.dependency_groups.map(|groups| {
                     groups.into_iter().collect()
                 }),
+                included_groups: self.resources.included_groups,
                 save_catalog_name: self.resources.save_catalog_name,
                 supported_architectures: self.resources.supported_architectures,
             },
@@ -203,43 +215,14 @@ where
     pub async fn run<Reporter: self::Reporter + 'static>(self) -> Result<(), AddError> {
         let (add, owned, manifest) = self.split();
         begin::<Reporter>(add, &owned);
-        let (catalog_ctx, updated_catalogs) =
-            prepare_single_add::<Reporter>(add, &owned, manifest).await?;
-        let (dropped_pins, preferred_versions_override) = catalog_version_requests(
-            add.package_names,
-            manifest,
-            &catalog_ctx.catalogs,
-            add.lockfile,
-            add.config,
-            owned.save_catalog_name.as_deref(),
-        );
-        let ignored_builds = add_install(
-            add,
-            owned,
-            manifest,
-            AddSeed {
-                seed_policies: project_seed_policy(add.config, manifest, dropped_pins),
-                preferred_versions_override,
-                catalogs_override: merged_catalogs_override(
-                    catalog_ctx.catalogs,
-                    &updated_catalogs,
-                ),
-            },
-        )
-        .run::<Reporter>()
-        .await
-        .pipe(defer_ignored_builds)
-        .map_err(AddError::Install)?;
+        let preparation = prepare_single_add::<Reporter>(add, &owned, manifest).await?;
+        let (seed, workspace_dir) = single_add_seed(add, &owned, manifest, preparation);
+        let install_result = add_install(add, owned, manifest, seed)
+            .run::<Reporter>()
+            .await
+            .pipe(defer_ignored_builds);
 
-        persist_manifest::<Reporter>(manifest)?;
-
-        post_install_prune(add.config, Some(&catalog_ctx.workspace_dir), manifest)
-            .map_err(AddError::WriteWorkspaceManifest)?;
-
-        if let Some(ignored_builds) = ignored_builds {
-            return Err(AddError::Install(ignored_builds));
-        }
-        Ok(())
+        finish_single_add::<Reporter>(add, manifest, &workspace_dir, install_result)
     }
 
     pub async fn run_selected<Reporter: self::Reporter + 'static>(
@@ -264,15 +247,15 @@ where
             &owned,
             manifest,
             (selected.projects, &selected_indices),
+            &prepared.picked_versions,
             prepared.catalogs_override,
             &prepared.catalogs,
         );
-        let ignored_builds = Box::pin(
+        let install_result = Box::pin(
             add_install(add, owned, manifest, seed).run_selected::<Reporter>(selected.selection()),
         )
         .await
-        .pipe(defer_ignored_builds)
-        .map_err(AddError::Install)?;
+        .pipe(defer_ignored_builds);
 
         finish_selected_add::<Reporter>(
             add,
@@ -280,7 +263,7 @@ where
             selected.projects,
             &selected_indices,
             &prepared.workspace_dir,
-            ignored_builds,
+            install_result,
         )
     }
 }
@@ -291,8 +274,9 @@ pub struct AddOptions<'a> {
     pub resolved_packages: &'a ResolvedPackages,
     pub http_client: &'a ThrottledClient,
     pub config: &'static Config,
-    pub lockfile: Option<&'a Lockfile>,
-    pub lockfile_path: Option<&'a std::path::Path>,
+    /// The wanted lockfile, as the command reads it and as the
+    /// install it runs needs it.
+    pub lockfile: CommandLockfile<'a>,
     /// Package selectors, each of which may carry an `@<version>` suffix.
     pub package_names: &'a [String],
     /// How the freshly-resolved version is pinned into the manifest range,
@@ -303,19 +287,25 @@ pub struct AddOptions<'a> {
     /// `pnpm-lock.yaml`, but skip materializing `node_modules`. Forwarded
     /// to the follow-up `Install` run. See [`crate::InstallExecution::lockfile_only`].
     pub lockfile_only: bool,
+    /// Discover companion declaration packages for an explicit add command.
+    pub save_types: bool,
 }
 
 /// The add's owned inputs, consumed by the install it runs.
 pub struct AddResources<DependencyGroupList> {
     pub tarball_mem_cache: std::sync::Arc<MemCache>,
     pub http_client_arc: std::sync::Arc<ThrottledClient>,
-    /// The manifest group(s) the added packages are saved into. `None`
+    /// The manifest groups the added packages are saved into. `None`
     /// means pnpm's default: an already-declared package is updated in
     /// the group it occupies (`guessDependencyType` — checked in
     /// `optionalDependencies`, `dependencies`, `devDependencies`,
     /// `peerDependencies` order, with a peer-only entry left untouched),
     /// and a new package lands in `dependencies`.
     pub dependency_groups: Option<DependencyGroupList>,
+    /// The dependency groups the install that follows the manifest edit
+    /// resolves and materializes, from `--prod` / `--dev`. `None` includes
+    /// every direct group the `optional` setting allows.
+    pub included_groups: Option<Vec<DependencyGroup>>,
     /// `--save-catalog-name=<name>` (with `--save-catalog` a shorthand for
     /// `default`), or the `saveCatalogName` config default. When `Some`,
     /// the added dependency is written as `catalog:` / `catalog:<name>`
@@ -336,35 +326,65 @@ fn begin<Reporter: self::Reporter>(add: AddOptions<'_>, owned: &AddOwned) {
 /// What one add pass shares across the selectors it resolves, and across
 /// the projects a selected add touches: the `latest` picker (created on
 /// first use, so a pass that resolves no `latest` tag never builds one),
-/// the packument cache and the fetch locker.
+/// the packument cache, the fetch locker and the offline store view (opened
+/// on first use as well).
 struct AddResolution<'a> {
+    started_at: chrono::DateTime<chrono::Utc>,
     latest_picker: tokio::sync::OnceCell<LatestPicker<'a>>,
     meta_cache: std::sync::Arc<InMemoryPackageMetaCache>,
     fetch_locker: PackumentFetchLocker,
+    store_view: std::sync::OnceLock<Option<OfflineStoreView>>,
 }
 
 impl AddResolution<'_> {
     fn new() -> Self {
         Self {
+            started_at: chrono::Utc::now(),
             latest_picker: tokio::sync::OnceCell::new(),
             meta_cache: std::sync::Arc::new(InMemoryPackageMetaCache::default()),
             fetch_locker: shared_packument_fetch_locker(),
+            store_view: std::sync::OnceLock::new(),
         }
+    }
+
+    fn store_view(&self, config: &Config) -> Option<&OfflineStoreView> {
+        self.store_view
+            .get_or_init(|| crate::resolution_policy::offline_store_view(config))
+            .as_ref()
     }
 }
 
 /// What every selector of an add resolves against.
 struct AddResolveInputs<'a, 'r> {
     add: AddOptions<'a>,
-    http_client_arc: &'r std::sync::Arc<ThrottledClient>,
+    owned: &'r AddOwned,
     /// One checkout per repository and commit for every alias-less git
     /// selector this command resolves.
     git_source_cache: &'r std::sync::Arc<pnpm_git_fetcher::GitSourceCache>,
     resolution: &'r AddResolution<'a>,
-    save_catalog_name: Option<&'r str>,
+    preferred_versions: &'r std::sync::OnceLock<pnpm_resolving_resolver_base::PreferredVersions>,
     catalogs: &'r Catalogs,
     prefix: &'r str,
     workspace_packages: Option<&'r WorkspacePackages>,
+}
+
+impl AddResolveInputs<'_, '_> {
+    fn preferred_versions(
+        &self,
+        manifest: &PackageManifest,
+    ) -> &pnpm_resolving_resolver_base::PreferredVersions {
+        self.preferred_versions.get_or_init(|| {
+            pnpm_lockfile_preferred_versions::get_preferred_versions_from_lockfile_and_manifests(
+                self.add.lockfile.document.and_then(|lockfile| {
+                    lockfile.snapshots.as_ref()
+                }),
+                pnpm_lockfile_preferred_versions::DirectSpecs {
+                    manifests: &[manifest],
+                    catalogs: self.catalogs,
+                },
+            )
+        })
+    }
 }
 
 #[cfg(test)]

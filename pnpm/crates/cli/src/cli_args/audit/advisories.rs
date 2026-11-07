@@ -1,12 +1,12 @@
 use super::{
     AuditError, AuditGraph, AuditReport, AuditVulnerabilityCounts, BTreeMap, Config,
-    ConfigAuditLevel, DepKind, Duration, Edge, EnvLockfile, GraphImporter, HashMap, HashSet,
-    Include, Lockfile, PackageKey, PackumentPublishInfo, Range, RawBulkAdvisory, RetryOpts,
-    append_snapshot_edges, bulk_response_to_audit_report, empty_snapshots, env_roots,
+    ConfigAuditLevel, DepKind, Edge, EnvLockfile, GraphImporter, HashMap, HashSet, Include,
+    Lockfile, PackageKey, PackumentPublishInfo, PeerEdgeOptions, PeerSatisfactionEdges, Range,
+    RawBulkAdvisory, bulk_response_to_audit_report, empty_packages, empty_snapshots, env_roots,
     fetch_publish_times, importer_roots, lockfile_to_audit_request, normalize_ghsa_id,
-    normalize_registry, pick_registry_for_package, redact_url_userinfo, sanitize_response_body,
-    send_with_retry,
+    pick_registry_for_package, sanitize_response_body, send_with_retry,
 };
+use pnpm_network::{normalize_registry_url, redact_url_credentials};
 
 pub(super) async fn audit(
     lockfile: &Lockfile,
@@ -16,24 +16,24 @@ pub(super) async fn audit(
     http_client: &pnpm_network::ThrottledClient,
 ) -> Result<AuditReport, AuditError> {
     let audit_request = lockfile_to_audit_request(lockfile, env_lockfile, include);
-    let registry = normalize_registry(&config.registry);
+    let registry = normalize_registry_url(&config.registry).into_owned();
     let body = serde_json::to_vec(&audit_request.request)
         .expect("audit request is a map of package names to version strings");
     let authorization = config.auth_headers.for_url(&registry);
-    let request_url = redact_url_userinfo(&format!("{registry}-/npm/v1/security/advisories/bulk"));
-    let (_, response) =
-        send_with_retry(http_client, &request_url, retry_opts_from_config(config), |client| {
-            let mut request = client
-                .post(&request_url)
-                .header("content-type", "application/json")
-                .body(body.clone());
-            if let Some(value) = &authorization {
-                request = request.header("authorization", value);
-            }
-            request
-        })
-        .await
-        .map_err(|source| AuditError::Network { url: request_url.clone(), source })?;
+    let request_url =
+        redact_url_credentials(&format!("{registry}-/npm/v1/security/advisories/bulk"));
+    let (_, response) = send_with_retry(http_client, &request_url, config.retry_opts(), |client| {
+        let mut request = client
+            .post(&request_url)
+            .header("content-type", "application/json")
+            .body(body.clone());
+        if let Some(value) = &authorization {
+            request = request.header("authorization", value);
+        }
+        request
+    })
+    .await
+    .map_err(|source| AuditError::Network { url: request_url.clone(), source })?;
 
     let status = response.status().as_u16();
     let raw_body = response
@@ -72,15 +72,6 @@ fn parse_bulk_advisories(
             url: url.to_string(),
             body: sanitize_response_body(&parsed.to_string()),
         })
-}
-
-pub(super) fn retry_opts_from_config(config: &Config) -> RetryOpts {
-    RetryOpts {
-        retries: config.fetch_retries,
-        factor: config.fetch_retry_factor,
-        min_timeout: Duration::from_millis(config.fetch_retry_mintimeout),
-        max_timeout: Duration::from_millis(config.fetch_retry_maxtimeout),
-    }
 }
 
 /// Corrects inferred `patched_versions` ranges against the registry: the
@@ -140,9 +131,11 @@ pub(super) async fn correct_inferred_patched_versions(
 }
 
 impl<'a> AuditGraph<'a> {
-    pub(super) fn main(lockfile: &'a Lockfile) -> Self {
+    pub(super) fn main(lockfile: &'a Lockfile, peer_edges: PeerEdgeOptions) -> Self {
         let empty = empty_snapshots();
         let snapshots = lockfile.snapshots.as_ref().unwrap_or(empty);
+        let empty_pkgs = empty_packages();
+        let packages = lockfile.packages.as_ref().unwrap_or(empty_pkgs);
         let importers = lockfile.importers
             .iter()
             .map(|(id, importer)| GraphImporter {
@@ -150,14 +143,28 @@ impl<'a> AuditGraph<'a> {
                 roots: importer_roots(importer),
             })
             .collect();
-        Self { importers, snapshots }
+        let root_dev_dependencies = lockfile
+            .root_project()
+            .filter(|_| peer_edges.resolve_peers_from_workspace_root)
+            .map(importer_roots)
+            .into_iter()
+            .flatten()
+            .filter(|(kind, _)| *kind == DepKind::Dev)
+            .map(|(_, edge)| edge.key)
+            .collect();
+        Self::new(importers, root_dev_dependencies, snapshots, packages)
     }
 
     pub(super) fn env(env_lockfile: &'a EnvLockfile) -> Self {
         let importer = env_lockfile.importers.get(EnvLockfile::ROOT_IMPORTER_KEY);
         let mut importers = Vec::new();
         let Some(importer) = importer else {
-            return Self { importers, snapshots: &env_lockfile.snapshots };
+            return Self::new(
+                importers,
+                HashSet::new(),
+                &env_lockfile.snapshots,
+                &env_lockfile.packages,
+            );
         };
         let config_roots = env_roots(&importer.config_dependencies);
         if !config_roots.is_empty() {
@@ -182,17 +189,22 @@ impl<'a> AuditGraph<'a> {
             }
         }
 
-        Self { importers, snapshots: &env_lockfile.snapshots }
+        Self::new(importers, HashSet::new(), &env_lockfile.snapshots, &env_lockfile.packages)
     }
 
-    pub(super) fn children(&self, key: &PackageKey, include_optional_edges: bool) -> Vec<Edge> {
+    /// The snapshots `key` depends on in a walk over `include`: its
+    /// optional dependencies only when `include` has them, and its
+    /// peer-satisfaction edges only when `include` has every group.
+    pub(super) fn children(&self, key: &PackageKey, include: Include) -> Vec<Edge> {
         let Some(snapshot) = self.snapshots.get(key) else { return Vec::new() };
-        let mut children = Vec::new();
-        append_snapshot_edges(&mut children, snapshot.dependencies.as_ref());
-        if include_optional_edges {
-            append_snapshot_edges(&mut children, snapshot.optional_dependencies.as_ref());
-        }
-        children
+        let no_peer_edges = PeerSatisfactionEdges::default();
+        let skipped =
+            if include.excludes_a_group() { &self.peer_satisfaction_edges } else { &no_peer_edges };
+        skipped
+            .followed_entries(key, snapshot, include.optional_dependencies)
+            .filter_map(|(name, dep_ref)| dep_ref.resolve(name))
+            .map(|key| Edge { key })
+            .collect()
     }
 }
 
@@ -200,7 +212,16 @@ pub(super) fn filter_ignored_advisories(
     report: &mut AuditReport,
     config: &Config,
 ) -> AuditVulnerabilityCounts {
-    let ignore_set = config.audit_config.ignore_ghsas
+    remove_advisories_by_ghsa(report, &config.audit_config.ignore_ghsas)
+}
+
+/// Remove the advisories whose GHSA id is in `ghsas` and count them per
+/// severity. Ids match after normalization, and a blank id matches nothing.
+pub(super) fn remove_advisories_by_ghsa(
+    report: &mut AuditReport,
+    ghsas: &[String],
+) -> AuditVulnerabilityCounts {
+    let ignore_set = ghsas
         .iter()
         .filter_map(|ghsa| {
             let ghsa_id = normalize_ghsa_id(ghsa);

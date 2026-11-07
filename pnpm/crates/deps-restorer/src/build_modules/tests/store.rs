@@ -9,8 +9,6 @@ use crate::{RequiresBuildBySnapshot, SkippedSnapshots, VirtualStoreLayout};
 #[cfg(unix)]
 use pnpm_config::PackageImportMethod;
 #[cfg(unix)]
-use pnpm_executor::ScriptsPrependNodePath;
-#[cfg(unix)]
 use pnpm_lockfile::SnapshotEntry;
 #[cfg(unix)]
 use pnpm_reporter::SilentReporter;
@@ -114,14 +112,17 @@ fn materialization_failure_on_incomplete_slot_is_fatal() {
         },
     );
     // Overlay points at a non-existent CAS blob, so materialization fails.
-    let overlay = std::collections::HashMap::from([(
+    let overlay = pnpm_fs::CasPaths::from([(
         "generated.txt".to_string(),
-        virtual_store_dir.path().join("missing-cas-blob"),
+        virtual_store_dir
+            .path()
+            .join("missing-cas-blob")
+            .into(),
     )]);
     let mut side_effects_maps = std::collections::HashMap::new();
     side_effects_maps.insert(
         pkg_key.clone(),
-        std::sync::Arc::new(HashMap::from([(expected_cache_key, overlay)])),
+        std::sync::Arc::new(HashMap::from([(expected_cache_key, overlay.into())])),
     );
     // `requires_build` must be forced on: the gate is only reached for a
     // build candidate, and the manifest-less slot would otherwise probe as
@@ -130,7 +131,10 @@ fn materialization_failure_on_incomplete_slot_is_fatal() {
 
     let result = BuildModules {
         cache: crate::BuildCacheContext {
-            maps_by_snapshot: Some(&side_effects_maps),
+            side_effects: crate::CachedSideEffects {
+                overlays: Some(&side_effects_maps),
+                rows: None,
+            },
             engine_name: Some(engine),
             read: true,
             write: false,
@@ -140,6 +144,7 @@ fn materialization_failure_on_incomplete_slot_is_fatal() {
             frozen_store: false,
         },
         directories: crate::BuildLayout {
+            link_options: &pnpm_cmd_shim::LinkBinsOptions::default(),
             layout: &VirtualStoreLayout::legacy(
                 virtual_store_dir.path(),
                 pnpm_config::default_virtual_store_dir_max_length() as usize,
@@ -157,15 +162,23 @@ fn materialization_failure_on_incomplete_slot_is_fatal() {
             patches: None,
             requires_build_by_snapshot: Some(&requires_build),
             importers: &importers,
+            dependency_groups: None,
+            build_scope: None,
+            variant_platforms: None,
         },
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),
             user_agent: "pnpm/test",
-            prepend_node_path: ScriptsPrependNodePath::Never,
+            path: crate::ScriptPath { extra_bin_paths: &[], private_hoisting: false },
             shell: None,
             shell_emulator: false,
             unsafe_perm: true,
             ignore: false,
+            patched_engines: crate::PatchedEngineCheck {
+                engine_strict: false,
+                node_version: None,
+                install_state_dir: None,
+            },
         },
 
         allow_build_policy: &policy,
@@ -204,13 +217,16 @@ fn side_effects_cache_disabled_bypasses_the_gate() {
     // `side_effects_cache: false` flag must short-circuit before
     // the lookup even runs.
     let mut overlay = std::collections::HashMap::new();
-    overlay.insert("any-key".to_string(), std::collections::HashMap::new());
+    overlay.insert("any-key".to_string(), pnpm_store_dir::SideEffectsOverlay::default());
     let mut side_effects_maps = std::collections::HashMap::new();
     side_effects_maps.insert(pkg_key, std::sync::Arc::new(overlay));
 
     let err = BuildModules {
         cache: crate::BuildCacheContext {
-            maps_by_snapshot: Some(&side_effects_maps),
+            side_effects: crate::CachedSideEffects {
+                overlays: Some(&side_effects_maps),
+                rows: None,
+            },
             engine_name: Some("darwin;arm64;node20"),
             read: false,
             write: false,
@@ -220,6 +236,7 @@ fn side_effects_cache_disabled_bypasses_the_gate() {
             frozen_store: false,
         },
         directories: crate::BuildLayout {
+            link_options: &pnpm_cmd_shim::LinkBinsOptions::default(),
             layout: &VirtualStoreLayout::legacy(
                 virtual_store_dir.path(),
                 pnpm_config::default_virtual_store_dir_max_length() as usize,
@@ -237,15 +254,23 @@ fn side_effects_cache_disabled_bypasses_the_gate() {
             patches: None,
             requires_build_by_snapshot: None,
             importers: &importers,
+            dependency_groups: None,
+            build_scope: None,
+            variant_platforms: None,
         },
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),
             user_agent: "pnpm/test",
-            prepend_node_path: ScriptsPrependNodePath::Never,
+            path: crate::ScriptPath { extra_bin_paths: &[], private_hoisting: false },
             shell: None,
             shell_emulator: false,
             unsafe_perm: true,
             ignore: false,
+            patched_engines: crate::PatchedEngineCheck {
+                engine_strict: false,
+                node_version: None,
+                install_state_dir: None,
+            },
         },
 
         allow_build_policy: &policy,
@@ -349,6 +374,7 @@ async fn write_path_populates_side_effects_row() {
         files: base_files,
         side_effects: None,
         remote_side_effects_quarantine: None,
+        tar_integrity: None,
     };
     {
         let mut index = StoreIndex::open_in(&store_dir).expect("open index for seed");
@@ -377,7 +403,7 @@ async fn write_path_populates_side_effects_row() {
 
     BuildModules {
         cache: crate::BuildCacheContext {
-            maps_by_snapshot: None,
+            side_effects: crate::CachedSideEffects { overlays: None, rows: None },
             engine_name: Some(engine),
             read: true,
             write: true,
@@ -387,6 +413,7 @@ async fn write_path_populates_side_effects_row() {
             frozen_store: false,
         },
         directories: crate::BuildLayout {
+            link_options: &pnpm_cmd_shim::LinkBinsOptions::default(),
             layout: &VirtualStoreLayout::legacy(
                 virtual_store_dir.path(),
                 pnpm_config::default_virtual_store_dir_max_length() as usize,
@@ -404,15 +431,23 @@ async fn write_path_populates_side_effects_row() {
             patches: None,
             requires_build_by_snapshot: None,
             importers: &importers,
+            dependency_groups: None,
+            build_scope: None,
+            variant_platforms: None,
         },
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),
             user_agent: "pnpm/test",
-            prepend_node_path: ScriptsPrependNodePath::Never,
+            path: crate::ScriptPath { extra_bin_paths: &[], private_hoisting: false },
             shell: None,
             shell_emulator: false,
             unsafe_perm: true,
             ignore: false,
+            patched_engines: crate::PatchedEngineCheck {
+                engine_strict: false,
+                node_version: None,
+                install_state_dir: None,
+            },
         },
 
         allow_build_policy: &policy,

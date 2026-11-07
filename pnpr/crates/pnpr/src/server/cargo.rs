@@ -64,9 +64,9 @@ const INDEX_CONFIG_LIMIT: usize = 64 * 1024;
 /// `.`, so it can never collide with a crate's own entry.
 const INDEX_CONFIG_KEY: &str = "config.json";
 
-pub(super) fn routes(prefixed: bool) -> Router<AppState> {
+pub(super) fn routes() -> Router<AppState> {
     let mut router = Router::new();
-    for base in mount_bases(ECOSYSTEM, prefixed) {
+    for base in mount_bases(ECOSYSTEM) {
         router = router
             .route(&format!("{base}/index/config.json"), get(get_index_config))
             .route(&format!("{base}/index/{{a}}/{{b}}"), get(get_index_file))
@@ -87,6 +87,11 @@ pub(super) fn routes(prefixed: bool) -> Router<AppState> {
 /// when a request names none.
 const DEFAULT_SEARCH_PAGE: usize = 10;
 
+/// `GET api/v1/crates?q=<query>&per_page=<n>&page=<n>` — `cargo search`.
+///
+/// Hosted sources only. An upstream contributes nothing, the way an npm
+/// upstream does until its `search` is turned on, and searching one needs
+/// its `config.json` `api` base rather than the index base pnpr proxies.
 async fn get_search(
     State(state): State<AppState>,
     AuthedCaller(identity): AuthedCaller,
@@ -147,16 +152,7 @@ async fn collect_hosted_crates(
     Ok(())
 }
 
-/// `GET api/v1/crates?q=<query>&per_page=<n>&page=<n>` — `cargo search`.
-///
-/// Hosted sources only. An upstream contributes nothing, the way an npm
-/// upstream does until its `search` is turned on, and searching one needs
-/// its `config.json` `api` base rather than the index base pnpr proxies.
 /// Add one hosted source's names to the page.
-///
-/// A hosted namespace shared with another ecosystem holds names that are not
-/// crate names. Dropping them before the position is claimed keeps them out of
-/// the page and out of the total, and costs no read.
 async fn add_crates_to_page(
     page: &mut SearchPage<SearchCrate>,
     storage: &pnpr_storage::Storage,
@@ -181,24 +177,26 @@ async fn search_crate(storage: &pnpr_storage::Storage, key: &CanonicalPackageNam
         CrateDocument::parse(&bytes).ok()
     }
     .await;
-    document
-        .as_ref()
-        .map_or_else(
-            || SearchCrate {
-                name: key.as_str().to_string(),
-                description: None,
-                max_version: String::new(),
-            },
-            CrateDocument::to_search_crate,
-        )
+    match &document {
+        Some(document) => document.to_search_crate(),
+        None => SearchCrate {
+            name: key.as_str().to_string(),
+            description: None,
+            max_version: String::new(),
+        },
+    }
 }
 
 /// A registry error in the crates API's JSON shape, so `cargo` prints the
 /// detail instead of a bare status.
 fn error_response(err: RegistryError) -> Response {
     let detail = err.public_message();
-    let status = err.into_response().status();
-    json_response(status, &errors_json(&detail))
+    let original = err.into_response();
+    let mut response = json_response(original.status(), &errors_json(&detail));
+    if let Some(retry_after) = original.headers().get(header::RETRY_AFTER) {
+        response.headers_mut().insert(header::RETRY_AFTER, retry_after.clone());
+    }
+    response
 }
 
 fn bad_request(reason: impl Display) -> Response {
@@ -432,3 +430,6 @@ fn parse_upstream_index(index: &str, name: &str) -> Result<Vec<IndexEntry>, Regi
             reason: err.to_string(),
         })
 }
+
+#[cfg(test)]
+mod tests;

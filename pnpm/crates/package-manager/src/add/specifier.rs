@@ -1,32 +1,41 @@
+pub(super) use super::protocol_selector::ProtocolSelector;
 use super::{
-    AddError, AddOptions, AddResolution, AddResolveInputs,
-    aliasless::{AliaslessDependency, resolve_aliasless_specifier},
+    AddError, AddResolveInputs,
+    alias::{npm_alias_target, resolve_npm_alias_save_specifier},
     manifest::apply_catalog_decision,
+    protocol_selector::resolve_jsr_save_specifier,
+    range_fallback::add_range_fallback,
     registry::{pick_latest_range, resolve_explicit_registry_spec},
+    selector::AddSelector,
+    workspace_specifier::workspace_save_specifier,
 };
-use crate::{CatalogModeDep, decide_catalog_outcome};
+use crate::{
+    CatalogModeDep, decide_catalog_outcome,
+    runtime_specifier::{node_runtime_version_spec, runtime_save_specifier},
+};
 use pnpm_catalogs_types::Catalogs;
-use pnpm_config::{Config, SaveWorkspaceProtocol};
+use pnpm_config::Tool;
 use pnpm_engine_runtime_node_resolver::NodeResolver;
 use pnpm_package_manifest::{DependencyGroup, PackageManifest};
-use pnpm_package_name::is_valid_dependency_alias;
-use pnpm_registry::RangeSpecStyle;
 use pnpm_reporter::LogEvent;
 use pnpm_resolving_git_resolver::{HostedGit, HostedOpts};
-use pnpm_resolving_jsr_specifier_parser::{JsrSpec, parse_jsr_specifier};
-use pnpm_resolving_npm_resolver::{
-    DeclaredSpecifiers, calc_specifier_for_workspace_dep, parse_bare_specifier,
-    pick_matching_local_version_or_null, pick_registry_for_package,
-};
-use pnpm_resolving_resolver_base::WorkspacePackages;
-use pnpm_workspace_range_resolver::resolve_workspace_range;
-use pnpm_workspace_spec::WorkspaceSpec;
 
 pub(super) struct ResolvedAddedDependency {
     pub(super) package_name: String,
     pub(super) manifest_specifier: String,
     pub(super) updated_catalogs: Catalogs,
-    pub(super) warning: Option<LogEvent>,
+    pub(super) warnings: Vec<LogEvent>,
+    pub(super) types_selector: Option<String>,
+    /// The version an explicit registry specifier resolved to, which the
+    /// install must lock.
+    pub(super) picked: Option<PickedPackage>,
+}
+/// A registry package version picked while resolving an added selector.
+pub(super) struct PickedPackage {
+    /// The registry name, which differs from the dependency's alias for a
+    /// `jsr:` selector.
+    pub(super) name: String,
+    pub(super) version: String,
 }
 pub(super) async fn resolve_added_dependency(
     package_selector: &str,
@@ -36,7 +45,7 @@ pub(super) async fn resolve_added_dependency(
     let selector = AddSelector::parse(package_selector, manifest, inputs).await?;
     let package_name = selector.package_name(package_selector);
     let prev_specifier = declared_specifier(manifest, package_name);
-    let bare_specifier = bare_save_specifier(
+    let SaveSpecifier { specifier: bare_specifier, picked } = bare_save_specifier(
         package_selector,
         &selector,
         prev_specifier.as_deref(),
@@ -44,15 +53,73 @@ pub(super) async fn resolve_added_dependency(
         inputs,
     )
     .await?;
+    let types_selector =
+        super::types::resolve_types_selector(package_name, &bare_specifier, manifest, inputs)
+            .await?;
+    let (manifest_specifier, mut updated_catalogs, mut warnings) = resolve_catalog_and_warnings(
+        inputs,
+        package_name,
+        bare_specifier,
+        prev_specifier.as_deref(),
+        package_selector,
+        picked.as_ref(),
+    )?;
+    if let Some(picked) =
+        picked.as_ref().filter(|_| pins_dist_tag(package_selector, inputs.add.config.default_tag()))
+    {
+        pin_catalog_entry(&mut updated_catalogs, package_name, &picked.version);
+    }
+    warnings.extend(selector.linked_peer_dependencies_warning(package_name, inputs.prefix));
+    Ok(ResolvedAddedDependency {
+        package_name: package_name.to_string(),
+        manifest_specifier,
+        updated_catalogs,
+        warnings,
+        types_selector,
+        picked,
+    })
+}
+
+/// Whether the selector asks for a dist-tag other than `latest`, whose new
+/// catalog entry [`pin_catalog_entry`] pins.
+fn pins_dist_tag(package_selector: &str, default_tag: &str) -> bool {
+    super::registry::requested_dist_tag(package_selector, Some(default_tag))
+        .is_some_and(|tag| tag != "latest")
+}
+
+/// A catalog entry written for a dist-tag records the exact version the tag
+/// pointed to, so the catalog does not drift when the tag moves.
+fn pin_catalog_entry(updated_catalogs: &mut Catalogs, package_name: &str, version: &str) {
+    for entry in updated_catalogs
+        .values_mut()
+        .filter_map(|catalog| catalog.get_mut(package_name))
+    {
+        *entry = version.to_string();
+    }
+}
+
+fn resolve_catalog_and_warnings(
+    inputs: &AddResolveInputs<'_, '_>,
+    package_name: &str,
+    bare_specifier: String,
+    prev_specifier: Option<&str>,
+    package_selector: &str,
+    picked: Option<&PickedPackage>,
+) -> Result<(String, Catalogs, Vec<LogEvent>), AddError> {
     let mut updated_catalogs = Catalogs::new();
+    // A tag resolved locally through `linkWorkspacePackages` names no registry
+    // version, so it cannot match a catalog entry.
+    let requested_dist_tag =
+        picked.and_then(|_| super::registry::requested_dist_tag(package_selector, None));
     let outcome = decide_catalog_outcome(
         inputs.add.config.catalog_mode,
-        inputs.save_catalog_name,
+        inputs.owned.save_catalog_name.as_deref(),
         inputs.catalogs,
         &CatalogModeDep {
             alias: package_name,
             bare_specifier: &bare_specifier,
-            prev_specifier: prev_specifier.as_deref(),
+            requested_dist_tag,
+            prev_specifier,
         },
         inputs.prefix,
     )
@@ -63,52 +130,14 @@ pub(super) async fn resolve_added_dependency(
         bare_specifier,
         &mut updated_catalogs,
     );
-    Ok(ResolvedAddedDependency {
-        package_name: package_name.to_string(),
-        manifest_specifier,
-        updated_catalogs,
-        warning: outcome.warning,
-    })
-}
-/// A selector as parsed: its protocol, and the package an aliasless
-/// specifier names once resolved.
-pub(super) struct AddSelector {
-    protocol: Option<ProtocolSelector>,
-    aliasless: Option<AliaslessDependency>,
-}
-impl AddSelector {
-    async fn parse(
-        package_selector: &str,
-        manifest: &PackageManifest,
-        inputs: &AddResolveInputs<'_, '_>,
-    ) -> Result<Self, AddError> {
-        let parsed =
-            pnpm_resolving_parse_wanted_dependency::parse_wanted_dependency(package_selector);
-        let protocol = ProtocolSelector::parse(package_selector)?;
-        let aliasless = match (parsed.alias.as_deref(), parsed.bare_specifier.as_deref()) {
-            (None, Some(specifier)) if protocol.is_none() => {
-                resolve_aliasless_specifier(specifier, inputs, manifest).await?
-            }
-            _ => None,
-        };
-        Ok(Self { protocol, aliasless })
-    }
-
-    fn package_name<'s>(&'s self, package_selector: &'s str) -> &'s str {
-        match (self.aliasless.as_ref(), self.protocol.as_ref()) {
-            (Some(dep), _) => dep.package_name.as_str(),
-            (None, Some(protocol)) => protocol.package_name(),
-            (None, None) => split_name_spec(package_selector).0,
-        }
-    }
-
-    fn explicit_spec<'s>(&'s self, package_selector: &'s str) -> Option<&'s str> {
-        match (self.aliasless.as_ref(), self.protocol.as_ref()) {
-            (Some(dep), _) => Some(dep.manifest_specifier.as_str()),
-            (None, Some(protocol)) => protocol.explicit_spec(package_selector),
-            (None, None) => split_name_spec(package_selector).1,
-        }
-    }
+    let warnings = super::source::collect_dependency_warnings(
+        outcome.warning,
+        prev_specifier,
+        package_selector,
+        package_name,
+        inputs.prefix,
+    );
+    Ok((manifest_specifier, updated_catalogs, warnings))
 }
 /// The dependency's current specifier, so a re-add keeps the
 /// existing range / `catalog:` reference rather than re-pinning to
@@ -133,28 +162,42 @@ pub(super) fn declared_specifier(manifest: &PackageManifest, package_name: &str)
 /// - an explicit `@<version>` is resolved to a concrete version and
 ///   recorded with the range operator it (or the existing entry)
 ///   pins — `pnpm add foo@^7` records `^7.8.4`, not
-///   `^7`. Specifiers that aren't a plain registry range/tag/version
-///   for this package (protocols, `npm:` aliases) stay verbatim;
+///   `^7`. An `npm:` alias records its target the same way —
+///   `pnpm add v2@npm:foo@1` records `npm:foo@^1.0.0`. Other protocols
+///   stay verbatim;
 /// - an explicit `node@runtime:<spec>` is likewise pinned to the
 ///   picked Node.js version, so the `devEngines.runtime` entry the
 ///   saved dependency folds into records e.g. `26.5.0`, not the
 ///   requested `26`;
+/// - an explicit `deno` / `bun` `tool:` or `runtime:` request is saved as
+///   `runtime:`, the spelling its folded declaration reads back as;
 /// - a `jsr:` selector is pinned the same way and rendered back under
 ///   its protocol — `pnpm add jsr:@scope/pkg` records `jsr:^1.2.3`;
 /// - a re-add with no version keeps the dependency's current
 ///   specifier verbatim (a `catalog:` reference, a range, or an
 ///   exact pin) — `pnpm add <existing>` without a
 ///   version leaves the declared range untouched;
-/// - a brand-new dependency fetches and pins the `latest` range.
+/// - a brand-new dependency the catalog already lists takes the
+///   `catalog:` reference — naming no version asks for whatever the
+///   workspace agreed on, which is the entry, not the `latest` range
+///   it happens to resolve to today;
+/// - any other brand-new dependency takes the range the workspace
+///   projects agree on, or the one a matching override sets
+///   ([`add_range_fallback`]), and otherwise fetches and pins the range of
+///   the configured `tag`, `latest` by default.
 pub(super) async fn bare_save_specifier(
     package_selector: &str,
     selector: &AddSelector,
     prev_specifier: Option<&str>,
     manifest: &PackageManifest,
     inputs: &AddResolveInputs<'_, '_>,
-) -> Result<String, AddError> {
+) -> Result<SaveSpecifier, AddError> {
     let package_name = selector.package_name(package_selector);
     let explicit_spec = selector.explicit_spec(package_selector);
+    if let Some(ProtocolSelector::Npm { name, spec }) = npm_alias_target(package_selector)? {
+        return resolve_npm_alias_save_specifier(&name, spec, prev_specifier, manifest, inputs)
+            .await;
+    }
     if let Some(workspace_specifier) = workspace_save_specifier(
         package_name,
         explicit_spec,
@@ -163,31 +206,146 @@ pub(super) async fn bare_save_specifier(
         inputs.add.range_spec_style,
         inputs.workspace_packages,
     ) {
-        return Ok(workspace_specifier);
+        return Ok(workspace_specifier.into());
     }
-    if let Some(version_spec) = node_runtime_version_spec(package_name, explicit_spec) {
-        return resolve_node_runtime_specifier(version_spec, prev_specifier, inputs).await;
+    if let Some(version_spec) =
+        explicit_spec.and_then(|spec| node_runtime_version_spec(package_name, spec))
+    {
+        return resolve_node_runtime_specifier(version_spec, prev_specifier, inputs)
+            .await
+            .map(SaveSpecifier::from);
+    }
+    if let Some(specifier) =
+        explicit_spec.and_then(|spec| runtime_save_specifier(package_name, spec))
+    {
+        return Ok(specifier.into());
     }
     if let Some(ProtocolSelector::Jsr(jsr)) = selector.protocol.as_ref() {
-        return Ok(resolve_jsr_save_specifier(jsr, inputs.add, manifest, inputs.resolution)
-            .await?
-            .unwrap_or_else(|| package_selector.to_string()));
+        return Ok(resolve_jsr_save_specifier(jsr, manifest, inputs).await?
+            .unwrap_or_else(|| package_selector.to_string().into()));
     }
+    registry_save_specifier(package_name, explicit_spec, prev_specifier, manifest, inputs).await
+}
+/// [`bare_save_specifier`] for a plain registry selector.
+async fn registry_save_specifier(
+    package_name: &str,
+    explicit_spec: Option<&str>,
+    prev_specifier: Option<&str>,
+    manifest: &PackageManifest,
+    inputs: &AddResolveInputs<'_, '_>,
+) -> Result<SaveSpecifier, AddError> {
     match (explicit_spec, prev_specifier) {
-        (Some(spec), prev) => Ok(resolve_explicit_registry_spec(
-            package_name,
-            spec,
-            prev,
-            inputs.add,
-            manifest,
-            inputs.resolution,
-        )
-        .await?
-        .unwrap_or_else(|| normalized_save_specifier(spec))),
-        (None, Some(prev)) => Ok(prev.to_string()),
-        (None, None) => pick_latest_range(package_name, inputs).await,
+        (Some(spec), prev) => {
+            explicit_registry_save_specifier(package_name, spec, prev, manifest, inputs).await
+        }
+        (None, Some(prev)) => Ok(prev.to_string().into()),
+        (None, None) => {
+            if let Some(specifier) = cataloged_specifier(package_name, inputs) {
+                return Ok(specifier.into());
+            }
+            if let Some(range) = add_range_fallback(package_name, manifest, inputs)? {
+                return resolve_fallback_range(package_name, &range, manifest, inputs).await;
+            }
+            match inputs.add.config.default_tag() {
+                // The default tag keeps the shared picker every plain add uses.
+                "latest" => {
+                    pick_latest_range(package_name, manifest, inputs).await.map(SaveSpecifier::from)
+                }
+                tag => {
+                    explicit_registry_save_specifier(package_name, tag, None, manifest, inputs)
+                        .await
+                }
+            }
+        }
     }
 }
+/// A fallback `range` resolved and re-rendered in the configured range
+/// style.
+pub(super) async fn resolve_fallback_range(
+    package_name: &str,
+    range: &str,
+    manifest: &PackageManifest,
+    inputs: &AddResolveInputs<'_, '_>,
+) -> Result<SaveSpecifier, AddError> {
+    let mut resolved =
+        explicit_registry_save_specifier(package_name, range, None, manifest, inputs).await?;
+    if let Some(picked) = &resolved.picked {
+        let version = picked.version.parse().expect("picked versions are valid");
+        let previous_specifier = match pnpm_resolving_npm_resolver::infer_range_spec_style(range) {
+            Some(pnpm_registry::RangeSpecStyle::Patch | pnpm_registry::RangeSpecStyle::Exact) => {
+                None
+            }
+            _ => Some(range),
+        };
+        resolved.specifier = pnpm_resolving_npm_resolver::calc_version_range(
+            &version,
+            previous_specifier,
+            None,
+            inputs.add.range_spec_style,
+        );
+    }
+    Ok(resolved)
+}
+/// [`registry_save_specifier`] for a registry selector that names `spec`.
+pub(super) async fn explicit_registry_save_specifier(
+    package_name: &str,
+    spec: &str,
+    prev_specifier: Option<&str>,
+    manifest: &PackageManifest,
+    inputs: &AddResolveInputs<'_, '_>,
+) -> Result<SaveSpecifier, AddError> {
+    Ok(
+        match resolve_explicit_registry_spec(package_name, spec, prev_specifier, manifest, inputs)
+            .await?
+        {
+            Some(picked) => SaveSpecifier {
+                specifier: picked.range,
+                picked: Some(PickedPackage {
+                    name: package_name.to_string(),
+                    version: picked.version,
+                }),
+            },
+            None => normalized_save_specifier(spec).into(),
+        },
+    )
+}
+/// What [`bare_save_specifier`] records, and the version it resolved an
+/// explicit registry specifier to.
+pub(super) struct SaveSpecifier {
+    pub(super) specifier: String,
+    pub(super) picked: Option<PickedPackage>,
+}
+impl From<String> for SaveSpecifier {
+    fn from(specifier: String) -> Self {
+        Self { specifier, picked: None }
+    }
+}
+/// The `catalog:` reference for a dependency the catalog already lists, or
+/// `None` when it lists no entry for it.
+fn cataloged_specifier(package_name: &str, inputs: &AddResolveInputs<'_, '_>) -> Option<String> {
+    let catalog_name = listing_catalog_name(
+        package_name,
+        inputs.catalogs,
+        inputs.owned.save_catalog_name.as_deref(),
+    )?;
+    Some(if catalog_name == pnpm_catalogs_types::DEFAULT_CATALOG_NAME {
+        "catalog:".to_string()
+    } else {
+        format!("catalog:{catalog_name}")
+    })
+}
+
+/// The catalog `pnpm add` saves to, when it lists `package_name`.
+pub(super) fn listing_catalog_name<'a>(
+    package_name: &str,
+    catalogs: &Catalogs,
+    save_catalog_name: Option<&'a str>,
+) -> Option<&'a str> {
+    let catalog_name = crate::per_dep_catalog_name(None, save_catalog_name);
+    catalogs.get(catalog_name)?.get(package_name)?;
+    Some(catalog_name)
+}
+
 pub(super) async fn resolve_node_runtime_specifier(
     version_spec: &str,
     prev_specifier: Option<&str>,
@@ -195,219 +353,18 @@ pub(super) async fn resolve_node_runtime_specifier(
 ) -> Result<String, AddError> {
     let config = inputs.add.config;
     let mut node_resolver = NodeResolver::new_with_auth(
-        std::sync::Arc::clone(inputs.http_client_arc),
+        std::sync::Arc::clone(&inputs.owned.http_client_arc),
         std::sync::Arc::clone(&config.auth_headers),
     );
     node_resolver.node_download_mirrors.clone_from(&config.node_download_mirrors);
+    node_resolver.mirror = config.tool_mirror(Tool::Node).map(ToString::to_string);
+    node_resolver.channel_mirrors = config.tool_channel_mirrors(Tool::Node);
     node_resolver.offline = config.offline;
     node_resolver.cache_dir = Some(config.cache_dir.clone());
     node_resolver
         .resolve_save_specifier(version_spec, prev_specifier)
         .await
         .map_err(AddError::ResolveRuntimeSpec)
-}
-/// Index the workspace projects by name and version, or `None` when
-/// there is no workspace or it cannot be enumerated.
-///
-/// A failure to walk the workspace is not this function's problem to
-/// report — the install that follows the manifest write surfaces it with
-/// far more context — so it degrades to "no workspace packages", which
-/// only costs the pinned form its version.
-pub(super) fn workspace_packages_for_add(config: &Config) -> Option<WorkspacePackages> {
-    let workspace_dir = config.workspace_dir.as_ref()?;
-    let manifest = pnpm_workspace::read_workspace_manifest(workspace_dir).ok()??;
-    let projects = pnpm_workspace::find_workspace_projects(
-        workspace_dir,
-        &pnpm_workspace::FindWorkspaceProjectsOpts {
-            patterns: Some(pnpm_workspace::workspace_package_patterns(&manifest)),
-        },
-    )
-    .ok()?;
-    crate::install::build_workspace_packages_map(Some(&projects))
-}
-/// The `workspace:` specifier to save for `package_name`, or `None`
-/// when this add isn't a workspace dependency.
-///
-/// A relative `workspace:./pkg` is left alone: it names a directory, not
-/// a range, so there is no operator to roll.
-pub(super) fn workspace_save_specifier(
-    package_name: &str,
-    explicit_spec: Option<&str>,
-    prev_specifier: Option<&str>,
-    config: &Config,
-    range_spec_style: RangeSpecStyle,
-    workspace_packages: Option<&WorkspacePackages>,
-) -> Option<String> {
-    let (target_name, resolved_version) = match explicit_spec.and_then(WorkspaceSpec::parse) {
-        Some(spec) => explicit_workspace_target(spec, package_name, workspace_packages)?,
-        None => implicit_workspace_target(package_name, explicit_spec, config, workspace_packages)?,
-    };
-    let workspace_specifier = calc_specifier_for_workspace_dep(
-        DeclaredSpecifiers { prev: prev_specifier, bare: explicit_spec },
-        Some(package_name),
-        &target_name,
-        resolved_version.as_deref(),
-        config.save_workspace_protocol,
-        range_spec_style,
-    );
-    if config.save_workspace_protocol == SaveWorkspaceProtocol::Off
-        && !explicit_spec.is_some_and(|specifier| specifier.starts_with("workspace:"))
-    {
-        return workspace_specifier.strip_prefix("workspace:").map(str::to_string);
-    }
-    Some(workspace_specifier)
-}
-/// The workspace package a `workspace:` specifier names. A path form
-/// (`workspace:./pkg`) names no package here.
-pub(super) fn explicit_workspace_target(
-    spec: WorkspaceSpec,
-    package_name: &str,
-    workspace_packages: Option<&WorkspacePackages>,
-) -> Option<(String, Option<String>)> {
-    if spec.version.starts_with('.') {
-        return None;
-    }
-    let target_name = spec.alias.unwrap_or_else(|| package_name.to_string());
-    let resolved_version = workspace_packages
-        .and_then(|packages| packages.get(&target_name))
-        .and_then(|versions| {
-            let available: Vec<String> = versions.keys().cloned().collect();
-            // Not `spec.version`: the pinned form records the local
-            // package's own version, which wins over the range the
-            // user typed.
-            resolve_workspace_range("*", &available)
-        });
-    Some((target_name, resolved_version))
-}
-/// The workspace package a plain registry request resolves to locally, when
-/// `linkWorkspacePackages` lets it.
-pub(super) fn implicit_workspace_target(
-    package_name: &str,
-    explicit_spec: Option<&str>,
-    config: &Config,
-    workspace_packages: Option<&WorkspacePackages>,
-) -> Option<(String, Option<String>)> {
-    if !config.link_workspace_packages.enabled_at_depth(0) {
-        return None;
-    }
-    if explicit_spec.is_some_and(|specifier| specifier.starts_with("npm:")) {
-        return None;
-    }
-    let registries: std::collections::HashMap<String, String> = config
-        .resolved_registries()
-        .into_iter()
-        .collect();
-    let registry = pick_registry_for_package(&registries, package_name, explicit_spec);
-    let parsed = parse_bare_specifier(
-        explicit_spec.unwrap_or("latest"),
-        Some(package_name),
-        "latest",
-        &registry,
-    )?;
-    if parsed.name != package_name || parsed.normalized_bare_specifier.is_some() {
-        return None;
-    }
-    let versions = workspace_packages?.get(package_name)?;
-    let resolved_version = pick_matching_local_version_or_null(versions, &parsed)?;
-    Some((package_name.to_string(), Some(resolved_version)))
-}
-/// A `pacquet add` argument that spells its package name *inside* a
-/// dependency protocol, so the manifest key cannot be read off the front of
-/// the argument: `pacquet add jsr:@scope/pkg` keys on `@scope/pkg`, not on
-/// `jsr:`.
-///
-/// `catalog:` has no variant. The text after it names a catalog, not a
-/// package, so `catalog:foo` carries no name to key an entry by.
-pub(super) enum ProtocolSelector {
-    /// `npm:<name>[@<spec>]`. Nothing here is aliased — the install name is
-    /// the real package name — so the entry is saved as the plain
-    /// `<name>[@<spec>]` request would be.
-    Npm { name: String, spec: Option<String> },
-    /// `jsr:@<scope>/<name>[@<selector>]`.
-    Jsr(JsrSpec),
-    /// The alias form `workspace:<name>@<range>`. A version-only
-    /// (`workspace:^1.2.3`) or path (`workspace:./pkg`, `workspace:C:\pkg`)
-    /// specifier names no package, and [`WorkspaceSpec`] already tells the
-    /// three apart.
-    Workspace { name: String },
-}
-impl ProtocolSelector {
-    /// Returns `Ok(None)` for an argument that carries no name-bearing
-    /// protocol, so the caller falls through to the alias-less resolvers
-    /// and then to [`split_name_spec`].
-    pub(super) fn parse(selector: &str) -> Result<Option<Self>, AddError> {
-        if let Some(rest) = selector.strip_prefix("npm:") {
-            let (name, spec) = split_name_spec(rest);
-            let name = protocol_package_name(name, selector)?;
-            return Ok(Some(Self::Npm { name, spec: spec.map(str::to_string) }));
-        }
-        if let Some(spec) =
-            parse_jsr_specifier(selector, None).map_err(AddError::ParseJsrSpecifier)?
-        {
-            return Ok(Some(Self::Jsr(spec)));
-        }
-        let Some(alias) = WorkspaceSpec::parse(selector).and_then(|spec| spec.alias) else {
-            return Ok(None);
-        };
-        let name = protocol_package_name(&alias, selector)?;
-        Ok(Some(Self::Workspace { name }))
-    }
-
-    pub(super) fn package_name(&self) -> &str {
-        match self {
-            Self::Npm { name, .. } | Self::Workspace { name } => name,
-            Self::Jsr(spec) => &spec.jsr_pkg_name,
-        }
-    }
-
-    /// The specifier half to reconcile against the manifest and the
-    /// catalogs. `jsr:` and `workspace:` keep the whole argument, since what
-    /// is saved for them is rendered back under the protocol; an `npm:`
-    /// request keeps only the registry range it wraps.
-    pub(super) fn explicit_spec<'a>(&'a self, selector: &'a str) -> Option<&'a str> {
-        match self {
-            Self::Npm { spec, .. } => spec.as_deref(),
-            Self::Jsr(_) | Self::Workspace { .. } => Some(selector),
-        }
-    }
-}
-pub(super) fn protocol_package_name(name: &str, selector: &str) -> Result<String, AddError> {
-    if !is_valid_dependency_alias(name) {
-        return Err(AddError::InvalidPackageName {
-            specifier: selector.to_string(),
-            name: name.to_string(),
-        });
-    }
-    Ok(name.to_string())
-}
-/// The `jsr:` specifier to save for `spec`, with the version the install
-/// will lock pinned into it: `pacquet add jsr:@scope/pkg` records
-/// `jsr:^1.2.3` and `jsr:@scope/pkg@0.1` records `jsr:~0.1.0`.
-///
-/// JSR ships every package on npm under the `@jsr` scope, so the version is
-/// picked through the same registry path a plain `@jsr/<scope>__<name>` add
-/// takes. `None` when that pick finds no version — the caller then keeps the
-/// argument verbatim, as it does for any other unresolvable specifier.
-pub(super) async fn resolve_jsr_save_specifier(
-    spec: &JsrSpec,
-    add: AddOptions<'_>,
-    manifest: &PackageManifest,
-    resolution: &AddResolution<'_>,
-) -> Result<Option<String>, AddError> {
-    let version_selector = spec.version_selector.as_deref().unwrap_or("latest");
-    let range = resolve_explicit_registry_spec(
-        &spec.npm_pkg_name,
-        version_selector,
-        // The range operator is read off the selector the user typed, the
-        // way pnpm reads it for an alias-less request: there is no alias to
-        // find a manifest entry by.
-        None,
-        add,
-        manifest,
-        resolution,
-    )
-    .await?;
-    Ok(range.map(|range| format!("jsr:{range}")))
 }
 /// Split a `pacquet add` argument into its package name and optional
 /// `@<version>` part. The version separator is the first `@` at or after
@@ -441,17 +398,4 @@ pub(super) fn normalized_save_specifier(spec: &str) -> String {
         Some(hosted) if hosted.auth.is_none() => hosted.shortcut(HostedOpts::default()),
         _ => spec.to_string(),
     }
-}
-/// The `<spec>` half of an explicit `node@runtime:<spec>` request, when that
-/// is what's being added. Only the node resolver pins the saved specifier to
-/// the picked version; deno and bun normalize to the requested spec, so they
-/// stay on the verbatim save path.
-pub(super) fn node_runtime_version_spec<'a>(
-    package_name: &str,
-    explicit_spec: Option<&'a str>,
-) -> Option<&'a str> {
-    if package_name != "node" {
-        return None;
-    }
-    explicit_spec?.strip_prefix("runtime:")
 }

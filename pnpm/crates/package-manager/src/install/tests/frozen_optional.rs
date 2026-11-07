@@ -11,17 +11,18 @@ use pnpm_modules_yaml::{
     read_modules_manifest, write_modules_manifest,
 };
 use pnpm_package_manifest::{DependencyGroup, PackageManifest};
-use pnpm_reporter::SilentReporter;
+use pnpm_reporter::{
+    LogEvent, Reporter, SilentReporter, SkippedOptionalPackage, SkippedOptionalReason, StatsLog,
+    StatsMessage,
+};
+use std::sync::Mutex;
 use tempfile::tempdir;
 use text_block_macros::text_block;
 
-/// GVS-off frozen-lockfile install. The dispatch path is the same,
-/// but `Install::run` skips the project-registry write entirely.
-/// Pins that turning off `enable_global_virtual_store` makes the
-/// install behave like today — no `<store_dir>/projects/` directory
-/// appears.
+/// GVS-off frozen-lockfile install still registers the project in
+/// `<store_dir>/projects/`.
 #[tokio::test]
-async fn frozen_lockfile_with_gvs_off_skips_project_registry() {
+async fn frozen_lockfile_with_gvs_off_registers_the_project() {
     let dirs = InstallDirs::new();
 
     std::fs::create_dir_all(&dirs.project_root).expect("create project root");
@@ -33,7 +34,7 @@ async fn frozen_lockfile_with_gvs_off_skips_project_registry() {
     config.lockfile = false;
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
     let config = config.leak();
 
     let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
@@ -91,16 +92,21 @@ async fn frozen_lockfile_with_gvs_off_skips_project_registry() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
     .await
     .expect("frozen-lockfile install with GVS off should succeed");
 
-    assert!(
-        !dirs.store_dir.join("v11/projects").exists(),
-        "GVS-off install must NOT create the project-registry directory",
-    );
+    let registered: Vec<_> = pnpm_store_dir::get_registered_projects(&config.store_dir)
+        .expect("list registered projects")
+        .iter()
+        .map(|project| dunce::canonicalize(project).expect("resolve registered project"))
+        .collect();
+    let project_root = dunce::canonicalize(&dirs.project_root).expect("resolve project root");
+    assert_eq!(registered, [project_root]);
 
     drop(dirs.dir);
 }
@@ -132,7 +138,7 @@ async fn frozen_lockfile_under_gvs_registers_workspace_root_only() {
     config.lockfile = false;
     config.store_dir = store_dir.clone().into();
     config.modules_dir = modules_dir.clone();
-    config.virtual_store_dir = virtual_store_dir.clone();
+    config.install_state_dir = virtual_store_dir.clone();
     config.global_virtual_store_dir = store_dir.join("links");
     let config = config.leak();
 
@@ -196,6 +202,8 @@ async fn frozen_lockfile_under_gvs_registers_workspace_root_only() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -252,7 +260,7 @@ async fn frozen_install_preserves_seeded_skipped_across_reinstall() {
     config.lockfile = false;
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
     let config = config.leak();
 
     // Pre-write `.modules.yaml` with a non-empty `skipped` list —
@@ -332,6 +340,8 @@ async fn frozen_install_preserves_seeded_skipped_across_reinstall() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -364,8 +374,8 @@ async fn frozen_install_preserves_seeded_skipped_across_reinstall() {
 }
 /// Scenario: skipping an optional dependency if it cannot be fetched.
 /// An `optional: true` snapshot whose tarball URL is unreachable must
-/// not abort the install — the failure is silently swallowed at
-/// the per-snapshot fetch dispatch in `CreateVirtualStore`.
+/// not abort the install — the failure is swallowed at the
+/// per-snapshot fetch dispatch in `CreateVirtualStore`.
 ///
 /// Asserts:
 /// 1. The install resolves `Ok` (no abort).
@@ -374,10 +384,26 @@ async fn frozen_install_preserves_seeded_skipped_across_reinstall() {
 ///    broken snapshot — fetch failures are transient (the catch site
 ///    never updates `opts.skipped`), so a subsequent install retries
 ///    the fetch.
+/// 4. The skip is reported as `pnpm:skipped-optional-dependency` with
+///    `reason=fetch_failure`, and `pnpm:stats` does not count the
+///    package as added (<https://github.com/pnpm/pnpm/issues/16514>).
 #[tokio::test]
-async fn frozen_install_silently_swallows_unreachable_optional_tarball() {
+async fn frozen_install_swallows_and_reports_unreachable_optional_tarball() {
+    static EVENTS: Mutex<Vec<LogEvent>> = Mutex::new(Vec::new());
+    EVENTS.lock().unwrap().clear();
+
+    struct RecordingReporter;
+    impl Reporter for RecordingReporter {
+        fn emit(event: &LogEvent) {
+            EVENTS
+                .lock()
+                .unwrap()
+                .push(event.clone());
+        }
+    }
+
     // Lockfile with one `optional: true` snapshot whose `tarball` URL
-    // dials `127.0.0.1:1` (a reserved port that always refuses) so
+    // dials `0.0.0.0:1`, whose connect fails at once on every OS, so
     // the fetch reliably fails without a network round-trip. The
     // integrity is arbitrary — we never get far enough to verify it.
     const BROKEN_OPTIONAL_LOCKFILE: &str = text_block! {
@@ -390,7 +416,7 @@ async fn frozen_install_silently_swallows_unreachable_optional_tarball() {
         "        version: 1.0.0"
         "packages:"
         "  broken-pkg@1.0.0:"
-        "    resolution: {integrity: sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA, tarball: 'http://127.0.0.1:1/broken.tgz'}"
+        "    resolution: {integrity: sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA, tarball: 'http://0.0.0.0:1/broken.tgz'}"
         "snapshots:"
         "  broken-pkg@1.0.0:"
         "    optional: true"
@@ -416,8 +442,8 @@ async fn frozen_install_silently_swallows_unreachable_optional_tarball() {
     config.enable_global_virtual_store = false;
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
-    // Keep retries minimal — 127.0.0.1:1 fails immediately on every
+    config.install_state_dir = dirs.virtual_store_dir.clone();
+    // Keep retries minimal: 0.0.0.0:1 fails immediately on every
     // try, but a long retry schedule would dominate the test runtime.
     config.fetch_retries = 0;
     config.minimum_release_age = None;
@@ -432,7 +458,7 @@ async fn frozen_install_silently_swallows_unreachable_optional_tarball() {
             prefer_frozen: None,
             ignore_manifest_check: false,
             // The lockfile-resolution verifier is unrelated to what this test
-            // exercises (the optional-tarball swallow path) and now always runs;
+            // exercises (the optional-tarball swallow path);
             // its fail-closed tarball-URL check would otherwise try to fetch
             // metadata for `broken-pkg` from the unreachable default registry and
             // abort the install before the optional-snapshot code path runs.
@@ -477,9 +503,11 @@ async fn frozen_install_silently_swallows_unreachable_optional_tarball() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
-    .run::<SilentReporter>()
+    .run::<RecordingReporter>()
     .await
     .expect("install must NOT abort when an optional snapshot fails to fetch");
 
@@ -505,6 +533,47 @@ async fn frozen_install_silently_swallows_unreachable_optional_tarball() {
         written.skipped,
     );
 
+    let events = EVENTS.lock().unwrap();
+    let skipped: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            LogEvent::SkippedOptionalDependency(log) => Some(log),
+            _ => None,
+        })
+        .collect();
+    let [log] = skipped.as_slice() else {
+        panic!("expected one skipped-optional-dependency event, got {skipped:?}");
+    };
+    assert_eq!(log.reason, SkippedOptionalReason::FetchFailure);
+    assert!(
+        matches!(
+            &log.package,
+            SkippedOptionalPackage::Installed { id, name, version }
+                if id == "broken-pkg@1.0.0" && name == "broken-pkg" && version == "1.0.0",
+        ),
+        "unexpected package: {:?}",
+        log.package,
+    );
+    assert!(
+        log.details
+            .as_deref()
+            .is_some_and(|details| details.contains("broken.tgz")),
+        "details must name the failed fetch, got {:?}",
+        log.details,
+    );
+    let added: Vec<u64> = events
+        .iter()
+        .filter_map(|event| match event {
+            LogEvent::Stats(StatsLog {
+                message: StatsMessage::Added { added, .. },
+                ..
+            }) => Some(*added),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(added, [0], "a skipped optional package must not be counted as added");
+    drop(events);
+
     drop(dirs.dir);
 }
 /// The fetch-failure swallow is gated on `snapshot.optional`. A
@@ -525,7 +594,7 @@ async fn frozen_install_propagates_non_optional_fetch_failure() {
         "        version: 1.0.0"
         "packages:"
         "  broken-pkg@1.0.0:"
-        "    resolution: {integrity: sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA, tarball: 'http://127.0.0.1:1/broken.tgz'}"
+        "    resolution: {integrity: sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA, tarball: 'http://0.0.0.0:1/broken.tgz'}"
         "snapshots:"
         "  broken-pkg@1.0.0: {}"
     };
@@ -546,7 +615,7 @@ async fn frozen_install_propagates_non_optional_fetch_failure() {
     config.enable_global_virtual_store = false;
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
     config.fetch_retries = 0;
     let config = config.leak();
 
@@ -558,7 +627,10 @@ async fn frozen_install_propagates_non_optional_fetch_failure() {
             frozen: true,
             prefer_frozen: None,
             ignore_manifest_check: false,
-            trust: false,
+            // As in the sister test: without it the lockfile verifier fetches
+            // `broken-pkg` metadata from the live default registry and fails
+            // the install before the tarball fetch this test is about.
+            trust: true,
             update_checksums: false,
             excludes: PolicyExcludes::Persist,
             disable_optimistic_repeat: false,
@@ -598,26 +670,32 @@ async fn frozen_install_propagates_non_optional_fetch_failure() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
     .await;
 
-    assert!(result.is_err(), "non-optional fetch failure must abort the install, got {result:?}");
+    let error = result.expect_err("non-optional fetch failure must abort the install");
+    assert!(
+        format!("{error:?}").contains("DownloadTarball"),
+        "the install must abort on the tarball fetch, got {error:?}",
+    );
 
     drop(dirs.dir);
 }
 /// The frozen-install `--no-optional` scenario.
 ///
-/// The fixture is designed to discriminate slice 5 (`--no-optional`
-/// filter) from slice 4 (fetch-failure swallow): a snapshot with
+/// The fixture is designed to discriminate the `--no-optional`
+/// filter from the fetch-failure swallow: a snapshot with
 /// `optional: true` whose **metadata row is missing from
-/// `packages:`**. Slice 4's swallow only covers `DownloadTarball`
+/// `packages:`**. The swallow only covers `DownloadTarball`
 /// and `GitFetch` — `MissingPackageMetadata` propagates even for
-/// optional snapshots. So if slice 5's filter doesn't fire, the
-/// missing-metadata error aborts the install regardless of slice
-/// 4. A successful install therefore proves the snapshot was
-/// dropped **before** cache-key derivation by the slice 5 gate.
+/// optional snapshots. So if the filter doesn't fire, the
+/// missing-metadata error aborts the install.
+/// A successful install therefore proves the snapshot was
+/// dropped **before** cache-key derivation by the filter.
 ///
 /// When `!include.optionalDependencies`, every depNode whose
 /// `optional` flag is true is dropped from the install graph
@@ -625,14 +703,14 @@ async fn frozen_install_propagates_non_optional_fetch_failure() {
 ///
 /// Also asserts that `--no-optional` exclusions are **not**
 /// persisted to `.modules.yaml.skipped` — same convention as the
-/// fetch-failure swallow (slice 4): the exclusion is transient,
+/// fetch-failure swallow: the exclusion is transient,
 /// so a later install without `--no-optional` brings the snapshot
 /// back into the install graph.
 #[tokio::test]
 async fn frozen_install_no_optional_drops_optional_only_snapshots() {
     // Lockfile with one `optional: true` snapshot whose metadata
-    // row is intentionally missing from `packages:`. Slice 4
-    // (fetch-failure swallow) does NOT cover `MissingPackageMetadata`,
+    // row is intentionally missing from `packages:`. The
+    // fetch-failure swallow does NOT cover `MissingPackageMetadata`,
     // so reaching the cache-key derivation step would abort the
     // install. The `--no-optional` filter must drop the snapshot
     // before that step runs.
@@ -662,12 +740,11 @@ async fn frozen_install_no_optional_drops_optional_only_snapshots() {
     let mut config = Config::new();
     config.lockfile = false;
     // Opt out of GVS so the slot-path assertion targets the legacy
-    // `<dirs.virtual_store_dir>/<flat-name>` layout. Same pattern as the
-    // slice 4 swallow tests.
+    // `<dirs.virtual_store_dir>/<flat-name>` layout.
     config.enable_global_virtual_store = false;
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
     let config = config.leak();
 
     let lockfile: Lockfile = serde_saphyr::from_str(OPTIONAL_NO_METADATA_LOCKFILE)
@@ -722,6 +799,8 @@ async fn frozen_install_no_optional_drops_optional_only_snapshots() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -751,10 +830,10 @@ async fn frozen_install_no_optional_drops_optional_only_snapshots() {
 /// Polarity test for [`frozen_install_no_optional_drops_optional_only_snapshots`].
 /// Same fixture, but the dispatch list **includes** `Optional`. With
 /// the snapshot's metadata missing from `packages:`, the install
-/// must now abort with `MissingPackageMetadata` — slice 4's
+/// must now abort with `MissingPackageMetadata` — the
 /// fetch-failure swallow doesn't cover that variant, so the
 /// optional-ness alone doesn't save the install. Proves the
-/// slice 5 filter is gated on the dispatch list rather than firing
+/// filter is gated on the dispatch list rather than firing
 /// unconditionally.
 #[tokio::test]
 async fn frozen_install_optional_included_surfaces_missing_metadata() {
@@ -784,7 +863,7 @@ async fn frozen_install_optional_included_surfaces_missing_metadata() {
     config.enable_global_virtual_store = false;
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
     let config = config.leak();
 
     let lockfile: Lockfile = serde_saphyr::from_str(OPTIONAL_NO_METADATA_LOCKFILE)
@@ -835,6 +914,8 @@ async fn frozen_install_optional_included_surfaces_missing_metadata() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -854,31 +935,29 @@ async fn frozen_install_optional_included_surfaces_missing_metadata() {
 
     drop(dirs.dir);
 }
-/// Regression coverage for the shared-dependency case
-/// (`dependency that is both optional and non-optional is installed,
-/// when optional dependencies should be skipped`).
+/// Polarity test for [`frozen_install_no_optional_drops_optional_only_snapshots`]:
+/// `--no-optional` may drop a snapshot only when no non-optional edge
+/// reaches it.
 ///
 /// `SnapshotEntry::optional` is set by the resolver only
 /// when a snapshot is reachable **exclusively** through optional
-/// edges. A snapshot reachable through any non-optional edge carries
+/// edges. A snapshot reachable through a non-optional edge carries
 /// `optional: false` and **must not** be dropped by `--no-optional`.
 ///
-/// Fixture: a single snapshot `shared@1.0.0` with `optional: false`
-/// (default) and metadata missing from `packages:`. With
-/// `--no-optional`, the filter must skip this snapshot only if it
-/// checks the `optional` flag — if it accidentally drops every
-/// snapshot listed under `optionalDependencies` regardless of the
-/// flag, the install would silently succeed (the missing-metadata
-/// error wouldn't surface). Conversely, if the filter is correct,
-/// the install aborts with `MissingPackageMetadata` because the
-/// non-optional snapshot reaches cache-key derivation.
+/// Fixture: a single snapshot `shared@1.0.0` the importer declares
+/// under `dependencies`, with `optional: false` (default) and
+/// metadata missing from `packages:`. With `--no-optional`, the
+/// install must abort with `MissingPackageMetadata` because the
+/// snapshot reaches cache-key derivation. An install that dropped
+/// snapshots wholesale once `--no-optional` is in play would
+/// silently succeed instead.
 #[tokio::test]
 async fn frozen_install_no_optional_keeps_shared_non_optional_snapshot() {
     const SHARED_NON_OPTIONAL_LOCKFILE: &str = text_block! {
         "lockfileVersion: '9.0'"
         "importers:"
         "  .:"
-        "    optionalDependencies:"
+        "    dependencies:"
         "      shared:"
         "        specifier: 1.0.0"
         "        version: 1.0.0"
@@ -891,7 +970,7 @@ async fn frozen_install_no_optional_keeps_shared_non_optional_snapshot() {
 
     let manifest_path = dirs.path().join("package.json");
     let mut manifest = PackageManifest::create_if_needed(manifest_path).unwrap();
-    manifest.add_dependency("shared", "1.0.0", DependencyGroup::Optional).unwrap();
+    manifest.add_dependency("shared", "1.0.0", DependencyGroup::Prod).unwrap();
     manifest.save().unwrap();
 
     let mut config = Config::new();
@@ -899,7 +978,7 @@ async fn frozen_install_no_optional_keeps_shared_non_optional_snapshot() {
     config.enable_global_virtual_store = false;
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
     let config = config.leak();
 
     let lockfile: Lockfile = serde_saphyr::from_str(SHARED_NON_OPTIONAL_LOCKFILE)
@@ -951,6 +1030,8 @@ async fn frozen_install_no_optional_keeps_shared_non_optional_snapshot() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()

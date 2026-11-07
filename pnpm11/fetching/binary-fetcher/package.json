@@ -1,6 +1,6 @@
 {
   "name": "@pnpm/fetching.binary-fetcher",
-  "version": "1102.0.14",
+  "version": "1102.0.23",
   "description": "A fetcher for binary archives",
   "keywords": [
     "pnpm",
@@ -31,15 +31,19 @@
     ".test": "cross-env NODE_OPTIONS=\"$NODE_OPTIONS --experimental-vm-modules --disable-warning=ExperimentalWarning --disable-warning=DEP0169\" jest"
   },
   "dependencies": {
+    "@pnpm/core-loggers": "workspace:*",
     "@pnpm/error": "workspace:*",
     "@pnpm/fetching.fetcher-base": "workspace:*",
     "@pnpm/fetching.types": "workspace:*",
+    "@pnpm/network.fetch": "workspace:*",
+    "@pnpm/store.cafs": "workspace:*",
     "@pnpm/store.index": "workspace:*",
-    "adm-zip": "catalog:",
+    "@zkochan/retry": "catalog:",
     "is-subdir": "catalog:",
     "rename-overwrite": "catalog:",
     "ssri": "catalog:",
-    "tempy": "catalog:"
+    "tempy": "catalog:",
+    "yauzl": "catalog:"
   },
   "peerDependencies": {
     "@pnpm/worker": "workspace:^"
@@ -49,6 +53,8 @@
     "@pnpm/fetching.binary-fetcher": "workspace:*",
     "@types/adm-zip": "catalog:",
     "@types/ssri": "catalog:",
+    "@types/yauzl": "catalog:",
+    "adm-zip": "catalog:",
     "tempy": "catalog:"
   },
   "engines": {

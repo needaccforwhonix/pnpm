@@ -14,7 +14,7 @@ pub struct NodeApiProject {
     pub dependency_manifest: Option<serde_json::Value>,
 }
 
-/// Options for [`install`](fn@crate::install). Mirrors [`InstallOptions`] in `index.d.ts`; only the
+/// Options for [`install`](fn@crate::install). Only the
 /// fields the engine consumes today are read, the rest are accepted and
 /// ignored so the contract stays forward-compatible.
 #[napi(object)]
@@ -43,9 +43,8 @@ pub struct InstallOptions {
     pub hoist_pattern: Option<Vec<String>>,
     pub public_hoist_pattern: Option<Vec<String>>,
     pub external_dependencies: Option<Vec<String>>,
-    /// `IndexMap` so the JS object's key order survives into
-    /// `pnpm-lock.yaml#overrides` — a `HashMap` here reordered the
-    /// recorded block at random on every install.
+    /// The JS object's key order survives into
+    /// `pnpm-lock.yaml#overrides`.
     pub overrides: Option<IndexMap<String, String>>,
     pub package_import_method: Option<String>,
     pub auto_install_peers: Option<bool>,
@@ -72,11 +71,17 @@ pub struct InstallOptions {
     pub peers_suffix_max_length: Option<u32>,
     pub dedupe_peer_dependents: Option<bool>,
     pub dedupe_peers: Option<bool>,
+    pub add_missing_peer_types: Option<bool>,
+    pub project_scoped_optional_peers: Option<bool>,
     pub dedupe_direct_deps: Option<bool>,
     pub dedupe_injected_deps: Option<bool>,
     pub resolve_peers_from_workspace_root: Option<bool>,
     pub inject_workspace_packages: Option<bool>,
     pub hoist_workspace_packages: Option<bool>,
+    /// `false` writes nothing under `node_modules`. The install still
+    /// resolves, writes the lockfile, and fetches the registry packages the
+    /// host can install into the store, for a `node_modules` that something
+    /// else mounts from the store; `lockfileOnly` and a dry run fetch nothing.
     pub enable_modules_dir: Option<bool>,
     /// Install from the lockfile alone, ignoring the project manifests —
     /// pnpm's `pnpm fetch` semantics: the frozen path, no post-import
@@ -122,7 +127,8 @@ pub struct InstallOptions {
     pub return_list_of_deps_requiring_build: Option<bool>,
     /// Per-package build-script allow-list: `name -> allowed`.
     pub allow_builds: Option<HashMap<String, bool>>,
-    /// Allow every dependency's build scripts to run.
+    /// Allow every dependency's build scripts to run, except the ones
+    /// `allow_builds` sets to `false`.
     pub dangerously_allow_all_builds: Option<bool>,
     /// `peerDependencyRules` — how peer-dependency mismatches are treated.
     pub peer_dependency_rules: Option<PeerDependencyRulesInput>,
@@ -139,10 +145,18 @@ pub struct InstallOptions {
     /// prints nothing and the embedder renders the `onLog` event stream
     /// itself (or not at all).
     pub reporter: Option<ReporterOptions>,
+    /// Recorded as `pnpmfileChecksum` for the `readPackageHook` passed to
+    /// the same call. The host changes it whenever the hook's behavior
+    /// changes. Without it the engine cannot tell whether the hook
+    /// changed, so every install resolves again.
+    pub read_package_hook_checksum: Option<String>,
+    /// Read by [`rebuild`](fn@crate::rebuild) only: skip the build of a
+    /// package the side-effects cache already holds a build of, restoring
+    /// that build instead.
+    pub skip_if_has_side_effects_cache: Option<bool>,
 }
 
-/// Options for [`get_peer_dependency_issues`](crate::get_peer_dependency_issues). Mirrors the TypeScript
-/// declaration in `index.d.ts`.
+/// Options for [`get_peer_dependency_issues`](crate::get_peer_dependency_issues).
 #[napi(object)]
 #[cfg_attr(
     dylint_lib = "perfectionist",
@@ -221,7 +235,7 @@ pub struct PeerDependencyMetaInput {
     pub optional: Option<bool>,
 }
 
-/// `peerDependencyRules` input. Mirrors `PeerDependencyRules` in `index.d.ts`.
+/// `peerDependencyRules` input.
 #[napi(object)]
 pub struct PeerDependencyRulesInput {
     pub ignore_missing: Option<Vec<String>>,

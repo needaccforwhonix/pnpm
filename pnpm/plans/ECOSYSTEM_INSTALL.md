@@ -90,11 +90,40 @@ Its workspace source links, managed source configuration and lockfile publish
 after all participants prepare successfully. Source links are additive cache
 entries; metadata rollback restores the selected graph, not cache contents.
 
+Cargo workspaces with git dependencies use `cargo generate-lockfile` when a
+lockfile must be generated or an added crate requires resolution. This path
+uses Cargo's git, feature and nightly artifact dependency support. Trusted
+user-level Cargo authentication settings remain available. It requires the default Cargo index; a registry declared in
+`registries` still requires an existing lockfile. Frozen installs never enter this path.
+Cargo runs from the selected toolchain directory with an explicit manifest
+path, so checkout-controlled executable helpers, environment settings and
+managed sources are not loaded. pnpm copies only `unstable.bindeps` and
+`resolver.incompatible-rust-versions` from workspace or ancestor configuration.
+Checkout configuration remains unchanged. Resolution does not compile crates
+or execute their build scripts.
+
+When workspace or ancestor Cargo configuration enables `unstable.build-std`,
+pnpm also prepares registry dependencies from the active Rust toolchain's
+`rust-src` standard library lockfile. The toolchain must have `rust-src`
+installed. Conflicting package identities or checksums fail preparation.
+
 Python prepares a complete interpreter-specific environment generation. Its
 publication switches the managed environment link and writes `pylock.toml`.
 Rollback restores the previous link. Old successful generations remain alive
 for already-running processes. Interpreter and platform identity stay inside
 Python's lockfile freshness and wheel-selection logic.
+
+`packageImportMethod` controls how unchanged wheel files reach an environment,
+using the same methods and default as npm packages. `clone-or-copy` uses
+copy-on-write clones with a copy fallback, and `clone` requires cloning support.
+`copy` creates independent files. `hardlink` shares inodes with the store, so
+writing an installed file changes the store and other hardlinked environments.
+Generated metadata and scripts whose shebang or permissions need changing always
+remain independent files. Isolated build environments use the same setting but
+replace `auto` and `hardlink` with `clone-or-copy` to keep backend writes private.
+Environment generations live in the store under `python-envs/<project>/`, with
+the project's `.venv` as its managed link, so an environment shares the store's
+filesystem.
 
 npm explicitly enrolls as an in-place installer. Its existing materialization
 and lifecycle-script behavior remains intact; mixed add supplies metadata for

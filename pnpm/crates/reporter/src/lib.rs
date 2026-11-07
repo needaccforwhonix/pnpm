@@ -11,6 +11,8 @@
 //! channels are added incrementally as the surrounding code starts using
 //! them.
 
+pub use fatal_error::FatalErrorLog;
+
 pub use dependencies::{
     AddedRoot, DependencyType, PackageManifestLog, PackageManifestMessage, RemovedRoot, RootLog,
     RootMessage, SkippedOptionalDependencyLog, SkippedOptionalPackage, SkippedOptionalParent,
@@ -31,7 +33,7 @@ use std::{
 
 /// One log channel from `@pnpm/core-loggers`.
 ///
-/// Variants are added as pacquet starts emitting them. The `name` tag in
+/// The `name` tag in
 /// the serialized JSON identifies the channel; consumers (notably
 /// `@pnpm/cli.default-reporter`) dispatch on this value.
 #[derive(Debug, Clone, Serialize)]
@@ -70,11 +72,7 @@ pub enum LogEvent {
     /// The import method used to materialise files from the store
     /// (`pnpm:package-import-method`). Fires the first time each
     /// resolved method (`clone` / `hardlink` / `copy`) actually
-    /// succeeds during an install — so for the `auto` and
-    /// `clone-or-copy` config values, the wire value reflects the
-    /// post-fallback method rather than the optimistic configured
-    /// one. Up to three events per install (one per resolved method)
-    /// gated by an install-scoped atomic in `pnpm-package-manager`.
+    /// succeeds during an install.
     #[serde(rename = "pnpm:package-import-method")]
     PackageImportMethod(PackageImportMethodLog),
 
@@ -84,9 +82,7 @@ pub enum LogEvent {
     #[serde(rename = "pnpm:progress")]
     Progress(ProgressLog),
 
-    /// Per-tarball download progress (`pnpm:fetching-progress`). The
-    /// `in_progress` events are throttled to ~200ms while the body
-    /// streams.
+    /// Per-tarball download progress (`pnpm:fetching-progress`).
     #[serde(rename = "pnpm:fetching-progress")]
     FetchingProgress(FetchingProgressLog),
 
@@ -105,10 +101,7 @@ pub enum LogEvent {
     Root(RootLog),
 
     /// Aggregate add / remove counts emitted once per project after
-    /// the link phase (`pnpm:stats`). Pnpm emits `added` and
-    /// `removed` from separate sites; pacquet currently emits both
-    /// together because pruning hasn't landed yet — see
-    /// [`StatsMessage::Removed`].
+    /// the link phase (`pnpm:stats`).
     #[serde(rename = "pnpm:stats")]
     Stats(StatsLog),
 
@@ -134,6 +127,11 @@ pub enum LogEvent {
     #[serde(rename = "pnpm:ignored-scripts")]
     IgnoredScripts(IgnoredScriptsLog),
 
+    /// One per install that found direct dependencies whose agent skills
+    /// await approval (`pnpm:pending-skills`).
+    #[serde(rename = "pnpm:pending-skills")]
+    PendingSkills(PendingSkillsLog),
+
     /// The latest pnpm the registry offers, next to the running one
     /// (`pnpm:update-check`). Emitted at most once a day by the
     /// install-family commands the update notifier covers; the default
@@ -142,12 +140,7 @@ pub enum LogEvent {
     UpdateCheck(UpdateCheckLog),
 
     /// One per optional-dependency pacquet decided to skip rather
-    /// than fail the install over. Reason discriminates the cause —
-    /// pacquet currently only emits `build_failure` (from
-    /// `BuildModules` when a postinstall fails on an optional dep);
-    /// the `unsupported_engine` / `unsupported_platform` /
-    /// `resolution_failure` reasons come from earlier phases that
-    /// haven't landed in pacquet yet.
+    /// than fail the install over.
     #[serde(rename = "pnpm:skipped-optional-dependency")]
     SkippedOptionalDependency(SkippedOptionalDependencyLog),
 
@@ -177,6 +170,12 @@ pub enum LogEvent {
     #[serde(rename = "pnpm:lockfile-verification")]
     LockfileVerification(LockfileVerificationLog),
 
+    /// Lockfile reader messages (`pnpm:lockfile`). This channel reports
+    /// events such as the automatic recovery of Git-conflicted wanted
+    /// lockfiles.
+    #[serde(rename = "pnpm:lockfile")]
+    Lockfile(LockfileLog),
+
     /// Generic global-logger message (`name: "pnpm"`). Carries a
     /// `{ message, prefix }` payload — for example, the "Lockfile is
     /// up to date, resolution step is skipped" line the frozen-install
@@ -195,10 +194,8 @@ pub enum LogEvent {
 
     /// Global-logger message (`name: "pnpm:global"`). Written to a
     /// `bole('pnpm:global')` logger with just a message string — no
-    /// `prefix`, unlike [`LogEvent::Pnpm`]. The interactive
-    /// web-authentication flow (`pnpm-network-web-auth`) emits on this
-    /// channel to surface the auth URL / QR code and the browser-open
-    /// prompts. `@pnpm/cli.default-reporter` routes these into the "other"
+    /// `prefix`, unlike [`LogEvent::Pnpm`].
+    /// `@pnpm/cli.default-reporter` routes these into the "other"
     /// log stream.
     #[serde(rename = "pnpm:global")]
     Global(GlobalLog),
@@ -355,6 +352,15 @@ pub struct IgnoredScriptsLog {
     pub strict_dep_builds: bool,
 }
 
+/// `pnpm:pending-skills` payload: the packages whose agent skills await
+/// approval, by the keys `permissions` approves them under, sorted.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingSkillsLog {
+    pub level: LogLevel,
+    pub package_names: Vec<String>,
+}
+
 /// `pnpm:update-check` payload: the running pnpm version and the latest
 /// one the registry resolved for the `latest` tag.
 #[derive(Debug, Clone, Serialize)]
@@ -413,6 +419,14 @@ pub struct LockfileVerificationLog {
     pub level: LogLevel,
     #[serde(flatten)]
     pub message: LockfileVerificationMessage,
+}
+
+/// Lockfile-reader message (`pnpm:lockfile`).
+#[derive(Debug, Clone, Serialize)]
+pub struct LockfileLog {
+    pub level: LogLevel,
+    pub message: String,
+    pub prefix: String,
 }
 
 /// `pnpm:lockfile-verification` discriminated payload. `Started`
@@ -568,8 +582,19 @@ pub struct DeprecationLog {
     pub pkg_version: String,
     pub pkg_id: String,
     pub prefix: String,
-    pub deprecated: String,
     pub depth: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub non_deprecated_alternative: Option<NonDeprecatedAlternative>,
+}
+
+/// A version of the same package that is not deprecated, as the resolver read
+/// it off the packument. Unlike the deprecation notice this is pnpm's own
+/// reading rather than publisher-written text, so it is safe to print.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NonDeprecatedAlternative {
+    pub version: String,
+    pub outside_declared_range: bool,
 }
 
 /// Severity level on the [bunyan]-shaped envelope.
@@ -604,18 +629,22 @@ pub enum LogLevel {
 /// rayon `par_iter`, and tarball download / store-index work runs
 /// across tokio workers, all of which can fire reporter events at
 /// once. Implementations must therefore guard any shared state they
-/// touch (`Mutex`, atomic, or write-once initialization). Both
-/// production sinks satisfy this: [`SilentReporter`] is a no-op, and
-/// [`NdjsonReporter`] serializes per-event then writes under
-/// `std::io::stderr().lock()`.
+/// touch (`Mutex`, atomic, or write-once initialization).
 ///
 /// The `Send + Sync + 'static` supertraits state the same contract in
 /// the type system, so emitting code can hand `R` to a spawned task
 /// (the concurrent lockfile-verification gate) without re-declaring the
-/// bounds at every generic hop. Implementations are unit structs, which
-/// satisfy them automatically.
+/// bounds at every generic hop.
 pub trait Reporter: Send + Sync + 'static {
     fn emit(event: &LogEvent);
+
+    /// Report a preformatted fatal error, or return it for the CLI to write
+    /// to stderr after the command unwinds.
+    #[must_use]
+    fn report_fatal_error(message: String) -> Option<String> {
+        Self::emit(&LogEvent::Global(GlobalLog { level: LogLevel::Error, message }));
+        None
+    }
 }
 
 /// Adapt a [`Reporter`] into the warning callback used by the network client.
@@ -638,27 +667,27 @@ impl Reporter for SilentReporter {
 /// produces under `--reporter=ndjson`, so the same consumers work
 /// unmodified.
 ///
-/// Today this writes synchronously under the stderr lock. When the volume
-/// of emit sites grows past coarse start/end markers, the writer should
-/// move behind an MPSC channel.
-///
 /// [bunyan]: https://github.com/trentm/node-bunyan
 pub struct NdjsonReporter;
 
 impl Reporter for NdjsonReporter {
     fn emit(event: &LogEvent) {
-        let mut buf = Vec::with_capacity(256);
-        if write_record(&mut buf, event).is_err() {
-            return;
-        }
-        buf.push(b'\n');
-        let _ = std::io::stderr().lock().write_all(&buf);
+        emit_record(event);
     }
 }
 
-fn write_record(buf: &mut Vec<u8>, event: &LogEvent) -> serde_json::Result<()> {
+fn emit_record(event: &impl Serialize) {
+    let mut buffer = Vec::with_capacity(256);
+    if write_record(&mut buffer, event).is_err() {
+        return;
+    }
+    buffer.push(b'\n');
+    let _ = std::io::stderr().lock().write_all(&buffer);
+}
+
+fn write_record(buf: &mut Vec<u8>, event: &impl Serialize) -> serde_json::Result<()> {
     let envelope =
-        Envelope { time: now_millis(), hostname: &HOSTNAME, pid: std::process::id(), event };
+        Envelope { time: now_millis(), hostname: &HOSTNAME, pid: crate::process_id(), event };
     serde_json::to_writer(buf, &envelope)
 }
 
@@ -667,12 +696,12 @@ fn write_record(buf: &mut Vec<u8>, event: &LogEvent) -> serde_json::Result<()> {
 // to the top level of the JSON object so the wire format is one flat record
 // per line.
 #[derive(Serialize)]
-struct Envelope<'a> {
+struct Envelope<'a, Event> {
     time: u128,
     hostname: &'a str,
     pid: u32,
     #[serde(flatten)]
-    event: &'a LogEvent,
+    event: &'a Event,
 }
 
 fn now_millis() -> u128 {
@@ -689,10 +718,7 @@ fn now_millis() -> u128 {
 /// trait. The trait therefore exists for two narrow reasons: to keep the
 /// `gethostname` syscall behind a named seam (so the production call site
 /// is consistent with the rest of `Host`'s capability surface), and so the
-/// capability can be exercised in isolation by unit tests. Substituting a
-/// hostname per-test in the rendered envelope would require plumbing a
-/// `Sys: GetHostName` generic through the emission site, which has not
-/// been done.
+/// capability can be exercised in isolation by unit tests.
 ///
 /// [bunyan]: https://github.com/trentm/node-bunyan
 pub trait GetHostName {
@@ -701,13 +727,19 @@ pub trait GetHostName {
 
 /// Production implementation of the capability traits in this crate.
 ///
-/// Each trait method calls into the real underlying system facility (for
-/// [`GetHostName`], the `gethostname` syscall via the [`gethostname`] crate).
+/// Each trait method reads the underlying system facility or WASI host metadata.
 pub struct Host;
 
 impl GetHostName for Host {
     fn get_host_name() -> String {
-        gethostname::gethostname().to_string_lossy().into_owned()
+        #[cfg(not(target_family = "wasm"))]
+        {
+            gethostname::gethostname().to_string_lossy().into_owned()
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            std::env::var("PNPM_WASM_HOSTNAME").expect("WASI host must supply PNPM_WASM_HOSTNAME")
+        }
     }
 }
 
@@ -720,6 +752,13 @@ static HOSTNAME: LazyLock<String> = LazyLock::new(Host::get_host_name);
 #[cfg(test)]
 mod tests;
 
+mod fatal_error;
+
 mod progress;
 
 mod dependencies;
+
+#[cfg(target_family = "wasm")]
+pub(crate) use pnpm_wasm_host::process_id;
+#[cfg(not(target_family = "wasm"))]
+pub(crate) use std::process::id as process_id;

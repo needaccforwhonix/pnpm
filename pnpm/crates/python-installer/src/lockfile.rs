@@ -8,11 +8,11 @@ use super::{
         LockfileInputs, LockfileReplay, PythonPrepare, accept_server_lockfile, read_existing_lock,
         resolve_via_pnpr,
     },
-    resolver,
+    projects, resolver, workspace,
 };
 use miette::Result;
 use pnpm_reporter::{GlobalLog, LogEvent, LogLevel, Reporter};
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 impl PythonPrepare<'_> {
     /// The lockfile on disk when this install may replay it: one that
@@ -23,15 +23,17 @@ impl PythonPrepare<'_> {
         lock_path: &Path,
         inputs: &Inputs,
         requires_python: Option<&str>,
+        local: &[workspace::LocalProject],
     ) -> Result<Option<Lockfile>> {
         let existing = read_existing_lock(lock_path).await?;
-        let stale = if self.resolve {
+        let stale = if self.asked.resolve {
             Some(miette::miette!("adding a dependency resolves the project again"))
         } else {
             match &existing {
-                Some(lock) => {
-                    lock.applies_to(inputs, requires_python, &self.interpreter.target).err()
-                }
+                Some(lock) => lock
+                    .applies_to(inputs, requires_python, &self.interpreter.target)
+                    .and_then(|()| workspace::describes(lock, local))
+                    .err(),
                 None => Some(miette::miette!("the project has no lockfile")),
             }
         };
@@ -59,6 +61,8 @@ impl PythonPrepare<'_> {
             requirements,
             inputs,
             requires_python,
+            local,
+            members,
         } = inputs;
         if let Some(lock) = existing {
             let replay = LockfileReplay {
@@ -66,33 +70,71 @@ impl PythonPrepare<'_> {
                 lock,
                 lock_path,
                 requirements,
+                local: Arc::clone(&local),
             };
             if let Some(lock) = self.replay_lockfile::<Reporter>(registry, replay).await? {
                 return Ok(lock);
             }
         }
-        if let Some(lock) = resolve_via_pnpr(
+        if registry.resolution.packages.overrides.is_empty()
+            && registry.resolution.packages.constraints.is_empty()
+            && let Some(lock) =
+                self.resolve_remotely(requirements, (&inputs, requires_python.as_deref()), &local)
+                    .await?
+        {
+            return self.accept_lockfile::<Reporter>(registry, lock, requirements, &local).await;
+        }
+        let solved =
+            resolver::resolve_all::<Reporter>(registry, requirements, &self.environments.list)
+                .await
+                .map_err(|error| projects::disagreement(&registry.resolution, members, error))?;
+        Lockfile::merged(
+            &registry.resolution.packages.metadata,
+            requirements,
+            &solved,
+            inputs,
+            requires_python,
+        )
+    }
+
+    /// The lockfile a pnpr server resolves, when one can answer this
+    /// project, checked to answer `inputs`. A server resolves one
+    /// interpreter's environment from an index, so a project that declares
+    /// the environments it locks for is resolved here instead, as is one
+    /// that installs a project from this repository.
+    async fn resolve_remotely(
+        &self,
+        requirements: &[pep508_rs::Requirement],
+        (inputs, requires_python): (&Inputs, Option<&str>),
+        local: &[workspace::LocalProject],
+    ) -> Result<Option<Lockfile>> {
+        if self.environments.declared
+            || !local.is_empty()
+            || requirements
+                .iter()
+                .any(|requirement| {
+                    matches!(requirement.version_or_url, Some(pep508_rs::VersionOrUrl::Url(_)))
+                })
+            || !self.index.can_resolve_remotely()
+        {
+            return Ok(None);
+        }
+        let Some(mut lock) = resolve_via_pnpr(
             self.context.config,
             requirements,
             &self.interpreter.target,
-            self.index.as_str(),
-            requires_python.clone(),
+            self.index.url.as_str(),
+            requires_python.map(str::to_string),
         )
         .await?
-        {
-            accept_server_lockfile(&lock, &inputs, requires_python.as_deref())?;
-            self.accept_lockfile::<Reporter>(registry, lock, requirements).await
-        } else {
-            let solution = resolver::resolve::<Reporter>(registry, requirements).await?;
-            Lockfile::new(
-                &registry.packages,
-                &self.interpreter.target,
-                requirements,
-                solution,
-                inputs,
-                requires_python,
-            )
-        }
+        else {
+            return Ok(None);
+        };
+        // A server answers for the requirements, not for which projects
+        // asked them together: the members are this install's to record.
+        lock.tool.pnpm.set_members(inputs.members().to_vec());
+        accept_server_lockfile(&lock, inputs, requires_python)?;
+        Ok(Some(lock))
     }
 
     /// Replay the lockfile on disk, or `None` when an install that may
@@ -109,12 +151,16 @@ impl PythonPrepare<'_> {
             lock,
             lock_path,
             requirements,
+            local,
             same_target,
         }: LockfileReplay<'_>,
     ) -> Result<Option<Lockfile>> {
-        lock.seed(&mut registry.packages)?;
-        let replayed = match registry.fetch_wheels::<Reporter>(&lock.packages).await {
-            Ok(()) => resolver::validate_locked(registry, requirements),
+        registry.resolution.packages.candidates.clear();
+        lock.seed(&mut registry.resolution.packages, &self.interpreter.target)?;
+        workspace::offer_locked(&mut registry.resolution.packages, &local, &lock);
+        registry.record_sources(requirements)?;
+        let replayed = match registry.fetch_wheels::<Reporter>(requirements).await {
+            Ok(()) => resolver::validate_locked(&registry.resolution, requirements),
             Err(error) if same_target => return Err(error),
             Err(error) => Err(error),
         };
@@ -128,21 +174,30 @@ impl PythonPrepare<'_> {
             level: LogLevel::Warn,
             message: format!("Ignoring Python lockfile {}: {error}", lock_path.display()),
         }));
-        registry.packages = pnpm_python_resolver::Packages::new();
+        registry.resolution.packages.candidates.clear();
+        registry.resolution.packages.excluded.clear();
+        registry.resolution.packages.metadata.clear();
+        registry.resolution.packages.direct_urls.clear();
+        registry.resolution.packages.rejected_sources.clear();
+        workspace::offer(&mut registry.resolution.packages, &local);
         Ok(None)
     }
 
     /// Fetch the wheels a ready-made lockfile pins and check that it still
     /// covers the project's requirements.
-    async fn accept_lockfile<Reporter: self::Reporter + 'static>(
+    pub(super) async fn accept_lockfile<Reporter: self::Reporter + 'static>(
         &self,
         registry: &mut Registry<'_>,
         lock: Lockfile,
         requirements: &[pep508_rs::Requirement],
+        local: &[workspace::LocalProject],
     ) -> Result<Lockfile> {
-        lock.seed(&mut registry.packages)?;
-        registry.fetch_wheels::<Reporter>(&lock.packages).await?;
-        resolver::validate_locked(registry, requirements)?;
+        registry.resolution.packages.candidates.clear();
+        lock.seed(&mut registry.resolution.packages, &self.interpreter.target)?;
+        workspace::offer_locked(&mut registry.resolution.packages, local, &lock);
+        registry.record_sources(requirements)?;
+        registry.fetch_wheels::<Reporter>(requirements).await?;
+        resolver::validate_locked(&registry.resolution, requirements)?;
         Ok(lock)
     }
 }

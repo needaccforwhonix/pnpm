@@ -124,10 +124,16 @@ impl CratePublication {
         &self.key
     }
 
+    /// The organization whose catalog the crate is published into.
+    pub(in super::super) fn org(&self) -> &str {
+        &self.org
+    }
+
     /// The one-version document this publish contributes, which merges into
     /// whatever the registry already holds for the crate.
     pub(super) fn document(&self) -> CrateDocument {
         CrateDocument {
+            format_version: pnpr_cargo::CRATE_DOCUMENT_FORMAT_VERSION,
             name: self.entry.name.clone(),
             versions: vec![self.entry.clone()],
             description: self.description.clone(),
@@ -232,13 +238,9 @@ pub(super) async fn set_yanked(
     }
     let _guard = state.inner.locks.packages.lock(key.as_str()).await;
     let outcome = state.inner.storage
-        .for_hosted(&target.org)
-        .update_hosted_document_with_retry(&key, DOCUMENT_WRITE_RETRIES, |existing| {
-            let Some(bytes) = existing else { return Ok(None) };
-            let mut document = CrateDocument::parse(bytes)?;
-            let Some(entry) = document.version_mut(version) else { return Ok(None) };
-            entry.yanked = yanked;
-            Ok(Some(document.to_bytes()))
+        .for_hosted(&target.org, ECOSYSTEM)
+        .update_hosted_document_with_retry(&key, DOCUMENT_WRITE_RETRIES, None, |existing| {
+            update_crate_yank_status(existing, &key, version, yanked)
         })
         .await;
     match outcome {
@@ -246,4 +248,24 @@ pub(super) async fn set_yanked(
         Ok(DocumentUpdate::NotFound) => not_found(),
         Err(err) => error_response(err),
     }
+}
+
+fn update_crate_yank_status(
+    existing: Option<&[u8]>,
+    key: &CanonicalPackageName,
+    version: &str,
+    yanked: bool,
+) -> Result<Option<Vec<u8>>, RegistryError> {
+    let Some(bytes) = existing else { return Ok(None) };
+    let mut document = CrateDocument::parse(bytes)?;
+    if document.format_version > pnpr_cargo::CRATE_DOCUMENT_FORMAT_VERSION {
+        return Err(RegistryError::DocumentFormatTooNew {
+            document: key.as_str().to_string(),
+            format_version: document.format_version,
+            supported_version: pnpr_cargo::CRATE_DOCUMENT_FORMAT_VERSION,
+        });
+    }
+    let Some(entry) = document.version_mut(version) else { return Ok(None) };
+    entry.yanked = yanked;
+    Ok(Some(document.to_bytes()))
 }

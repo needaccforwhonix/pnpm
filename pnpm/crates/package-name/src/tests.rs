@@ -1,4 +1,4 @@
-use super::is_valid_old_npm_package_name;
+use super::{is_valid_old_npm_package_name, is_valid_package_version};
 
 #[test]
 fn is_valid_old_npm_package_name_accepts_common_shapes() {
@@ -29,5 +29,77 @@ fn is_valid_old_npm_package_name_rejects_error_cases() {
         "@scope/",          // scoped shape with empty pkg
     ] {
         assert!(!is_valid_old_npm_package_name(bad), "{bad:?} should be invalid");
+    }
+}
+
+#[test]
+fn is_valid_package_version_accepts_valid_versions() {
+    for ok in ["1.0.0", "0.0.0", "1.2.3-alpha.1+build", "2.0.0-rc.0", "directory"] {
+        assert!(is_valid_package_version(ok), "{ok:?} should be valid");
+    }
+}
+
+#[test]
+fn is_valid_package_version_rejects_traversals_and_separators() {
+    for bad in [
+        "",
+        ".",
+        "..",
+        "../escaped",
+        "../../escaped",
+        "../../../escaped",
+        "foo/bar",
+        r"foo\bar",
+        "/1.0.0",
+        "1.0.0/",
+        r"\1.0.0",
+        r"1.0.0\",
+        "1.0.0/../escape",
+    ] {
+        assert!(!is_valid_package_version(bad), "{bad:?} should be invalid");
+    }
+}
+
+#[test]
+fn new_package_names_reject_legacy_warnings() {
+    for name in ["Upper", "@Upper/pkg", "a~b", "a'b", "a!b", "a(b", "a)b", "a*b", "http", "fs"] {
+        assert!(super::is_valid_old_npm_package_name(name), "{name}");
+        assert!(!super::is_valid_new_npm_package_name(name), "{name}");
+    }
+    assert!(!super::is_valid_new_npm_package_name(&"a".repeat(215)));
+    assert!(super::is_valid_new_npm_package_name(&"a".repeat(214)));
+}
+
+#[test]
+fn new_package_names_follow_npm_scoped_rules() {
+    for name in [
+        "pkg",
+        "pkg.name",
+        "pkg_name",
+        "1",
+        "@scope/pkg",
+        "@scope/_pkg",
+        "@scope/-pkg",
+        "@~scope/pkg",
+        "@scope/http",
+    ] {
+        assert!(super::is_valid_new_npm_package_name(name), "{name}");
+    }
+    for name in [
+        "",
+        "-pkg",
+        "_pkg",
+        ".pkg",
+        "node_modules",
+        "favicon.ico",
+        "pkg@x",
+        "@scope/pkg@x",
+        "@scope/.pkg",
+        "@scope/pkg~",
+        "café",
+        "@scope/café",
+        "@scope/pkg/extra",
+    ] {
+        assert!(!super::is_valid_new_npm_package_name(name), "{name}");
     }
 }

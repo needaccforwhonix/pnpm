@@ -1,10 +1,11 @@
-use crate::{FileHash, StoreDir};
+use crate::{CafsFileInfo, FileHash, StoreDir};
 use derive_more::{Display, Error};
 use miette::Diagnostic;
 use pnpm_fs::{
-    EnsureFileError, cas_write_lock, create_exclusive_temp_file, ensure_file, ensure_parent_dir,
+    EnsureFileError, StoreFile, TempFile, cas_write_lock, create_exclusive_temp_file,
+    ensure_cas_file, ensure_parent_dir,
     file_mode::{EXEC_MODE, is_executable},
-    rename_with_retry,
+    overwrite_file_in_place, rename_with_retry,
 };
 use sha2::{Digest, Sha512};
 use std::{
@@ -62,6 +63,26 @@ impl StoreDir {
     }
 }
 
+/// A file [`StoreDir::write_cas_file`] or
+/// [`StoreDir::write_cas_file_from_reader`] committed to the store.
+#[derive(Debug)]
+pub struct WrittenFile {
+    /// The blob, with its mode (see [`ensure_cas_file`]).
+    pub file: StoreFile,
+    pub hash: FileHash,
+    /// Byte count of the content.
+    pub size: u64,
+}
+
+impl WrittenFile {
+    /// The store index row for this file. `mode` is the mode the package
+    /// declares, which the index keeps even though the blob's path keeps
+    /// only its executable bit.
+    pub fn index_entry(&self, mode: u32, checked_at: Option<u64>) -> CafsFileInfo {
+        CafsFileInfo { digest: format!("{:x}", self.hash), mode, size: self.size, checked_at }
+    }
+}
+
 /// Error type of [`StoreDir::write_cas_file`].
 #[derive(Debug, Display, Error, Diagnostic)]
 pub enum WriteCasFileError {
@@ -86,15 +107,20 @@ impl StoreDir {
         &self,
         buffer: &[u8],
         executable: bool,
-    ) -> Result<(PathBuf, FileHash), WriteCasFileError> {
+    ) -> Result<WrittenFile, WriteCasFileError> {
         let file_hash = Sha512::digest(buffer);
         let file_path = self.cas_file_path(file_hash, executable);
         let mode = executable.then_some(EXEC_MODE);
 
         self.ensure_shard_dir(&file_path, file_hash[0])?;
 
-        ensure_file(&file_path, buffer, mode).map_err(WriteCasFileError::WriteFile)?;
-        Ok((file_path, file_hash))
+        let blob_mode =
+            ensure_cas_file(&file_path, buffer, mode).map_err(WriteCasFileError::WriteFile)?;
+        Ok(WrittenFile {
+            file: StoreFile::with_mode(file_path, blob_mode),
+            hash: file_hash,
+            size: buffer.len() as u64,
+        })
     }
 
     /// Stream a file from an npm package into the store directory
@@ -108,12 +134,13 @@ impl StoreDir {
     /// file is renamed to its content-addressed path at the end. Peak
     /// memory is one fixed copy buffer regardless of file size.
     ///
-    /// Returns the CAS path, the content hash, and the streamed byte
-    /// count. A reader that yields the same bytes as a `buffer` handed
-    /// to [`StoreDir::write_cas_file`] lands at the same path with the
-    /// same guarantees: an existing regular file at the target is kept
+    /// A reader that yields the same bytes as a `buffer` handed to
+    /// [`StoreDir::write_cas_file`] lands at the same path with the same
+    /// guarantees: an existing regular file at the target is kept
     /// as the live entry only after a byte-compare against the streamed
-    /// content, and anything else is atomically replaced.
+    /// content, a corrupt regular file is repaired in place so its
+    /// inode — and every hard link to it — survives (pnpm/pnpm#3445),
+    /// and anything else is atomically replaced.
     ///
     /// When `expected_size` is given, a reader that yields any other
     /// number of bytes fails with the `Read` variant *before* anything
@@ -125,12 +152,15 @@ impl StoreDir {
         reader: &mut dyn Read,
         executable: bool,
         expected_size: Option<u64>,
-    ) -> Result<(PathBuf, FileHash, u64), WriteCasFileFromReaderError> {
+    ) -> Result<WrittenFile, WriteCasFileFromReaderError> {
         let files_dir = self.files_dir();
         ensure_parent_dir(files_dir).map_err(write_cas_error)?;
         let mode = executable.then_some(EXEC_MODE);
-        let (tmp_path, file) =
-            create_exclusive_temp_file(files_dir, "stream", mode).map_err(write_cas_error)?;
+        let TempFile {
+            path: tmp_path,
+            file,
+            mode: tmp_mode,
+        } = create_exclusive_temp_file(files_dir, "stream", mode).map_err(write_cas_error)?;
 
         let streamed = stream_into_temp_file(reader, file, &tmp_path, expected_size);
         let (file_hash, size) = match streamed {
@@ -147,45 +177,11 @@ impl StoreDir {
             return Err(WriteCasFileFromReaderError::Write(error));
         }
 
-        // Serialize with buffer-based writers ([`ensure_file`]) and
-        // verifiers of the same path, per [`cas_write_lock`]'s
-        // coordination contract.
-        let lock = cas_write_lock(&file_path);
-        let _guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        // A regular file already at the hash-derived target is kept —
-        // preserving its inode — only after its bytes are verified
-        // against the freshly streamed temp, the same guarantee
-        // [`ensure_file`]'s byte-compare gives the buffered writer.
-        // Anything else (missing, torn or corrupt blob, symlink or
-        // other non-regular dirent) is atomically replaced by the
-        // rename, which is self-healing in every such state.
-        let existing_is_live = fs::symlink_metadata(&file_path)
-            .is_ok_and(|meta| meta.file_type().is_file() && meta.len() == size)
-            && files_have_equal_contents(&tmp_path, &file_path);
-        if existing_is_live {
-            let _ = fs::remove_file(&tmp_path);
-            return Ok((file_path, file_hash, size));
-        }
-        if let Err(error) = rename_with_retry(&tmp_path, &file_path) {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(write_cas_error(EnsureFileError::RenameFile {
-                tmp_path,
-                file_path: file_path.clone(),
-                error,
-            }));
-        }
-        Ok((file_path, file_hash, size))
+        let blob_mode = commit_streamed_temp_file(&tmp_path, tmp_mode, &file_path, size)?;
+        Ok(WrittenFile { file: StoreFile::with_mode(file_path, blob_mode), hash: file_hash, size })
     }
 
-    /// Ensure the shard directory (`files/XX/`) exists. The CAS has
-    /// 256 shards keyed by `file_hash[0]`; `create_dir_all` does a
-    /// `stat` syscall every call even when the directory is already
-    /// there, so remember which shards we've created and skip on
-    /// repeat. Duplicate mkdirs across threads are benign — the first
-    /// few writes into a fresh shard may each call `create_dir_all`,
-    /// which is idempotent; once any of them completes and inserts
-    /// into the cache, subsequent writes take the fast path.
+    /// Ensure the shard directory (`files/XX/`) exists.
     fn ensure_shard_dir(&self, file_path: &Path, shard_byte: u8) -> Result<(), WriteCasFileError> {
         if !self.shard_already_ensured(shard_byte) {
             let parent = file_path.parent().expect("CAS file path always has a parent shard dir");
@@ -200,14 +196,70 @@ fn write_cas_error(error: EnsureFileError) -> WriteCasFileFromReaderError {
     WriteCasFileFromReaderError::Write(WriteCasFileError::WriteFile(error))
 }
 
+/// Commit a fully streamed temp file to its content-addressed path,
+/// consuming the temp in every outcome.
+///
+/// A regular file already at the hash-derived target is kept —
+/// preserving its inode — only after its bytes are verified against the
+/// freshly streamed temp, the same guarantee [`ensure_cas_file`]'s
+/// byte-compare gives the buffered writer. A corrupt regular file is
+/// repaired in place. Anything else (missing or torn blob, symlink or
+/// other non-regular dirent, refused in-place write) is atomically
+/// replaced by the rename, which is self-healing in every such state.
+/// Returns the blob's mode: the existing blob's when it kept it, or
+/// `tmp_mode` when it renamed the temp file into place.
+fn commit_streamed_temp_file(
+    tmp_path: &Path,
+    tmp_mode: Option<u32>,
+    file_path: &Path,
+    size: u64,
+) -> Result<Option<u32>, WriteCasFileFromReaderError> {
+    // Serialize with buffer-based writers ([`ensure_cas_file`]) and
+    // verifiers of the same path, per [`cas_write_lock`]'s
+    // coordination contract.
+    let lock = cas_write_lock(file_path);
+    let _guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let existing_meta = fs::symlink_metadata(file_path).ok();
+    let existing_is_regular = existing_meta
+        .as_ref()
+        .is_some_and(|meta| meta.file_type().is_file());
+    let existing_is_live = existing_meta
+        .as_ref()
+        .is_some_and(|meta| meta.file_type().is_file() && meta.len() == size)
+        && files_have_equal_contents(tmp_path, file_path);
+    if existing_is_live || (existing_is_regular && repair_in_place(tmp_path, file_path)) {
+        let _ = fs::remove_file(tmp_path);
+        return Ok(existing_meta.as_ref().and_then(pnpm_fs::file_mode::metadata_mode));
+    }
+    if let Err(error) = rename_with_retry(tmp_path, file_path) {
+        let _ = fs::remove_file(tmp_path);
+        return Err(write_cas_error(EnsureFileError::RenameFile {
+            tmp_path: tmp_path.to_path_buf(),
+            file_path: file_path.to_path_buf(),
+            error,
+        }));
+    }
+    Ok(tmp_mode)
+}
+
+/// Overwrite the corrupt regular file at `file_path` in place with the
+/// bytes just streamed into `tmp_path`, keeping the inode so hard links
+/// to it from other projects' `node_modules` are healed by the same
+/// write (pnpm/pnpm#3445). Returns false — the caller falls back to the
+/// atomic rename — when the in-place write is refused or the result
+/// fails a byte-compare against the temp, which covers a concurrent
+/// process still mid-write on the same path.
+fn repair_in_place(tmp_path: &Path, file_path: &Path) -> bool {
+    let Ok(mut tmp_reader) = fs::File::open(tmp_path) else { return false };
+    overwrite_file_in_place(file_path, &mut tmp_reader)
+        && files_have_equal_contents(tmp_path, file_path)
+}
+
 /// Copy the reader into the temp file, hashing as it goes, and return the
 /// content hash and byte count.
 ///
-/// When `expected_size` is given, a reader that yields any other number of
-/// bytes fails with the `Read` variant, so a truncated source (e.g. a
-/// cut-short archive) never commits its partial content to the store, even
-/// though such a blob would be correctly addressed. The caller removes the
-/// temp file on every error.
+/// The caller removes the temp file on every error.
 fn stream_into_temp_file(
     reader: &mut dyn Read,
     file: fs::File,

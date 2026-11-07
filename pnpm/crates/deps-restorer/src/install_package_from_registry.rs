@@ -1,6 +1,5 @@
 use crate::{
     ImportIndexedDirError, ImportIndexedDirOpts, SymlinkPackageError, import_indexed_dir,
-    retry_config::retry_opts_from_config,
     safe_join_modules_dir::{InvalidDependencyAliasError, safe_join_modules_dir},
     symlink_package,
 };
@@ -138,10 +137,14 @@ impl InstallPackageFromRegistry<'_> {
             fetching: pnpm_tarball::ArchiveFetchOptions {
                 http_client: self.fetching.http_client,
                 auth_headers: &config.auth_headers,
-                retry_opts: retry_opts_from_config(config),
+                retry_opts: config.retry_opts(),
                 offline: config.offline,
+                tar_limits: config.tar_limits(),
             },
             package: pnpm_tarball::TarballPackage {
+                integrity_kind: self.resolution.resolution
+                    .integrity_target(config.lockfile_integrity_target)
+                    .into(),
                 integrity: Some(integrity),
                 unpacked_size: manifest_unpacked_size(self.resolution.package.manifest.as_deref()),
                 file_count: manifest_file_count(self.resolution.package.manifest.as_deref()),
@@ -301,7 +304,51 @@ pub fn manifest_file_count(manifest: Option<&Value>) -> Option<usize> {
     manifest_dist_field(manifest, "fileCount")
 }
 
+/// Read `dist.pnpr.requiresBuild` off the resolver-fetched manifest.
+/// Only trusted from this field — never from `dist.requiresBuild` or
+/// top-level `hasInstallScript` — because only `dist.pnpr.requiresBuild`
+/// is derived from the tarball's own bytes and stripped on ingest.
+#[must_use]
+pub fn manifest_requires_build(manifest: Option<&Value>) -> Option<bool> {
+    let manifest = manifest.filter(|manifest| !has_platform_variants(manifest));
+    manifest?
+        .get("dist")?
+        .get("pnpr")?
+        .get("requiresBuild")?
+        .as_bool()
+}
+
+/// Read `dist.pnpr.bins` off the resolver-fetched manifest.
+#[must_use]
+pub fn manifest_bins(
+    manifest: Option<&Value>,
+) -> Option<std::sync::Arc<std::collections::BTreeMap<String, pnpm_package_manifest::PackageBin>>> {
+    let raw = manifest
+        .filter(|manifest| !has_platform_variants(manifest))?
+        .get("dist")?
+        .get("pnpr")?
+        .get("bins")?;
+    let bins: std::collections::BTreeMap<String, pnpm_package_manifest::PackageBin> =
+        serde_json::from_value(raw.clone()).ok()?;
+    (!bins.is_empty()
+        && bins
+            .iter()
+            .all(|(name, bin)| pnpm_package_manifest::is_safe_bin_name(name) && bin.is_valid()))
+    .then(|| std::sync::Arc::new(bins))
+}
+
+/// Whether the version publishes platform variants. Its `dist` facts then
+/// describe only the variant that targets `any`, which a host may not
+/// install.
+fn has_platform_variants(manifest: &Value) -> bool {
+    manifest
+        .pointer("/dist/pnpr/variants")
+        .and_then(Value::as_array)
+        .is_some_and(|variants| !variants.is_empty())
+}
+
 fn manifest_dist_field(manifest: Option<&Value>, field: &str) -> Option<usize> {
+    let manifest = manifest.filter(|manifest| !has_platform_variants(manifest));
     // `usize::try_from` so a `u64` value larger than the host's
     // `usize` (32-bit targets) degrades to "no hint" rather than
     // truncating silently and producing an undersized pre-allocation.

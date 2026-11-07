@@ -7,6 +7,156 @@ use super::{
     write_workspace,
 };
 use assert_cmd::assert::OutputAssertExt;
+use std::process::Command;
+
+#[test]
+fn legacy_deploy_includes_nested_linked_dependencies() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    append_workspace_yaml_key(&workspace, "packages", "\n  - packages/*");
+    write_project(
+        &workspace,
+        "app",
+        &serde_json::json!({
+            "name": "app", "version": "1.0.0", "dependencies": { "lib": "workspace:*" },
+        }),
+    );
+    write_project(
+        &workspace,
+        "lib",
+        &serde_json::json!({
+            "name": "lib", "version": "1.0.0", "files": ["index.js"], "dependencies": { "leaf": "link:./leaf" },
+        }),
+    );
+    write_project(
+        &workspace,
+        "lib/leaf",
+        &serde_json::json!({
+            "name": "leaf", "version": "1.0.0",
+        }),
+    );
+    fs::write(workspace.join("packages/lib/leaf/index.js"), "module.exports = 'nested leaf'")
+        .unwrap();
+    fs::write(workspace.join("packages/lib/index.js"), "module.exports = require('leaf')").unwrap();
+    fs::write(workspace.join("packages/app/index.js"), "console.log(require('lib'))").unwrap();
+
+    pacquet_cmd(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+    pacquet_cmd(&workspace)
+        .with_args(["--filter", "app", "deploy", "--legacy", "deployed"])
+        .assert()
+        .success();
+
+    fs::rename(workspace.join("packages/lib"), workspace.join("source-lib")).unwrap();
+    Command::new("node")
+        .current_dir(workspace.join("deployed"))
+        .arg("index.js")
+        .assert()
+        .success()
+        .stdout("nested leaf\n");
+    drop((root, mock_instance));
+}
+
+#[test]
+fn legacy_deploy_resolves_local_dependencies_from_the_selected_project() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    append_workspace_yaml_key(&workspace, "packages", "\n  - packages/*");
+    write_project(
+        &workspace,
+        "app",
+        &serde_json::json!({
+            "name": "app",
+            "version": "1.0.0",
+            "dependencies": {
+                "file-dep": "file:../../local/file-dep",
+                "link-dep": "link:../../local/link-dep",
+                "path-dep": "../../local/path-dep",
+                "backslash-dep": r"file:..\..\local\backslash-dep",
+                "copied-dep": "../app/copied-dep",
+            },
+            "peerDependencies": { "peer-dep": "link:../../local/peer-dep" },
+        }),
+    );
+    let names = ["file-dep", "link-dep", "path-dep", "backslash-dep", "peer-dep", "copied-dep"];
+    for name in names {
+        let dir = if name == "copied-dep" {
+            workspace.join("packages/app").join(name)
+        } else {
+            workspace.join("local").join(name)
+        };
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("package.json"),
+            serde_json::json!({ "name": name, "version": "1.0.0" }).to_string(),
+        )
+        .unwrap();
+        fs::write(dir.join("index.js"), format!("module.exports = '{name}'")).unwrap();
+    }
+    fs::write(
+        workspace.join("packages/app/index.js"),
+        format!("console.log({names:?}.map(require).join(','))"),
+    )
+    .unwrap();
+
+    pacquet_cmd(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+    pacquet_cmd(&workspace)
+        .with_args(["--filter", "app", "deploy", "--legacy", "deployed"])
+        .assert()
+        .success();
+
+    fs::rename(workspace.join("packages/app"), workspace.join("source-app")).unwrap();
+    Command::new("node")
+        .current_dir(workspace.join("deployed"))
+        .arg("index.js")
+        .assert()
+        .success()
+        .stdout(format!("{}\n", names.join(",")));
+    drop((root, mock_instance));
+}
+
+#[test]
+fn legacy_deploy_resolves_a_workspace_path_from_the_selected_project() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    append_workspace_yaml_key(&workspace, "packages", "\n  - packages/*");
+    write_project(
+        &workspace,
+        "app",
+        &serde_json::json!({
+            "name": "app", "version": "1.0.0", "dependencies": { "lib": "workspace:../lib" },
+        }),
+    );
+    write_project(&workspace, "lib", &serde_json::json!({ "name": "lib", "version": "1.0.0" }));
+    fs::write(workspace.join("packages/lib/index.js"), "module.exports = 'lib'").unwrap();
+    fs::write(workspace.join("packages/app/index.js"), "console.log(require('lib'))").unwrap();
+
+    pacquet_cmd(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+    pacquet_cmd(&workspace)
+        .with_args(["--filter", "app", "deploy", "--legacy", "deployed"])
+        .assert()
+        .success();
+
+    fs::rename(workspace.join("packages/lib"), workspace.join("source-lib")).unwrap();
+    Command::new("node")
+        .current_dir(workspace.join("deployed"))
+        .arg("index.js")
+        .assert()
+        .success()
+        .stdout("lib\n");
+    drop((root, mock_instance));
+}
 
 #[test]
 fn legacy_deploy_installs_selected_project() {
@@ -25,11 +175,14 @@ fn legacy_deploy_installs_selected_project() {
         .assert()
         .success();
     let workspace_lockfile = fs::read_to_string(workspace.join("pnpm-lock.yaml")).unwrap();
+    let workspace_state_path = workspace.join("node_modules/.pnpm-workspace-state-v1.json");
+    let workspace_state = fs::read_to_string(&workspace_state_path).unwrap();
     pacquet_cmd(&workspace)
         .with_args(["--filter", "app", "deploy", "--legacy", "--prod", "legacy-deploy"])
         .assert()
         .success();
 
+    assert_eq!(fs::read_to_string(&workspace_state_path).unwrap(), workspace_state);
     let deploy_dir = workspace.join("legacy-deploy");
     assert!(deploy_dir.join("index.js").exists());
     assert!(!deploy_dir.join("test.js").exists());
@@ -162,6 +315,94 @@ fn legacy_deploy_injects_transitive_workspace_dependencies() {
     drop((root, mock_instance));
 }
 
+/// `@pnpm.e2e/foo` also exists in the registry, which must not provide it.
+#[test]
+fn legacy_deploy_injects_workspace_peers_of_workspace_dependencies() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    write_workspace(&workspace, false);
+    write_project(
+        &workspace,
+        "lib",
+        &serde_json::json!({
+            "name": "lib",
+            "version": "1.0.0",
+            "files": ["index.js"],
+            "peerDependencies": { "peer": "workspace:^", "@pnpm.e2e/foo": "workspace:^1.0.0" },
+        }),
+    );
+    write_project(
+        &workspace,
+        "peer",
+        &serde_json::json!({
+            "name": "peer",
+            "version": "1.0.0",
+            "files": ["index.js"],
+        }),
+    );
+    write_project(
+        &workspace,
+        "foo",
+        &serde_json::json!({
+            "name": "@pnpm.e2e/foo",
+            "version": "1.0.0",
+            "files": ["index.js"],
+        }),
+    );
+    fs::write(workspace.join("packages/peer/index.js"), "module.exports = 'workspace peer'")
+        .unwrap();
+    fs::write(workspace.join("packages/foo/index.js"), "module.exports = 'workspace foo'").unwrap();
+    fs::write(
+        workspace.join("packages/lib/index.js"),
+        "module.exports = require('peer') + ' ' + require('@pnpm.e2e/foo')",
+    )
+    .unwrap();
+    fs::write(workspace.join("packages/app/index.js"), "console.log(require('lib'))").unwrap();
+
+    pacquet
+        .with_arg("install")
+        .assert()
+        .success();
+    pacquet_cmd(&workspace)
+        .with_args(["--filter", "app", "deploy", "--legacy", "--prod", "legacy-deploy"])
+        .assert()
+        .success();
+
+    let deploy_dir = workspace.join("legacy-deploy");
+    let entries = virtual_store_entries(&deploy_dir);
+    dbg!(&entries);
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.starts_with("peer@file+"))
+            && entries
+                .iter()
+                .any(|entry| entry.starts_with("@pnpm.e2e+foo@file+")),
+        "the workspace peers should be injected into the deploy virtual store",
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| entry.starts_with("@pnpm.e2e+foo@1.")),
+        "the registry must not provide a workspace peer",
+    );
+    fs::rename(workspace.join("packages"), workspace.join("source-packages")).unwrap();
+    Command::new("node")
+        .current_dir(&deploy_dir)
+        .arg("index.js")
+        .assert()
+        .success()
+        .stdout("workspace peer workspace foo\n");
+
+    drop((root, mock_instance));
+}
+
 #[test]
 fn legacy_deploy_prefers_workspace_lockfile_versions() {
     let CommandTempCwd {
@@ -215,7 +456,7 @@ fn legacy_deploy_prefers_workspace_lockfile_versions() {
     assert_eq!(deploy_manifest["dependenciesMeta"]["lib"]["injected"], true);
 
     let virtual_store_dir = deploy_dir.join("node_modules/.pnpm");
-    let current_lockfile = Lockfile::load_current_from_virtual_store_dir(&virtual_store_dir)
+    let current_lockfile = Lockfile::load_current_from_install_state_dir(&virtual_store_dir)
         .expect("load deploy current lockfile")
         .expect("deploy current lockfile exists");
     assert_eq!(
@@ -521,7 +762,7 @@ fn legacy_deploy_preserves_source_pnpmfile_hooks() {
     .expect("parse deploy manifest");
     assert_eq!(deploy_manifest["dependencies"]["@pnpm.e2e/foo"], "^100.0.0");
     let current_lockfile =
-        Lockfile::load_current_from_virtual_store_dir(&deploy_dir.join("node_modules/.pnpm"))
+        Lockfile::load_current_from_install_state_dir(&deploy_dir.join("node_modules/.pnpm"))
             .expect("load deploy current lockfile")
             .expect("deploy current lockfile exists");
     let foo_name = PkgName::parse("@pnpm.e2e/foo").expect("parse fixture package name");
@@ -782,6 +1023,46 @@ fn legacy_deploy_keeps_the_workspace_branch_lockfiles() {
     assert!(
         branch_lockfile.exists(),
         "a deploy install never saves the workspace lockfile, so it cannot have merged them",
+    );
+
+    drop((root, mock_instance));
+}
+
+#[test]
+fn legacy_deploy_with_dedicated_lockfile_writes_no_workspace_state() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    write_workspace(&workspace, false);
+    append_workspace_yaml_key(&workspace, "sharedWorkspaceLockfile", false);
+
+    pacquet
+        .with_arg("install")
+        .assert()
+        .success();
+    let workspace_state_path = workspace.join("node_modules/.pnpm-workspace-state-v1.json");
+    let workspace_state = fs::read_to_string(&workspace_state_path).unwrap();
+
+    pacquet_cmd(&workspace)
+        .with_args(["--filter", "app", "deploy", "--legacy", "--prod", "legacy-deploy"])
+        .assert()
+        .success();
+
+    let deploy_dir = workspace.join("legacy-deploy");
+    assert!(deploy_dir.join("node_modules/lib").exists());
+    assert!(
+        !deploy_dir.join("node_modules/.pnpm-workspace-state-v1.json").exists(),
+        "legacy deploy must not record a workspace state in the deploy directory",
+    );
+    assert_eq!(
+        fs::read_to_string(&workspace_state_path).unwrap(),
+        workspace_state,
+        "legacy deploy must not rewrite the source workspace state",
     );
 
     drop((root, mock_instance));

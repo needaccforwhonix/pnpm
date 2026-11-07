@@ -18,7 +18,7 @@ let registriesByScope: Record<string, string>
 beforeAll(async () => {
   const { config } = await getConfig({ cliOptions: {}, packageManager: { name: '', version: '' } })
   registriesByScope = config.registriesByScope
-  registriesByScope.default = `http://localhost:${REGISTRY_MOCK_PORT}/`
+  registriesByScope.default = `http://localhost:${REGISTRY_MOCK_PORT}/npm/`
 })
 
 const createCacheKey = (...packages: string[]): string => dlx.createCacheKey({ packages, registriesByScope })
@@ -235,6 +235,25 @@ describe('catalogs inherited from pnpm-workspace.yaml', () => {
   })
 })
 
+test.each([
+  { flags: ['-C', '../target'], runDir: 'target' },
+  { flags: ['-w'], runDir: '.' },
+  { flags: [], runDir: 'invoker' },
+])('dlx runs the command in the directory selected by $flags', async ({ flags, runDir }) => {
+  prepare()
+  writeYamlFileSync('pnpm-workspace.yaml', { packages: [] })
+  fs.mkdirSync('invoker')
+  fs.mkdirSync('target')
+  const expectedDir = fs.realpathSync(runDir)
+
+  const result = execPnpmSync([...flags, 'dlx', 'shx@0.3.4', 'pwd'], {
+    cwd: path.resolve('invoker'),
+    expectSuccess: true,
+  })
+
+  expect(fs.realpathSync(result.stdout.toString().trim())).toBe(expectedDir)
+})
+
 test('dlx should work with pnpm_config_save_dev env variable', async () => {
   prepareEmpty()
   execPnpmSync(['dlx', '@foo/touch-file-one-bin@latest'], {
@@ -276,10 +295,15 @@ testParallel('parallel dlx calls of the same package', async () => {
 
   // parallel dlx calls with cache
   await Promise.all(['abc', 'def', 'ghi'].map(
-    name => execPnpm(['dlx', 'shx@0.3.4', 'mkdir', name])
+    name => execPnpm([
+      `--config.store-dir=${path.resolve('store')}`,
+      `--config.cache-dir=${path.resolve('cache')}`,
+      '--config.dlx-cache-max-age=Infinity',
+      'dlx', 'shx@0.3.4', 'mkdir', name])
   ))
 
   expect(['abc', 'def', 'ghi'].filter(name => fs.existsSync(name))).toStrictEqual(['abc', 'def', 'ghi'])
+  expect(fs.existsSync(path.resolve('../cache'))).toBe(false)
   expect(fs.readdirSync(path.resolve('cache', 'dlx', createCacheKey('shx@0.3.4'))).sort()).toStrictEqual(cacheContentAfterFirstRun)
   expect(
     fs.readdirSync(path.resolve('cache', 'dlx', createCacheKey('shx@0.3.4'), 'pkg'))
@@ -332,13 +356,15 @@ test('dlx creates cache and store prune cleans cache', async () => {
   ]
 
   // The git-hosted artifact has an untrusted package identity, so it has to
-  // be approved by its depPath; the registry shx is approved by name.
+  // be approved by its depPath. Approve both resolution shapes because the
+  // resolver falls back to a git clone when the GitHub visibility probe fails.
   const allowBuilds = [
     '--allow-build=shx',
     '--allow-build=shx@https://codeload.github.com/shelljs/shx/tar.gz/61aca968cd7afc712ca61a4fc4ec3201e3770dc7',
+    '--allow-build=shx@git+https://github.com/shelljs/shx.git#61aca968cd7afc712ca61a4fc4ec3201e3770dc7',
   ]
 
-  /* eslint-disable no-await-in-loop */
+  /* eslint-disable no-await-in-loop -- the commands share one dlx cache, so they run one at a time */
   for (const [cmd, args] of Object.entries(commands)) {
     await execPnpm([...settings, ...allowBuilds, 'dlx', cmd, ...args])
   }
@@ -411,7 +437,7 @@ test('dlx read registry from .npmrc in the current directory', async () => {
   })
 
   fs.writeFileSync('.npmrc', [
-    `registry=http://localhost:${REGISTRY_MOCK_PORT}/`,
+    `registry=http://localhost:${REGISTRY_MOCK_PORT}/npm/`,
     `//localhost:${REGISTRY_MOCK_PORT}/:_authToken=${data.token}`,
   ].join('\n'))
 

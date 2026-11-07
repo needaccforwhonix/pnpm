@@ -4,13 +4,36 @@ use crate::pick_package_from_meta::{
 };
 use pnpm_registry::Package;
 use pnpm_resolving_resolver_base::{
-    ResolveOptions, VersionSelectorEntry, VersionSelectorType, VersionSelectors,
+    ResolveOptions, VersionSelectorEntry, VersionSelectorType, VersionSelectorWithWeight,
+    VersionSelectors,
 };
-use std::sync::Mutex;
+use std::{borrow::Cow, sync::Mutex};
+
+/// Keep an eligible edge on its own locked version even when its subtree
+/// needs fresh resolution. Other edges combine the workspace and level preferences.
+pub(crate) fn preferred_selectors<'a>(
+    opts: &'a ResolveOptions,
+    name: &str,
+) -> Option<Cow<'a, VersionSelectors>> {
+    if opts.refresh.prefer_current_version
+        && let Some(current) = &opts.refresh.current_pkg
+        && current.name.as_deref() == Some(name)
+        && let Some(version) = &current.version
+    {
+        return Some(Cow::Owned(VersionSelectors::from([(
+            version.clone(),
+            VersionSelectorEntry::Plain(VersionSelectorType::Version),
+        )])));
+    }
+    overlay_merged_selectors(opts, name)
+        .map(Cow::Owned)
+        .or_else(|| opts.version.preferred_versions.get(name).map(Cow::Borrowed))
+}
 
 /// The picker's preferred selectors for `name` with the per-level
-/// overlay folded in: each overlay version joins as a plain `version`
-/// selector.
+/// overlay folded in: each overlay version joins as a weighted `version`
+/// selector bumped by [`pnpm_resolving_resolver_base::DIRECT_DEP_SELECTOR_WEIGHT`]
+/// so direct dependencies take precedence over versions in sibling workspaces.
 /// `None` when no level resolved this name; callers then borrow the
 /// static map directly, so the owned merge allocates only on the rare
 /// overlay hit.
@@ -18,18 +41,29 @@ pub(crate) fn overlay_merged_selectors(
     opts: &ResolveOptions,
     name: &str,
 ) -> Option<VersionSelectors> {
-    let versions = opts.version.preferred_versions_overlay.as_ref()?.versions_for(name);
-    if versions.is_empty() {
+    let weighted_selectors =
+        opts.version.preferred_versions_overlay.as_ref()?.weighted_selectors_for(name);
+    if weighted_selectors.is_empty() {
         return None;
     }
     let mut selectors = opts.version.preferred_versions
         .get(name)
         .cloned()
         .unwrap_or_default();
-    for version in versions {
-        selectors
-            .entry(version.to_string())
-            .or_insert(VersionSelectorEntry::Plain(VersionSelectorType::Version));
+    for (selector, selector_type, weight) in weighted_selectors {
+        let entry = selectors
+            .entry(selector.to_string())
+            .or_insert_with(|| {
+                VersionSelectorEntry::Weighted(VersionSelectorWithWeight {
+                    selector_type,
+                    weight: 0,
+                })
+            });
+        let existing_weight = entry.weight();
+        *entry = VersionSelectorEntry::Weighted(VersionSelectorWithWeight {
+            selector_type,
+            weight: existing_weight + weight,
+        });
     }
     Some(selectors)
 }
@@ -72,14 +106,9 @@ pub(crate) fn warn_once_on_held_back_update(
         return;
     };
     let key = format!("{}@{}:{picked_version}<{preferred}", spec.name, spec.fetch_spec);
-    let mut warned = WARNED_HELD_BACK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if warned.contains(&key) {
+    if !crate::warn_once::first_warning(&WARNED_HELD_BACK, key, MAX_WARNED_HELD_BACK) {
         return;
     }
-    if warned.len() >= MAX_WARNED_HELD_BACK {
-        warned.shift_remove_index(0);
-    }
-    warned.insert(key);
     tracing::warn!(
         target: "pnpm_resolving_npm_resolver::preferred_overlay",
         pkg_name = spec.name,

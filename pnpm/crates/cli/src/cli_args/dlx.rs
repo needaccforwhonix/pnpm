@@ -1,28 +1,31 @@
+pub(crate) use clean::clean_expired_dlx_cache;
+
 use crate::{
     State,
     cli_args::{
-        add::add_package, catalogs::configured_catalogs,
+        add::add_package, catalogs::configured_catalogs, exec::set_package_manager_env,
         supported_architectures::SupportedArchitecturesArgs,
     },
     engine_pm::{channel::PackageManager, provision::provision},
     path_env::{BadPathDir, prepend_dirs_to_path, set_command_path},
+    process::Command,
     shim_dispatch::materialize_runtime,
 };
-use cache::{
-    command_cache_dir, get_valid_cache_dir, prepare_cache_dir, read_json, resolve_catalog_specs,
-};
+
+use cache::{read_json, resolve_catalog_specs};
 use clap::Args;
 use derive_more::{Display, Error};
 use miette::{Context, Diagnostic, IntoDiagnostic};
 use pnpm_catalogs_protocol_parser::parse_catalog_protocol;
 use pnpm_catalogs_resolver::{
-    CatalogResolutionResult, WantedDependency as CatalogWantedDependency, resolve_from_catalog,
+    CatalogAnchor, CatalogResolutionResult, WantedDependency as CatalogWantedDependency,
+    resolve_from_catalog,
 };
 use pnpm_cmd_shim::{Host as CmdShimHost, get_bins_from_package_manifest};
 use pnpm_config::Config;
 use pnpm_config_parse_overrides::parse_overrides_iter;
 use pnpm_crypto_hash::create_short_hash;
-use pnpm_fs::force_symlink_dir;
+use pnpm_fs::{force_symlink_dir, remove_dirent};
 use pnpm_package_is_installable::SupportedArchitectures;
 use pnpm_package_manifest::{
     DependencyGroup, convert_engines_runtime_to_dependencies, is_runtime_alias,
@@ -33,12 +36,13 @@ use pnpm_registry::RangeSpecStyle;
 use pnpm_reporter::Reporter;
 use pnpm_resolving_parse_wanted_dependency::parse_wanted_dependency;
 use provision::{ProvisionedTool, provisioned_tool, run_package_manager, run_runtime};
+use rust::run_rust;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashMap},
-    fs,
+    ffi::OsStr,
+    fs, io,
     path::{Path, PathBuf},
-    process::Command,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -48,12 +52,17 @@ use std::{
 /// runtime (`node`, `deno`, `bun`) is provisioned rather than installed
 /// from the package that shares its name: those npm packages are either a
 /// different line of the tool (`yarn` stops at Classic) or a wrapper that
-/// downloads it.
+/// downloads it. So is a Rust release that `--package=rust@<channel>`
+/// names for one of its tools.
 #[derive(Debug, Args)]
 pub struct DlxArgs {
     /// The command to run, followed by its arguments.
-    #[clap(trailing_var_arg = true, allow_hyphen_values = true)]
+    #[clap(trailing_var_arg = true)]
     pub command: Vec<String>,
+
+    /// Print the pnpm version.
+    #[clap(short = 'v', long = "version", action = clap::ArgAction::Version)]
+    pub version: Option<bool>,
 
     /// The package to install before running the command. May be
     /// repeated. When omitted, the command name is the package.
@@ -158,9 +167,7 @@ impl From<BadPathDir> for DlxError {
 
 impl DlxArgs {
     /// Execute the subcommand. The package is installed into a cache
-    /// directory under `config.cache_dir`, and the resolved bin runs in
-    /// the process working directory (`cwd: process.cwd()`). `dir` is only
-    /// the fallback when the process cwd can't be read.
+    /// directory under `config.cache_dir`, and the resolved bin runs in `dir`.
     pub async fn run<Reporter: self::Reporter + 'static>(
         self,
         dir: &Path,
@@ -179,8 +186,8 @@ impl DlxArgs {
             return run_provisioned::<Reporter>(tool, config, bin_command, args, &spawn).await;
         }
 
-        // `pkgs = package ?? [command]`. With `--package`, the command
-        // names the bin to run; otherwise the command is also the package.
+        // With `--package`, the command names the bin to run; otherwise the
+        // command is also the package.
         let pkgs: Vec<String> =
             if self.package.is_empty() { vec![bin_command.clone()] } else { self.package.clone() };
         // Resolved here rather than in the install below so the catalog's
@@ -193,49 +200,47 @@ impl DlxArgs {
         // is part of the cache key: it changes which platform-tagged
         // optional dependencies get installed, so two invocations that
         // differ only by architecture must not share a cache entry.
-        let dlx_command_cache_dir =
-            command_cache_dir(config, &pkgs, &self.allow_build, &supported_architectures)?;
-        let cache_link = dlx_command_cache_dir.join("pkg");
-
-        let cached_dir =
-            match get_valid_cache_dir(&cache_link, config.dlx_cache_max_age, SystemTime::now()) {
-                Some(cached_dir) => cached_dir,
-                None => {
-                    prepare_cache_dir::<Reporter>(
-                        &dlx_command_cache_dir,
-                        &cache_link,
-                        &pkgs,
-                        &self.allow_build,
-                        &supported_architectures,
-                        config,
-                    )
-                    .await?
-                }
-            };
+        let cached_dir = cache::get_or_prepare_cache::<Reporter>(
+            config,
+            &pkgs,
+            &self.allow_build,
+            &supported_architectures,
+        )
+        .await?;
 
         let bin_name =
             if self.package.is_empty() { get_bin_name(&cached_dir)? } else { bin_command.clone() };
 
-        run_bin(
+        let status = run_bin(
             DlxProgram::Named(&bin_name),
             args,
             vec![cached_dir.join("node_modules").join(".bin")],
             &spawn,
-        )
+        )?;
+        exit_unless_success(status);
+        Ok(())
+    }
+}
+
+/// End pnpm the way a failed child did. `exit_like` runs no destructors,
+/// so a caller drops what has to be cleaned up before calling this.
+pub(crate) fn exit_unless_success(status: crate::process::ExitStatus) {
+    if !status.success() {
+        pnpm_executor::exit_like(pnpm_executor::ScriptExit::Process(status));
     }
 }
 
 /// The config values every dlx spawn applies, read before the install path
 /// consumes `config` to anchor it at the cache directory.
-struct SpawnEnv {
-    cwd: PathBuf,
+struct SpawnEnv<'a> {
+    cwd: &'a Path,
     extra_bin_paths: Vec<PathBuf>,
     extra_env: HashMap<String, String>,
     user_agent: String,
 }
 
-impl SpawnEnv {
-    fn from_config(config: &Config, dir: &Path) -> Self {
+impl<'a> SpawnEnv<'a> {
+    fn from_config(config: &Config, dir: &'a Path) -> Self {
         let mut extra_env = config.extra_env.clone();
         // The GVS resolution env injected by `Config::current` points at
         // the *invoking* project's node_modules; the dlx tool runs from
@@ -245,9 +250,7 @@ impl SpawnEnv {
         extra_env.remove("NODE_PATH");
         extra_env.remove("NODE_OPTIONS");
         SpawnEnv {
-            // The dlx command runs in the process working directory
-            // (`cwd: process.cwd()`), independent of `--dir`.
-            cwd: std::env::current_dir().unwrap_or_else(|_| dir.to_path_buf()),
+            cwd: dir,
             extra_bin_paths: config.extra_bin_paths.clone(),
             extra_env,
             user_agent: config.user_agent.clone(),
@@ -256,7 +259,7 @@ impl SpawnEnv {
 
     fn spawn(&self, shell_mode: bool) -> DlxSpawn<'_> {
         DlxSpawn {
-            cwd: &self.cwd,
+            cwd: self.cwd,
             extra_bin_paths: &self.extra_bin_paths,
             extra_env: &self.extra_env,
             user_agent: &self.user_agent,
@@ -278,6 +281,9 @@ async fn run_provisioned<Reporter: self::Reporter + 'static>(
         }
         ProvisionedTool::Runtime { name, version_spec } => {
             run_runtime(&config.state_dir, name, version_spec, bin_command, args, spawn).await
+        }
+        ProvisionedTool::Rust(channel) => {
+            run_rust::<Reporter>(config, channel, bin_command, args, spawn).await
         }
     }
 }
@@ -332,7 +338,7 @@ fn run_bin(
     args: &[String],
     bin_dirs: Vec<PathBuf>,
     spawn: &DlxSpawn<'_>,
-) -> miette::Result<()> {
+) -> miette::Result<crate::process::ExitStatus> {
     let mut prepend = bin_dirs;
     prepend.extend(spawn.extra_bin_paths.iter().cloned());
     let path = prepend_dirs_to_path(&prepend).map_err(DlxError::from)?;
@@ -372,15 +378,13 @@ fn run_bin(
     // works if that changes.
     cmd.envs(spawn.extra_env);
     set_command_path(&mut cmd, &path);
+    set_package_manager_env(&mut cmd, spawn.cwd, spawn.extra_env);
     cmd.env("npm_config_user_agent", spawn.user_agent);
 
-    let status = pnpm_executor::spawn_child(&mut cmd, None)
+    pnpm_executor::spawn_child(&mut cmd, None)
         .and_then(|mut child| child.wait())
-        .map_err(|source| DlxError::Spawn { command: program.command().to_string(), source })?;
-    if !status.success() {
-        pnpm_executor::exit_like(pnpm_executor::ScriptExit::Process(status));
-    }
-    Ok(())
+        .map_err(|source| DlxError::Spawn { command: program.command().to_string(), source })
+        .map_err(miette::Report::new)
 }
 
 /// Determine the bin to run from the first installed dependency.
@@ -445,5 +449,7 @@ fn scopeless(pkg_name: &str) -> &str {
 mod tests;
 
 mod cache;
+mod clean;
 
 mod provision;
+mod rust;

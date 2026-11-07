@@ -12,14 +12,12 @@ use super::{
 use crate::{
     Install, PolicyExcludes, UpdateSeedPolicy, WorkspaceInstallSelection,
     catalog_cleanup::{write_workspace_catalogs, write_workspace_catalogs_selected},
-    defer_ignored_builds, included_direct_groups,
+    defer_ignored_builds,
     manifest_spec_bumps::ManifestSpecBumps,
 };
 use pipe_trait::Pipe;
 use pnpm_catalogs_types::Catalogs;
-use pnpm_lockfile::MaybeLazyLockfile;
 use pnpm_package_manifest::{DependencyGroup, PackageManifest};
-use pnpm_registry::RangeSpecStyle;
 use pnpm_reporter::Reporter;
 use pnpm_resolving_resolver_base::PreferredVersions;
 use std::{
@@ -42,6 +40,7 @@ pub(super) async fn run_prepared_selected_update<Reporter: self::Reporter + 'sta
             update.config,
             site.catalogs_dir(prepared.workspace_dir_for_catalogs.as_deref()),
             &prepared.updated_catalogs,
+            None,
             selected.projects,
         )
         .map_err(UpdateError::WriteWorkspaceManifest)?;
@@ -49,7 +48,7 @@ pub(super) async fn run_prepared_selected_update<Reporter: self::Reporter + 'sta
 
     let bumps = (!prepared.bump_targets.is_empty()).then(|| ManifestSpecBumps {
         targets: std::mem::take(&mut prepared.bump_targets),
-        range_spec_style: RangeSpecStyle::from_save_options(update.version.save_exact, None),
+        range_spec_style: update.version.range_spec_style,
         applied: Mutex::default(),
     });
     let ignored_builds = run_selected_update_install::<Reporter, _>(
@@ -92,6 +91,7 @@ pub(super) async fn run_prepared_update<Reporter: self::Reporter + 'static>(
             update.config,
             prepared.workspace_dir_for_catalogs.as_deref(),
             &prepared.updated_catalogs,
+            None,
             manifest,
         )
         .map_err(UpdateError::WriteWorkspaceManifest)?;
@@ -103,7 +103,7 @@ pub(super) async fn run_prepared_update<Reporter: self::Reporter + 'static>(
             importer_id.clone(),
             std::mem::take(&mut prepared.bump_targets),
         )]),
-        range_spec_style: RangeSpecStyle::from_save_options(update.version.save_exact, None),
+        range_spec_style: update.version.range_spec_style,
         applied: Mutex::default(),
     });
     let ignored_builds = run_update_install::<Reporter, _>(
@@ -143,9 +143,8 @@ pub(super) struct UpdateSeed {
     pub(super) preferred_versions_override: PreferredVersions,
     pub(super) catalogs_override: Option<Catalogs>,
 }
-/// `include` is always all-true for updates: the materialized
-/// `node_modules` layout must not change just because the
-/// update scope was narrowed.
+/// An explicitly selected peer group reaches resolution; the install honors
+/// `autoInstallPeers` when deciding whether to materialize those peers.
 /// `update` always re-resolves against the registry, so the
 /// auto-frozen / repeat-install fast paths must not fire.
 pub(super) fn update_install<'i>(
@@ -154,20 +153,14 @@ pub(super) fn update_install<'i>(
     manifest: &'i PackageManifest,
     seed: UpdateSeed,
     read_package_hook: Option<&ReadPackageHook>,
-) -> Install<'i, impl Iterator<Item = DependencyGroup>> {
+) -> Install<'i, Vec<DependencyGroup>> {
+    let dependency_groups = update_dependency_groups(&update, &owned);
     Install {
         lockfile_policy: update.lockfile_policy(),
-        execution: crate::InstallExecution {
-            skip_runtimes: update.config.skip_runtimes,
-            mutation: update_mutation(update.selection.packages, update.version.latest),
-            installs_only: true,
-            node_linker: update.config.node_linker,
-            lockfile_only: update.lockfile_only,
-            dry_run: false,
-        },
+        execution: update_execution(&update),
         resolution: crate::ResolutionInputs {
             update_seed_policy: seed.policy,
-            preferred_versions_override: Some(seed.preferred_versions_override),
+            preferred_versions_override: Some(seed.preferred_versions_override.into()),
             auth_override: None,
             observer: owned.resolution_observer,
             peer_issues_sink: None,
@@ -178,8 +171,8 @@ pub(super) fn update_install<'i>(
             config: update.config,
             manifest,
             emit_initial_manifest: false,
-            lockfile: MaybeLazyLockfile::Loaded(update.lockfile),
-            lockfile_path: update.lockfile_path,
+            lockfile: update.lockfile.source,
+            lockfile_path: update.lockfile.path,
         },
         fetching: crate::InstallFetching {
             tarball_mem_cache: owned.tarball_mem_cache,
@@ -187,13 +180,65 @@ pub(super) fn update_install<'i>(
             resolved_packages: update.resolved_packages,
         },
         projects: crate::InstallProjects {
-            dependency_groups: included_direct_groups(update.config.optional),
+            dependency_groups,
             supported_architectures: owned.supported_architectures,
             catalogs_override: seed.catalogs_override,
             pnpmfile_hook_override: read_package_hook.map(|(hook, _)| Arc::clone(hook)),
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
+}
+fn update_execution(update: &UpdateOptions<'_>) -> crate::InstallExecution {
+    crate::InstallExecution {
+        skip_runtimes: update.config.skip_runtimes,
+        mutation: update_mutation(update.selection.packages, update.version.latest),
+        installs_only: false,
+        node_linker: update.config.node_linker,
+        lockfile_only: update.lockfile_only,
+        dry_run: false,
+    }
+}
+fn update_dependency_groups(
+    update: &UpdateOptions<'_>,
+    owned: &UpdateResources,
+) -> Vec<DependencyGroup> {
+    let prior_included = pnpm_modules_yaml::read_modules_layout::<pnpm_modules_yaml::Host>(
+        &update.config.modules_dir,
+    )
+    .ok()
+    .flatten()
+    .map(|layout| layout.included);
+    let is_explicit_dev = owned.explicit_groups.dev;
+    let is_explicit_prod = owned.explicit_groups.prod;
+    let is_explicit_optional = owned.explicit_groups.optional;
+
+    let (prod, dev, optional) = if let Some(included) = prior_included {
+        (
+            included.dependencies || is_explicit_prod,
+            included.dev_dependencies || is_explicit_dev,
+            !owned.explicit_groups.no_optional
+                && (is_explicit_optional
+                    || (included.optional_dependencies && update.config.optional)),
+        )
+    } else {
+        (
+            true,
+            !is_explicit_prod || is_explicit_dev,
+            !owned.explicit_groups.no_optional
+                && (is_explicit_optional || update.config.optional),
+        )
+    };
+
+    std::iter::empty()
+        .chain(prod.then_some(DependencyGroup::Prod))
+        .chain(dev.then_some(DependencyGroup::Dev))
+        .chain(optional.then_some(DependencyGroup::Optional))
+        .chain(
+            owned.include_direct.contains(&DependencyGroup::Peer).then_some(DependencyGroup::Peer),
+        )
+        .collect()
 }
 /// A selector that matched nothing at depth 0 is an error; anything else
 /// leaves the command a no-op.

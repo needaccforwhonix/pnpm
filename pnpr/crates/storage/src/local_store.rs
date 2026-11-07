@@ -1,22 +1,20 @@
-mod revision_refs;
-
 mod hosted_backend;
 
 use super::{
-    Arc, AsyncReadExt, AsyncSeekExt, BlobFinalize, BlobWrite, Body, BoxStream, CachedDocument,
-    CanonicalPackageName, DOCUMENT_FILE, DocumentWrite, Duration, ErrorKind, GetRange,
-    HOSTED_REVISION_REF_INDEX_FILE, HOSTED_REVISION_REFS_DIR, HostedBackend, HostedBlobFile,
-    HostedDocumentForUpdate, HostedDocumentVersion, HostedRevisionRefIndex, HostedRevisionRefWrite,
-    MAX_NAME_COMPONENTS, Path, PathBuf, RangedBlob, RegistryError, Result, SeekFrom, StreamExt,
-    SystemTime, async_trait, create_tmp_file, fs, stream, streaming, unique_tmp_path, write_atomic,
-    write_atomic_new,
+    ARCHIVES_DIR, Arc, AsyncReadExt, AsyncSeekExt, BLOBS_DIR, BlobWrite, Body, BoxStream,
+    CachedDocument, CanonicalPackageName, DOCUMENT_FILE, DocumentStamp, DocumentWrite, Duration,
+    Ecosystem, ErrorKind, GetRange, HostedBackend, HostedDocumentForUpdate, HostedDocumentVersion,
+    PACKAGES_DIR, Path, PathBuf, RangedBlob, RegistryError, Result, SeekFrom, StoredArchive,
+    StreamExt, SystemTime, async_trait, blob_segment, create_tmp_file, fs, package_segments,
+    stream, streaming, unique_tmp_path, write_atomic, write_atomic_new,
 };
 
-/// One verdaccio-shaped on-disk store rooted at a single directory.
+/// One on-disk store rooted at a single directory, laid out as
+/// [`crate::layout`] describes.
 #[derive(Debug, Clone)]
 pub(super) struct Store {
     pub(super) root: PathBuf,
-    pub(super) revision_ref_write_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(super) ecosystem: Ecosystem,
     /// Serializes the read-compare-write of a record against every other
     /// write to it, removals included. One process owns this store, so an
     /// in-process lock is the whole of the compare-and-set the object-store
@@ -28,7 +26,7 @@ impl Store {
     pub(super) fn new(root: PathBuf) -> Self {
         Self {
             root,
-            revision_ref_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            ecosystem: Ecosystem::Npm,
             record_write_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
@@ -39,7 +37,15 @@ impl Store {
     pub(super) fn namespaced(&self, prefix: &str) -> Store {
         Store {
             root: self.root.join(prefix),
-            revision_ref_write_lock: Arc::clone(&self.revision_ref_write_lock),
+            ecosystem: self.ecosystem,
+            record_write_lock: Arc::clone(&self.record_write_lock),
+        }
+    }
+
+    pub(super) fn with_ecosystem(&self, ecosystem: Ecosystem) -> Store {
+        Store {
+            root: self.root.clone(),
+            ecosystem,
             record_write_lock: Arc::clone(&self.record_write_lock),
         }
     }
@@ -64,6 +70,20 @@ impl Store {
             // Stale: treated as a miss so the caller refetches from the upstream
             // (there is no conditional revalidation), so the body isn't read here.
             Ok(Some(CachedDocument::Stale))
+        }
+    }
+
+    pub(super) async fn document_stamp(
+        &self,
+        name: &CanonicalPackageName,
+    ) -> Result<Option<DocumentStamp>> {
+        match fs::metadata(self.document_path(name)).await {
+            Ok(metadata) => Ok(Some(DocumentStamp {
+                modified: metadata.modified().map_err(RegistryError::Io)?,
+                size: metadata.len(),
+            })),
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err.into()),
         }
     }
 
@@ -129,55 +149,12 @@ impl Store {
         self.open_blob_tmp_at(final_path).await
     }
 
-    pub(super) async fn open_revision_blob(&self, digest: &str) -> Result<Option<(fs::File, u64)>> {
-        let file = match fs::File::open(self.revision_blob_path(digest)).await {
-            Ok(file) => file,
-            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(err) => return Err(err.into()),
-        };
-        let len = file.metadata().await?.len();
-        Ok(Some((file, len)))
-    }
-
-    pub(super) async fn open_revision_blob_tmp(&self, digest: &str) -> Result<BlobWrite> {
-        self.open_blob_tmp_at(self.revision_blob_path(digest)).await
-    }
-
     pub(super) async fn open_blob_tmp_at(&self, final_path: PathBuf) -> Result<BlobWrite> {
         if let Some(parent) = final_path.parent() {
             fs::create_dir_all(parent).await?;
         }
         let (file, tmp_path) = create_tmp_file(&final_path).await?;
         Ok(BlobWrite { file: Some(file), tmp_path: Some(tmp_path), final_path })
-    }
-
-    /// Reserve a tmp path in the destination package directory so the
-    /// publish flow can write there and [`Self::finalize_blob`] can
-    /// rename within the same directory (atomic on POSIX).
-    pub(super) async fn reserve_blob_tmp(
-        &self,
-        name: &CanonicalPackageName,
-        filename: &str,
-    ) -> Result<PathBuf> {
-        let final_path = self.blob_path(name, filename);
-        if let Some(parent) = final_path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-        Ok(unique_tmp_path(&final_path))
-    }
-
-    pub(super) async fn finalize_blob(
-        &self,
-        tmp_path: &Path,
-        name: &CanonicalPackageName,
-        filename: &str,
-    ) -> Result<()> {
-        let final_path = self.blob_path(name, filename);
-        if let Some(parent) = final_path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-        fs::rename(tmp_path, &final_path).await?;
-        Ok(())
     }
 
     /// Remove the entire package directory. Returns `Ok(false)` if it
@@ -208,89 +185,17 @@ impl Store {
         }
     }
 
-    pub(super) async fn prune_package_index(&self, name: &CanonicalPackageName) -> Result<()> {
-        let root = self.root.join(".package-index");
-        let mut directory = root.join(name.as_str());
-        while directory != root {
-            match fs::remove_dir(&directory).await {
-                Ok(()) => {}
-                Err(err) if err.kind() == ErrorKind::NotFound => {}
-                Err(err) if err.kind() == ErrorKind::DirectoryNotEmpty => break,
-                Err(err) => return Err(err.into()),
-            }
-            directory.pop();
-        }
-        Ok(())
-    }
-
-    pub(super) async fn indexed_package_names(&self) -> Result<Vec<String>> {
-        let mut names = Vec::new();
-        let mut pending = vec![(self.root.join(".package-index"), String::new())];
-        while let Some((dir, name)) = pending.pop() {
-            let Some(mut entries) = read_dir_if_present(&dir).await? else {
-                continue;
-            };
-            while let Some(entry) = entries.next_entry().await? {
-                match self.classify_index_entry(&entry, &name).await? {
-                    IndexEntry::Package => names.push(name.clone()),
-                    IndexEntry::Child(path, child) => pending.push((path, child)),
-                    IndexEntry::Ignored => {}
-                }
-            }
-        }
-        Ok(names)
-    }
-
-    /// What one entry of the `.package-index` tree contributes to the walk.
-    pub(super) async fn classify_index_entry(
-        &self,
-        entry: &fs::DirEntry,
-        name: &str,
-    ) -> Result<IndexEntry> {
-        let component = entry
-            .file_name()
-            .to_string_lossy()
-            .into_owned();
-        if component == ".present" {
-            // A marker whose document is gone is a stale index entry.
-            let present =
-                !name.is_empty() && fs::try_exists(self.root.join(name).join(DOCUMENT_FILE)).await?;
-            return Ok(if present { IndexEntry::Package } else { IndexEntry::Ignored });
-        }
-        if component.starts_with('.') || !entry.file_type().await?.is_dir() {
-            return Ok(IndexEntry::Ignored);
-        }
-        let child = if name.is_empty() { component } else { format!("{name}/{component}") };
-        Ok(IndexEntry::Child(entry.path(), child))
-    }
-
-    pub(super) async fn list_package_names(&self) -> Result<Vec<String>> {
-        let mut names = self.indexed_package_names().await?;
-        if fs::try_exists(self.root.join(".package-index/.complete")).await? {
-            names.sort();
-            return Ok(names);
-        }
-        let mut pending = vec![(self.root.clone(), String::new(), 1usize)];
-        while let Some((dir, prefix, depth)) = pending.pop() {
-            let Some(mut entries) = read_dir_if_present(&dir).await? else {
-                continue;
-            };
-            while let Some(entry) = entries.next_entry().await? {
-                match classify_hosted_entry(&entry, &prefix, depth).await {
-                    HostedEntry::Package(name) => names.push(name),
-                    HostedEntry::Child(path, name) => pending.push((path, name, depth + 1)),
-                    HostedEntry::Ignored => {}
-                    HostedEntry::EndOfPackageDir => break,
-                }
-            }
-        }
-        names.sort();
-        names.dedup();
-        Ok(names)
-    }
-
     pub(super) fn package_dir(&self, name: &CanonicalPackageName) -> PathBuf {
-        self.root.join(name.as_str())
+        let mut dir = self.root.join(PACKAGES_DIR);
+        dir.extend(package_segments(name.ecosystem(), name.as_str()));
+        dir
+    }
+
+    /// Where the hosted archive stored under `key` is.
+    pub(super) fn archive_path(&self, key: &str) -> PathBuf {
+        let mut path = self.root.clone();
+        path.extend(crate::layout::archive_object_path(key).split('/'));
+        path
     }
 
     pub(super) fn document_path(&self, name: &CanonicalPackageName) -> PathBuf {
@@ -298,14 +203,9 @@ impl Store {
     }
 
     pub(super) fn blob_path(&self, name: &CanonicalPackageName, filename: &str) -> PathBuf {
-        self.package_dir(name).join(filename)
-    }
-
-    pub(super) fn revision_blob_path(&self, digest: &str) -> PathBuf {
-        self.root
-            .join(".revisions")
-            .join("sha512")
-            .join(digest)
+        self.package_dir(name)
+            .join(BLOBS_DIR)
+            .join(blob_segment(name.as_str(), filename))
     }
 
     /// A record's path. The key's `/` separators become path components, so a
@@ -384,56 +284,6 @@ impl Store {
         }
         Ok(keys)
     }
-}
-
-/// What one entry of the `.package-index` tree contributes to the index walk.
-pub(super) enum IndexEntry {
-    /// A `.present` marker whose package document is still on disk.
-    Package,
-    /// A nested index directory to walk, with the name it carries.
-    Child(PathBuf, String),
-    /// A stale marker, a dot entry, or a non-directory.
-    Ignored,
-}
-
-/// What one entry of the hosted tree contributes to the legacy walk.
-pub(super) enum HostedEntry {
-    /// A directory holding a package document, under this name.
-    Package(String),
-    /// A directory to walk for a nested package name.
-    Child(PathBuf, String),
-    /// A dot entry, or a file shallow enough to sit beside a package.
-    Ignored,
-    /// A file inside a package directory. Legacy package trees keep blobs
-    /// beside the document, and nested packages are discovered through the
-    /// separate index, so the rest of this directory holds no package.
-    EndOfPackageDir,
-}
-
-/// Classify one entry of the hosted tree during the legacy walk. An entry
-/// whose kind cannot be read is ignored, the same as a non-directory.
-pub(super) async fn classify_hosted_entry(
-    entry: &fs::DirEntry,
-    prefix: &str,
-    depth: usize,
-) -> HostedEntry {
-    let entry_name = entry.file_name();
-    let name = entry_name.to_string_lossy();
-    if name.starts_with('.') {
-        return HostedEntry::Ignored;
-    }
-    if !entry.file_type().await.is_ok_and(|kind| kind.is_dir()) {
-        return if depth > 1 { HostedEntry::EndOfPackageDir } else { HostedEntry::Ignored };
-    }
-    let path = entry.path();
-    let name = if prefix.is_empty() { name.into_owned() } else { format!("{prefix}/{name}") };
-    if fs::try_exists(path.join(DOCUMENT_FILE)).await.unwrap_or(false) {
-        return HostedEntry::Package(name);
-    }
-    if depth < MAX_NAME_COMPONENTS {
-        return HostedEntry::Child(path, name);
-    }
-    HostedEntry::Ignored
 }
 
 /// A record key from the walk's directory prefix and one entry name.

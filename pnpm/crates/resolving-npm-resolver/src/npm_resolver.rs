@@ -15,28 +15,25 @@
 //! package map; the path-relative forms (`workspace:./foo`,
 //! `workspace:../bar`) return `Ok(None)` so the local-resolver in the
 //! chain claims them.
-//!
-//! Not yet implemented:
-//!
-//! - **`peek_manifest_from_store` fast path.** Short-circuiting a
-//!   registry fetch when the lockfile-pinned tarball is already in the
-//!   store. Pacquet today goes through the picker unconditionally;
-//!   adding the fast path is a separate item.
-
-pub(crate) use resolution_result::{RegistryResolutionSource, ResolvedSpecifier};
+pub use release_policy::detect_min_release_age_violation;
+pub use resolution_result::normalize_tarball_url;
+pub(crate) use resolution_result::{RegistryResolutionSource, ResolvedSpecifier, dist_integrity};
 
 pub(crate) use package_revision::validate_revision_selector;
 
 pub(crate) use guarded_pick::{
     PickFromRegistryOptions, PickedFromRegistry, RegistryPick, pick_from_registry_with_guard,
+    warn_once_on_trust_downgrade_fallback,
 };
 
 pub(crate) use workspace_pick::{no_matching_version, swallowed_as_no_latest};
 
+mod platform_variants;
+mod release_policy;
 mod resolution_result;
+use release_policy::latest_allowed_by_policy;
 use resolution_result::{
-    calculated_specifier, fail_if_trust_downgraded_for_pick, is_not_found_error,
-    latest_allowed_by_policy, registry_response_status,
+    calculated_specifier, is_not_found_error, registry_response_status, trust_check_for_pick,
 };
 
 mod package_revision;
@@ -46,37 +43,19 @@ mod guarded_pick;
 
 mod workspace_pick;
 use workspace_pick::{
-    prefer_workspace_pick, saved_specifier_options, wanted_spec, workspace_fallback_for,
-    workspace_packages_active, workspace_shadow_pick,
+    resolve_workspace_protocol, wanted_spec, workspace_packages_active, workspace_shadow_pick,
 };
 
-use std::{borrow::Cow, collections::HashMap, path::PathBuf, sync::Arc};
+mod store_peek;
+use store_peek::fast_path_pick;
 
-use chrono::{DateTime, Utc};
-use node_semver::Version;
-use pnpm_config::{
-    DEFAULT_JSR_REGISTRY, NeedsFullMetadataFor, TrustPolicy, version_policy::PackageVersionPolicy,
-};
-use pnpm_lockfile::{
-    LockfileResolution, PkgName, PkgNameVer, TarballResolution, TarballRevision,
-    is_integrity_addressed_registry_tarball_url,
-};
-use pnpm_network::{AuthHeaders, RetryOpts, ThrottledClient, redact_and_sanitize};
-use pnpm_registry::{Package, PackageDistribution, PackageVersion, RangeSpecStyle};
-use pnpm_resolving_resolver_base::{
-    GuardExhaustionPolicy, LatestInfo, LatestQuery, NoMatchingVersionError,
-    PackageVersionGuardDecision, PkgResolutionId, RegistryResponseError,
-    RegistryResponseErrorOptions, ResolutionPolicyViolation, ResolveError, ResolveFuture,
-    ResolveLatestFuture, ResolveOptions, ResolveResult, Resolver, UpdateBehavior, WantedDependency,
-    WorkspacePackages, parse_packument_timestamp,
-};
-use ssri::{Algorithm, Integrity};
-
+mod registry_dependency;
 use crate::{
+    OfflineStoreView,
     errors::{
         AllVersionsBlockedError, GuardRepickLimitError, InvalidRevisionSpecifierError,
         InvalidTarballIntegrityError, InvalidTarballRevisionMetadataError,
-        MalformedRevisionHistoryError, NoMatchingRevisionError,
+        MalformedRevisionHistoryError, MissingTarballUrlError, NoMatchingRevisionError,
     },
     named_registry::pick_registry_for_package,
     parse_bare_specifier::{parse_bare_specifier, parse_jsr_specifier_to_registry_package_spec},
@@ -92,8 +71,34 @@ use crate::{
         pick_matching_local_version_or_null, resolve_from_local_package,
         try_resolve_from_workspace, try_resolve_from_workspace_packages,
     },
-    trust_checks::{TrustCheckOptions, fail_if_trust_downgraded},
+    trust_checks::TrustCheckOptions,
     violation_codes::MINIMUM_RELEASE_AGE_VIOLATION_CODE,
+};
+use chrono::{DateTime, Utc};
+use node_semver::Version;
+use pnpm_lockfile::{
+    DeclaredRegistryPrefixes, LockfileResolution, PkgName, PkgNameVer, RegistryOptions,
+    RegistryServerType, TarballResolution, TarballRevision, TarballUrlOptions,
+    has_complete_sha512_digest, is_on_revision_tarball_route, is_revision_registry_tarball_url,
+    npm_tarball_url, registry_server_type,
+};
+use pnpm_network::{AuthHeaders, RetryOpts, ThrottledClient, redact_and_sanitize};
+use pnpm_registry::{Package, PackageDistribution, PackageVersion, RangeSpecStyle};
+use pnpm_resolving_resolver_base::{
+    DEFAULT_JSR_REGISTRY, GuardExhaustionPolicy, LatestInfo, LatestQuery, NeedsFullMetadataFor,
+    NoMatchingVersionError, PackageVersionGuardDecision, PkgResolutionId, RegistryResponseError,
+    RegistryResponseErrorOptions, ResolutionPolicyViolation, ResolveError, ResolveFuture,
+    ResolveLatestFuture, ResolveOptions, ResolveResult, Resolver, TrustPolicy, UpdateBehavior,
+    WantedDependency, WorkspacePackages, parse_packument_timestamp,
+};
+use pnpm_version_policy::PackageVersionPolicy;
+use registry_dependency::ResolvedRegistry;
+use ssri::{Algorithm, Integrity};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, HashMap},
+    path::PathBuf,
+    sync::Arc,
 };
 
 /// Provenance tag for [`ResolveResult::resolved_via`] when the picker
@@ -112,21 +117,19 @@ const NPM_REGISTRY_RESOLVED_VIA: &str = "npm-registry";
 pub struct NpmResolver<Cache: PackageMetaCache> {
     /// `default` plus per-scope (`@scope`) entries. The picker consults
     /// the `default` entry as the install-wide default and the scope
-    /// entry when the resolved package name carries one. Pacquet today
-    /// only populates
-    /// `default` — per-scope wiring lands when `.npmrc`'s
-    /// `<scope>:registry` parsing does.
+    /// entry when the resolved package name carries one.
     pub registries: HashMap<String, String>,
-    /// User-supplied named-registry aliases (e.g. `gh:` →
-    /// `https://npm.pkg.github.com/`). Merged with
-    /// [`crate::BUILTIN_REGISTRIES_BY_PREFIX`] at construction. Today
-    /// only consulted by the named-registry resolver (out of scope
-    /// for this port); kept here so the install layer can build one
-    /// resolver instance with the full registry view.
-    pub registries_by_prefix: HashMap<String, String>,
+    /// The prefixes the project declares. A package resolved from a registry
+    /// one of them names gets a registry-qualified id, whichever way its
+    /// dependency was spelled, so it shares its lockfile key with the
+    /// packages the named-registry resolver picks from that registry.
+    pub declared_prefixes: DeclaredRegistryPrefixes,
     pub metadata: RegistryMetadataClient<Cache>,
     pub format: RegistryMetadataFormat,
     pub cache_policy: crate::MetadataCachePolicy,
+    /// The install's store view, when the store is available. Offline picks
+    /// consult it to prefer versions whose tarball is already stored.
+    pub store_view: Option<OfflineStoreView>,
 }
 
 pub struct RegistryMetadataClient<Cache: PackageMetaCache> {
@@ -167,6 +170,14 @@ pub struct RegistryMetadataFormat {
     /// When full metadata is forced, read and write pnpm's filtered
     /// full-metadata mirror.
     pub filter_metadata: bool,
+    /// The declared per-registry settings, keyed like
+    /// `Config::registry_options_by_url`. A version without `dist.tarball`
+    /// gets its URL rebuilt in the layout its registry declares.
+    pub registry_options_by_url: Arc<BTreeMap<String, RegistryOptions>>,
+    /// The effective `minimumReleaseAge`, in minutes, checked against what
+    /// pnpr's own package document supports (see
+    /// [`crate::PnprFormatPolicy`]).
+    pub minimum_release_age: Option<u64>,
 }
 
 impl<Cache: PackageMetaCache + 'static> Resolver for NpmResolver<Cache> {
@@ -198,7 +209,13 @@ impl<Cache: PackageMetaCache + 'static> NpmResolver<Cache> {
         if let Some(bare) = wanted_dependency.bare_specifier.as_deref()
             && bare.starts_with("workspace:")
         {
-            return self.resolve_workspace_protocol(wanted_dependency, opts, bare, default_tag);
+            return resolve_workspace_protocol(
+                &self.registries,
+                wanted_dependency,
+                opts,
+                bare,
+                default_tag,
+            );
         }
 
         // `jsr:` resolves through the `@jsr` registry under the
@@ -211,139 +228,6 @@ impl<Cache: PackageMetaCache + 'static> NpmResolver<Cache> {
         }
 
         self.resolve_registry_dependency(wanted_dependency, opts, default_tag).await
-    }
-
-    async fn resolve_registry_dependency(
-        &self,
-        wanted_dependency: &WantedDependency,
-        opts: &ResolveOptions,
-        default_tag: &str,
-    ) -> Result<Option<ResolveResult>, ResolveError> {
-        // Pick registry from `(alias, bare_specifier)` so an npm-alias
-        // entry like `"foo": "npm:@scope/bar@^1"` routes through
-        // `registries[@scope]` instead of the alias's own scope.
-        let registry = pick_registry_for_package(
-            &self.registries,
-            wanted_dependency.alias.as_deref().unwrap_or_default(),
-            wanted_dependency.bare_specifier.as_deref(),
-        );
-
-        let Some(spec) = wanted_spec(wanted_dependency, default_tag, &registry) else {
-            return Ok(None);
-        };
-        validate_revision_selector(&spec)?;
-
-        let optional = wanted_dependency.optional.unwrap_or(false);
-        let workspace_packages_active = workspace_packages_active(opts, &spec);
-
-        if let Some(result) =
-            prefer_workspace_pick(workspace_packages_active, &spec, wanted_dependency, opts)
-        {
-            return Ok(Some(result));
-        }
-
-        let picked = match self.pick_from_registry(&registry, &spec, opts, optional).await {
-            Ok(RegistryPick::Picked(picked)) => picked,
-            outcome => {
-                return workspace_fallback_for(
-                    outcome,
-                    wanted_dependency,
-                    &registry,
-                    workspace_packages_active,
-                    &spec,
-                    opts,
-                );
-            }
-        };
-
-        self.finish_registry_pick(
-            wanted_dependency,
-            opts,
-            &spec,
-            &registry,
-            &picked,
-            workspace_packages_active,
-        )
-    }
-
-    fn finish_registry_pick(
-        &self,
-        wanted_dependency: &WantedDependency,
-        opts: &ResolveOptions,
-        spec: &RegistryPackageSpec,
-        registry: &str,
-        picked: &PickedFromRegistry,
-        workspace_packages_active: Option<&Arc<pnpm_resolving_resolver_base::WorkspacePackages>>,
-    ) -> Result<Option<ResolveResult>, ResolveError> {
-        fail_if_trust_downgraded_for_pick(
-            opts,
-            picked,
-            self.cache_policy.ignore_missing_time_field,
-        )?;
-
-        if let Some(result) =
-            workspace_shadow_pick(workspace_packages_active, spec, picked, wanted_dependency, opts)
-        {
-            return Ok(Some(result));
-        }
-
-        self.registry_pick_result(wanted_dependency, opts, spec, registry, picked)
-    }
-
-    fn registry_pick_result(
-        &self,
-        wanted_dependency: &WantedDependency,
-        opts: &ResolveOptions,
-        spec: &RegistryPackageSpec,
-        registry: &str,
-        picked: &PickedFromRegistry,
-    ) -> Result<Option<ResolveResult>, ResolveError> {
-        crate::npm_resolver::RegistryResolutionSource {
-            resolved_via: NPM_REGISTRY_RESOLVED_VIA,
-            registry,
-            registry_name: None,
-        }
-        .build_result(
-            picked,
-            &opts.policy,
-            &self.metadata.picked_manifest_cache,
-            crate::npm_resolver::ResolvedSpecifier {
-                spec,
-                alias: wanted_dependency.alias.as_deref(),
-                calculated_specifier: calculated_specifier(wanted_dependency, opts, spec, picked),
-            },
-        )
-        .map(Some)
-    }
-
-    /// `workspace:` resolves against the workspace alone; `workspace:.` is
-    /// the project itself and belongs to no resolver.
-    fn resolve_workspace_protocol(
-        &self,
-        wanted_dependency: &WantedDependency,
-        opts: &ResolveOptions,
-        bare: &str,
-        default_tag: &str,
-    ) -> Result<Option<ResolveResult>, ResolveError> {
-        if bare.starts_with("workspace:.") {
-            return Ok(None);
-        }
-        let registry = pick_registry_for_package(
-            &self.registries,
-            wanted_dependency.alias.as_deref().unwrap_or_default(),
-            wanted_dependency.bare_specifier.as_deref(),
-        );
-        let ws_opts = ResolveFromWorkspaceOptions {
-            project_dir: opts.project.project_dir.as_path(),
-            lockfile_dir: opts.project.lockfile_dir.as_path(),
-            registry: &registry,
-            default_tag,
-            workspace_packages: opts.project.workspace_packages.as_deref(),
-            inject_workspace_packages: opts.project.inject_workspace_packages,
-            saved_specifier: saved_specifier_options(opts),
-        };
-        try_resolve_from_workspace(wanted_dependency, &ws_opts)
-            .map_err(|err| Box::new(err) as ResolveError)
     }
 
     /// JSR counterpart to the npm path: runs the JSR-specifier parser,
@@ -375,18 +259,19 @@ impl<Cache: PackageMetaCache + 'static> NpmResolver<Cache> {
         let registry = self.registries.get("@jsr").map_or(DEFAULT_JSR_REGISTRY, String::as_str);
 
         let optional = wanted_dependency.optional.unwrap_or(false);
-        let picked = match self.pick_from_registry(registry, &jsr_spec.spec, opts, optional).await?
-        {
-            RegistryPick::Picked(picked) => picked,
-            RegistryPick::NoMatchingVersion(meta) => {
-                return Err(no_matching_version(wanted_dependency, registry, &meta));
-            }
-        };
+        let picked =
+            match self.pick_from_registry(registry, &jsr_spec.spec, opts, optional, None).await? {
+                RegistryPick::Picked(picked) => picked,
+                RegistryPick::NoMatchingVersion(meta) => {
+                    return Err(no_matching_version(wanted_dependency, registry, &meta));
+                }
+            };
 
         crate::npm_resolver::RegistryResolutionSource {
             resolved_via: JSR_REGISTRY_RESOLVED_VIA,
             registry,
-            registry_name: None,
+            registry_name: self.declared_prefixes.prefix_for(registry),
+            server_type: registry_server_type(&self.format.registry_options_by_url, registry),
         }
         .build_result(
             &picked,
@@ -410,37 +295,21 @@ impl<Cache: PackageMetaCache + 'static> NpmResolver<Cache> {
         spec: &RegistryPackageSpec,
         opts: &ResolveOptions,
         optional: bool,
+        trust_check: Option<TrustCheckOptions<'_>>,
     ) -> Result<RegistryPick, ResolveError> {
-        let overlay_selectors =
-            crate::preferred_overlay::overlay_merged_selectors(opts, &spec.name);
-        let base_selectors = overlay_selectors
-            .as_ref()
-            .or_else(|| opts.version.preferred_versions.get(&spec.name));
-        let ctx = self.metadata.pick_context(&self.format, self.cache_policy);
-
-        let picked = pick_from_registry_with_guard(
-            &ctx,
-            PickFromRegistryOptions {
-                registry,
-                spec,
-                preferred_version_selectors: base_selectors,
-                pick_lowest_version: opts.version.pick_lowest_version,
-                include_latest_tag: opts.refresh.update == UpdateBehavior::Latest,
-                package_version_guard: opts.policy.package_version_guard.as_ref(),
-                policy: crate::PackagePickPolicy {
-                    published_by: opts.policy.published_by,
-                    published_by_exclude: opts.policy.published_by_exclude.as_ref(),
-                    trust_policy: opts.policy.trust_policy,
-                },
-                request: crate::MetadataPickRequest {
-                    dry_run: opts.refresh.dry_run,
-                    optional,
-                    update_checksums: opts.refresh.update_checksums
-                        || opts.refresh.update == UpdateBehavior::Patches,
-                },
-            },
-        )
-        .await?;
+        let selectors = crate::preferred_overlay::preferred_selectors(opts, &spec.name);
+        let base_selectors = selectors.as_deref();
+        let ctx =
+            self.metadata.pick_context(&self.format, self.cache_policy, self.store_view.as_ref());
+        let pick_opts = PickFromRegistryOptions::new(
+            registry,
+            spec,
+            opts,
+            base_selectors,
+            optional,
+            trust_check,
+        );
+        let picked = pick_from_registry_with_guard(&ctx, pick_opts).await?;
         if let RegistryPick::Picked(picked) = &picked {
             crate::preferred_overlay::warn_once_on_held_back_update(
                 opts,
@@ -503,12 +372,18 @@ impl<Cache: PackageMetaCache> RegistryMetadataClient<Cache> {
         &'a self,
         format: &'a RegistryMetadataFormat,
         cache_policy: crate::MetadataCachePolicy,
+        store_view: Option<&'a OfflineStoreView>,
     ) -> PickPackageContext<'a, Cache> {
         PickPackageContext {
+            pnpr_format: Some(crate::PnprFormatPolicy {
+                registry_options: &format.registry_options_by_url,
+                minimum_release_age: format.minimum_release_age,
+            }),
             full_metadata: format.full_metadata,
             needs_full_metadata_for: format.needs_full_metadata_for.as_deref(),
             filter_metadata: format.filter_metadata,
             cache_policy,
+            store_view,
             metadata: crate::MetadataRequestContext {
                 meta_cache: self.meta_cache.as_ref(),
                 fetch_locker: &self.fetch_locker,

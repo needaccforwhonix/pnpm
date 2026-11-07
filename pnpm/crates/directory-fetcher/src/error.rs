@@ -3,10 +3,6 @@ use pnpm_diagnostics::miette::{self, Diagnostic};
 use std::path::PathBuf;
 
 /// Error type of [`crate::DirectoryFetcher`].
-///
-/// Covers the failure modes of a directory fetch: directory-walk I/O,
-/// manifest parse / read, and the `include_only_package_files` packlist
-/// pass (which pacquet delegates to `pnpm_git_fetcher::packlist`).
 #[derive(Debug, Display, Error, Diagnostic)]
 #[non_exhaustive]
 pub enum DirectoryFetcherError {
@@ -30,7 +26,7 @@ pub enum DirectoryFetcherError {
     PathOutsideDirectory { path: PathBuf, directory: PathBuf },
 
     #[diagnostic(transparent)]
-    Packlist(#[error(source)] pnpm_git_fetcher::PacklistError),
+    Packlist(#[error(source)] pnpm_fs_packlist::PacklistError),
 
     #[diagnostic(transparent)]
     ReadManifest(#[error(source)] pnpm_package_manifest::PackageManifestError),

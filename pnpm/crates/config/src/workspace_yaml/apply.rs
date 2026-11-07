@@ -1,8 +1,9 @@
 use super::{
-    Config, Path, PnpmfileSetting, ProxyKeys, ProxyValue, SideEffectsCacheSetting, StoreDir,
-    UpdateConfig, WorkspaceSettings, decided_allow_builds, no_proxy_scalar, normalize_registry_url,
-    overlay, overlay_some, registries, resolve, resolve_child_concurrency, warn_deprecated_pairing,
+    Config, LockfileSetting, NodePackageMapMode, Path, PnpmfileSetting, ProxyKeys, ProxyValue,
+    SideEffectsCacheSetting, StoreDir, UpdateConfig, WorkspaceSettings, no_proxy_scalar, overlay,
+    overlay_some, registries, resolve, resolve_child_concurrency, warn_deprecated_pairing,
 };
+use pnpm_network::normalize_registry_url;
 
 impl WorkspaceSettings {
     /// Apply every set field onto `config`, leaving unset ones untouched.
@@ -28,6 +29,8 @@ impl WorkspaceSettings {
         // from an explicit `false`, so the macro's "apply when set" shape
         // would collapse the distinction.
         overlay_some(&mut config.reporter_hide_prefix, self.reporter_hide_prefix.take());
+        overlay_some(&mut config.loglevel, self.loglevel.take());
+        overlay_some(&mut config.reporter, self.reporter.take());
 
         // pnpm spells the setting `gitBranchLockfile` and exposes the
         // resolved answer as `useGitBranchLockfile`; the macro below can
@@ -47,17 +50,17 @@ impl WorkspaceSettings {
         }
 
         identically_named_settings!(apply);
+        self.apply_lockfile(config);
+
+        self.apply_node_package_map(config);
 
         overlay_some(&mut config.pipeline_base, self.pipeline_base.take());
+        if let Some(concurrency_groups) = self.concurrency_groups.take() {
+            config.concurrency_groups.extend(concurrency_groups);
+        }
 
         if let Some(virtual_store_type) = virtual_store_type {
             config.enable_global_virtual_store = virtual_store_type.is_global();
-        }
-
-        // `globalShims` merges key-wise instead of replacing,
-        // so a layer can flip one package without restating the defaults.
-        if let Some(global_shims) = self.global_shims.take() {
-            config.global_shims.apply(&global_shims);
         }
 
         self.apply_update_settings(config, update_config_in_yaml);
@@ -70,6 +73,19 @@ impl WorkspaceSettings {
         self.apply_process_settings(config);
         self.apply_resolution_settings(config, base_dir);
         self.apply_policy_settings(config, audit_level_in_yaml, audit_config_in_yaml);
+    }
+
+    /// The `nodePackageMap` section is applied after its deprecated
+    /// spellings so it wins when one source carries both.
+    fn apply_node_package_map(&mut self, config: &mut Config) {
+        if let Some(enabled) = self.node_experimental_package_map.take() {
+            config.node_package_map_mode = NodePackageMapMode::from_experimental_flag(enabled);
+        }
+        overlay(&mut config.node_package_map_type, self.node_package_map_type.take());
+        if let Some(section) = self.node_package_map.take() {
+            overlay(&mut config.node_package_map_mode, section.mode);
+            overlay(&mut config.node_package_map_type, section.map_type);
+        }
     }
 
     pub(super) fn apply_update_settings(
@@ -87,8 +103,6 @@ impl WorkspaceSettings {
                     r#"Both the "update" and "updateConfig" settings are set. The deprecated "updateConfig" setting is ignored in favor of "update"."#,
                 );
             }
-            // The `update` section is authoritative when present, superseding
-            // any deprecated `updateConfig`.
             config.update_config = UpdateConfig {
                 ignore_dependencies: update.ignore_deps,
                 changeset: update.changeset,
@@ -100,17 +114,24 @@ impl WorkspaceSettings {
 
     pub(super) fn apply_optional_settings(&mut self, config: &mut Config) {
         overlay_some(&mut config.frozen_lockfile, self.frozen_lockfile.take());
+        overlay_some(&mut config.provenance, self.provenance.take());
         overlay_some(
             &mut config.prefer_symlinked_executables,
             self.prefer_symlinked_executables.take(),
         );
         overlay_some(&mut config.save_catalog_name, self.save_catalog_name.take());
+        overlay_some(&mut config.tag, self.tag.take());
         overlay_some(&mut config.init_author_name, self.init_author_name.take());
         overlay_some(&mut config.init_author_email, self.init_author_email.take());
         overlay_some(&mut config.init_author_url, self.init_author_url.take());
         overlay_some(&mut config.init_license, self.init_license.take());
         overlay_some(&mut config.init_version, self.init_version.take());
         overlay_some(&mut config.save_prefix, self.save_prefix.take());
+        overlay(&mut config.tag_version_prefix, self.tag_version_prefix.take());
+
+        if let Some(node_linker) = self.node_linker.take() {
+            node_linker.apply_to(config);
+        }
 
         overlay(&mut config.hoist_pattern, self.hoist_pattern.take());
         overlay(&mut config.public_hoist_pattern, self.public_hoist_pattern.take());
@@ -129,20 +150,14 @@ impl WorkspaceSettings {
             config.modules_dir = resolve(base_dir, &v);
         }
         if let Some(v) = self.virtual_store_dir.take() {
-            config.virtual_store_dir = resolve(base_dir, &v);
+            config.set_virtual_store_dir(resolve(base_dir, &v));
         }
         if let Some(v) = self.global_virtual_store_dir.take() {
             config.global_virtual_store_dir = resolve(base_dir, &v);
         }
-        if let Some(v) = self.global_dir.take() {
-            config.global_dir = Some(resolve(base_dir, &v));
-        }
-        if let Some(v) = self.global_bin_dir.take() {
-            config.global_bin_dir = Some(resolve(base_dir, &v));
-        }
         // Last of the path-valued settings: pinning the lockfile dir
         // re-resolves `modulesDir` / `virtualStoreDir` against it, so it
-        // must see whatever this layer just set.
+        // must see whatever this layer set.
         if let Some(v) = self.lockfile_dir.take() {
             config.pin_lockfile_dir(&resolve(base_dir, &v));
         }
@@ -153,16 +168,19 @@ impl WorkspaceSettings {
 
     /// Registry endpoints, their credentials, and the caches keyed by them.
     pub(super) fn apply_registry_settings(&mut self, config: &mut Config) {
+        self.apply_tls_to(&mut config.tls);
         let declared_prefixes = self.apply_registry_declarations(config);
         if let Some(v) = self.registry.take() {
-            config.registry = normalize_registry_url(&v);
+            config.registry = normalize_registry_url(&v).into_owned();
         }
-        overlay_some(&mut config.scope, self.scope.take());
         overlay_some(&mut config.pnpr_server, self.pnpr_server.take());
         overlay(&mut config.cargo, self.cargo.take());
         overlay(&mut config.python, self.python.take());
         if let Some(v) = self.remote_side_effects_cache.take() {
             config.remote_side_effects_cache.get_or_insert_default().overlay(v);
+        }
+        if let Some(remote) = self.remote_cache.take() {
+            config.remote_cache.get_or_insert_default().overlay(remote);
         }
         self.apply_side_effects_cache(config);
         self.apply_named_registries(config, declared_prefixes);
@@ -175,6 +193,13 @@ impl WorkspaceSettings {
             return false;
         };
         let lookups = registries::into_lookups(entries);
+        registries::take_roles_from_earlier_layers(
+            &mut config.registries_by_scope,
+            &mut config.registries_by_prefix,
+            &mut config.registry_options_by_url,
+            &mut config.indexes_by_ecosystem,
+            &lookups,
+        );
         if let Some(registry) = lookups.default_registry {
             config.registry = registry;
         }
@@ -182,6 +207,8 @@ impl WorkspaceSettings {
         config.registries_by_scope.extend(lookups.registries_by_scope);
         config.registries_by_prefix.extend(lookups.registries_by_prefix);
         config.registry_options_by_url.extend(lookups.registry_options_by_url);
+        config.indexes_by_ecosystem.extend(lookups.indexes_by_ecosystem);
+        config.network_concurrency_by_registry.extend(lookups.network_concurrency_by_registry);
         declared_prefixes
     }
 
@@ -200,6 +227,23 @@ impl WorkspaceSettings {
                 if let Some(remote) = settings.remote {
                     config.remote_side_effects_cache.get_or_insert_default().overlay(remote);
                 }
+                overlay_some(&mut config.side_effects_cache_exclude, settings.exclude);
+            }
+            None => {}
+        }
+    }
+
+    /// The section form turns the lockfile on, and a field it leaves out
+    /// takes its default, as in `sideEffectsCache`.
+    pub(super) fn apply_lockfile(&mut self, config: &mut Config) {
+        match self.lockfile.take() {
+            Some(LockfileSetting::Enabled(enabled)) => config.lockfile = enabled,
+            Some(LockfileSetting::Settings(settings)) => {
+                config.lockfile = true;
+                config.lockfile_include_resolution_settings = settings
+                    .include_resolution_settings
+                    .unwrap_or(false);
+                config.lockfile_integrity_target = settings.integrity_target.unwrap_or_default();
             }
             None => {}
         }
@@ -218,6 +262,17 @@ impl WorkspaceSettings {
             );
         }
         for (name, registry) in named {
+            // An alias addressing a URL `registries` serves to another
+            // ecosystem would put that URL in two roles, which the entries
+            // themselves cannot express and nothing downstream expects.
+            if registries::serves_another_ecosystem(&config.indexes_by_ecosystem, &registry) {
+                tracing::warn!(
+                    target: "pacquet::config",
+                    prefix = name,
+                    r#"The deprecated "namedRegistries" setting addresses a registry that "registries" declares an index of another ecosystem. The prefix is not declared."#,
+                );
+                continue;
+            }
             config.registries_by_prefix.entry(name).or_insert(registry);
         }
     }
@@ -244,16 +299,20 @@ impl WorkspaceSettings {
             );
         }
         overlay_some(&mut config.config_dependencies, self.config_dependencies.take());
-        if let Some(v) = self.allow_builds.take() {
-            config.allow_builds = decided_allow_builds(v);
-        }
+        self.apply_permissions(config);
         overlay(&mut config.dangerously_allow_all_builds, self.dangerously_allow_all_builds.take());
         overlay(&mut config.strict_dep_builds, self.strict_dep_builds.take());
         overlay(&mut config.ignore_scripts, self.ignore_scripts.take());
         overlay(&mut config.ignore_pnpmfile, self.ignore_pnpmfile.take());
         overlay(&mut config.git_checks, self.git_checks.take());
+        overlay(&mut config.git_tag_version, self.git_tag_version.take());
+        overlay_some(&mut config.publish_branch, self.publish_branch.take());
         overlay(&mut config.engine_strict, self.engine_strict.take());
+        overlay(&mut config.force_ignores_platform, self.force_ignores_platform.take());
         overlay_some(&mut config.node_version, self.node_version.take());
+        if let Some(runtime) = self.runtime.take() {
+            config.skip_runtimes = !runtime;
+        }
         overlay_some(&mut config.runtime_on_fail, self.runtime_on_fail.take());
         overlay(&mut config.node_download_mirrors, self.node_download_mirrors.take());
     }
@@ -264,7 +323,6 @@ impl WorkspaceSettings {
         // file carries both.
         overlay_some(&mut config.max_sockets, self.maxsockets.take());
         overlay_some(&mut config.max_sockets, self.max_sockets.take());
-        overlay(&mut config.scripts_prepend_node_path, self.scripts_prepend_node_path.take());
         overlay(&mut config.script_shell, self.script_shell.take());
         overlay(&mut config.node_options, self.node_options.take());
         overlay(&mut config.unsafe_perm, self.unsafe_perm.take());
@@ -312,6 +370,7 @@ impl WorkspaceSettings {
         audit_level_in_yaml: bool,
         audit_config_in_yaml: bool,
     ) {
+        overlay_some(&mut config.boot_config, self.boot_config.take().map(Box::new));
         overlay_some(&mut config.minimum_release_age, self.minimum_release_age.take());
         overlay_some(
             &mut config.minimum_release_age_exclude,
@@ -359,6 +418,16 @@ impl WorkspaceSettings {
             config.audit_config.ignore_ghsas = ignore;
         }
         overlay_some(&mut config.audit_ignore_prune, audit.ignore_prune);
+    }
+
+    /// Overlay `strictSsl` and `localAddress` onto `tls`, the project's or
+    /// the package-manager bootstrap's. An invalid `localAddress` clears the
+    /// one a lower source set, as it does between `.npmrc` layers.
+    pub(crate) fn apply_tls_to(&self, tls: &mut pnpm_network::TlsConfig) {
+        overlay_some(&mut tls.strict_ssl, self.strict_ssl);
+        if let Some(local_address) = self.local_address.as_deref() {
+            tls.local_address = local_address.parse().ok();
+        }
     }
 
     /// Overlay this file's proxy keys onto the merged view and re-resolve.

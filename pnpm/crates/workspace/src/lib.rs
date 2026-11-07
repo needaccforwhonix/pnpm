@@ -1,6 +1,6 @@
 //! Workspace discovery and project enumeration.
 //!
-//! Three responsibilities, kept in separate private modules while
+//! Responsibilities, kept in separate private modules while
 //! keeping the public surface flat:
 //!
 //! - `root_finder` — locate the workspace dir (`pnpm-workspace.yaml`).
@@ -12,29 +12,40 @@
 
 pub use api::{EnvVarOs, Host};
 pub use importer_id::importer_id_from_root_dir;
+pub use include::{
+    Delegation, INCLUDE_KEY, Include, IncludeError, IncludeSource, Ownership, PackageEntry,
+    SETTINGS_FORBIDDEN_TO_PACKAGES, SettingOwner, SettingSlot, WorkspaceIncludes,
+    WorkspaceManifestDocument, canonical_setting_name, config_dependency_dir,
+    load_workspace_manifest_document, merge_local_includes, read_workspace_manifest_document,
+    rebase_path, rebase_setting, rebase_specifier,
+};
 pub use inventory::{FindWorkspaceInventoryError, WorkspaceInventory, find_workspace_inventory};
 pub use manifest::{
     InvalidWorkspaceManifestError, ReadWorkspaceManifestError, WORKSPACE_MANIFEST_FILENAME,
-    WorkspaceManifest, read_workspace_manifest, workspace_package_patterns,
+    WorkspaceManifest, parse_workspace_manifest, read_workspace_manifest,
+    workspace_package_patterns,
 };
 pub use project_manifest::{
-    ReadProjectManifestError, ReadProjectManifestOnlyError, read_exact_project_manifest,
-    read_project_manifest_only, read_project_name, safe_read_project_manifest_only,
-    try_read_project_manifest,
+    ReadProjectManifestError, ReadProjectManifestOnlyError, project_manifest_path,
+    read_exact_project_manifest, read_project_manifest_only, read_project_name,
+    safe_read_project_manifest_only, try_read_project_manifest,
 };
 pub use projects::{
-    FindWorkspaceProjectsError, FindWorkspaceProjectsOpts, Project, find_workspace_projects,
-    find_workspace_projects_no_check,
+    DiscoveryKey, FindWorkspaceProjectsError, FindWorkspaceProjectsOpts, Project,
+    ProjectManifestPaths, belongs_to_workspace, find_workspace_project_manifests,
+    find_workspace_projects, find_workspace_projects_no_check, is_workspace_project_dir,
+    needs_package_patterns, read_workspace_projects,
 };
 pub use projects_graph_view::GraphPkg;
 pub use root_finder::{
-    BadWorkspaceManifestNameError, FindWorkspaceDirError, find_workspace_dir,
-    find_workspace_dir_from_env,
+    BadWorkspaceManifestNameError, FindWorkspaceDirError, WORKSPACE_DIR_ENV_VARS,
+    find_workspace_dir, find_workspace_dir_from_env,
 };
 
 mod api;
 mod directory_patterns;
 mod importer_id;
+mod include;
 mod inventory;
 mod manifest;
 mod project_manifest;

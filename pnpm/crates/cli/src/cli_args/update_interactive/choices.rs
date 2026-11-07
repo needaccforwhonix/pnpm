@@ -11,7 +11,7 @@ use crate::cli_args::{
 use console::measure_text_width;
 use node_semver::Version;
 use pnpm_package_manifest::DependencyGroup;
-use std::collections::HashMap;
+use std::{borrow::Cow, collections::HashMap};
 
 /// One line of a [`ChoiceGroup`].
 #[derive(Debug, PartialEq, Eq)]
@@ -21,6 +21,8 @@ pub(crate) struct ChoiceRow {
     /// The package name selecting this row updates. `None` marks the
     /// group's header row, which carries no selection.
     pub value: Option<String>,
+    /// The key of the row's release notes, `None` for the header row.
+    pub notes_key: Option<String>,
 }
 
 /// The outdated dependencies of one dependency type.
@@ -169,13 +171,14 @@ fn render_rows(choices: &[&Choice<'_>], workspaces_enabled: bool) -> Vec<ChoiceR
     let widths = column_widths(&cells);
     let mut rows = cells
         .into_iter()
-        .map(|row| ChoiceRow { label: pad_row(&row, &widths), value: None });
+        .map(|row| ChoiceRow { label: pad_row(&row, &widths), value: None, notes_key: None });
     let header = rows.next().expect("the header row is always pushed first");
     std::iter::once(header)
         .chain(
             rows.zip(choices)
                 .map(|(row, choice)| ChoiceRow {
                     value: Some(choice.package.alias.clone()),
+                    notes_key: Some(super::notes::notes_key(choice.package)),
                     ..row
                 }),
         )
@@ -264,18 +267,17 @@ fn choice_cells(choice: &Choice<'_>, workspaces_enabled: bool) -> Vec<String> {
     // the row apart.
     let mut row = vec![
         sanitize_inline(&package.package_name).into_owned(),
-        package.current.to_string(),
+        package.current_str().into_owned(),
         "❯".to_string(),
         colorize_target(package),
     ];
     if workspaces_enabled {
-        row.push(
-            choice.workspaces
+        row.push(workspaces_cell(
+            &choice.workspaces
                 .iter()
                 .map(|workspace| sanitize_inline(workspace))
-                .collect::<Vec<_>>()
-                .join(", "),
-        );
+                .collect::<Vec<_>>(),
+        ));
     }
     row.push(
         package.metadata.homepage
@@ -285,4 +287,29 @@ fn choice_cells(choice: &Choice<'_>, workspaces_enabled: bool) -> Vec<String> {
             .into_owned(),
     );
     row
+}
+
+/// A dependency shared by every project of a large workspace names all of
+/// them in one `Workspace` cell, which would push its row, and through the
+/// column padding every row of its group, past any terminal. Past this
+/// many columns the cell names the projects that fit and counts the rest.
+const WORKSPACE_COLUMN_WIDTH: usize = 30;
+
+fn workspaces_cell(workspaces: &[Cow<'_, str>]) -> String {
+    let all = workspaces.join(", ");
+    if workspaces.len() < 2 || measure_text_width(&all) <= WORKSPACE_COLUMN_WIDTH {
+        return all;
+    }
+    let mut named = 1;
+    while named + 1 < workspaces.len()
+        && measure_text_width(&abbreviate_workspaces(workspaces, named + 1))
+            <= WORKSPACE_COLUMN_WIDTH
+    {
+        named += 1;
+    }
+    abbreviate_workspaces(workspaces, named)
+}
+
+fn abbreviate_workspaces(workspaces: &[Cow<'_, str>], named: usize) -> String {
+    format!("{}, +{} more", workspaces[..named].join(", "), workspaces.len() - named)
 }

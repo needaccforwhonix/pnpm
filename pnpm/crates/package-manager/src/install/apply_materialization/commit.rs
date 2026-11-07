@@ -1,8 +1,8 @@
 use super::super::{
-    Config, Host, InstallError, InstallWithFreshLockfileError, Lockfile, Modules, NodeLinker,
-    PackageManifest, Path, PathBuf, SystemTime, build_modules_manifest, current_contains_dep_path,
-    merge_filtered_modules_metadata, merge_pending_builds, project_requires_lifecycle_scripts,
-    write_modules_manifest,
+    Config, Host, InstallError, InstallWithFreshLockfileError, Lockfile, Modules,
+    PROJECT_LIFECYCLE_STAGES, PackageManifest, Path, PathBuf, SystemTime, build_modules_manifest,
+    current_contains_dep_path, keep_recorded_layout, merge_filtered_modules_metadata,
+    merge_pending_builds, project_requires_lifecycle_scripts, write_modules_manifest,
 };
 
 pub(super) struct CommitModulesStateInputs<'a> {
@@ -13,10 +13,12 @@ pub(super) struct CommitModulesStateInputs<'a> {
     pub(crate) materialized: crate::install::state_options::CommittedProjects<'a>,
     pub(crate) prior: crate::install::state_options::PriorModulesState<'a>,
     pub(crate) write: crate::install::state_options::LockfileWritePolicy,
+    pub(crate) force_prune: bool,
 }
+/// Returns the packages whose agent skills await approval.
 pub(super) fn commit_modules_state(
     mut inputs: CommitModulesStateInputs<'_>,
-) -> Result<(), InstallError> {
+) -> Result<Vec<String>, InstallError> {
     let (pruned_at, pending_builds, allow_build_policy) =
         prepare_committed_build_state(&mut inputs)?;
 
@@ -35,6 +37,9 @@ pub(super) fn commit_modules_state(
         pruned_at,
     );
     merge_committed_modules_metadata(&inputs, &mut next_modules, allow_build_policy.as_ref());
+    // A skills failure fails the install only once the rest of the state is
+    // written, so the next install starts from what this one materialized.
+    let pending_skills = record_agent_skills(&inputs, &mut next_modules);
     let phase_start = std::time::Instant::now();
     write_modules_manifest::<Host>(&inputs.tree.config.modules_dir, next_modules)
         .map_err(InstallError::WriteModules)?;
@@ -43,12 +48,6 @@ pub(super) fn commit_modules_state(
     let phase_start = std::time::Instant::now();
     save_current_lockfile(inputs.tree.config, inputs.lockfiles.materialized)?;
     tracing::info!(target: "pacquet::install::phase", phase = "apply.current_lockfile", elapsed_ms = phase_start.elapsed().as_millis() as u64, "phase complete");
-    // Regenerate `pnpm-lock.yaml` from the synthesized snapshot when
-    // the wanted lockfile was reconstructed from
-    // `<virtual_store_dir>/lock.yaml`. The no-op short-circuit above
-    // handles the common case; this branch covers the rare path where
-    // `.modules.yaml` was wiped or inconsistent and the frozen install
-    // had to relink.
     if inputs.materialized.frozen {
         save_relinked_wanted_lockfile(&RelinkedLockfileSave {
             config: inputs.tree.config,
@@ -60,7 +59,39 @@ pub(super) fn commit_modules_state(
         })?;
     }
 
-    Ok(())
+    pending_skills
+}
+/// Link the approved agent skills of the installed direct dependencies and
+/// record the result in `next_modules`. Returns the approval keys of the
+/// packages whose skills await approval.
+fn record_agent_skills(
+    inputs: &CommitModulesStateInputs<'_>,
+    next_modules: &mut Modules,
+) -> Result<Vec<String>, InstallError> {
+    // Carried over until a sync replaces them, so the entries pnpm linked
+    // stay recorded, and prunable, whatever happens below.
+    if let Some(prior) = inputs.prior.metadata {
+        next_modules.pending_skills.clone_from(&prior.pending_skills);
+        next_modules.linked_skills.clone_from(&prior.linked_skills);
+        next_modules.has_unlinked_skills = prior.has_unlinked_skills;
+    }
+    let Some(lockfile) = inputs.lockfiles.materialized else { return Ok(Vec::new()) };
+    let linked = inputs.prior.metadata
+        .and_then(|modules| modules.linked_skills.as_deref())
+        .unwrap_or_default();
+    let state = crate::sync_agent_skills(&crate::SyncAgentSkills {
+        config: inputs.tree.config,
+        workspace_root: inputs.tree.workspace_root,
+        lockfile,
+        included: inputs.tree.included,
+        linked,
+        agent_dir: crate::agent_skills_dir_from_env(),
+        hoisted_locations: next_modules.hoisted_locations.as_ref(),
+    })
+    .map_err(InstallError::AgentSkills)?;
+    let pending_keys = state.pending_keys();
+    state.update_modules(next_modules);
+    Ok(pending_keys)
 }
 pub(super) fn prepare_committed_build_state(
     inputs: &mut CommitModulesStateInputs<'_>,
@@ -72,10 +103,12 @@ pub(super) fn prepare_committed_build_state(
         inputs.prior.layout,
         inputs.lockfiles.materialized,
         inputs.materialized.skipped,
+        inputs.force_prune,
         now,
     );
     tracing::info!(target: "pacquet::install::phase", phase = "apply.prune", elapsed_ms = phase_start.elapsed().as_millis() as u64, "phase complete");
-    let pruned_at = pruned_at(inputs.prior.layout, did_prune, now);
+    let pruned_at =
+        pruned_at(inputs.prior.layout, did_prune, now, inputs.tree.config.source_date_epoch);
     // The build phase settles a dependency only when it actually
     // rebuilt it, so a `pnpm rebuild --pending` that the policy still
     // blocks (`allowBuilds: None`/`false`) leaves the debt in place.
@@ -111,13 +144,17 @@ pub(super) fn merge_committed_modules_metadata(
     next_modules: &mut Modules,
     allow_build_policy: Option<&crate::AllowBuildPolicy>,
 ) {
+    if inputs.builds.rebuild.is_some()
+        && let Some(recorded) = inputs.prior.layout
+    {
+        keep_recorded_layout(next_modules, recorded);
+    }
     if let (Some(previous), Some(current), Some(policy)) =
         (inputs.prior.layout, inputs.lockfiles.materialized, allow_build_policy)
     {
         retain_current_ignored_builds(next_modules, previous, current, policy);
     }
     if inputs.prior.filtered_install
-        && !matches!(inputs.tree.node_linker, NodeLinker::Hoisted)
         && !inputs.prior.is_inconsistent
         && let (Some(previous), Some(current), Some(selected)) =
             (inputs.prior.metadata, inputs.lockfiles.materialized, inputs.lockfiles.selected)
@@ -127,12 +164,19 @@ pub(super) fn merge_committed_modules_metadata(
 }
 /// Stamp `prunedAt` only when the sweep ran (or there was no prior
 /// `.modules.yaml`); otherwise preserve the recorded timestamp so
-/// the throttle keeps counting from the last real prune.
-pub(super) fn pruned_at(
+/// the throttle keeps counting from the last real prune. When
+/// `SOURCE_DATE_EPOCH` is set, always record the capped epoch so
+/// existing installations produce reproducible output even when a
+/// sweep is not due.
+pub(in crate::install) fn pruned_at(
     prior_modules: Option<&pnpm_modules_yaml::ModulesLayout>,
     did_prune: bool,
     now: SystemTime,
+    source_date_epoch: Option<SystemTime>,
 ) -> String {
+    if let Some(epoch) = source_date_epoch {
+        return httpdate::fmt_http_date(epoch.min(now));
+    }
     match (prior_modules, did_prune) {
         (Some(prior), false) => prior.pruned_at.clone(),
         _ => httpdate::fmt_http_date(now),
@@ -150,7 +194,7 @@ pub(super) fn deferred_projects(
         materialized_project_manifests
             .iter()
             .filter(|(project_dir, manifest)| {
-                project_requires_lifecycle_scripts(project_dir, manifest)
+                project_requires_lifecycle_scripts(project_dir, manifest, &PROJECT_LIFECYCLE_STAGES)
             })
             .map(|(project_dir, _)| {
                 pnpm_workspace::importer_id_from_root_dir(workspace_root, project_dir)
@@ -158,7 +202,7 @@ pub(super) fn deferred_projects(
             .collect()
     })
 }
-/// Write `<virtual_store_dir>/lock.yaml`. Captures what was
+/// Write `<install_state_dir>/lock.yaml`. Captures what was
 /// actually materialized so the next install can diff each
 /// snapshot against it and skip the unchanged
 /// slots. Persist *after* `write_modules_manifest` succeeds so
@@ -172,72 +216,37 @@ pub(super) fn deferred_projects(
 /// install records the full shared graph it materialized. This
 /// keeps the file aligned with physical state without discarding
 /// unselected slots that remain on disk.
-/// Filter the wanted lockfile down to the snapshots that
-/// were actually materialized: dep maps the user excluded
-/// (`--no-optional`, `--no-dev`) plus snapshots the
-/// install-time skip set transiently dropped (a fetch
-/// failure, `--no-optional`-only entries). The next install
-/// diffs against this filtered shape so dropped snapshots
-/// aren't mistaken for already-done work.
 pub(super) fn save_current_lockfile(
     config: &Config,
     materialized_current_lockfile: Option<&Lockfile>,
 ) -> Result<(), InstallError> {
     let Some(lockfile) = materialized_current_lockfile else { return Ok(()) };
     lockfile
-        .save_current_to_virtual_store_dir(&config.virtual_store_dir)
+        .save_current_to_install_state_dir(&config.install_state_dir)
         .map_err(InstallError::SaveCurrentLockfile)
 }
 /// Sweep the virtual store of everything the install no longer needs, and
 /// report whether the sweep actually ran (enumerated the store) rather than
 /// just being allowed by the throttle. It does not run when there is no
-/// wanted lockfile to derive the needed set from (`config.lockfile == false`
-/// leaves both `fresh_lockfile` and a loaded `lockfile` absent), when the
-/// target is refused as unsafe, or when enumeration failed. `prunedAt` must
-/// not advance on a run where nothing was swept, or the next real sweep is
-/// throttled off for `modulesCacheMaxAge`.
+/// lockfile to derive the needed set from (`materialized_current_lockfile` is
+/// `None`), when the target is refused as unsafe, or when enumeration failed.
+/// `prunedAt` must not advance on a run where nothing was swept, or the next
+/// real sweep is throttled off for `modulesCacheMaxAge`.
 pub(super) fn sweep_virtual_store(
     config: &Config,
     prior_modules: Option<&pnpm_modules_yaml::ModulesLayout>,
     materialized_current_lockfile: Option<&Lockfile>,
     install_skipped: &crate::SkippedSnapshots,
+    force: bool,
     now: SystemTime,
 ) -> bool {
-    let effective_virtual_store_dir = config.effective_virtual_store_dir();
-    // Decide "this is the global store" from the resolved paths, not
-    // the `enableGlobalVirtualStore` flag alone: the global store is
-    // shared across projects, so a config that points `virtualStoreDir`
-    // at it must not be pruned even when the flag is off.
-    let is_global_virtual_store = crate::prune_virtual_store::same_dir(
-        effective_virtual_store_dir,
-        &config.global_virtual_store_dir,
-    );
-    if !crate::prune_virtual_store::should_prune_virtual_store(
-        is_global_virtual_store,
-        prior_modules.map(|modules| modules.pruned_at.as_str()),
-        config.modules_cache_max_age,
-        now,
-    ) {
+    if !virtual_store_prune_is_due(config, prior_modules, force, now) {
         return false;
     }
     let Some(wanted) = materialized_current_lockfile else {
         return false;
     };
-    // Sweep the canonicalized prune target returned by the containment
-    // check, never the raw configured path: deleting from the validated path
-    // closes the time-of-check/time-of-use gap a symlink swap would
-    // otherwise open.
-    let Some(prune_dir) = crate::prune_virtual_store::prune_target_within_modules(
-        effective_virtual_store_dir,
-        &config.modules_dir,
-    ) else {
-        // A wanted lockfile exists but the store path is unsafe
-        // (escapes node_modules); refuse the destructive sweep.
-        tracing::warn!(
-            virtual_store_dir = %effective_virtual_store_dir.display(),
-            modules_dir = %config.modules_dir.display(),
-            "skipping virtual-store prune: the virtual store is not inside node_modules",
-        );
+    let Some(prune_dir) = confined_virtual_store_prune_target(config) else {
         return false;
     };
     crate::prune_virtual_store::prune_virtual_store(
@@ -247,6 +256,51 @@ pub(super) fn sweep_virtual_store(
         config.virtual_store_dir_max_length as usize,
     )
     .is_some()
+}
+
+fn virtual_store_prune_is_due(
+    config: &Config,
+    prior_modules: Option<&pnpm_modules_yaml::ModulesLayout>,
+    force: bool,
+    now: SystemTime,
+) -> bool {
+    let virtual_store_dir = config.virtual_store_dir();
+    // Decide "this is the global store" from the resolved paths, not
+    // the `enableGlobalVirtualStore` flag alone: the global store is
+    // shared across projects, so a config that points `virtualStoreDir`
+    // at it must not be pruned even when the flag is off.
+    let is_global_virtual_store =
+        crate::prune_virtual_store::same_dir(virtual_store_dir, &config.global_virtual_store_dir);
+    !is_global_virtual_store
+        && (force
+            || crate::prune_virtual_store::should_prune_virtual_store(
+                false,
+                prior_modules.map(|modules| modules.pruned_at.as_str()),
+                config.modules_cache_max_age,
+                config.source_date_epoch.map_or(now, |epoch| epoch.min(now)),
+            ))
+}
+
+fn confined_virtual_store_prune_target(config: &Config) -> Option<PathBuf> {
+    let virtual_store_dir = config.virtual_store_dir();
+    // Sweep the canonicalized prune target returned by the containment
+    // check, never the raw configured path: deleting from the validated path
+    // closes the time-of-check/time-of-use gap a symlink swap would
+    // otherwise open.
+    let Some(prune_dir) = crate::prune_virtual_store::prune_target_within_modules(
+        virtual_store_dir,
+        &config.modules_dir,
+    ) else {
+        // A wanted lockfile exists but the store path is unsafe
+        // (escapes node_modules); refuse the destructive sweep.
+        tracing::warn!(
+            virtual_store_dir = %virtual_store_dir.display(),
+            modules_dir = %config.modules_dir.display(),
+            "skipping virtual-store prune: the virtual store is not inside node_modules",
+        );
+        return None;
+    };
+    Some(prune_dir)
 }
 /// What decides whether a relinking frozen install rewrites `pnpm-lock.yaml`.
 pub(super) struct RelinkedLockfileSave<'a> {
@@ -258,7 +312,7 @@ pub(super) struct RelinkedLockfileSave<'a> {
     loaded_wanted_lockfile: Option<&'a Lockfile>,
 }
 /// Regenerate `pnpm-lock.yaml` from the synthesized snapshot when the wanted
-/// lockfile was reconstructed from `<virtual_store_dir>/lock.yaml`. The
+/// lockfile was reconstructed from `<install_state_dir>/lock.yaml`. The
 /// no-op short-circuit in the caller handles the common case; this covers the
 /// rare path where `.modules.yaml` was wiped or inconsistent and the frozen
 /// install had to relink.
@@ -274,7 +328,10 @@ pub(super) fn save_relinked_wanted_lockfile(
         && let Some(updated) = save.loaded_wanted_lockfile
     {
         updated
-            .save_to_path(&save.workspace_root.join(config.wanted_lockfile_name()))
+            .save_to_path(
+                &save.workspace_root.join(config.wanted_lockfile_name()),
+                config.symlinked_lockfile(),
+            )
             .map_err(InstallError::SaveWantedLockfile)?;
     }
     Ok(())

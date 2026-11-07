@@ -1,9 +1,14 @@
+pub use applied_policies::AppliedPolicies;
+
 use super::{
     BTreeMap, Deserialize, HashSet, IndexMap, Lockfile, PnprClient, PnprClientError,
     ResolveOptions, ResolveOutcome, ResolveProjectsOptions, ResolvedPackage, Stats,
     TarballRevision, WireViolation, build_verify_error, hash_object_nullable_with_prefix,
 };
+use applied_policies::assert_applied_policies;
 use futures_util::StreamExt as _;
+
+mod applied_policies;
 
 /// Reject unsupported project transforms before consuming any package
 /// frame, so an older server cannot trigger downloads for this request.
@@ -78,14 +83,20 @@ fn resolve_request_body(opts: &ResolveProjectsOptions) -> serde_json::Value {
     serde_json::to_value(opts).expect("resolution request serializes to JSON")
 }
 
-fn handle_resolve_frame(
-    frame: Frame,
-    on_package: &mut impl FnMut(ResolvedPackage),
-    permitted_importers: &HashSet<String>,
-    opts: &ResolveProjectsOptions,
-) -> Result<Option<ResolveOutcome>, PnprClientError> {
-    match frame {
-        Frame::Package {
+fn forward_package_frame(frame: Frame, on_package: &mut impl FnMut(ResolvedPackage)) {
+    if let Frame::Package {
+        id,
+        name,
+        version,
+        integrity,
+        tarball,
+        unpacked_size,
+        file_count,
+        revision,
+        requires_build,
+    } = frame
+    {
+        on_package(ResolvedPackage {
             id,
             name,
             version,
@@ -94,28 +105,34 @@ fn handle_resolve_frame(
             unpacked_size,
             file_count,
             revision,
-        } => {
-            on_package(ResolvedPackage {
-                id,
-                name,
-                version,
-                integrity,
-                tarball,
-                unpacked_size,
-                file_count,
-                revision,
-            });
+            requires_build,
+        });
+    }
+}
+
+fn handle_resolve_frame(
+    frame: Frame,
+    on_package: &mut impl FnMut(ResolvedPackage),
+    permitted_importers: &HashSet<String>,
+    opts: &ResolveProjectsOptions,
+) -> Result<Option<ResolveOutcome>, PnprClientError> {
+    match frame {
+        Frame::Package { .. } => {
+            forward_package_frame(frame, on_package);
             Ok(None)
         }
-        Frame::Done { lockfile, stats } => {
+        Frame::Done { lockfile, stats, applied_policies } => {
             assert_requested_importers(&lockfile, permitted_importers)?;
             assert_transform_metadata(&lockfile, opts)?;
-            Ok(Some(ResolveOutcome { lockfile: *lockfile, stats }))
+            assert_publish_directories(&lockfile, opts)?;
+            assert_applied_policies(applied_policies.as_ref(), opts)?;
+            Ok(Some(ResolveOutcome { lockfile: *lockfile, stats, applied_policies }))
         }
-        Frame::Error { message } => Err(PnprClientError::Server(message)),
+        Frame::Error { message, code } => Err(PnprClientError::Server { message, code }),
         Frame::Violations { violations } => {
             Err(PnprClientError::Verification(build_verify_error(violations)))
         }
+        Frame::Ignored => Ok(None),
     }
 }
 
@@ -182,6 +199,34 @@ fn assert_transform_metadata(
     Ok(())
 }
 
+/// A project that publishes from a subdirectory must come back with that
+/// directory on its importer. The server rebuilds each project's manifest from
+/// the request, so a server that ignored `publishConfig` would have the caller
+/// link the project root — and install other code than a local install does.
+fn assert_publish_directories(
+    lockfile: &Lockfile,
+    opts: &ResolveProjectsOptions,
+) -> Result<(), PnprClientError> {
+    for project in &opts.projects {
+        let Some(directory) = project.publish_config
+            .as_ref()
+            .map(|publish_config| publish_config.directory.as_str())
+        else {
+            continue;
+        };
+        let Some(importer) = lockfile.importers.get(&project.dir) else {
+            continue;
+        };
+        if importer.publish_directory.as_deref() != Some(directory) {
+            return Err(PnprClientError::Protocol(format!(
+                "/-/pnpr/v0/resolve returned importer {:?} linked at {:?} instead of its publishConfig.directory {directory:?}; the server may not forward project publishConfig",
+                project.dir, importer.publish_directory,
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn equal_patch_hashes(
     actual: Option<&BTreeMap<String, String>>,
     expected: &IndexMap<String, String>,
@@ -198,7 +243,7 @@ pub(super) fn parse_frame(line: &[u8]) -> Result<Frame, PnprClientError> {
     serde_json::from_slice(line).map_err(|err| PnprClientError::Protocol(err.to_string()))
 }
 
-/// One NDJSON frame from `/-/pnpr/v0/resolve`. `package` frames stream as the
+/// One NDJSON frame from resolve endpoint. `package` frames stream as the
 /// server resolves; exactly one terminal frame (`done` / `error` /
 /// `violations`) closes the response.
 #[derive(Deserialize)]
@@ -216,6 +261,8 @@ pub(super) enum Frame {
         file_count: Option<usize>,
         #[serde(default)]
         revision: Option<TarballRevision>,
+        #[serde(rename = "requiresBuild", default)]
+        requires_build: Option<bool>,
     },
     /// Boxed: the lockfile dwarfs the other variants, so keeping it
     /// behind a pointer keeps the enum small.
@@ -223,13 +270,19 @@ pub(super) enum Frame {
         lockfile: Box<Lockfile>,
         #[serde(default)]
         stats: Stats,
+        #[serde(default, rename = "appliedPolicies")]
+        applied_policies: Option<AppliedPolicies>,
     },
     Error {
         message: String,
+        #[serde(default)]
+        code: Option<String>,
     },
     Violations {
         violations: Vec<WireViolation>,
     },
+    #[serde(other)]
+    Ignored,
 }
 
 impl PnprClient {
@@ -270,13 +323,8 @@ impl PnprClient {
         if opts.fix_lockfile {
             self.handshake_fix_lockfile().await?;
         }
-        // The server's response is untrusted, and the caller merges the
-        // returned lockfile into `pnpm-lock.yaml`. Constrain it to the
-        // importers this request is about — the requested projects plus
-        // whatever the input lockfile already carried — so a hostile server
-        // cannot introduce dependencies for a project that was never sent.
-        // This is a containment check (every returned importer was
-        // requested), which is the injection boundary; it deliberately does
+        // The importer check is a containment check (every returned importer
+        // was requested), which is the injection boundary; it deliberately does
         // not require every requested importer to be present. A dependency-
         // free importer is still present-but-empty (pnpm records it as
         // `{ specifiers: {} }`), and a genuinely missing importer is surfaced
@@ -293,19 +341,13 @@ impl PnprClient {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(PnprClientError::Server(format!(
+            return Err(PnprClientError::server(format!(
                 "/-/pnpr/v0/resolve returned {status}: {body}",
             )));
         }
 
         verify_transform_support(&response, project_transforms_requested)?;
 
-        // Consume the NDJSON stream line by line. The response header above
-        // proves transform support before any package frame is consumed, so
-        // current servers preserve resolution/fetch overlap while older
-        // servers fail without triggering downloads or buffering hints.
-        // reqwest's `gzip` feature transparently inflates the byte stream if a
-        // proxy compressed it, so the frames arrive as plain JSON lines.
         let outcome = read_ndjson_frames(response, |line| {
             handle_resolve_frame(parse_frame(line)?, &mut on_package, &permitted_importers, &opts)
         })

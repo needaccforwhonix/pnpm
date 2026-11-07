@@ -31,11 +31,40 @@ mod tarball_proxy;
 #[path = "server/packuments.rs"]
 mod packuments;
 
+#[path = "server/tar_registry.rs"]
+mod tar_registry;
+
+#[path = "server/package_documents.rs"]
+mod package_documents;
+
+#[path = "server/release_record_logs.rs"]
+mod release_record_logs;
+
+#[path = "server/platform_variants.rs"]
+mod platform_variants;
+
+#[path = "server/version_tarballs.rs"]
+mod version_tarballs;
+
+#[path = "server/packument_caching.rs"]
+mod packument_caching;
+
 #[path = "server/resolver_access.rs"]
 mod resolver_access;
 
-#[path = "common/registry_groups.rs"]
-mod registry_groups;
+#[path = "server/web_ui.rs"]
+mod web_ui;
+
+#[path = "server/sign_in.rs"]
+mod sign_in;
+
+#[path = "server/audit.rs"]
+mod audit;
+
+#[path = "server/web_login.rs"]
+mod web_login;
+
+use crate::registry_groups;
 
 use axum::{
     Router,
@@ -44,11 +73,12 @@ use axum::{
 };
 use flate2::read::GzDecoder;
 use futures_util::stream;
-use pnpm_crypto_hash::integrity_addressed_tarball_path;
 use pnpr::{
-    AccessList, AuthState, Config, Ecosystem, HostedConfig, MaxUsers, PackagePattern, PackageRule,
-    PackageRules, PublicRoute, Registries, Registry, router, router_with_auth,
+    AccessList, AuthState, Config, Ecosystem, HostedConfig, IpNetwork, MaxUsers, PackagePattern,
+    PackageRule, PackageRules, PublicRoute, Registries, Registry, router, router_with_auth,
 };
+use pnpr_fixtures::MockConfigPresets;
+use pnpr_storage::layout::{blob_segment, package_segments};
 use serde_json::{Value, json};
 use ssri::{Algorithm, IntegrityOpts};
 use std::{
@@ -76,6 +106,7 @@ fn config_for(upstream: &str, storage: PathBuf) -> Config {
         upstream.to_string();
     config.http.public_url = "http://example.test".to_string();
     config.http.packument_ttl = Duration::from_mins(1);
+    config.routing.route_policy.allowed_private_networks = crate::network::loopback_networks();
     config
 }
 
@@ -84,12 +115,11 @@ fn config_for(upstream: &str, storage: PathBuf) -> Config {
 /// authenticated user, the registry-mock contract these fixtures always ran
 /// under (the safe per-registry default would deny destructive writes).
 fn hosted_with_access(org: &str, access: &str) -> HostedConfig {
-    HostedConfig {
-        org: org.to_string(),
-        rules: PackageRules::new(Vec::new(), Some(AccessList::from_tokens([access])))
+    HostedConfig::new(
+        org,
+        PackageRules::new(Vec::new(), Some(AccessList::from_tokens([access])))
             .with_default_unpublish(AccessList::from_tokens(["$authenticated"])),
-        teams: pnpr::Teams::default(),
-    }
+    )
 }
 
 /// One `packages:` entry carrying only an `access` rule.
@@ -102,7 +132,8 @@ fn access_rule(pattern: &str, access: &str) -> PackageRule {
     }
 }
 
-/// A public upstream registry caches under `.pnpr-cache/~public/<digest>/<pkg>/`.
+/// A public upstream registry caches under
+/// `.pnpr-cache/~public/<digest>/packages/<encoded pkg>/`.
 /// The proxy tests use a single `npmjs` registry, so there is one digest dir; this
 /// resolves the per-package cache dir under it. When nothing is cached yet it
 /// returns a path that does not exist, so existence assertions read naturally.
@@ -127,7 +158,18 @@ fn public_cache_pkg(cache_root: &Path, pkg: &str) -> PathBuf {
         .first()
         .cloned()
         .unwrap_or_else(|| public.join("__none__"))
-        .join(pkg)
+        .join("packages")
+        .join(PathBuf::from_iter(package_segments(pnpr_storage::Ecosystem::Npm, pkg)))
+}
+
+/// The directory [`public_cache_pkg`] keeps `pkg`'s cached tarballs in.
+fn public_cache_blobs(cache_root: &Path, pkg: &str) -> PathBuf {
+    public_cache_pkg(cache_root, pkg).join("blobs")
+}
+
+/// Where [`public_cache_blobs`] keeps `pkg`'s cached `file`.
+fn public_cache_blob(cache_root: &Path, pkg: &str, file: &str) -> PathBuf {
+    public_cache_blobs(cache_root, pkg).join(blob_segment(pkg, file))
 }
 
 async fn body_bytes(body: Body) -> Vec<u8> {
@@ -207,6 +249,19 @@ async fn drain_resolve_response(response: axum::response::Response) -> (StatusCo
 }
 
 async fn spawn_git_probe() -> (String, Arc<AtomicUsize>) {
+    let (origin, request_count) = spawn_counting_server(
+        b"HTTP/1.1 500 Internal Server Error\r\n\
+          Content-Length: 0\r\n\
+          Connection: close\r\n\
+          \r\n",
+    )
+    .await;
+    (format!("{origin}/repo.git"), request_count)
+}
+
+/// A server answering every request with `response`, returning its
+/// `http://127.0.0.1:<port>` origin and how many connections it accepted.
+async fn spawn_counting_server(response: &'static [u8]) -> (String, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let request_count = Arc::new(AtomicUsize::new(0));
@@ -217,21 +272,42 @@ async fn spawn_git_probe() -> (String, Arc<AtomicUsize>) {
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 4096];
                 let _ = socket.read(&mut buf).await;
-                let _ = socket.write_all(
-                    b"HTTP/1.1 500 Internal Server Error\r\n\
-                          Content-Length: 0\r\n\
-                          Connection: close\r\n\
-                          \r\n",
-                )
-                .await;
+                let _ = socket.write_all(response).await;
             });
         }
     });
-    (format!("http://{addr}/repo.git"), request_count)
+    (format!("http://{addr}"), request_count)
 }
 
 async fn body_json(body: Body) -> Value {
     serde_json::from_slice(&body_bytes(body).await).expect("body parses as JSON")
+}
+
+fn tar_of(files: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut builder = tar::Builder::new(Vec::new());
+    for (path, body) in files {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(body.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_data(&mut header, path, *body).unwrap();
+    }
+    builder.into_inner().unwrap()
+}
+
+fn gzip(bytes: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(bytes).unwrap();
+    encoder.finish().unwrap()
+}
+
+/// A package tar holding `package/package.json` with `contents`, and its
+/// `.tgz`.
+pub(crate) fn package_tar_and_tgz(contents: &str) -> (Vec<u8>, Vec<u8>) {
+    let tar = tar_of(&[("package/package.json", contents.as_bytes())]);
+    let tgz = gzip(&tar);
+    (tar, tgz)
 }
 
 fn sha512_integrity(bytes: &[u8]) -> String {
@@ -249,15 +325,16 @@ fn hosted_publish_request(
 ) -> Request<Body> {
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
+    let tarball = &crate::npm::publishable_tgz(package, version, tarball);
     let basename = package.rsplit('/').next().unwrap();
     let attachment = format!("{package}-{version}.tgz");
     let body = json!({
         "name": package,
         "dist-tags": { "latest": version },
-        "versions": { (version): { "name": package, "version": version, "dist": {
+        "versions": { (version): crate::npm::version_metadata(tarball, package, version, json!({
             "tarball": format!("http://example.test/{package}/-/{basename}-{version}.tgz"),
             "integrity": sha512_integrity(tarball),
-        } } },
+        })) },
         "_attachments": { (attachment): {
             "content_type": "application/octet-stream",
             "data": BASE64.encode(tarball),
@@ -458,6 +535,13 @@ async fn await_no_tgz(dir: &std::path::Path, budget: Duration) -> bool {
     }
 }
 
+fn header_of(response: &axum::response::Response, name: impl header::AsHeaderName) -> Option<&str> {
+    response
+        .headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+}
+
 fn foo_packument(upstream_url: &str) -> Value {
     json!({
         "name": "foo",
@@ -468,7 +552,8 @@ fn foo_packument(upstream_url: &str) -> Value {
                 "version": "1.0.0",
                 "dist": {
                     "tarball": format!("{upstream_url}/foo/-/foo-1.0.0.tgz"),
-                    "shasum": "deadbeef",
+                    "shasum": sha1_hex_of(b"foo tarball"),
+                    "integrity": sha512_integrity(b"foo tarball"),
                 },
             },
         },
@@ -539,9 +624,9 @@ fn router_config(npmjs_url: &str, corp_url: &str, storage: PathBuf) -> Config {
     config
 }
 
-/// Seed a hosted package directly into the hosted store (root == `storage`),
-/// as a publish would have.
-fn seed_hosted(storage: &Path, pkg: &str) {
+/// Seed a hosted package directly into `org`'s namespace of the hosted store
+/// at `storage` (`""` for the default namespace), as a publish would have.
+fn seed_hosted(storage: &Path, org: &str, pkg: &str) {
     let packument = json!({
         "name": pkg,
         "dist-tags": { "latest": "1.0.0" },
@@ -550,16 +635,26 @@ fn seed_hosted(storage: &Path, pkg: &str) {
             "shasum": "abc",
         } } },
     });
-    std::fs::create_dir_all(storage.join(pkg)).unwrap();
-    std::fs::write(storage.join(pkg).join("package.json"), packument.to_string()).unwrap();
+    write_hosted_packument(storage, org, pkg, &packument);
 }
 
 fn seed_hosted_with_maintainer(storage: &Path, pkg: &str, maintainer: &str) {
-    seed_hosted(storage, pkg);
-    let path = storage.join(pkg).join("package.json");
-    let mut packument: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    seed_hosted(storage, "", pkg);
+    let mut packument = read_hosted_packument(storage, "", pkg).unwrap();
     packument["maintainers"] = json!([{ "username": maintainer }]);
-    std::fs::write(path, serde_json::to_vec(&packument).unwrap()).unwrap();
+    write_hosted_packument(storage, "", pkg, &packument);
+}
+
+/// The packument of `pkg` in `org`'s namespace of the hosted store at
+/// `storage`, as its metadata holds it.
+fn read_hosted_packument(storage: &Path, org: &str, pkg: &str) -> Option<Value> {
+    pnpr_fixtures::read_hosted_document(storage, org, pnpr_storage::Ecosystem::Npm, pkg)
+        .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+}
+
+fn write_hosted_packument(storage: &Path, org: &str, pkg: &str, packument: &Value) {
+    let bytes = serde_json::to_vec(packument).unwrap();
+    pnpr_fixtures::write_hosted_document(storage, org, pnpr_storage::Ecosystem::Npm, pkg, &bytes);
 }
 
 /// The grouped config declares `internal` and the `main` router over it in

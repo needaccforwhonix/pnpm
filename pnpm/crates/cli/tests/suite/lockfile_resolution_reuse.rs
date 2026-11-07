@@ -42,11 +42,8 @@ fn compatible_package_range_update_skips_resolution() {
     let workspace_yaml_path = workspace.join("pnpm-workspace.yaml");
     let workspace_yaml =
         fs::read_to_string(&workspace_yaml_path).expect("read pnpm-workspace.yaml");
-    fs::write(
-        &workspace_yaml_path,
-        format!("{workspace_yaml}trustLockfile: true\nfetchRetries: 0\nfetchTimeout: 1000\n"),
-    )
-    .expect("enable trusted lockfile");
+    fs::write(&workspace_yaml_path, format!("{workspace_yaml}trustLockfile: true\n"))
+        .expect("enable trusted lockfile");
     pacquet_at(&workspace)
         .with_arg("install")
         .assert()
@@ -114,9 +111,9 @@ fn reuses_unchanged_subtree_without_re_resolving_from_the_registry() {
 
     // Trust the lockfile so the post-resolution verifier doesn't fetch
     // each entry's metadata from the registry — that verification is a
-    // separate concern from resolution reuse, and (now that it always runs
-    // and fails closed) it would hit the dead registry regardless of
-    // whether resolution was reused, masking what this test proves.
+    // separate concern from resolution reuse, and it would hit the dead
+    // registry regardless of whether resolution was reused, masking what
+    // this test proves.
     let workspace_yaml = workspace.join("pnpm-workspace.yaml");
     let existing = fs::read_to_string(&workspace_yaml).expect("read pnpm-workspace.yaml");
     fs::write(&workspace_yaml, format!("{existing}trustLockfile: true\n"))
@@ -188,7 +185,7 @@ fn reuses_unchanged_subtree_without_re_resolving_from_the_registry() {
 /// fresh resolve would, so reuse can never silently drift the resolution.
 ///
 /// Compared **byte-for-byte**: the writer sorts every lockfile map by its
-/// rendered key, so build-insertion order no longer leaks into the file. A
+/// rendered key, so build-insertion order cannot leak into the file. A
 /// reuse build and a fresh build of the same manifest therefore emit
 /// identical bytes — this is the byte-stability guarantee from
 /// [#12117](https://github.com/pnpm/pnpm/issues/12117).
@@ -249,8 +246,7 @@ fn a_reused_tree_is_structurally_identical_to_a_fresh_resolve() {
 /// When that leaf occurrence sits at a shallower depth than the healthy
 /// reused occurrence it wins children ownership, so the package's
 /// snapshot collapses to `{}`, its peer suffix is dropped, and its
-/// dependents re-point at the bare instance
-/// (`'@yarnpkg/shell@4.0.0': {}` in the original report).
+/// dependents re-point at the bare instance.
 ///
 /// Scenario, driven by the `@pnpm.e2e/reuse-chain-*` fixtures
 /// (`grand → parent → target`, where `target` deps `@pnpm.e2e/abc` +
@@ -267,8 +263,8 @@ fn a_reused_tree_is_structurally_identical_to_a_fresh_resolve() {
 ///
 /// Importers resolve in order, so pkg-a's cache entry exists when
 /// pkg-b's denied edge looks up; the depth-1 occurrence out-ranks the
-/// depth-2 one for children ownership, making the corruption (before
-/// the fix) deterministic rather than a race.
+/// depth-2 one for children ownership, making the corruption
+/// deterministic rather than a race.
 ///
 /// `target`'s dep `@pnpm.e2e/abc` wants peers nothing in the subtree
 /// provides, so auto-install-peers suffixes `target` — the corrupted
@@ -421,11 +417,8 @@ fn peer_setting_change_on_a_peerless_lockfile_skips_resolution() {
     let workspace_yaml_path = workspace.join("pnpm-workspace.yaml");
     let workspace_yaml =
         fs::read_to_string(&workspace_yaml_path).expect("read pnpm-workspace.yaml");
-    fs::write(
-        &workspace_yaml_path,
-        format!("{workspace_yaml}trustLockfile: true\nfetchRetries: 0\nfetchTimeout: 1000\n"),
-    )
-    .expect("enable trusted lockfile");
+    fs::write(&workspace_yaml_path, format!("{workspace_yaml}trustLockfile: true\n"))
+        .expect("enable trusted lockfile");
     pacquet_at(&workspace)
         .with_arg("install")
         .assert()
@@ -483,11 +476,8 @@ fn peer_setting_change_falls_back_when_the_lockfile_records_peers() {
     let workspace_yaml_path = workspace.join("pnpm-workspace.yaml");
     let workspace_yaml =
         fs::read_to_string(&workspace_yaml_path).expect("read pnpm-workspace.yaml");
-    fs::write(
-        &workspace_yaml_path,
-        format!("{workspace_yaml}trustLockfile: true\nfetchRetries: 0\nfetchTimeout: 1000\n"),
-    )
-    .expect("enable trusted lockfile");
+    fs::write(&workspace_yaml_path, format!("{workspace_yaml}trustLockfile: true\n"))
+        .expect("enable trusted lockfile");
     pacquet_at(&workspace)
         .with_arg("install")
         .assert()
@@ -864,6 +854,142 @@ fn combined_manifest_and_ignore_list_drift_skips_resolution() {
     drop((root, mock_instance));
 }
 
+#[test]
+fn updating_prerelease_to_stable_re_resolves_and_frozen_install_succeeds() {
+    let CommandTempCwd { workspace, root, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+
+    let manifest_path = workspace.join("package.json");
+    fs::write(
+        &manifest_path,
+        serde_json::json!({
+            "dependencies": {
+                "@pnpm.e2e/prerelease-to-stable": "1.0.0-rc.0"
+            }
+        })
+        .to_string(),
+    )
+    .expect("write package.json with prerelease");
+
+    // 1. Install prerelease 1.0.0-rc.0
+    pacquet_at(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+
+    let lockfile = pnpm_lockfile::Lockfile::load_wanted_from_dir(&workspace)
+        .expect("load wanted lockfile")
+        .expect("wanted lockfile");
+    let dep_name = "@pnpm.e2e/prerelease-to-stable".parse().expect("package name");
+    assert_eq!(
+        lockfile.importers["."].dependencies.as_ref().expect("dependencies")[&dep_name]
+            .version
+            .to_string(),
+        "1.0.0-rc.0",
+    );
+
+    // 2. Update package.json to stable 1.0.0
+    fs::write(
+        &manifest_path,
+        serde_json::json!({
+            "dependencies": {
+                "@pnpm.e2e/prerelease-to-stable": "1.0.0"
+            }
+        })
+        .to_string(),
+    )
+    .expect("update package.json to stable");
+
+    // 3. Run pnpm install
+    pacquet_at(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+
+    // 4. Verify lockfile has version 1.0.0 (NOT 1.0.0-rc.0)
+    let lockfile = pnpm_lockfile::Lockfile::load_wanted_from_dir(&workspace)
+        .expect("load wanted lockfile")
+        .expect("wanted lockfile");
+    assert_eq!(
+        lockfile.importers["."].dependencies.as_ref().expect("dependencies")[&dep_name]
+            .version
+            .to_string(),
+        "1.0.0",
+    );
+    assert_eq!(
+        lockfile.importers["."].dependencies.as_ref().expect("dependencies")[&dep_name].specifier,
+        "1.0.0",
+    );
+
+    // 5. Run pnpm install --frozen-lockfile and verify it succeeds
+    pacquet_at(&workspace)
+        .with_args(["install", "--frozen-lockfile"])
+        .assert()
+        .success();
+
+    drop((root, mock_instance));
+}
+
+#[test]
+fn updating_prerelease_to_stable_range_with_lockfile_only_re_resolves() {
+    let CommandTempCwd { workspace, root, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+
+    let manifest_path = workspace.join("package.json");
+    fs::write(
+        &manifest_path,
+        serde_json::json!({
+            "dependencies": {
+                "@pnpm.e2e/prerelease-to-stable": "1.0.0-rc.0"
+            }
+        })
+        .to_string(),
+    )
+    .expect("write package.json with prerelease");
+
+    pacquet_at(&workspace)
+        .with_args(["install", "--lockfile-only"])
+        .assert()
+        .success();
+
+    // Update package.json to stable range ^1.0.0
+    fs::write(
+        &manifest_path,
+        serde_json::json!({
+            "dependencies": {
+                "@pnpm.e2e/prerelease-to-stable": "^1.0.0"
+            }
+        })
+        .to_string(),
+    )
+    .expect("update package.json to stable range");
+
+    pacquet_at(&workspace)
+        .with_args(["install", "--lockfile-only"])
+        .assert()
+        .success();
+
+    let lockfile = pnpm_lockfile::Lockfile::load_wanted_from_dir(&workspace)
+        .expect("load wanted lockfile")
+        .expect("wanted lockfile");
+    let dep_name = "@pnpm.e2e/prerelease-to-stable".parse().expect("package name");
+    assert_eq!(
+        lockfile.importers["."].dependencies.as_ref().expect("dependencies")[&dep_name]
+            .version
+            .to_string(),
+        "1.0.0",
+    );
+
+    pacquet_at(&workspace)
+        .with_args(["install", "--frozen-lockfile"])
+        .assert()
+        .success();
+
+    drop((root, mock_instance));
+}
+
 /// A workspace whose two members each depend on a package of their own.
 fn write_two_member_workspace(workspace: &Path) {
     let workspace_yaml_path = workspace.join("pnpm-workspace.yaml");
@@ -897,3 +1023,7 @@ mod overrides;
 mod mutations;
 
 mod peer_variants;
+
+mod direct_versions;
+
+mod cycles;

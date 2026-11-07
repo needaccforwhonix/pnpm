@@ -1,5 +1,8 @@
 use super::{gvs_layout_cache, gvs_version_segment, local_directory_scope};
-use crate::{AllowBuildPolicy, install_frozen_lockfile::find_own_runtime_node_major};
+use crate::{
+    AllowBuildPolicy, install_frozen_lockfile::find_own_runtime_node_major,
+    platform_selection::VariantPlatforms,
+};
 use indexmap::IndexMap;
 use pnpm_deps_path::get_pkg_id_with_patch_hash;
 use pnpm_graph_hasher::{
@@ -37,6 +40,7 @@ pub(super) fn lockfile_to_dep_graph(
     snapshots: &HashMap<PackageKey, SnapshotEntry>,
     packages: Option<&HashMap<PackageKey, PackageMetadata>>,
     lockfile_dir: Option<&Path>,
+    platform: &VariantPlatforms,
 ) -> HashMap<String, DepsGraphNode<String>> {
     let mut graph = HashMap::with_capacity(snapshots.len());
     let mut link_target_nodes = HashSet::new();
@@ -52,7 +56,10 @@ pub(super) fn lockfile_to_dep_graph(
         );
         graph.insert(
             snapshot_key.to_string(),
-            DepsGraphNode { full_pkg_id: full_pkg_id_of(snapshot_key, packages), children },
+            DepsGraphNode {
+                full_pkg_id: full_pkg_id_of(snapshot_key, packages, platform),
+                children,
+            },
         );
     }
     for link_target_node in link_target_nodes {
@@ -71,6 +78,11 @@ pub(super) fn child_graph_key(
     if let Some(snapshot_key) = dep_ref.resolve(alias) {
         return Some(snapshot_key.to_string());
     }
+    // A link into the package itself is covered by the package's own
+    // integrity, and a path under the project would tie the hash to it.
+    if dep_ref.package_root_link_target().is_some() {
+        return None;
+    }
     let link_target = dep_ref.as_link_target()?;
     let resolved = pnpm_fs::lexical_normalize(&lockfile_dir?.join(link_target));
     Some(format!("link:{}", resolved.to_string_lossy()))
@@ -78,13 +90,14 @@ pub(super) fn child_graph_key(
 pub(super) fn full_pkg_id_of(
     snapshot_key: &PackageKey,
     packages: Option<&HashMap<PackageKey, PackageMetadata>>,
+    platform: &VariantPlatforms,
 ) -> String {
     let pkg_id_with_patch_hash =
         PkgIdWithPatchHash::from(get_pkg_id_with_patch_hash(&snapshot_key.to_string()).to_string());
     let resolution = packages
         .and_then(|packages| packages.get(&snapshot_key.without_peer()))
         .map(|meta| &meta.resolution);
-    create_full_pkg_id(&pkg_id_with_patch_hash, resolution)
+    create_full_pkg_id(&pkg_id_with_patch_hash, resolution, platform)
 }
 /// Length-prefixed so two adjacent fields cannot be confused with one
 /// longer field carrying the same bytes.
@@ -109,6 +122,12 @@ pub(super) struct GvsHasher<'h> {
     /// this is the identical input. Hashing the raw bytes instead would
     /// give the two stacks different slots for the same project.
     project_scope: Option<std::borrow::Cow<'h, str>>,
+    /// The snapshots `sideEffectsCache.exclude` names, and every snapshot
+    /// that depends on one. An excluded build must not reach another
+    /// project, so each takes the project's own slot just as a local
+    /// directory snapshot does, and so does a dependent, whose slot links
+    /// to it.
+    uncached_builds: HashSet<String>,
     engine: Option<&'h str>,
     packages: Option<&'h HashMap<PackageKey, PackageMetadata>>,
 }
@@ -119,15 +138,20 @@ impl<'h> GvsHasher<'h> {
         engine: Option<&'h str>,
         allow_build_policy: Option<&AllowBuildPolicy>,
         lockfile_dir: Option<&'h Path>,
+        platform: &VariantPlatforms,
     ) -> Self {
-        let graph = lockfile_to_dep_graph(snapshots, packages, lockfile_dir);
+        let graph = lockfile_to_dep_graph(snapshots, packages, lockfile_dir, platform);
         let build_required_dep_paths =
             allow_build_policy.map(|policy| engine_gating_dep_paths(policy, snapshots, &graph));
+        let uncached_builds = allow_build_policy
+            .map(|policy| uncached_build_dep_paths(policy, snapshots, &graph))
+            .unwrap_or_default();
         Self {
             graph,
             build_required_dep_paths,
             cache: HashMap::new(),
             project_scope: lockfile_dir.map(|dir| dir.to_string_lossy()),
+            uncached_builds,
             engine,
             packages,
         }
@@ -141,17 +165,12 @@ impl<'h> GvsHasher<'h> {
     /// second. Default host platform / arch (`None`, `None`) matches
     /// whatever the caller used to format the fallback `engine` so the
     /// two strings remain comparable across snapshots in one install.
-    /// Every snapshot's suffix, walked in lockfile key order rather
-    /// than `HashMap` order: [`calc_graph_node_hash`] memoizes into
-    /// `cache`, and for a snapshot inside a dependency cycle the digest
-    /// that lands there depends on which snapshot the walk reached it
-    /// from.
     pub(super) fn suffixes(
         &mut self,
         snapshots: &HashMap<PackageKey, SnapshotEntry>,
     ) -> HashMap<PackageKey, String> {
         let mut gvs_suffixes = HashMap::with_capacity(snapshots.len());
-        for (snapshot_key, snapshot) in crate::deps_graph::in_lockfile_order(snapshots) {
+        for (snapshot_key, snapshot) in snapshots {
             gvs_suffixes.insert(snapshot_key.clone(), self.suffix(snapshot_key, snapshot));
         }
         gvs_suffixes
@@ -184,6 +203,7 @@ impl<'h> GvsHasher<'h> {
         }
         write_field(&mut hasher, self.project_scope.as_deref().unwrap_or(""));
         self.write_gating_set(&mut hasher);
+        write_sorted(&mut hasher, &self.uncached_builds);
         self.write_graph(&mut hasher);
         self.write_snapshot_extras(&mut hasher, snapshots);
         format!("{:x}", hasher.finalize())
@@ -200,12 +220,7 @@ impl<'h> GvsHasher<'h> {
             return hasher.update([0_u8]);
         };
         hasher.update([1_u8]);
-        let mut sorted: Vec<&str> = paths
-            .iter()
-            .map(String::as_str)
-            .collect();
-        sorted.sort_unstable();
-        write_field(hasher, &sorted.join("\u{0}"));
+        write_sorted(hasher, paths);
     }
 
     /// The dep graph, in an order a `HashMap` cannot vary.
@@ -253,13 +268,21 @@ impl<'h> GvsHasher<'h> {
             find_own_runtime_node_major(snapshot).map(|major| engine_name(major, None, None));
         let metadata_key = snapshot_key.without_peer();
         let metadata = self.packages.and_then(|packages| packages.get(&metadata_key));
+        let dep_path = snapshot_key.to_string();
+        let project_scope =
+            local_directory_scope(metadata, &metadata_key.suffix, self.project_scope.as_deref())
+                .or_else(|| {
+                    self.project_scope
+                        .as_deref()
+                        .filter(|_| self.uncached_builds.contains(&dep_path))
+                });
         let hex_digest = calc_graph_node_hash(
             &self.graph,
             &mut self.cache,
-            &snapshot_key.to_string(),
+            &dep_path,
             own_engine.as_deref().or(self.engine),
             self.build_required_dep_paths.as_ref(),
-            local_directory_scope(metadata, &metadata_key.suffix, self.project_scope.as_deref()),
+            project_scope,
         );
         format_global_virtual_store_path(
             &metadata_key.name.to_string(),
@@ -268,6 +291,31 @@ impl<'h> GvsHasher<'h> {
         )
     }
 }
+/// The dep paths of the snapshots whose build `sideEffectsCache.exclude`
+/// keeps out of every cache, and of their transitive dependents.
+fn uncached_build_dep_paths(
+    policy: &AllowBuildPolicy,
+    snapshots: &HashMap<PackageKey, SnapshotEntry>,
+    graph: &HashMap<String, DepsGraphNode<String>>,
+) -> HashSet<String> {
+    let excluded = snapshots
+        .keys()
+        .filter(|snapshot_key| !policy.caches_build(snapshot_key))
+        .map(ToString::to_string)
+        .collect();
+    pnpm_graph_hasher::build_required_dep_paths(graph, &excluded)
+}
+
+/// Hash a set in an order a `HashSet` cannot vary.
+fn write_sorted(hasher: &mut sha2::Sha256, paths: &HashSet<String>) {
+    let mut sorted: Vec<&str> = paths
+        .iter()
+        .map(String::as_str)
+        .collect();
+    sorted.sort_unstable();
+    write_field(hasher, &sorted.join("\u{0}"));
+}
+
 pub(super) fn engine_gating_dep_paths(
     policy: &AllowBuildPolicy,
     snapshots: &HashMap<PackageKey, SnapshotEntry>,
@@ -280,21 +328,40 @@ pub(super) fn engine_gating_dep_paths(
         .collect();
     pnpm_graph_hasher::build_required_dep_paths(graph, &built_dep_paths)
 }
-/// `variations` (cross-platform variant) resolutions don't exist in
-/// pacquet's lockfile model yet — when they're added, this helper
-/// will need a `selectPlatformVariant` branch to pick the right
-/// integrity.
+/// A `variations` resolution is identified by the archive `platform`
+/// selects, so projects that select different archives of one version
+/// get different slots.
 pub(super) fn create_full_pkg_id(
     pkg_id_with_patch_hash: &PkgIdWithPatchHash,
     resolution: Option<&LockfileResolution>,
+    platform: &VariantPlatforms,
 ) -> String {
-    match resolution.and_then(LockfileResolution::integrity) {
-        Some(integrity) => format!("{pkg_id_with_patch_hash}:{integrity}"),
+    let resolution = match resolution {
+        Some(LockfileResolution::Variations(variations)) => variations
+            .select(platform.for_variations(variations))
+            .ok()
+            .flatten()
+            .map(|variant| &variant.resolution)
+            .or(resolution),
+        resolution => resolution,
+    };
+    if let Some(integrity) = resolution.and_then(LockfileResolution::integrity) {
+        return format!("{pkg_id_with_patch_hash}:{integrity}");
+    }
+    match resolution {
+        // A custom fetcher's bytes can change under the same package id,
+        // so the slot has to be named after what identifies them.
+        Some(resolution @ LockfileResolution::Custom(_)) => {
+            crate::deps_graph::full_pkg_id_without_builtin_integrity(
+                pkg_id_with_patch_hash.as_str(),
+                resolution,
+            )
+        }
         // Directory / git / missing-metadata fall through to the bare
         // id. The install path rejects these resolutions before the
         // hash is consulted (see
         // [`crate::InstallPackageBySnapshotError::UnsupportedResolution`]),
         // so the value never actually drives a slot path on disk.
-        None => pkg_id_with_patch_hash.to_string(),
+        _ => pkg_id_with_patch_hash.to_string(),
     }
 }

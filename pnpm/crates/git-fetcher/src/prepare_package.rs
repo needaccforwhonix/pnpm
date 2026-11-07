@@ -8,9 +8,11 @@
 
 use crate::{
     error::PreparePackageError,
-    pm_shims::{shim_names, write_pm_shims},
+    pm_shims::{provide_running_pnpm, shim_names, write_pm_shims},
     preferred_pm::{PreferredPm, WantedPm, detect_wanted_pm},
+    process::Command,
 };
+
 use pnpm_executor::{LifecycleScriptError, RunPostinstallHooks, run_lifecycle_hook};
 use pnpm_network::redact_and_sanitize;
 use pnpm_package_manifest::safe_read_package_json_from_dir;
@@ -20,7 +22,6 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    process::Command,
     sync::{LazyLock, Mutex, PoisonError},
 };
 
@@ -34,14 +35,15 @@ use std::{
 const PREPUBLISH_SCRIPTS: &[&str] = &["prepublish", "prepack", "publish"];
 
 /// Closure shape used to ask the install policy whether the package at
-/// a dep path is allowed to run lifecycle scripts.
+/// a dep path is allowed to run lifecycle scripts. `Some(false)` explicitly
+/// skips preparation; `None` requires a decision before installation.
 ///
 /// We pass a closure rather than `&AllowBuildPolicy` so the
 /// `pnpm-git-fetcher` crate stays free of a back-edge into
 /// `pnpm-package-manager`. The caller adapts whatever policy
 /// structure it has into this shape.
-pub type AllowBuildFn<'a> = Box<dyn Fn(&str) -> bool + Send + Sync + 'a>;
-pub type AllowBuildRef<'a> = &'a (dyn Fn(&str) -> bool + Send + Sync);
+pub type AllowBuildFn<'a> = Box<dyn Fn(&str) -> Option<bool> + Send + Sync + 'a>;
+pub type AllowBuildRef<'a> = &'a (dyn Fn(&str) -> Option<bool> + Send + Sync);
 
 /// Caller-supplied context for [`prepare_package`].
 pub struct PreparePackageOptions<'a> {
@@ -56,12 +58,31 @@ pub struct PreparePackageOptions<'a> {
     pub extra_env: &'a HashMap<String, String>,
 }
 
-/// Result of [`prepare_package`]. `should_be_built` drives the
-/// `built` dimension of the git-hosted store-index key.
+/// Result of [`prepare_package`], distinguishing a package that requires
+/// preparation from one whose preparation was explicitly skipped.
 #[derive(Debug)]
 pub struct PreparedPackage {
+    pub ignored_build: bool,
     pub pkg_dir: PathBuf,
     pub should_be_built: bool,
+}
+
+impl PreparedPackage {
+    pub(crate) fn store_index_key<'a>(
+        &self,
+        requested_key: &'a str,
+        package_id: &str,
+        ignore_scripts: bool,
+    ) -> std::borrow::Cow<'a, str> {
+        if self.should_be_built
+            && ((self.ignored_build && !ignore_scripts)
+                || (!self.ignored_build && requested_key.ends_with("\tnot-built")))
+        {
+            pnpm_store_dir::git_hosted_store_index_key(package_id, !self.ignored_build).into()
+        } else {
+            requested_key.into()
+        }
+    }
 }
 
 pub fn prepare_package<Reporter: self::Reporter>(
@@ -74,19 +95,23 @@ pub fn prepare_package<Reporter: self::Reporter>(
         safe_read_package_json_from_dir(&pkg_dir).map_err(PreparePackageError::ReadManifest)?;
 
     let Some(manifest) = manifest else {
-        return Ok(PreparedPackage { pkg_dir, should_be_built: false });
+        return Ok(PreparedPackage { pkg_dir, should_be_built: false, ignored_build: false });
     };
     let scripts = manifest.get("scripts").and_then(Value::as_object);
     if scripts.is_none_or(serde_json::Map::is_empty)
         || !package_should_be_built(&manifest, &pkg_dir)
     {
-        return Ok(PreparedPackage { pkg_dir, should_be_built: false });
+        return Ok(PreparedPackage { pkg_dir, should_be_built: false, ignored_build: false });
     }
-    if opts.scripts.ignore {
-        return Ok(PreparedPackage { pkg_dir, should_be_built: true });
+    if opts.scripts.ignore
+        || !resolve_package_build_permission(
+            opts.allow_build.as_ref(),
+            opts.pkg_resolution_id,
+            &manifest,
+        )?
+    {
+        return Ok(PreparedPackage { pkg_dir, should_be_built: true, ignored_build: true });
     }
-
-    assert_package_build_allowed(opts.allow_build.as_ref(), opts.pkg_resolution_id, &manifest)?;
 
     let wanted_pm = detect_wanted_pm(git_root_dir, Some(&manifest));
     let pm = wanted_pm.pm;
@@ -96,17 +121,18 @@ pub fn prepare_package<Reporter: self::Reporter>(
     // Kept alive until the prepare is over: dropping it takes the shims
     // with it.
     let shims_dir =
-        provide_wanted_pm::<Reporter>(&wanted_pm, &dep_path, opts.scripts.pnpm_execpath)?;
+        provide_wanted_pm::<Reporter>(&wanted_pm, &dep_path, opts.scripts.running_pnpm)?;
     if let Some(dir) = shims_dir.as_ref() {
         extra_bin_paths.insert(0, dir.path().to_path_buf());
     }
 
-    let run_opts = opts.lifecycle_options(&dep_path, &pkg_dir, &extra_bin_paths);
+    let extra_env = prepare_env(opts.extra_env, opts.scripts.running_pnpm.pm_on_fail);
+    let run_opts = opts.lifecycle_options(&dep_path, &pkg_dir, &extra_bin_paths, &extra_env);
 
     run_install_and_prepublish::<Reporter>(pm, &run_opts, &manifest)?;
     remove_install_node_modules(&pkg_dir)?;
 
-    Ok(PreparedPackage { pkg_dir, should_be_built: true })
+    Ok(PreparedPackage { pkg_dir, should_be_built: true, ignored_build: false })
 }
 
 impl PreparePackageOptions<'_> {
@@ -115,22 +141,23 @@ impl PreparePackageOptions<'_> {
         dep_path: &'a str,
         pkg_dir: &'a Path,
         extra_bin_paths: &'a [PathBuf],
+        extra_env: &'a HashMap<String, String>,
     ) -> RunPostinstallHooks<'a> {
         RunPostinstallHooks {
             environment: pnpm_executor::ScriptEnvironment {
                 init_cwd: pkg_dir,
                 node_execpath: self.scripts.node_execpath,
                 npm_execpath: self.scripts.npm_execpath,
-                node_gyp_path: None,
+                node_gyp_path: pnpm_executor::bundled_node_gyp_entry(),
                 user_agent: self.scripts.user_agent,
-                extra_env: self.extra_env,
+                extra_env,
             },
             execution: pnpm_executor::ScriptExecutionOptions {
                 extra_bin_paths,
                 node_gyp_bin: pnpm_executor::bundled_node_gyp_bin(),
-                prepend_node_path: self.scripts.prepend_node_path,
                 shell: self.scripts.shell,
                 shell_emulator: false,
+                wd_bin_dir: None,
             },
             dep_path,
             pkg_root: pkg_dir,
@@ -141,6 +168,34 @@ impl PreparePackageOptions<'_> {
             optional: false,
         }
     }
+}
+
+/// The environment the prepare scripts run with: the caller's `extra_env`
+/// with `strictDepBuilds` turned off and the install's `pmOnFail` passed on.
+///
+/// The install that prepares the package runs in a temporary checkout,
+/// where nobody can approve the build scripts of the package's own
+/// dependencies. Those builds are skipped there, as they are without
+/// `strictDepBuilds`, rather than failing the outer install.
+///
+/// That install also reads the package manager the dependency pins, and a
+/// `pmOnFail` given on the command line would not otherwise reach it.
+fn prepare_env(
+    extra_env: &HashMap<String, String>,
+    pm_on_fail: Option<&str>,
+) -> HashMap<String, String> {
+    let mut env = extra_env.clone();
+    // Both spellings: pnpm reads either, and a user's own variable in the
+    // other one must not win.
+    for key in ["pnpm_config_strict_dep_builds", "PNPM_CONFIG_STRICT_DEP_BUILDS"] {
+        env.insert(key.to_string(), "false".to_string());
+    }
+    if let Some(pm_on_fail) = pm_on_fail {
+        for key in ["pnpm_config_pm_on_fail", "PNPM_CONFIG_PM_ON_FAIL"] {
+            env.insert(key.to_string(), pm_on_fail.to_string());
+        }
+    }
+    env
 }
 
 fn manifest_dep_path(manifest: &Value) -> String {
@@ -200,12 +255,6 @@ fn remove_install_node_modules(pkg_dir: &Path) -> Result<(), PreparePackageError
     }
 }
 
-/// Read the manifest, decide whether the package needs building, and
-/// run the appropriate lifecycle scripts. Returns `should_be_built:
-/// false` early when there's nothing to do; otherwise runs
-/// `<pm>-install` plus any defined `prepublish` / `prepack` / `publish`
-/// hooks, then deletes `node_modules` so the install-time deps don't
-/// leak into the CAS.
 /// The lifecycle stage and command one prepublish script runs as, or `None`
 /// when the package declares no such script.
 ///
@@ -250,11 +299,20 @@ fn prepublish_invocation(
 /// satisfy what the dependency ships. Otherwise the host's own install is
 /// left to do the job it has always done, which is also what happens when
 /// the shims cannot be written for an unpinned one.
+///
+/// A `pmOnFail` other than `download` leaves pnpm itself to the running
+/// pnpm, whatever version the dependency pins.
 fn provide_wanted_pm<Reporter: self::Reporter>(
     wanted_pm: &WantedPm,
     dep_path: &str,
-    pnpm_execpath: Option<&Path>,
+    running_pnpm: crate::RunningPnpm<'_>,
 ) -> Result<Option<tempfile::TempDir>, PreparePackageError> {
+    let pnpm_execpath = running_pnpm.execpath;
+    if wanted_pm.pm == PreferredPm::Pnpm
+        && running_pnpm.pm_on_fail.is_some_and(|on_fail| on_fail != "download")
+    {
+        return Ok(provide_running_pnpm(pnpm_execpath));
+    }
     if !wanted_pm.pinned && host_can_prepare(wanted_pm) {
         return Ok(None);
     }
@@ -367,11 +425,11 @@ fn probe_host(wanted: &WantedPm) -> bool {
         })
 }
 
-pub fn assert_package_build_allowed(
+pub fn resolve_package_build_permission(
     allow_build: AllowBuildRef<'_>,
     pkg_resolution_id: &str,
     manifest: &Value,
-) -> Result<(), PreparePackageError> {
+) -> Result<bool, PreparePackageError> {
     let name = manifest
         .get("name")
         .and_then(Value::as_str)
@@ -381,8 +439,8 @@ pub fn assert_package_build_allowed(
         .and_then(Value::as_str)
         .unwrap_or("");
     let allow_build_dep_path = format!("{name}@{pkg_resolution_id}");
-    if allow_build(&allow_build_dep_path) {
-        return Ok(());
+    if let Some(allowed) = allow_build(&allow_build_dep_path) {
+        return Ok(allowed);
     }
     Err(PreparePackageError::NotAllowed {
         name: name.to_string(),

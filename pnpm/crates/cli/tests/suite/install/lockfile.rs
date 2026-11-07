@@ -2,12 +2,100 @@
 use super::set_dir_modes;
 use super::{
     AddMockedRegistry, BIG_LOCKFILE, BIG_MANIFEST, CommandExtra, CommandTempCwd, OpenOptions,
-    STORE_VERSION, Write, flatten_report, fs, new_pacquet_command,
+    STORE_VERSION, Write, assert_merged_conflicted_lockfile, flatten_report, fs,
+    new_pacquet_command, write_conflicted_lockfile_fixture,
     write_required_incompatible_engine_fixture,
 };
 #[cfg(unix)]
 use super::{enable_gvs_in_workspace_yaml, is_symlink_or_junction};
 use assert_cmd::{assert::OutputAssertExt, cargo::CommandCargoExt};
+
+#[test]
+fn install_merges_git_conflicts_and_keeps_the_locked_version() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    write_conflicted_lockfile_fixture(&workspace);
+
+    let output = new_pacquet_command(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+
+    assert_merged_conflicted_lockfile(
+        &workspace,
+        &String::from_utf8_lossy(&output.get_output().stdout),
+    );
+
+    drop((root, mock_instance));
+}
+
+#[test]
+fn fix_lockfile_merges_git_conflicts() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    write_conflicted_lockfile_fixture(&workspace);
+
+    let output = new_pacquet_command(&workspace)
+        .with_args(["install", "--fix-lockfile", "--lockfile-only"])
+        .assert()
+        .success();
+
+    assert_merged_conflicted_lockfile(
+        &workspace,
+        &String::from_utf8_lossy(&output.get_output().stdout),
+    );
+
+    drop((root, mock_instance));
+}
+
+/// <https://github.com/pnpm/pnpm/issues/16618>
+#[test]
+fn fix_lockfile_repairs_an_importer_reference_with_no_snapshot() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({ "dependencies": { "is-positive": "^3.0.0" } }).to_string(),
+    )
+    .expect("write package.json");
+    pacquet
+        .with_args(["install", "--lockfile-only"])
+        .assert()
+        .success();
+    let lockfile_path = workspace.join("pnpm-lock.yaml");
+    let locked = fs::read_to_string(&lockfile_path).expect("read lockfile");
+    assert!(locked.contains("        version: 3.1.0\n"), "{locked}");
+    fs::write(
+        &lockfile_path,
+        locked.replace("        version: 3.1.0\n", "        version: 3.0.0\n"),
+    )
+    .expect("write lockfile with a dangling importer reference");
+
+    new_pacquet_command(&workspace)
+        .with_args(["install", "--fix-lockfile", "--lockfile-only"])
+        .assert()
+        .success();
+
+    let repaired = pnpm_lockfile::Lockfile::load_from_path(&lockfile_path)
+        .expect("load repaired lockfile")
+        .expect("repaired lockfile");
+    repaired.verify_importer_snapshot_links().expect("every importer reference has a snapshot");
+    assert!(
+        fs::read_to_string(&lockfile_path)
+            .expect("read repaired lockfile")
+            .contains("        version: 3.1.0\n"),
+    );
+
+    drop((root, mock_instance));
+}
 
 #[test]
 fn fix_lockfile_regenerates_broken_metadata_without_changing_locked_versions() {
@@ -208,6 +296,74 @@ fn filtered_fix_lockfile_preserves_unselected_snapshot_metadata() {
             .iter()
             .all(|key| { repaired_snapshots.get(key).is_some_and(|snapshot| snapshot.optional) }),
     );
+
+    drop((root, mock_instance));
+}
+
+fn locked_package<'a>(
+    lockfile: &'a pnpm_lockfile::Lockfile,
+    package_key: &str,
+) -> &'a pnpm_lockfile::PackageMetadata {
+    lockfile.packages
+        .as_ref()
+        .expect("packages")
+        .get(&package_key.parse().expect("parse package key"))
+        .unwrap_or_else(|| panic!("missing package {package_key}"))
+}
+
+/// Record a deprecation notice the registry metadata does not carry, so only
+/// the lockfile can supply it.
+fn record_lockfile_only_deprecation(lockfile_path: &std::path::Path, package_key: &str) {
+    let mut lockfile = pnpm_lockfile::Lockfile::load_from_path(lockfile_path)
+        .expect("load lockfile")
+        .expect("lockfile present");
+    let metadata = lockfile.packages
+        .as_mut()
+        .expect("packages")
+        .get_mut(&package_key.parse().expect("parse package key"))
+        .unwrap_or_else(|| panic!("missing package {package_key}"));
+    metadata.deprecated = Some("locked deprecation".to_string());
+    lockfile
+        .save_to_path(lockfile_path, pnpm_lockfile::SymlinkedLockfile::Refuse)
+        .expect("write lockfile");
+}
+
+#[test]
+fn fix_lockfile_preserves_has_bin_and_deprecated() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info: AddMockedRegistry { mock_instance, .. },
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let pkg_json = serde_json::json!({
+        "dependencies": {
+            "is-positive": "1.0.0",
+            "@pnpm.e2e/hello-world-js-bin": "1.0.0",
+        },
+    });
+    fs::write(workspace.join("package.json"), pkg_json.to_string()).expect("write package.json");
+    pacquet
+        .with_args(["install", "--lockfile-only"])
+        .assert()
+        .success();
+    let lockfile_path = workspace.join("pnpm-lock.yaml");
+    record_lockfile_only_deprecation(&lockfile_path, "is-positive@1.0.0");
+
+    new_pacquet_command(&workspace)
+        .with_args(["install", "--fix-lockfile", "--lockfile-only"])
+        .assert()
+        .success();
+
+    let repaired = pnpm_lockfile::Lockfile::load_from_path(&lockfile_path)
+        .expect("load repaired lockfile")
+        .expect("repaired lockfile");
+    assert_eq!(
+        locked_package(&repaired, "is-positive@1.0.0").deprecated.as_deref(),
+        Some("locked deprecation"),
+    );
+    assert_eq!(locked_package(&repaired, "@pnpm.e2e/hello-world-js-bin@1.0.0").has_bin, Some(true));
 
     drop((root, mock_instance));
 }
@@ -686,4 +842,335 @@ fn frozen_lockfile_setting_drives_the_headless_install() {
     assert!(workspace.join("pnpm-lock.yaml").is_file(), "--no-frozen-lockfile must overrule");
 
     drop((root, mock_instance));
+}
+
+/// `add`, `remove` and `update` pass their install the loader rather
+/// than the document it loaded, so the install reports the merge from
+/// its own load the way a plain install does.
+#[test]
+fn add_over_a_conflicted_lockfile_reports_the_merge() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    write_conflicted_lockfile_fixture(&workspace);
+
+    let output = new_pacquet_command(&workspace)
+        .with_args(["add", "@pnpm.e2e/foo@100.0.0", "--lockfile-only"])
+        .assert()
+        .success();
+
+    assert_merged_conflicted_lockfile(
+        &workspace,
+        &String::from_utf8_lossy(&output.get_output().stdout),
+    );
+
+    drop((root, mock_instance));
+}
+
+/// The merge is reported by the install that performs it, not by the
+/// command's own load, so a run that returns before installing anything
+/// leaves the file conflicted without claiming to have merged it.
+#[test]
+fn a_command_that_installs_nothing_claims_no_merge() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    write_conflicted_lockfile_fixture(&workspace);
+    let conflicted = fs::read_to_string(workspace.join("pnpm-lock.yaml")).expect("read lockfile");
+
+    let output = new_pacquet_command(&workspace)
+        .with_args(["remove", "@pnpm.e2e/not-a-dependency", "--lockfile-only"])
+        .assert();
+    let stdout = String::from_utf8_lossy(&output.get_output().stdout);
+    eprintln!("STDOUT:\n{stdout}");
+
+    assert!(
+        !stdout.contains("Merge conflict detected"),
+        "nothing was installed, so nothing merged",
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join("pnpm-lock.yaml")).expect("read lockfile"),
+        conflicted,
+        "the lockfile is left exactly as it was found",
+    );
+
+    drop((root, mock_instance));
+}
+
+/// pnpm/pnpm#14912: `pnpm-lock.yaml` describes the manifest, not the
+/// `--prod` / `--dev` filter the run was invoked with, so a filtered
+/// install records every dependency group and a later unfiltered frozen
+/// install accepts what it wrote. The filter reaches the virtual store
+/// instead.
+fn assert_group_filter_reaches_materialization_only(
+    filter: &str,
+    excluded: (&str, &str),
+    expected_added: u64,
+) {
+    const PROD: (&str, &str) = ("@pnpm.e2e/pkg-with-1-dep", "100.0.0");
+    const DEV: (&str, &str) = ("@pnpm.e2e/hello-world-js-bin", "1.0.0");
+
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({
+            "dependencies": { PROD.0: PROD.1 },
+            "devDependencies": { DEV.0: DEV.1 },
+            "optionalDependencies": { "@pnpm.e2e/qar": "100.0.0" },
+        })
+        .to_string(),
+    )
+    .expect("write package.json");
+
+    let install = pacquet
+        .with_args(["install", filter, "--reporter=ndjson"])
+        .assert()
+        .success();
+
+    let wanted = super::read_lockfile(&workspace.join("pnpm-lock.yaml"));
+    dbg!(&wanted);
+    for (group, dependency) in [
+        ("dependencies", PROD.0),
+        ("devDependencies", DEV.0),
+        ("optionalDependencies", "@pnpm.e2e/qar"),
+    ] {
+        assert!(
+            super::importer_has_group_dependency(
+                &wanted,
+                pnpm_lockfile::Lockfile::ROOT_IMPORTER_KEY,
+                group,
+                dependency,
+            ),
+            "`install {filter}` dropped {group} from the wanted lockfile",
+        );
+    }
+
+    let slot = |(name, version): (&str, &str)| {
+        workspace
+            .join("node_modules/.pnpm")
+            .join(format!("{}@{version}", name.replace('/', "+")))
+    };
+    let installed = if excluded == DEV { PROD } else { DEV };
+    assert!(slot(installed).is_dir(), "`install {filter}` must materialize the group it installs");
+    assert!(
+        !slot(excluded).exists(),
+        "`install {filter}` must not materialize the group it excludes",
+    );
+    // The slot assertions above only see the end state. This is the
+    // count the pipeline decided to import, which pnpm renders as
+    // `Packages: +N`, so a group that materializes and is cleaned up
+    // again still fails here.
+    let added: Vec<u64> = super::ndjson_records(install.get_output())
+        .iter()
+        .filter_map(|record| {
+            (record["name"] == "pnpm:stats")
+                .then(|| record["added"].as_u64())
+                .flatten()
+        })
+        .collect();
+    assert_eq!(added, vec![expected_added], "`install {filter}` imported the wrong package count");
+
+    new_pacquet_command(&workspace)
+        .with_args(["install", "--frozen-lockfile", "--lockfile-only"])
+        .assert()
+        .success();
+
+    drop((root, mock_instance));
+}
+
+#[test]
+fn a_prod_install_records_every_group_and_materializes_only_production() {
+    // `@pnpm.e2e/pkg-with-1-dep` plus its dependency, plus the optional
+    // `@pnpm.e2e/qar` a bare `--prod` keeps.
+    assert_group_filter_reaches_materialization_only(
+        "--prod",
+        ("@pnpm.e2e/hello-world-js-bin", "1.0.0"),
+        3,
+    );
+}
+
+#[test]
+fn a_dev_install_records_every_group_and_materializes_only_development() {
+    // `@pnpm.e2e/hello-world-js-bin` alone: a dev-only install drops the
+    // project's optional dependencies along with the production ones.
+    assert_group_filter_reaches_materialization_only(
+        "--dev",
+        ("@pnpm.e2e/pkg-with-1-dep", "100.0.0"),
+        1,
+    );
+}
+
+/// Commands that run before the first install record the env document
+/// alone. A frozen install of a project with no dependencies accepts it,
+/// even with the trailing separator trimmed off, and keeps it in front of
+/// the main document it writes (<https://github.com/pnpm/pnpm/issues/16477>).
+#[test]
+fn frozen_install_accepts_a_lockfile_with_only_the_env_document() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    fs::write(workspace.join("package.json"), r#"{"name":"app","dependencies":{}}"#)
+        .expect("write package.json");
+    let env_document = "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    configDependencies: {}\n\npackages: {}\n\nsnapshots: {}\n";
+    let lockfile_path = workspace.join("pnpm-lock.yaml");
+    fs::write(&lockfile_path, format!("---\n{env_document}")).expect("write pnpm-lock.yaml");
+
+    pacquet
+        .with_args(["install", "--frozen-lockfile"])
+        .assert()
+        .success();
+
+    let lockfile = fs::read_to_string(&lockfile_path).expect("read pnpm-lock.yaml");
+    eprintln!("pnpm-lock.yaml:\n{lockfile}");
+    assert!(
+        lockfile.starts_with(&format!("---\n{env_document}---\n")),
+        "the env document must lead the lockfile",
+    );
+    drop((root, mock_instance));
+}
+
+/// Stage `pnpm-lock.yaml` as a relative symlink to a lockfile outside the
+/// project, then add a local dependency so the next install must change it.
+/// Returns the symlink's target.
+#[cfg(unix)]
+fn stage_symlinked_lockfile_needing_update(
+    pacquet: std::process::Command,
+    root: &std::path::Path,
+    workspace: &std::path::Path,
+) -> std::path::PathBuf {
+    fs::write(workspace.join("package.json"), r#"{"name":"app","version":"1.0.0"}"#).unwrap();
+    pacquet
+        .with_args(["install", "--lockfile-only"])
+        .assert()
+        .success();
+    let source = root.join("source");
+    fs::create_dir(&source).unwrap();
+    let source_lockfile = source.join("pnpm-lock.yaml");
+    fs::rename(workspace.join("pnpm-lock.yaml"), &source_lockfile).unwrap();
+    std::os::unix::fs::symlink("../source/pnpm-lock.yaml", workspace.join("pnpm-lock.yaml"))
+        .unwrap();
+    fs::create_dir(workspace.join("dep")).unwrap();
+    fs::write(workspace.join("dep/package.json"), r#"{"name":"dep","version":"1.0.0"}"#).unwrap();
+    fs::write(
+        workspace.join("package.json"),
+        r#"{"name":"app","version":"1.0.0","dependencies":{"dep":"file:./dep"}}"#,
+    )
+    .unwrap();
+    source_lockfile
+}
+
+/// <https://github.com/pnpm/pnpm/issues/17222>
+#[cfg(unix)]
+#[test]
+fn symlinked_lockfile_writes_through_into_a_target_dir() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    let source_lockfile = stage_symlinked_lockfile_needing_update(pacquet, root.path(), &workspace);
+
+    new_pacquet_command(&workspace)
+        .with_env("PNPM_CONFIG_SYMLINKED_LOCKFILE_TARGET_DIRS", target_dirs_json(&source_lockfile))
+        .with_args(["install", "--lockfile-only"])
+        .assert()
+        .success();
+
+    assert!(fs::symlink_metadata(workspace.join("pnpm-lock.yaml")).unwrap().is_symlink());
+    let lockfile = fs::read_to_string(&source_lockfile).unwrap();
+    eprintln!("LOCKFILE:\n{lockfile}");
+    assert!(lockfile.contains("file:dep"), "the symlink target must receive the update");
+
+    drop((root, mock_instance));
+}
+
+/// The repository that commits the symlink must not be the one that allows
+/// writing through it.
+#[cfg(unix)]
+#[test]
+fn changed_symlinked_lockfile_is_refused_even_if_the_workspace_yaml_allows_it() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    let workspace_yaml = fs::read_to_string(workspace.join("pnpm-workspace.yaml")).unwrap();
+    let source_lockfile = stage_symlinked_lockfile_needing_update(pacquet, root.path(), &workspace);
+    let allowed_dirs = target_dirs_json(&source_lockfile);
+    fs::write(
+        workspace.join("pnpm-workspace.yaml"),
+        format!("{workspace_yaml}\nsymlinkedLockfileTargetDirs: {allowed_dirs}\n"),
+    )
+    .unwrap();
+    let before = fs::read_to_string(&source_lockfile).unwrap();
+
+    let output = new_pacquet_command(&workspace)
+        .with_args(["install", "--lockfile-only"])
+        .assert()
+        .failure();
+
+    let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+    eprintln!("STDERR:\n{stderr}");
+    assert!(stderr.contains("Refusing to write symlinked lockfile"));
+    assert!(fs::symlink_metadata(workspace.join("pnpm-lock.yaml")).unwrap().is_symlink());
+    assert_eq!(fs::read_to_string(&source_lockfile).unwrap(), before);
+
+    drop((root, mock_instance));
+}
+
+/// A target outside every listed directory is refused like an unlisted link.
+#[cfg(unix)]
+#[test]
+fn symlinked_lockfile_outside_the_allowed_dirs_is_refused() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    let source_lockfile = stage_symlinked_lockfile_needing_update(pacquet, root.path(), &workspace);
+    let before = fs::read_to_string(&source_lockfile).unwrap();
+
+    let output = new_pacquet_command(&workspace)
+        .with_env(
+            "PNPM_CONFIG_SYMLINKED_LOCKFILE_TARGET_DIRS",
+            target_dirs_json(&workspace.join("pnpm-lock.yaml")),
+        )
+        .with_args(["install", "--lockfile-only"])
+        .assert()
+        .failure();
+
+    let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+    eprintln!("STDERR:\n{stderr}");
+    assert!(stderr.contains("Refusing to write symlinked lockfile"));
+    assert_eq!(fs::read_to_string(&source_lockfile).unwrap(), before);
+
+    drop((root, mock_instance));
+}
+
+/// `symlinkedLockfileTargetDirs` listing the directory of `file`, as JSON.
+#[cfg(unix)]
+fn target_dirs_json(file: &std::path::Path) -> String {
+    serde_json::to_string(&[file.parent().unwrap()]).unwrap()
 }

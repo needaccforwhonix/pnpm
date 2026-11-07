@@ -50,22 +50,28 @@ the script is executed instead of the built-in command.',
   })
 }
 
+export interface CleanOptions {
+  dir: string
+  modulesDir?: string
+  virtualStoreDir?: string
+  workspaceDir?: string
+  workspacePackagePatterns?: string[]
+}
+
 export async function handler (
-  opts: {
-    dir: string
-    lockfile?: boolean
-    modulesDir?: string
-    virtualStoreDir?: string
-    workspaceDir?: string
-    workspacePackagePatterns?: string[]
+  opts: CleanOptions & {
     cliOptions?: {
       lockfile?: boolean
     }
   }
 ): Promise<void> {
+  await cleanProjects({ ...opts, removeLockfile: opts.cliOptions?.lockfile === true })
+}
+
+export async function cleanProjects (opts: CleanOptions & { removeLockfile: boolean }): Promise<void> {
   const modulesDir = opts.modulesDir ?? 'node_modules'
   const rootDir = opts.workspaceDir ?? opts.dir
-  const cleanOpts = { modulesDir, removeLockfile: opts.cliOptions?.lockfile === true }
+  const cleanOpts = { modulesDir, removeLockfile: opts.removeLockfile }
   const dirs = await getProjectDirs(opts)
   await Promise.all(dirs.map(cleanProjectDir.bind(null, cleanOpts)))
   if (opts.virtualStoreDir) {
@@ -88,8 +94,8 @@ export async function handler (
   }
 }
 
-function printRemoving (p: string): void {
-  process.stdout.write(`Removing ${path.relative(process.cwd(), p) || '.'}\n`)
+function printRemoving (dir: string): void {
+  process.stdout.write(`Removing ${path.relative(process.cwd(), dir) || '.'}\n`)
 }
 
 async function cleanProjectDir (opts: { modulesDir: string, removeLockfile?: boolean }, dir: string): Promise<void> {
@@ -137,6 +143,8 @@ async function removeModulesDirContents (modulesDir: string): Promise<void> {
 async function getProjectDirs (
   opts: {
     dir: string
+    modulesDir?: string
+    modulesDirsByProjectName?: Record<string, string>
     workspaceDir?: string
     workspacePackagePatterns?: string[]
   }
@@ -146,6 +154,8 @@ async function getProjectDirs (
   }
   const pkgs = await findWorkspaceProjectsNoCheck(opts.workspaceDir, {
     patterns: opts.workspacePackagePatterns,
+    modulesDir: opts.modulesDir,
+    modulesDirsByProjectName: opts.modulesDirsByProjectName,
   })
   return pkgs.map((pkg) => pkg.rootDir)
 }

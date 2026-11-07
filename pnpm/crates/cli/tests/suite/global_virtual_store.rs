@@ -8,8 +8,6 @@
 //! contract — slot layout, hash-directory identity across `allowBuilds`
 //! changes, build artifacts, and `.modules.yaml` state — instead of the
 //! call counts. Where that loses a signal it is called out on the test.
-//!
-#![cfg(unix)] // the GVS slot assertions read symlinks
 
 pub use _utils::*;
 
@@ -37,7 +35,9 @@ fn gvs_root(store_dir: &Path) -> PathBuf {
 /// The `<gvs>/<scope>/<name>/<version>` directory whose children are the
 /// per-dependency-graph hash directories.
 fn pkg_version_dir(store_dir: &Path, name: &str, version: &str) -> PathBuf {
-    gvs_root(store_dir).join(name).join(version)
+    let prefix = if name.starts_with('@') { "" } else { "@/" };
+    let rel = format!("{prefix}{name}/{version}");
+    pnpm_fs::join_slash_separated_path(&gvs_root(store_dir), &rel)
 }
 
 /// Sorted hash-directory names under a `<name>/<version>` directory.
@@ -85,7 +85,7 @@ fn corrupt_pristine_file(path: &Path) {
 
 /// `<hash>/node_modules/<name>` — where the package's files actually live.
 fn pkg_in_slot(hash_dir: &Path, name: &str) -> PathBuf {
-    hash_dir.join("node_modules").join(name)
+    pnpm_fs::join_slash_separated_path(&hash_dir.join("node_modules"), name)
 }
 
 /// Rewrite `pnpm-workspace.yaml` as the harness's `storeDir` / `cacheDir`
@@ -340,6 +340,59 @@ fn a_slot_left_incomplete_by_an_interrupted_import_is_repaired() {
         pristine_marker,
         "the reinstall must finish the interrupted import at {marker:?}",
     );
+
+    drop((root, mock_instance));
+}
+
+/// A project's current lockfile cannot vouch for a shared slot: another
+/// project's interrupted install may have re-created it without its child
+/// links or package files, so a reinstall that keeps `node_modules` must
+/// still repair it (pnpm/pnpm#16642).
+///
+/// Each round also removes the project's direct link, so the frozen
+/// up-to-date check sees a broken tree and the install materializes.
+#[test]
+fn an_incomplete_slot_is_repaired_even_when_the_current_lockfile_records_it() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { store_dir, mock_instance, .. } = npmrc_info;
+
+    set_gvs_workspace_yaml(&workspace, "optimisticRepeatInstall: false\n");
+    write_manifest(&workspace, &serde_json::json!({ "@pnpm.e2e/pkg-with-1-dep": "100.0.0" }));
+
+    pacquet(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+    assert!(workspace.join("node_modules/.pnpm/lock.yaml").exists());
+
+    let hash_dir =
+        sole_hash_dir(&pkg_version_dir(&store_dir, "@pnpm.e2e/pkg-with-1-dep", "100.0.0"));
+    let child_link = pkg_in_slot(&hash_dir, "@pnpm.e2e/dep-of-pkg-with-1-dep");
+    let marker = pkg_in_slot(&hash_dir, "@pnpm.e2e/pkg-with-1-dep").join("package.json");
+
+    let direct_link = workspace.join("node_modules/@pnpm.e2e/pkg-with-1-dep");
+
+    eprintln!("Removing a child link from the slot...");
+    pnpm_fs::remove_symlink_dir(&child_link).expect("remove the child link");
+    pnpm_fs::remove_symlink_dir(&direct_link).expect("remove the direct link");
+    pacquet(&workspace)
+        .with_args(["install", "--frozen-lockfile"])
+        .assert()
+        .success();
+    assert!(
+        is_symlink_or_junction(&child_link).expect("inspect the child link"),
+        "the reinstall must restore the missing child link at {child_link:?}",
+    );
+
+    eprintln!("Removing the slot's completion marker...");
+    fs::remove_file(&marker).expect("remove the completion marker");
+    pnpm_fs::remove_symlink_dir(&direct_link).expect("remove the direct link");
+    pacquet(&workspace)
+        .with_args(["install", "--frozen-lockfile"])
+        .assert()
+        .success();
+    assert!(marker.is_file(), "the reinstall must re-import the package files at {marker:?}");
 
     drop((root, mock_instance));
 }
@@ -617,7 +670,7 @@ fn injected_local_packages_work_with_global_virtual_store() {
     drop((root, mock_instance));
 }
 
-/// The three negatives every `virtualStoreOnly` install shares: no
+/// The negatives every `virtualStoreOnly` install shares: no
 /// importer symlinks, no hoisted packages, no `.bin`.
 fn assert_no_post_import_linking(workspace: &Path) {
     assert!(
@@ -631,13 +684,9 @@ fn assert_no_post_import_linking(workspace: &Path) {
     assert!(!workspace.join("node_modules/.bin").exists(), "no bins must be linked");
 }
 
-/// The GVS hash of a package inside a dependency cycle depends on the
-/// order the hasher walks the lockfile, so an install that walked the
-/// parsed `HashMap`s directly re-derived a *different* slot for the
-/// cycle on some fraction of its runs — and re-imported the packages
-/// that landed there. `pnpm install --frozen-lockfile` over an
-/// unchanged project must reuse the slots the previous run
-/// materialized ([pnpm/pnpm#13316](https://github.com/pnpm/pnpm/issues/13316)).
+/// `pnpm install --frozen-lockfile` over an unchanged project must reuse
+/// the slots the previous run materialized for a dependency cycle
+/// ([pnpm/pnpm#13316](https://github.com/pnpm/pnpm/issues/13316)).
 #[test]
 fn repeat_installs_reuse_the_slots_of_circular_dependencies() {
     let CommandTempCwd { root, workspace, npmrc_info, .. } =
@@ -680,18 +729,57 @@ fn repeat_installs_reuse_the_slots_of_circular_dependencies() {
     drop((root, mock_instance));
 }
 
+/// A change below one member of a dependency cycle has to move every
+/// member to a new slot. A member that kept its slot would keep linking
+/// the other member's old slot, so the project and the cycle would load
+/// two copies of one package
+/// ([pnpm/pnpm#17466](https://github.com/pnpm/pnpm/issues/17466)).
+#[test]
+fn a_change_below_a_cycle_member_moves_the_whole_cycle() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+
+    write_manifest(&workspace, &serde_json::json!({ "@pnpm.e2e/circular-deps-1-of-2": "1.0.2" }));
+    for foo_version in ["100.0.0", "100.1.0", "100.0.0"] {
+        set_gvs_workspace_yaml(
+            &workspace,
+            &format!(
+                "packageExtensions:\n  '@pnpm.e2e/circular-deps-1-of-2':\n    dependencies:\n      '@pnpm.e2e/foo': {foo_version}\n",
+            ),
+        );
+        pacquet(&workspace)
+            .with_arg("install")
+            .assert()
+            .success();
+
+        let first = fs::canonicalize(workspace.join("node_modules/@pnpm.e2e/circular-deps-1-of-2"))
+            .expect("resolve the project's circular-deps-1-of-2");
+        let second = fs::canonicalize(first.join("../circular-deps-2-of-2"))
+            .expect("resolve circular-deps-2-of-2 next to circular-deps-1-of-2");
+        let first_seen_by_second = fs::canonicalize(second.join("../circular-deps-1-of-2"))
+            .expect("resolve circular-deps-1-of-2 next to circular-deps-2-of-2");
+        assert_eq!(
+            first_seen_by_second, first,
+            "with foo@{foo_version}, circular-deps-2-of-2 links another copy of circular-deps-1-of-2",
+        );
+    }
+
+    drop((root, mock_instance));
+}
+
 /// A `link:` dependency inside a slot has to be materialized as a
 /// symlink to the directory the lockfile names.
 ///
 /// The dependency is a peer resolved by a workspace sibling, so the
 /// lockfile records `@pnpm.e2e/peer-a: link:packages/peer-a` on the
 /// `@pnpm.e2e/abc` snapshot (see the `exclude_links_from_lockfile`
-/// suite for the resolution half). Nothing used to create that link:
-/// project-locally the omission is invisible, because the slot sits
+/// suite for the resolution half). Project-locally the omission is
+/// invisible, because the slot sits
 /// under the importer's `node_modules` and Node's upward walk finds the
 /// importer's own copy of the peer. A GVS slot lives in the shared
 /// store where no such walk exists, so without the link the peer is
-/// simply missing from the package that declared it.
+/// missing from the package that declared it.
 #[test]
 fn link_dep_in_a_slot_is_symlinked_to_its_target() {
     let CommandTempCwd { root, workspace, npmrc_info, .. } =

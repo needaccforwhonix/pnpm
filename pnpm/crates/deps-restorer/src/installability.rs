@@ -13,259 +13,37 @@
 //! host, since the host arch may have changed since the previous
 //! install wrote `.modules.yaml`.
 
+pub(crate) use patched::snapshot_is_patched;
 pub use platform::{
     InstallabilityHost, any_installability_constraint, any_optional_installability_constraint,
     check_installability, manifest_with_inferred_platform, platform_manifest_from_resolve_result,
 };
+pub use project::project_host_requirements;
+pub use skipped_snapshots::SkippedSnapshots;
 
 mod reachability;
+mod skipped_snapshots;
 use reachability::{LockfileEdgeReach, walk_lockfile_edges};
 
+mod patched;
 mod platform;
+mod project;
+mod variants;
+use patched::without_published_engines;
 use platform::manifest_from_metadata;
 
 use std::collections::{HashMap, HashSet};
 
 use pnpm_lockfile::{
-    LockfileResolution, PackageKey, PackageMetadata, ProjectSnapshot, SnapshotEntry,
+    Lockfile, LockfileResolution, PackageKey, PackageMetadata, PkgVerPeer, Prefix, ProjectSnapshot,
+    SnapshotEntry,
 };
 use pnpm_package_is_installable::{InstallabilityError, InstallabilityOptions, SkipReason};
+use pnpm_package_manifest::DependencyGroup;
 use pnpm_reporter::{
     LogEvent, LogLevel, Reporter, SkippedOptionalDependencyLog, SkippedOptionalPackage,
     SkippedOptionalReason,
 };
-
-/// The set of snapshot keys skipped on this host.
-///
-/// Three disjoint origin classes are tracked separately because
-/// they behave differently across installs:
-///
-/// - **Installability skips** (`installability`) — engine, platform,
-///   or libc mismatch surfaced by [`compute_skipped_snapshots`].
-///   Persisted to `.modules.yaml.skipped` and re-seeded on every
-///   subsequent install.
-///
-/// - **Fetch-failure skips** (`fetch_failed`) — an `optional: true`
-///   snapshot whose tarball / metadata / extract step blew up
-///   during the install. **Not** persisted: the catch site never
-///   records the skip, so a subsequent install retries the fetch.
-///
-/// - **`--no-optional` exclusions** (`optional_excluded`) —
-///   snapshots whose lockfile entry has `optional: true` AND the
-///   user passed `--no-optional` (or `IncludedDependencies::optional_dependencies`
-///   is false). **Not** persisted: the filter sits downstream of the
-///   skip set, so re-running without
-///   `--no-optional` brings the snapshots back into the install
-///   graph. Pacquet's downstream architecture walks the lockfile
-///   directly rather than a pre-pruned graph, so a separate filter
-///   is needed here.
-///
-/// All three subsets contribute to [`contains`] and [`iter`] —
-/// downstream walkers treat skipped-for-any-reason uniformly. Only
-/// the `installability` subset survives [`iter_installability`],
-/// which is what `.modules.yaml.skipped` writes.
-///
-/// [`compute_skipped_snapshots`]: crate::compute_skipped_snapshots
-/// [`contains`]: SkippedSnapshots::contains
-/// [`iter`]: SkippedSnapshots::iter
-/// [`iter_installability`]: SkippedSnapshots::iter_installability
-#[derive(Debug, Default, Clone)]
-pub struct SkippedSnapshots {
-    installability: HashSet<PackageKey>,
-    fetch_failed: HashSet<PackageKey>,
-    optional_excluded: HashSet<PackageKey>,
-}
-
-impl SkippedSnapshots {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Construct a [`SkippedSnapshots`] from an existing
-    /// installability set. Test helper for callers that want to
-    /// drive build-sequence / virtual-store filtering against a
-    /// known skip set without running the full installability pass.
-    #[must_use]
-    pub fn from_set(set: HashSet<PackageKey>) -> Self {
-        Self { installability: set, ..Self::default() }
-    }
-
-    /// Seed the installability set with snapshot keys recorded as
-    /// skipped by a previous install (read from
-    /// `.modules.yaml.skipped`). Unparsable strings are silently
-    /// dropped — the seed is only consulted by membership lookup; a
-    /// nonsense string never matches any current snapshot, so the
-    /// orphan is harmless.
-    pub fn from_strings<Iter>(iter: Iter) -> Self
-    where
-        Iter: IntoIterator,
-        Iter::Item: AsRef<str>,
-    {
-        let installability = iter
-            .into_iter()
-            .filter_map(|text| text.as_ref().parse::<PackageKey>().ok())
-            .collect();
-        Self { installability, ..Self::default() }
-    }
-
-    /// Record an `optional: true` snapshot whose fetch / extract
-    /// failed during this install. Slice 4 wire-up — call site is
-    /// inside [`crate::CreateVirtualStore`]'s cold-batch dispatch.
-    ///
-    /// Disjoint-subset guard: if `key` is already in any other
-    /// subset, the insert is a no-op so [`len`] / [`iter`] stay
-    /// consistent with [`contains`]. In practice the only
-    /// realistic overlap is with `installability`
-    /// (`optional_excluded` snapshots are dropped before reaching
-    /// the cold-batch dispatch), but the guard is symmetric with
-    /// [`add_optional_excluded`]'s so the public API enforces the
-    /// invariant regardless of call order.
-    ///
-    /// [`len`]: SkippedSnapshots::len
-    /// [`iter`]: SkippedSnapshots::iter
-    /// [`contains`]: SkippedSnapshots::contains
-    /// [`add_optional_excluded`]: SkippedSnapshots::add_optional_excluded
-    pub fn add_fetch_failed(&mut self, key: PackageKey) {
-        if self.installability.contains(&key) || self.optional_excluded.contains(&key) {
-            return;
-        }
-        self.fetch_failed.insert(key);
-    }
-
-    pub fn add_fetch_failed_all(&mut self, keys: impl IntoIterator<Item = PackageKey>) {
-        for key in keys {
-            self.add_fetch_failed(key);
-        }
-    }
-
-    /// Record a snapshot dropped because the user passed
-    /// `--no-optional` (or the matching config / `IncludedDependencies`
-    /// flag is false). Slice 5 wire-up — call site is inside
-    /// `InstallFrozenLockfile::run`, which iterates the lockfile
-    /// snapshots once and inserts every `snap.optional == true`
-    /// entry. Downstream gates then drop the snapshot from
-    /// extraction, symlinking, building, and hoisting through the
-    /// same skip-set check they use for installability skips.
-    ///
-    /// Disjoint-subset guard: a snapshot that is both
-    /// installability-skipped (platform / engine mismatch) and
-    /// would-be excluded by `--no-optional` stays in the
-    /// higher-precedence `installability` subset only. This is the
-    /// realistic overlap case (an `optional: true` snapshot that's
-    /// also `os: [<wrong>]`), and putting it in both subsets would
-    /// make [`len`] / [`iter`] inconsistent with [`contains`].
-    /// Same guard applies against `fetch_failed`, though that
-    /// overlap can't arise in practice (a snapshot dropped by
-    /// `--no-optional` never reaches the cold-batch dispatch).
-    ///
-    /// [`len`]: SkippedSnapshots::len
-    /// [`iter`]: SkippedSnapshots::iter
-    /// [`contains`]: SkippedSnapshots::contains
-    pub fn add_optional_excluded(&mut self, key: PackageKey) {
-        if self.installability.contains(&key) || self.fetch_failed.contains(&key) {
-            return;
-        }
-        self.optional_excluded.insert(key);
-    }
-
-    /// `true` if the snapshot is skipped for **any** reason
-    /// (installability, fetch-failure, or `--no-optional`).
-    /// Downstream consumers want the union: a dropped snapshot is
-    /// equally absent from the install regardless of origin.
-    #[must_use]
-    pub fn contains(&self, key: &PackageKey) -> bool {
-        self.installability.contains(key)
-            || self.fetch_failed.contains(key)
-            || self.optional_excluded.contains(key)
-    }
-
-    #[must_use]
-    pub fn contains_optional_excluded(&self, key: &PackageKey) -> bool {
-        self.optional_excluded.contains(key)
-    }
-
-    /// The same set with the `installability` subset dropped — the
-    /// skips a written current lockfile has to reflect.
-    ///
-    /// `.modules.yaml.skipped` carries the installability subset from
-    /// one install to the next, so the current lockfile can keep those
-    /// entries and still describe what is on disk. It has to keep
-    /// them: pnpm's current lockfile does, and a repeat install's
-    /// "already up to date" comparison against the wanted lockfile
-    /// would otherwise never match again once a platform-incompatible
-    /// optional dependency was skipped. Fetch failures and
-    /// `--no-optional` exclusions are recorded nowhere else, so
-    /// leaving those out is what makes the next install redo them.
-    #[must_use]
-    pub fn transient_only(&self) -> Self {
-        Self {
-            installability: HashSet::new(),
-            fetch_failed: self.fetch_failed.clone(),
-            optional_excluded: self.optional_excluded.clone(),
-        }
-    }
-
-    pub fn retain_installability_for_optional_snapshots(
-        &mut self,
-        snapshots: &HashMap<PackageKey, SnapshotEntry>,
-    ) {
-        self.installability.retain(|key| {
-            snapshots.get(key).is_some_and(|snapshot| snapshot.optional)
-        });
-    }
-
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.installability.len()
-            + self.fetch_failed.len()
-            + self.optional_excluded.len()
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.installability.is_empty()
-            && self.fetch_failed.is_empty()
-            && self.optional_excluded.is_empty()
-    }
-
-    /// Insert into the installability set — the persisted subset
-    /// written to `.modules.yaml.skipped`.
-    pub fn insert_installability(&mut self, key: PackageKey) {
-        self.installability.insert(key);
-    }
-
-    #[must_use]
-    pub fn contains_installability(&self, key: &PackageKey) -> bool {
-        self.installability.contains(key)
-    }
-
-    /// Drop a seeded installability skip whose package passes the
-    /// current installability check — e.g. after `--os` / `--cpu` /
-    /// `supportedArchitectures` changed between installs.
-    pub fn remove_installability(&mut self, key: &PackageKey) {
-        self.installability.remove(key);
-    }
-
-    /// Iterate over the **installability** subset only — the entries
-    /// written to `.modules.yaml.skipped`. Fetch-failure and
-    /// `--no-optional` entries are transient and intentionally
-    /// excluded so they aren't persisted across installs.
-    pub fn iter_installability(&self) -> impl Iterator<Item = &PackageKey> + '_ {
-        self.installability.iter()
-    }
-
-    /// Iterate over the union of all subsets — every snapshot that
-    /// downstream consumers should treat as absent from the install,
-    /// regardless of origin. Used by `hoist.rs` and similar
-    /// graph-walking passes that don't care why a snapshot is gone.
-    pub fn iter(&self) -> impl Iterator<Item = &PackageKey> + '_ {
-        self.installability
-            .iter()
-            .chain(self.fetch_failed.iter())
-            .chain(self.optional_excluded.iter())
-    }
-}
 
 /// Compute the [`SkippedSnapshots`] set for an install.
 ///
@@ -281,8 +59,7 @@ impl SkippedSnapshots {
 ///   install error when `engine_strict` is set, and otherwise emits
 ///   `tracing::warn!` and proceeds — even when the snapshot is also
 ///   optionally reachable. (The warn should emit `pnpm:install-check`,
-///   which pacquet's reporter does not yet expose — slice 1
-///   follow-up.)
+///   which pacquet's reporter does not expose.)
 /// - A snapshot the walk cannot reach from any importer applies the
 ///   same dispatch to its lockfile-propagated
 ///   [`SnapshotEntry::optional`] flag instead.
@@ -306,7 +83,7 @@ pub fn compute_skipped_snapshots<Reporter: self::Reporter>(
     seed.retain_installability_for_optional_snapshots(snapshots);
 
     // Fast path: if no package in the lockfile declares any
-    // installability constraint, every snapshot is trivially
+    // installability constraint, every snapshot is
     // installable. Skip the per-snapshot
     // `without_peer()` / `to_string()` / `check_package` loop
     // entirely. Pacquet has no resolver so the lockfile's packages
@@ -415,13 +192,9 @@ impl SkipScan<'_, '_> {
             (snapshot.optional, !snapshot.optional)
         };
 
-        let warn = cached_check(
-            &mut self.check_cache,
-            &metadata_key,
-            metadata,
-            skip_check_optional,
-            &self.base_options,
-        )?;
+        let defer_engines =
+            self.base_options.engine_strict && snapshot_is_patched(snapshot_key, Some(snapshot));
+        let warn = self.snapshot_warn(&metadata_key, metadata, skip_check_optional, defer_engines)?;
         // Whatever the seed recorded, this pass's verdict replaces it.
         self.skipped.remove_installability(snapshot_key);
         let Some(warn) = warn else { return Ok(()) };
@@ -430,7 +203,26 @@ impl SkipScan<'_, '_> {
             self.record_skip::<Reporter>(snapshot_key, &metadata_key, &warn);
             return Ok(());
         }
-        self.report_incompatible_required(&metadata_key, metadata, warn, skip_check_optional)
+        self.report_incompatible_required(
+            &metadata_key,
+            metadata,
+            warn,
+            skip_check_optional,
+            defer_engines,
+        )
+    }
+
+    fn snapshot_warn(
+        &mut self,
+        metadata_key: &PackageKey,
+        metadata: &PackageMetadata,
+        optional: bool,
+        defer_engines: bool,
+    ) -> Result<Option<InstallabilityError>, Box<InstallabilityError>> {
+        if defer_engines {
+            return without_published_engines(metadata_key, metadata, optional, &self.base_options);
+        }
+        cached_check(&mut self.check_cache, metadata_key, metadata, optional, &self.base_options)
     }
 
     fn record_skip<Reporter: self::Reporter>(
@@ -459,11 +251,14 @@ impl SkipScan<'_, '_> {
         metadata: &PackageMetadata,
         warn: InstallabilityError,
         skip_check_optional: bool,
+        defer_engines: bool,
     ) -> Result<(), Box<InstallabilityError>> {
         // The required dispatch drops the optional-only
         // platform-from-name inference, so its verdict needs the
         // non-optional check.
-        let warn = if skip_check_optional {
+        let warn = if skip_check_optional && defer_engines {
+            without_published_engines(metadata_key, metadata, false, &self.base_options)?
+        } else if skip_check_optional {
             cached_check(&mut self.check_cache, metadata_key, metadata, false, &self.base_options)?
         } else {
             Some(warn)
@@ -543,6 +338,45 @@ fn add_runtime_skips_from(
     }
 }
 
+/// The Node.js version the root project's `node` runtime dependency is
+/// locked to: the Node.js pnpm installs for the project.
+#[must_use]
+pub fn find_root_runtime_node_version(
+    importers: &HashMap<String, ProjectSnapshot>,
+) -> Option<String> {
+    root_runtime_node_ver_peer(importers)?.version_semver().map(ToString::to_string)
+}
+
+/// The snapshot of the root project's `node` runtime dependency, the one
+/// [`find_root_runtime_node_version`] reads the version of. A dependency's
+/// own `engines.runtime` pin adds another `node@runtime:` snapshot, which
+/// this never returns.
+#[must_use]
+pub fn find_root_runtime_node_key<'a>(
+    importers: &HashMap<String, ProjectSnapshot>,
+    snapshots: &'a HashMap<PackageKey, SnapshotEntry>,
+) -> Option<&'a PackageKey> {
+    let ver_peer = root_runtime_node_ver_peer(importers)?;
+    snapshots
+        .keys()
+        .find(|key| key.name.scope.is_none() && key.name.bare == "node" && key.suffix == *ver_peer)
+}
+
+pub(crate) fn root_runtime_node_ver_peer(
+    importers: &HashMap<String, ProjectSnapshot>,
+) -> Option<&PkgVerPeer> {
+    importers
+        .get(Lockfile::ROOT_IMPORTER_KEY)?
+        .dependencies_by_groups([
+            DependencyGroup::Prod,
+            DependencyGroup::Dev,
+            DependencyGroup::Optional,
+        ])
+        .filter(|(alias, _)| alias.scope.is_none() && alias.bare == "node")
+        .filter_map(|(_, spec)| spec.version.ver_peer())
+        .find(|ver_peer| ver_peer.prefix() == Prefix::Runtime)
+}
+
 /// `None` = compatible. `Some(err)` = incompatible, with the
 /// diagnostic the caller would surface (the skip's `details` payload
 /// or the warn / engine-strict error).
@@ -571,7 +405,8 @@ fn cached_check(
     let manifest = manifest_from_metadata(metadata_key, metadata);
     let pkg_id = metadata_key.to_string();
     let options = InstallabilityOptions { optional, ..*base_options };
-    let verdict = check_installability(&pkg_id, &manifest, &options)?;
+    let verdict = check_installability(&pkg_id, &manifest, &options)?
+        .or_else(|| variants::variants_installability(&pkg_id, metadata, &options));
     check_cache.insert(cache_key, verdict.clone());
     Ok(verdict)
 }
@@ -597,7 +432,9 @@ pub fn package_metadata_is_installable(
         current_libc: host.libc,
         supported_architectures: host.supported_architectures.as_ref(),
     };
-    Ok(check_installability(&metadata_key.to_string(), &manifest, &options)?.is_none())
+    let package_id = metadata_key.to_string();
+    Ok(check_installability(&package_id, &manifest, &options)?.is_none()
+        && variants::variants_installability(&package_id, metadata, &options).is_none())
 }
 
 fn emit_skipped<Reporter: self::Reporter>(

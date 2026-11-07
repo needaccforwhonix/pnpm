@@ -9,19 +9,18 @@ use std::{
 };
 
 use pnpm_config::{Config, NodeLinker};
-#[cfg(unix)]
-use pnpm_lockfile::Lockfile;
-use pnpm_lockfile::{LockfileResolution, PackageKey, PackageMetadata, TarballResolution};
-use pnpm_package_manifest::PackageManifest;
+use pnpm_lockfile::{Lockfile, LockfileResolution, PackageKey, PackageMetadata, TarballResolution};
+use pnpm_package_manifest::{DependencyGroup, PackageManifest};
 use pnpm_workspace::Project;
 use serde_json::json;
 
 use super::{
-    ConvertCtx, ProjectInfo, ProjectPathKey, convert_package_key, convert_package_metadata,
-    create_file_url_key, index_projects, validate_lockfile_local_path,
+    ConvertCtx, ProjectInfo, ProjectPathKey, SelectedProject, apply_deploy_hook,
+    convert_package_key, convert_package_metadata, create_deploy_files, create_file_url_key,
+    index_projects,
 };
 #[cfg(unix)]
-use super::{DeployFiles, DeployWorkspaceConfig, write_deploy_files};
+use super::{DeployFiles, DeployWorkspaceSettings, write_deploy_files};
 #[cfg(windows)]
 use super::{is_ancestor_path, is_child_path, same_path, validate_deploy_target};
 use crate::cli_args::deploy::{
@@ -57,19 +56,6 @@ fn hoisted_deploy_install_config_preserves_lockfile_setting() {
     base_config.lockfile = false;
     let deploy_config = create_deploy_install_config(&base_config, deploy_dir, NodeLinker::Hoisted);
     assert!(!deploy_config.lockfile);
-}
-
-#[test]
-fn lockfile_local_path_rejects_workspace_escape() {
-    let workspace = Path::new("workspace");
-    assert!(
-        validate_lockfile_local_path(&workspace.join("packages/app"), workspace).is_ok(),
-        "workspace children should be valid lockfile local paths",
-    );
-
-    let err = validate_lockfile_local_path(&workspace.join("../outside"), workspace)
-        .expect_err("parent traversal should be rejected");
-    assert!(err.to_string().contains("outside workspace"), "unexpected error: {err}");
 }
 
 #[test]
@@ -154,8 +140,12 @@ fn create_file_url_key_prefers_workspace_project_name() {
     projects_by_path.insert(
         ProjectPathKey::new(&project_root),
         ProjectInfo {
+            root_dir: project_root.clone(),
+            linked_publish_dir: None,
             name: Some("workspace-name".to_string()),
+            has_bin: false,
             peer_dependencies: Vec::new(),
+            peer_blocks: (None, None),
             declared_dependencies: HashSet::default(),
         },
     );
@@ -223,10 +213,7 @@ fn write_deploy_files_replaces_lockfile_symlink() {
         manifest: json!({ "name": "app" }),
         lockfile,
         workspace_manifest: None,
-        workspace_config: DeployWorkspaceConfig {
-            patched_dependencies: None,
-            allow_builds: std::collections::HashMap::new(),
-        },
+        workspace_config: DeployWorkspaceSettings::from_config(&Config::default()),
     };
 
     write_deploy_files(&deploy_dir, &deploy_files).expect("write deploy files");
@@ -255,12 +242,132 @@ fn windows_path_comparison_matches_case_variants() {
 #[test]
 fn windows_case_variant_workspace_root_is_rejected_as_deploy_target() {
     let err = validate_deploy_target(
-        Path::new("c:\\workspace"),
-        Path::new("C:\\Workspace"),
-        Path::new("C:\\Workspace\\packages\\app"),
-        Path::new("C:\\Workspace"),
+        Path::new(r"c:\workspace"),
+        Path::new(r"C:\Workspace"),
+        Path::new(r"C:\Workspace\packages\app"),
+        Path::new(r"C:\Workspace"),
         true,
     )
     .expect_err("case-variant workspace root must be rejected");
     assert!(err.to_string().contains("target is the workspace root"));
+}
+
+#[test]
+fn deploy_normalizes_registry_specifiers_and_preserves_snapshot_references() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let references = json!({
+        "plain": "1.0.0",
+        "peer": "1.0.0(react-dom@19.0.0(react@19.0.0))(react@19.0.0)",
+        "patched": "1.0.0(patch_hash=abc)(react@19.0.0)",
+        "alias": "@scope/pkg@1.0.0(react@19.0.0)",
+        "tarball": "https://example.com/pkg.tgz",
+        "opaque": "https://example.com/pkg.tgz(peer@1.0.0)",
+        "registry": "private:1.0.0(react@19.0.0)",
+        "runtime": "runtime:24.0.0",
+    });
+    let specifiers = json!({
+        "plain": "1.0.0",
+        "peer": "1.0.0",
+        "patched": "1.0.0",
+        "alias": "npm:@scope/pkg@1.0.0",
+        "tarball": "https://example.com/pkg.tgz",
+        "opaque": "https://example.com/pkg.tgz(peer@1.0.0)",
+        "registry": "private:1.0.0(react@19.0.0)",
+        "runtime": "runtime:24.0.0",
+    });
+    for field in ["dependencies", "devDependencies", "optionalDependencies"] {
+        let dependencies = references
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(name, version)| (name.clone(), json!({ "specifier": "*", "version": version })))
+            .collect::<serde_json::Map<_, _>>();
+        let lockfile: Lockfile = serde_json::from_value(json!({
+            "lockfileVersion": "9.0",
+            "importers": { ".": { field: dependencies } },
+            "snapshots": { "peer@1.0.0(react-dom@19.0.0(react@19.0.0))(react@19.0.0)": {} },
+        }))
+        .unwrap();
+        let selected = SelectedProject {
+            project: Project {
+                root_dir: tmp.path().to_path_buf(),
+                manifest: PackageManifest::from_value(
+                    tmp.path().join("package.json"),
+                    json!({ "name": "app", field: references }),
+                ),
+                dependency_manifest: None,
+            },
+            projects_by_path: HashMap::new(),
+            workspace_projects: Vec::new(),
+        };
+        let result = create_deploy_files(
+            &lockfile,
+            &selected,
+            ".",
+            tmp.path(),
+            &tmp.path().join("out"),
+            &Config::default(),
+            &[DependencyGroup::Prod, DependencyGroup::Dev, DependencyGroup::Optional],
+        )
+        .unwrap();
+        assert_eq!(result.manifest[field], specifiers);
+        let importer = serde_json::to_value(&result.lockfile.importers["."]).unwrap();
+        for (name, reference) in references.as_object().unwrap() {
+            assert_eq!(importer[field][name]["version"], *reference);
+            assert_eq!(importer[field][name]["specifier"], specifiers[name]);
+        }
+        assert_eq!(result.lockfile.snapshots, lockfile.snapshots);
+    }
+}
+
+fn deploy_copied_dependency(
+    dependencies: &serde_json::Value,
+) -> (tempfile::TempDir, serde_json::Value) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let deploy_dir = tmp.path().join("deployed");
+    std::fs::create_dir_all(deploy_dir.join("copied")).expect("create deployed copy");
+    std::fs::write(
+        deploy_dir.join("package.json"),
+        json!({ "name": "app", "dependencies": dependencies }).to_string(),
+    )
+    .expect("write deployed manifest");
+
+    apply_deploy_hook(&deploy_dir, &tmp.path().join("packages/app")).expect("apply deploy hook");
+
+    let manifest = std::fs::read_to_string(deploy_dir.join("package.json")).expect("read manifest");
+    (tmp, serde_json::from_str::<serde_json::Value>(&manifest).expect("parse manifest")["dependencies"].clone())
+}
+
+#[test]
+fn legacy_deploy_hook_keeps_a_specifier_that_already_names_the_copy() {
+    let (_tmp, dependencies) = deploy_copied_dependency(&json!({
+        "kept": "file:./copied",
+        "detour": "file:../app/copied",
+        "outside": "file:../../local/dep",
+    }));
+    assert_eq!(
+        dependencies,
+        json!({ "kept": "file:./copied", "detour": "file:copied", "outside": "file:../local/dep" }),
+    );
+}
+
+#[test]
+fn legacy_deploy_hook_rebases_workspace_paths() {
+    let (_tmp, dependencies) = deploy_copied_dependency(&json!({
+        "kept": "workspace:./copied",
+        "outside": "workspace:../lib",
+        "range": "workspace:*",
+    }));
+    dbg!(&dependencies);
+    assert_eq!(
+        dependencies,
+        json!({ "kept": "workspace:./copied", "outside": "workspace:../packages/lib", "range": "workspace:*" }),
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn legacy_deploy_hook_keeps_naming_the_copy_through_a_case_variant_project_dir() {
+    let (_tmp, dependencies) = deploy_copied_dependency(&json!({ "detour": "file:../APP/copied" }));
+    assert_eq!(dependencies, json!({ "detour": "file:copied" }));
 }

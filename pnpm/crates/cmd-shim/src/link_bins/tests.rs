@@ -2,12 +2,14 @@ use super::{
     BinOrigin, LinkBinsError, LinkBinsOptions, PackageBinSource, ShimTargetCache, link_bins,
     link_bins_of_packages, link_bins_of_packages_cached, remove_bin,
 };
+#[cfg(unix)]
+use crate::shim::is_sh_shim_hardened;
 use crate::{
     capabilities::{
         DirCreation, FsCreateDirAll, FsEnsureExecutableBits, FsReadDir, FsReadFile, FsReadHead,
         FsReadToString, FsSetExecutable, FsWalkFiles, FsWrite, Host,
     },
-    shim::{is_sh_shim_hardened, is_shim_pointing_at},
+    shim::is_shim_pointing_at,
 };
 use serde_json::{Value, json};
 use std::{
@@ -30,6 +32,8 @@ mod files;
 
 mod behavior;
 
+mod refresh;
+
 mod dependencies;
 
 mod manifests;
@@ -37,3 +41,15 @@ mod manifests;
 mod workspace_settings;
 
 mod security;
+
+#[cfg(unix)]
+mod concurrent_links;
+
+#[cfg(unix)]
+mod relocatable;
+
+#[cfg(unix)]
+mod relocation_validation;
+
+#[cfg(unix)]
+mod permissions;

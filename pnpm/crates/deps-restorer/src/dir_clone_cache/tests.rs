@@ -2,7 +2,7 @@ use super::DirCloneCache;
 use pnpm_config::{Config, NodeLinker, PackageImportMethod};
 
 #[test]
-fn eligible_only_for_isolated_clone_capable_local_virtual_store() {
+fn eligible_for_clone_capable_local_materialization() {
     let mut config = Config { enable_global_virtual_store: false, ..Config::default() };
     for method in
         [PackageImportMethod::Auto, PackageImportMethod::Clone, PackageImportMethod::CloneOrCopy]
@@ -13,7 +13,11 @@ fn eligible_only_for_isolated_clone_capable_local_virtual_store() {
             cfg!(target_os = "macos"),
             "clone-capable method {method:?} must be eligible exactly on macOS",
         );
-        assert!(!DirCloneCache::eligible(&config, NodeLinker::Hoisted));
+        assert_eq!(
+            DirCloneCache::eligible(&config, NodeLinker::Hoisted),
+            cfg!(target_os = "macos"),
+            "the hoisted linker clones into `node_modules` with {method:?}",
+        );
     }
     for method in [PackageImportMethod::Hardlink, PackageImportMethod::Copy] {
         config.package_import_method = method;
@@ -27,6 +31,16 @@ fn eligible_only_for_isolated_clone_capable_local_virtual_store() {
     assert!(
         !DirCloneCache::eligible(&config, NodeLinker::Isolated),
         "a GVS install links straight out of the canonical slots and needs no projection",
+    );
+}
+
+#[test]
+fn not_eligible_when_the_canonical_root_is_the_virtual_store() {
+    let config = Config { enable_global_virtual_store: false, ..Config::default() };
+    let config = Config { global_virtual_store_dir: config.install_state_dir.clone(), ..config };
+    assert!(
+        !DirCloneCache::eligible(&config, NodeLinker::Isolated),
+        "canonical slots under the virtual store would be a second copy of every package",
     );
 }
 
@@ -63,7 +77,7 @@ mod macos {
             enable_global_virtual_store: false,
             package_import_method: PackageImportMethod::Clone,
             global_virtual_store_dir: links_root.to_path_buf(),
-            virtual_store_dir: links_root.with_file_name("probe-virtual-store"),
+            install_state_dir: links_root.with_file_name("probe-virtual-store"),
             ..Config::default()
         };
         DirCloneCache::build(
@@ -92,9 +106,9 @@ mod macos {
         let lib_blob = store.join("lib-blob");
         fs::write(&manifest_blob, br#"{"name":"foo"}"#).expect("write manifest blob");
         fs::write(&lib_blob, b"module.exports = 1").expect("write lib blob");
-        let cas_paths: HashMap<String, PathBuf> = HashMap::from([
-            ("package.json".to_string(), manifest_blob),
-            ("lib/index.js".to_string(), lib_blob.clone()),
+        let cas_paths: pnpm_fs::CasPaths = HashMap::from([
+            ("package.json".to_string(), manifest_blob.into()),
+            ("lib/index.js".to_string(), lib_blob.clone().into()),
         ]);
 
         let key: PackageKey = "foo@1.0.0".parse().expect("valid snapshot key");
@@ -145,6 +159,7 @@ mod macos {
             None,
             None,
             None,
+            &crate::platform_selection::VariantPlatforms::host(),
         )
         .hashed_slot_dir(&key)
         .expect("hashed slot for the one snapshot");

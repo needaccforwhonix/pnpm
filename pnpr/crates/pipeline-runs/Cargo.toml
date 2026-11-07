@@ -11,7 +11,7 @@ license-file = "../../LICENSE.md"
 repository.workspace = true
 
 [dependencies]
-pnpr-error = { workspace = true }
+pnpr-error = { workspace = true, features = ["server"] }
 pnpr-storage = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -21,6 +21,9 @@ tokio = { workspace = true }
 object_store = { workspace = true }
 pnpr-config = { workspace = true }
 tempfile = { workspace = true }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tokio = { workspace = true, features = ["net", "signal"] }
 
 [lints]
 workspace = true

@@ -7,6 +7,8 @@ mod catalogs;
 
 mod store;
 
+mod modules_dir_disabled;
+
 mod frozen_policy;
 
 mod frozen_dispatch;
@@ -38,6 +40,8 @@ mod builds;
 mod workspace;
 
 mod hooks;
+
+mod external_importers;
 
 use super::{Install, InstallError, ProjectMutation};
 use crate::{
@@ -153,7 +157,7 @@ fn scoped_package_body(registry_url: &str) -> String {
     )
 }
 
-/// Unit tests for [`super::build_projects_map`] / [`super::build_workspace_state`].
+/// Unit tests for [`super::build_projects_map`] / [`super::workspace_state::build_workspace_state`].
 /// The `projects` map must contain one entry per project in the list,
 /// keyed on the project root dir. Pacquet's `build_projects_map`
 /// derives the list directly from `project_manifests`, so a fresh
@@ -165,10 +169,9 @@ mod build_workspace_state_tests;
 /// integrity is bogus on purpose. Pacquet enforces tarball integrity
 /// on the install path, so any test that lets the install reach the
 /// fetch site would fail — meaning a successful install with this
-/// fixture is *proof* that the per-snapshot skip path (issue [#433]
-/// section B) short-circuited the fetch entirely.
-///
-/// [#433]: https://github.com/pnpm/pacquet/issues/433
+/// fixture is *proof* that the per-snapshot skip path
+/// short-circuited the fetch entirely. The tarball URL fails
+/// the connect at once on every OS, with no name to resolve.
 const PARTIAL_INSTALL_LOCKFILE: &str = text_block! {
     "lockfileVersion: '9.0'"
     "importers:"
@@ -179,7 +182,7 @@ const PARTIAL_INSTALL_LOCKFILE: &str = text_block! {
     "        version: 1.0.0"
     "packages:"
     "  placeholder@1.0.0:"
-    "    resolution: {integrity: sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA, tarball: 'http://invalid.local/placeholder.tgz'}"
+    "    resolution: {integrity: sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA, tarball: 'http://0.0.0.0:1/placeholder.tgz'}"
     "snapshots:"
     "  placeholder@1.0.0: {}"
 };
@@ -203,19 +206,37 @@ fn seed_placeholder_virtual_store_slot(virtual_store_dir: &std::path::Path) {
 /// surfaced so the test can force a layout drift. `disable_optimistic_repeat_install`
 /// keeps every call on the full path so the purge branch is actually evaluated.
 async fn run_purge_regression_install(
-    store_dir: &std::path::Path,
-    modules_dir: &std::path::Path,
-    virtual_store_dir: &std::path::Path,
-    registry: String,
+    dirs: &InstallDirs,
+    registry: &str,
     manifest: &PackageManifest,
     dependency_groups: Vec<DependencyGroup>,
     virtual_store_dir_max_length: u64,
 ) {
+    run_purge_regression_install_with_lockfile(
+        dirs,
+        registry,
+        manifest,
+        dependency_groups,
+        virtual_store_dir_max_length,
+        true,
+    )
+    .await;
+}
+
+async fn run_purge_regression_install_with_lockfile(
+    dirs: &InstallDirs,
+    registry: &str,
+    manifest: &PackageManifest,
+    dependency_groups: Vec<DependencyGroup>,
+    virtual_store_dir_max_length: u64,
+    lockfile: bool,
+) {
     let mut config = Config::new();
-    config.store_dir = store_dir.to_path_buf().into();
-    config.modules_dir = modules_dir.to_path_buf();
-    config.virtual_store_dir = virtual_store_dir.to_path_buf();
-    config.registry = registry;
+    config.lockfile = lockfile;
+    config.store_dir = dirs.store_dir.clone().into();
+    config.modules_dir = dirs.modules_dir.clone();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
+    config.registry = registry.to_string();
     config.virtual_store_dir_max_length = virtual_store_dir_max_length;
     let config = config.leak();
     let mutation = if dependency_groups.contains(&DependencyGroup::Dev) {
@@ -271,6 +292,8 @@ async fn run_purge_regression_install(
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -309,8 +332,8 @@ async fn install_then_go_offline() -> (tempfile::TempDir, &'static Config, Packa
     config.cache_dir = cache_dir.clone();
     config.store_dir = store_dir.clone().into();
     config.modules_dir = modules_dir.clone();
-    config.virtual_store_dir = virtual_store_dir.clone();
-    config.registry = mock_instance.url();
+    config.install_state_dir = virtual_store_dir.clone();
+    config.registry = mock_instance.url().to_string();
     let config = config.leak();
 
     Install {
@@ -358,6 +381,8 @@ async fn install_then_go_offline() -> (tempfile::TempDir, &'static Config, Packa
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -374,7 +399,7 @@ async fn install_then_go_offline() -> (tempfile::TempDir, &'static Config, Packa
     offline_config.cache_dir = cache_dir;
     offline_config.store_dir = store_dir.into();
     offline_config.modules_dir = modules_dir;
-    offline_config.virtual_store_dir = virtual_store_dir;
+    offline_config.install_state_dir = virtual_store_dir;
     offline_config.registry = "http://127.0.0.1:9/".to_string();
     let offline_config = offline_config.leak();
 
@@ -417,8 +442,8 @@ async fn fresh_lockfile_only_with_overrides(
     let mut config = Config::new();
     config.store_dir = store_dir.into();
     config.modules_dir = modules_dir;
-    config.virtual_store_dir = virtual_store_dir;
-    config.registry = mock_instance.url();
+    config.install_state_dir = virtual_store_dir;
+    config.registry = mock_instance.url().to_string();
     if !overrides.is_empty() {
         let mut map = indexmap::IndexMap::new();
         for (selector, spec) in overrides {
@@ -473,6 +498,8 @@ async fn fresh_lockfile_only_with_overrides(
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -523,8 +550,8 @@ async fn fresh_lockfile_only_with_compatibility_db(
     let mut config = Config::new();
     config.store_dir = store_dir.into();
     config.modules_dir = modules_dir;
-    config.virtual_store_dir = virtual_store_dir;
-    config.registry = mock_instance.url();
+    config.install_state_dir = virtual_store_dir;
+    config.registry = mock_instance.url().to_string();
     config.ignore_compatibility_db = ignore_compatibility_db;
     let config = config.leak();
 
@@ -573,6 +600,8 @@ async fn fresh_lockfile_only_with_compatibility_db(
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -589,7 +618,7 @@ async fn fresh_lockfile_only_with_compatibility_db(
 /// dependencies and `pnpmfile_src` written to `<root>/.pnpmfile.cjs`, so the
 /// pnpmfile hooks are discovered and run during resolution.
 async fn install_with_pnpmfile(
-    registry_url: String,
+    registry_url: &str,
     root: &std::path::Path,
     root_deps: &[(&str, &str)],
     pnpmfile_src: &str,
@@ -602,7 +631,7 @@ async fn install_with_pnpmfile(
 /// given reporter, so a recording reporter can assert on the `pnpm:hook`
 /// log channel.
 async fn install_with_pnpmfile_reporter<Reporter: self::Reporter + 'static>(
-    registry_url: String,
+    registry_url: &str,
     root: &std::path::Path,
     root_deps: &[(&str, &str)],
     pnpmfile_src: &str,
@@ -622,8 +651,8 @@ async fn install_with_pnpmfile_reporter<Reporter: self::Reporter + 'static>(
     let mut config = Config::new();
     config.store_dir = root.join("pacquet-store").into();
     config.modules_dir = modules_dir;
-    config.virtual_store_dir = virtual_store_dir;
-    config.registry = registry_url;
+    config.install_state_dir = virtual_store_dir;
+    config.registry = registry_url.to_string();
     let config = config.leak();
 
     let http_client = Default::default();
@@ -676,6 +705,8 @@ async fn install_with_pnpmfile_reporter<Reporter: self::Reporter + 'static>(
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<Reporter>()
@@ -686,7 +717,7 @@ async fn install_with_pnpmfile_reporter<Reporter: self::Reporter + 'static>(
 /// carries the dependencies, so a hook rewriting a member's own
 /// specifier is exercised rather than only the root's.
 async fn install_workspace_member_with_pnpmfile(
-    registry_url: String,
+    registry_url: &str,
     root: &std::path::Path,
     member_deps: &[(&str, &str)],
     pnpmfile_src: &str,
@@ -722,9 +753,9 @@ async fn install_workspace_member_with_pnpmfile(
     let mut config = Config::new();
     config.workspace_dir = Some(root.to_path_buf());
     config.store_dir = root.join("pacquet-store").into();
-    config.virtual_store_dir = modules_dir.join(".pacquet");
+    config.install_state_dir = modules_dir.join(".pacquet");
     config.modules_dir = modules_dir;
-    config.registry = registry_url;
+    config.registry = registry_url.to_string();
     let config = config.leak();
 
     let http_client = Default::default();
@@ -777,6 +808,8 @@ async fn install_workspace_member_with_pnpmfile(
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()

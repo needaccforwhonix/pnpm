@@ -1,6 +1,9 @@
 use crate::State;
+#[cfg(target_family = "wasm")]
+use crate::dialoguer_wasm::MultiSelect;
 use clap::Args;
 use derive_more::{Display, Error};
+#[cfg(not(target_family = "wasm"))]
 use dialoguer::MultiSelect;
 use indexmap::IndexMap;
 use miette::Diagnostic;
@@ -75,7 +78,13 @@ pub enum PatchRemoveError {
 }
 
 impl PatchRemoveArgs {
-    pub async fn run(self, dir: &Path, state: State) -> Result<bool, PatchRemoveError> {
+    /// Remove the patches and return the `patchedDependencies` now
+    /// recorded in the workspace, for the install that follows to run with.
+    pub async fn run(
+        self,
+        dir: &Path,
+        state: State,
+    ) -> Result<IndexMap<String, String>, PatchRemoveError> {
         let mut patched_dependencies =
             state.config.patched_dependencies.clone().unwrap_or_default();
         let patches_to_remove =
@@ -119,7 +128,7 @@ impl PatchRemoveArgs {
         )
         .map_err(PatchRemoveError::UpdateWorkspaceManifest)?;
 
-        Ok(true)
+        Ok(patched_dependencies)
     }
 }
 

@@ -18,12 +18,17 @@ mod patches_and_approvals;
 
 mod build_policy;
 
+#[cfg(unix)]
+mod gvs_markers;
+
+#[cfg(unix)]
+mod empty_side_effects;
+
 use super::{BuildModules, allow_build_policy::AllowBuildPolicy};
 // Only the `#[cfg(unix)]` rebuild-selection test uses this; importing it
 // unconditionally would be an unused import on Windows.
 use crate::{SkippedSnapshots, VirtualStoreLayout};
 use pnpm_config::{Config, PackageImportMethod};
-use pnpm_executor::ScriptsPrependNodePath;
 use pnpm_lockfile::{
     PackageKey, PkgName, PkgVerPeer, ProjectSnapshot, ResolvedDependencyMap,
     ResolvedDependencySpec, SnapshotEntry,
@@ -146,7 +151,7 @@ fn gvs_layout(dir: &Path) -> &'static VirtualStoreLayout {
     config.enable_global_virtual_store = true;
     config.store_dir = dir.join("store").into();
     config.global_virtual_store_dir = dir.join("store/links");
-    config.virtual_store_dir = dir.join("node_modules/.pacquet");
+    config.install_state_dir = dir.join("node_modules/.pacquet");
     let config = config.leak();
     Box::leak(Box::new(VirtualStoreLayout::new(config, None, None, None, None, None)))
 }
@@ -173,7 +178,7 @@ fn frozen_backstop_run(
 
     BuildModules {
         cache: crate::BuildCacheContext {
-            maps_by_snapshot: None,
+            side_effects: crate::CachedSideEffects { overlays: None, rows: None },
             engine_name: None,
             read: false,
             write: false,
@@ -183,6 +188,7 @@ fn frozen_backstop_run(
             frozen_store,
         },
         directories: crate::BuildLayout {
+            link_options: &pnpm_cmd_shim::LinkBinsOptions::default(),
             layout,
             pkg_roots_by_key: None,
             gather_ancestor_bin_paths: false,
@@ -197,15 +203,23 @@ fn frozen_backstop_run(
             patches: Some(&patches),
             requires_build_by_snapshot: None,
             importers: &importers,
+            dependency_groups: None,
+            build_scope: None,
+            variant_platforms: None,
         },
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),
             user_agent: "pnpm/test",
-            prepend_node_path: ScriptsPrependNodePath::Never,
+            path: crate::ScriptPath { extra_bin_paths: &[], private_hoisting: false },
             shell: None,
             shell_emulator: false,
             unsafe_perm: true,
             ignore: false,
+            patched_engines: crate::PatchedEngineCheck {
+                engine_strict: false,
+                node_version: None,
+                install_state_dir: None,
+            },
         },
 
         allow_build_policy: &policy,
@@ -296,6 +310,7 @@ fn create_postinstall_modifies_source_fixture(
     (pkg_dir, actual_mode)
 }
 
+#[cfg(unix)]
 fn report_store_file_differences(
     before: &std::collections::BTreeMap<PathBuf, Vec<u8>>,
     after: &std::collections::BTreeMap<PathBuf, Vec<u8>>,

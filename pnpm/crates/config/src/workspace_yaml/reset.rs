@@ -20,6 +20,23 @@ fn apply_named_reset(
     true
 }
 
+/// `nodePackageMap` and the deprecated spellings that land in the same fields.
+fn reset_node_package_map(config: &mut Config, defaults: &Config, key: &str) -> bool {
+    let (mode, map_type) = match key {
+        "nodePackageMap" => (true, true),
+        "nodeExperimentalPackageMap" => (true, false),
+        "nodePackageMapType" => (false, true),
+        _ => return false,
+    };
+    if mode {
+        config.node_package_map_mode = defaults.node_package_map_mode;
+    }
+    if map_type {
+        config.node_package_map_type = defaults.node_package_map_type;
+    }
+    true
+}
+
 /// The paths anchored on the lockfile directory, re-anchored the way
 /// pinning it does, so a `modulesDir` still set keeps its shape and a
 /// pinned lockfile directory keeps its paths.
@@ -34,6 +51,12 @@ fn derive_lockfile(config: &mut Config) {
     if !config.explicit_settings.contains_key("lockfile") {
         config.lockfile = config.package_lock;
     }
+}
+
+fn reset_lockfile(config: &mut Config, defaults: &Config) {
+    config.lockfile_include_resolution_settings = defaults.lockfile_include_resolution_settings;
+    config.lockfile_integrity_target = defaults.lockfile_integrity_target;
+    derive_lockfile(config);
 }
 
 /// The hoist pattern `hoist` allows: the one still set, or the default,
@@ -67,6 +90,19 @@ fn reset_proxy_setting(config: &mut Config, defaults: &Config, key: &str) {
         _ => keys.noproxy = default_keys.noproxy.clone(),
     }
     config.proxy = config.proxy_keys.resolve();
+}
+
+fn reset_audit_settings(config: &mut Config, defaults: &Config) {
+    config.audit_level = defaults.audit_level;
+    config.audit_config.clone_from(&defaults.audit_config);
+    config.audit_ignore_prune = defaults.audit_ignore_prune;
+}
+
+fn reset_tls_setting(config: &mut Config, defaults: &Config, key: &str) {
+    match key {
+        "strictSsl" => config.tls.strict_ssl = defaults.tls.strict_ssl,
+        _ => config.tls.local_address = defaults.tls.local_address,
+    }
 }
 
 /// Leave `virtualStoreOnly` mode with the hoist patterns the mode
@@ -118,25 +154,29 @@ impl WorkspaceSettings {
         // The settings both structs name identically but hold at different
         // types, plus the ones `from_resolved` reports only when set.
         resets.extend(same_named! {
-            hoist_pattern, public_hoist_pattern, state_dir, lockfile_dir, npmrc_auth_file,
-            global_pnpmfile, pnpmfile, global_dir, global_bin_dir, cache_dir,
+            ci, hoist_pattern, public_hoist_pattern, state_dir, lockfile_dir, npmrc_auth_file,
+            global_pnpmfile, pnpmfile, global_dir, global_bin_dir, cache_dir, symlinked_lockfile_target_dirs,
             prefer_frozen_lockfile, lockfile, merge_git_branch_lockfiles,
             optimistic_repeat_install, minimum_release_age, global_shims, frozen_lockfile,
-            registry, scope, pnpr_server, cargo, python, remote_side_effects_cache,
-            reporter_hide_prefix, max_sockets, patched_dependencies, patches_dir,
+            provenance,
+            registry, scope, pnpr_server, cargo, python, tools, remote_side_effects_cache, remote_cache,
+            reporter_hide_prefix, loglevel, reporter, max_sockets, patched_dependencies, patches_dir,
             config_dependencies, dangerously_allow_all_builds, strict_dep_builds,
-            ignore_scripts, ignore_pnpmfile, git_checks, engine_strict, node_version,
-            runtime_on_fail, node_download_mirrors, scripts_prepend_node_path, script_shell,
+            ignore_scripts, ignore_pnpmfile, git_checks, git_tag_version, publish_branch, engine_strict, force_ignores_platform,
+            node_version,
+            runtime_on_fail, node_download_mirrors, script_shell,
             node_options, unsafe_perm, supported_architectures, ignored_optional_dependencies,
             overrides, package_extensions, package_configs, minimum_release_age_exclude,
             minimum_release_age_ignore_missing_time, minimum_release_age_strict,
             trust_lockfile, trust_policy, trust_policy_exclude, trust_policy_exclude_prune,
             trust_policy_ignore_after, init_author_name, init_author_email, init_author_url,
-            init_license, init_version, pm_on_fail, versioning, save_catalog_name,
-            save_prefix, pipeline_base, child_concurrency, workspace_concurrency, catalogs,
-            allow_builds,
+            init_license, init_version, pm_on_fail, versioning, save_catalog_name, tag,
+            save_prefix, tag_version_prefix, pipeline_base, child_concurrency, workspace_concurrency, catalogs,
+            allow_builds, concurrency_groups, boot_config,
         });
-        if Self::reset_derived_setting_to_default::<Sys>(config, defaults, key, base_dir) {
+        if reset_node_package_map(config, defaults, key)
+            || Self::reset_derived_setting_to_default::<Sys>(config, defaults, key, base_dir)
+        {
             return true;
         }
         apply_named_reset(config, defaults, (&resets, key))
@@ -158,6 +198,7 @@ impl WorkspaceSettings {
         Sys: EnvVar + GetCurrentDir + GetHomeDir + LinkProbe,
     {
         match key {
+            "macosBackup" => config.macos_backup.clone_from(&defaults.macos_backup),
             "storeDir" => config.reset_store_dir_to_default::<Sys>(base_dir),
             "lockfileDir" => {
                 config.lockfile_dir = None;
@@ -170,7 +211,7 @@ impl WorkspaceSettings {
                 config.package_lock = defaults.package_lock;
                 derive_lockfile(config);
             }
-            "lockfile" => derive_lockfile(config),
+            "lockfile" => reset_lockfile(config, defaults),
             "hoist" => {
                 config.hoist = defaults.hoist;
                 reset_hoist_pattern(config, defaults);
@@ -183,6 +224,7 @@ impl WorkspaceSettings {
             "publicHoistPattern" => reset_public_hoist_pattern(config, defaults),
             "nodeLinker" => {
                 config.node_linker = defaults.node_linker;
+                config.node_linker_excluded.clone_from(&defaults.node_linker_excluded);
                 config.apply_prefer_symlinked_executables_derivation();
             }
             "preferSymlinkedExecutables" => {
@@ -194,6 +236,24 @@ impl WorkspaceSettings {
                 leave_virtual_store_only(config);
             }
             _ => return Self::reset_aliased_setting_to_default(config, defaults, key),
+        }
+        true
+    }
+
+    /// `permissions` decides builds too, so resetting it also resets
+    /// `allowBuilds`.
+    fn reset_permission_setting_to_default(
+        config: &mut Config,
+        defaults: &Config,
+        key: &str,
+    ) -> bool {
+        match key {
+            "permissions" => {
+                config.allow_builds.clone_from(&defaults.allow_builds);
+                config.allow_skills.clone_from(&defaults.allow_skills);
+            }
+            "skills" => config.skills_dirs.clone_from(&defaults.skills_dirs),
+            _ => return false,
         }
         true
     }
@@ -210,26 +270,26 @@ impl WorkspaceSettings {
             "gitBranchLockfile" => {
                 config.use_git_branch_lockfile = defaults.use_git_branch_lockfile;
                 config.git_branch_lockfile_name = None;
+                config.git_branch_lockfile_candidates.clear();
             }
             "sideEffectsCache" => {
                 config.side_effects_cache_read_setting = defaults.side_effects_cache_read_setting;
                 config.side_effects_cache_write_setting = defaults.side_effects_cache_write_setting;
                 config.remote_side_effects_cache.clone_from(&defaults.remote_side_effects_cache);
+                config.side_effects_cache_exclude.clone_from(&defaults.side_effects_cache_exclude);
             }
             "httpsProxy" | "httpProxy" | "proxy" | "noProxy" | "noproxy" => {
                 reset_proxy_setting(config, defaults, key);
             }
-            "audit" | "auditLevel" | "auditConfig" => {
-                config.audit_level = defaults.audit_level;
-                config.audit_config.clone_from(&defaults.audit_config);
-                config.audit_ignore_prune = defaults.audit_ignore_prune;
-            }
+            "strictSsl" | "localAddress" => reset_tls_setting(config, defaults, key),
+            "audit" | "auditLevel" | "auditConfig" => reset_audit_settings(config, defaults),
             "update" | "updateConfig" => config.update_config.clone_from(&defaults.update_config),
             "cleanupUnusedCatalogs" => config.catalog_prune = defaults.catalog_prune,
             "virtualStoreType" => {
                 config.enable_global_virtual_store = defaults.enable_global_virtual_store;
             }
             "maxsockets" => config.max_sockets = defaults.max_sockets,
+            "runtime" => config.skip_runtimes = defaults.skip_runtimes,
             // Shapes only a file has, whose resolved form lives under the
             // keys above, or one nothing resolves from: nothing to restore.
             "registries"
@@ -239,7 +299,7 @@ impl WorkspaceSettings {
             | "neverBuiltDependencies"
             | "ignoredBuiltDependencies"
             | "_auth" => {}
-            _ => return false,
+            _ => return Self::reset_permission_setting_to_default(config, defaults, key),
         }
         true
     }

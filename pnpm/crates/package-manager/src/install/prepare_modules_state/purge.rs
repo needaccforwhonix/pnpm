@@ -1,6 +1,6 @@
 use super::super::{
-    Config, HashSet, IncludedDependencies, InstallError, Lockfile, Path, PathBuf,
-    check_modules_settings_diff,
+    Config, HashSet, IncludedDependencies, InstallError, Lockfile, NodeLinker, Path, PathBuf,
+    refuse_drifted_modules_dir,
 };
 
 pub(super) fn is_safe_modules_purge_target(modules_dir: &Path, workspace_root: &Path) -> bool {
@@ -11,36 +11,36 @@ pub(super) struct InconsistentModulesDir<'a> {
     pub(super) config: &'static Config,
     pub(super) workspace_root: &'a Path,
     pub(super) modules_manifest: Option<&'a pnpm_modules_yaml::ModulesLayout>,
+    pub(super) node_linker: NodeLinker,
     pub(super) installs_only: bool,
     pub(super) filtered_install: bool,
 }
+/// Returns whether the install still treats the tree as inconsistent.
+/// `false` when [`refuse_drifted_modules_dir`] accepts the drift, as upstream
+/// `checkCompatibility` accepts a sibling `v3` store: the tree is kept, so
+/// the install merges into its recorded state.
 pub(super) fn purge_inconsistent_modules_dir(
     context: &InconsistentModulesDir<'_>,
-) -> Result<(), InstallError> {
-    // A plain install may recreate the drifted modules dir; `add` / `remove`
-    // must surface the drift instead (upstream `validateModules` with
-    // `forceNewModules = installsOnly`).
-    if !context.installs_only
-        && let Some(modules) = context.modules_manifest
-    {
-        check_modules_settings_diff(modules, context.config)?;
+) -> Result<bool, InstallError> {
+    // Only a plain install (upstream `forceNewModules = installsOnly`) of
+    // every project purges. A project the install skips is not relinked, and
+    // its dependencies live in the purged directory or link into it.
+    if !context.installs_only || context.filtered_install {
+        refuse_drifted_modules_dir(context.modules_manifest, context.config, context.node_linker)?;
+        return Ok(false);
     }
     let (is_safe, target_dir) = purge_target(context.config, context.workspace_root);
     if !is_safe {
-        if context.filtered_install {
-            return Err(InstallError::UnsafeFilteredModulesDir {
-                modules_dir: context.config.modules_dir.clone(),
-                workspace_root: context.workspace_root.to_path_buf(),
-            });
-        }
         tracing::warn!(
             ?context.config.modules_dir,
             "refusing to remove inconsistent modules directory outside the project root",
         );
-        return Ok(());
+        return Ok(true);
     }
-    let Some(target) = target_dir else { return Ok(()) };
-    purge_modules_dir_entries(&target, context.config, context.modules_manifest)
+    if let Some(target) = target_dir {
+        purge_modules_dir_entries(&target, context.config, context.modules_manifest)?;
+    }
+    Ok(true)
 }
 /// The canonicalized directory the purge may sweep, and whether sweeping it is
 /// safe at all. Deleting from the validated path closes the
@@ -91,10 +91,12 @@ pub(super) fn purge_modules_entry(
         return Ok(());
     }
     let entry_path = entry.path();
-    if entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
-        return remove_modules_dir(&entry_path);
+    if let Err(error) = pnpm_fs::remove_dirent(&entry_path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(InstallError::RemoveModulesDir { path: entry_path, error });
     }
-    remove_modules_file(&entry_path)
+    Ok(())
 }
 pub(super) fn is_pnpm_owned_entry(
     file_name: &str,
@@ -103,7 +105,7 @@ pub(super) fn is_pnpm_owned_entry(
 ) -> bool {
     file_name == ".bin"
         || file_name == ".modules.yaml"
-        || config.virtual_store_dir
+        || config.install_state_dir
             .file_name()
             .is_some_and(|name| name == file_name)
         || modules_manifest.is_some_and(|manifest| {
@@ -125,28 +127,6 @@ pub(super) fn recorded_virtual_store_name(
     }
     recorded.file_name().map(std::ffi::OsStr::to_os_string)
 }
-pub(super) fn remove_modules_dir(entry_path: &Path) -> Result<(), InstallError> {
-    #[cfg(windows)]
-    let is_removed = pnpm_fs::remove_symlink_dir(entry_path).is_ok();
-    #[cfg(not(windows))]
-    let is_removed = false;
-
-    if !is_removed
-        && let Err(error) = std::fs::remove_dir_all(entry_path)
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        return Err(InstallError::RemoveModulesDir { path: entry_path.to_path_buf(), error });
-    }
-    Ok(())
-}
-pub(super) fn remove_modules_file(entry_path: &Path) -> Result<(), InstallError> {
-    if let Err(error) = std::fs::remove_file(entry_path)
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        return Err(InstallError::RemoveModulesDir { path: entry_path.to_path_buf(), error });
-    }
-    Ok(())
-}
 /// What decides whether direct links excluded by this run have to be pruned.
 pub(super) struct ExcludedGroupPrune<'a> {
     pub(crate) eligibility: crate::install::state_options::PruneEligibility,
@@ -156,6 +136,11 @@ pub(super) struct ExcludedGroupPrune<'a> {
     pub(super) modules_manifest: Option<&'a pnpm_modules_yaml::ModulesLayout>,
     pub(super) current_lockfile: Option<&'a Lockfile>,
     pub(super) requested_importer_ids: Option<&'a HashSet<String>>,
+    pub(super) manifest_links: ManifestLinkProjects<'a>,
+}
+pub(super) struct ManifestLinkProjects<'a> {
+    pub(super) manifests: &'a [(PathBuf, &'a pnpm_package_manifest::PackageManifest)],
+    pub(super) workspace_links: Option<crate::WorkspaceLinks<'a>>,
 }
 /// Remove direct links from dependency groups excluded by this run.
 /// Unfiltered installs can use the global `included` value recorded in
@@ -169,21 +154,40 @@ pub(super) fn prune_excluded_direct_deps(
         return Ok(());
     }
     let Some(modules) = context.modules_manifest else { return Ok(()) };
-    let Some(current) = context.current_lockfile else { return Ok(()) };
     if !context.eligibility.filtered_install && modules.included == context.included {
         return Ok(());
     }
-    let selected_prune_importer_ids = context.requested_importer_ids.map(|requested| {
-        crate::materialization_closure(
+    let selected_prune_importer_ids = selected_prune_importer_ids(context);
+    let previously_included = previously_included(context, modules);
+    if let Some(current) = context.current_lockfile {
+        crate::prune_direct_deps_excluded_by_groups(
             current,
-            context.workspace_root,
-            requested,
+            previously_included,
             context.included,
-            &crate::SkippedSnapshots::new(),
+            context.workspace_root,
+            context.config,
+            selected_prune_importer_ids.as_ref(),
         )
-        .importer_ids
-    });
-    let previously_included = if context.eligibility.filtered_install {
+        .map_err(InstallError::PruneDirectDeps)?;
+    }
+    crate::prune_manifest_link_deps(&crate::PruneManifestLinkDeps {
+        workspace_root: context.workspace_root,
+        project_manifests: context.manifest_links.manifests,
+        importers: context.current_lockfile.map(|current| &current.importers),
+        workspace_links: context.manifest_links.workspace_links,
+        previously_included,
+        new_included: context.included,
+        modules_dir_name: context.config.modules_dir_name(),
+        prunable_importer_ids: selected_prune_importer_ids.as_ref(),
+    })
+    .map_err(InstallError::PruneDirectDeps)
+}
+
+fn previously_included(
+    context: &ExcludedGroupPrune<'_>,
+    modules: &pnpm_modules_yaml::ModulesLayout,
+) -> IncludedDependencies {
+    if context.eligibility.filtered_install {
         IncludedDependencies {
             dependencies: true,
             dev_dependencies: true,
@@ -191,14 +195,22 @@ pub(super) fn prune_excluded_direct_deps(
         }
     } else {
         modules.included
-    };
-    crate::prune_direct_deps_excluded_by_groups(
-        current,
-        previously_included,
-        context.included,
-        context.workspace_root,
-        context.config,
-        selected_prune_importer_ids.as_ref(),
-    )
-    .map_err(InstallError::PruneDirectDeps)
+    }
+}
+
+fn selected_prune_importer_ids(context: &ExcludedGroupPrune<'_>) -> Option<HashSet<String>> {
+    let requested = context.requested_importer_ids?;
+    Some(match context.current_lockfile {
+        Some(current) => {
+            crate::materialization_closure(
+                current,
+                context.workspace_root,
+                requested,
+                &crate::GroupSelection::following_every_edge(context.included),
+                &crate::SkippedSnapshots::new(),
+            )
+            .importer_ids
+        }
+        None => requested.clone(),
+    })
 }

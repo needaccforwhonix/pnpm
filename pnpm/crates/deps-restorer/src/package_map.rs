@@ -5,7 +5,7 @@ pub use node_options::{
 
 mod dependencies;
 use dependencies::{
-    LinkReference, LinkTarget, PhysicalPackageIndex, add_importer_dependencies,
+    LinkBase, LinkReference, LinkTarget, PhysicalPackageIndex, add_importer_dependencies,
     add_loose_dependencies, add_physical_importer_dependencies, add_physical_snapshot_dependencies,
     add_snapshot_dependencies, get_node_modules_path, resolve_link_target,
 };
@@ -21,7 +21,7 @@ use pnpm_lockfile::{Lockfile, PackageKey};
 use pnpm_package_manifest::PackageManifest;
 use serde::Serialize;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fmt::Write as _,
     path::{Path, PathBuf},
 };
@@ -30,13 +30,13 @@ pub const PACKAGE_MAP_FILENAME: &str = ".package-map.json";
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub struct PackageMap {
-    packages: BTreeMap<String, PackageMapPackage>,
+    pub(crate) packages: BTreeMap<String, PackageMapPackage>,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub struct PackageMapPackage {
-    url: String,
-    dependencies: BTreeMap<String, String>,
+    pub(crate) url: String,
+    pub(crate) dependencies: BTreeMap<String, String>,
 }
 
 #[derive(Debug, derive_more::Display, derive_more::Error)]
@@ -103,10 +103,9 @@ pub fn write_package_map(
     let mut contents = serde_json::to_vec(&lockfile_to_package_map(lockfile, opts))
         .map_err(WritePackageMapError::Serialize)?;
     contents.push(b'\n');
-    // Hardened atomic write (temp file + rename): never follows a symlink an
-    // attacker (or a crashed prior install) may have pre-seeded at the target,
-    // and never leaves a torn file a concurrent reader could observe.
-    pnpm_fs::ensure_file(&opts.modules_dir.join(PACKAGE_MAP_FILENAME), &contents, None)
+    // Never follows a symlink pre-seeded at the target, and never exposes a
+    // partly written map to the tools that read it.
+    pnpm_fs::ensure_file_atomically(&opts.modules_dir.join(PACKAGE_MAP_FILENAME), &contents, None)
         .map_err(WritePackageMapError::Write)
 }
 
@@ -120,10 +119,9 @@ pub fn write_hoisted_package_map(
         serde_json::to_vec(&dependencies_graph_to_package_map(lockfile, graph, opts))
             .map_err(WritePackageMapError::Serialize)?;
     contents.push(b'\n');
-    // Hardened atomic write (temp file + rename): never follows a symlink an
-    // attacker (or a crashed prior install) may have pre-seeded at the target,
-    // and never leaves a torn file a concurrent reader could observe.
-    pnpm_fs::ensure_file(&opts.modules_dir.join(PACKAGE_MAP_FILENAME), &contents, None)
+    // Never follows a symlink pre-seeded at the target, and never exposes a
+    // partly written map to the tools that read it.
+    pnpm_fs::ensure_file_atomically(&opts.modules_dir.join(PACKAGE_MAP_FILENAME), &contents, None)
         .map_err(WritePackageMapError::Write)
 }
 
@@ -152,11 +150,20 @@ pub fn lockfile_to_package_map(lockfile: &Lockfile, opts: &PackageMapOptions<'_>
     }
 
     // A package with metadata but no snapshot still needs a map entry:
-    // it resolves to its own slot and to nothing else.
+    // it resolves to its own slot and to nothing else. A metadata key
+    // that is the peer-stripped form of a snapshot key is not such a
+    // package: it is installed only under its snapshots' slots, and
+    // nothing references the stripped key.
+    let snapshot_package_keys: HashSet<PackageKey> = lockfile.snapshots
+        .iter()
+        .flatten()
+        .map(|(key, _)| key.without_peer())
+        .collect();
     for key in lockfile.packages
         .iter()
         .flatten()
         .map(|(key, _)| key)
+        .filter(|key| !snapshot_package_keys.contains(*key))
     {
         add_metadata_only_package(&mut accum, opts, key);
     }
@@ -234,13 +241,19 @@ fn add_snapshot_package(
     let id = key.to_string();
     let mut dependencies = BTreeMap::new();
     dependencies.insert(key.name.to_string(), id.clone());
+    let package_dir = pnpm_fs::join_slash_separated_path(
+        &opts.layout.slot_dir(key).join("node_modules"),
+        &key.name.to_string(),
+    );
     for group in [snapshot.dependencies.as_ref(), snapshot.optional_dependencies.as_ref()] {
-        add_snapshot_dependencies(packages, &mut dependencies, lockfile, opts, group);
+        add_snapshot_dependencies(
+            packages,
+            &mut dependencies,
+            lockfile,
+            opts,
+            (&package_dir, group),
+        );
     }
-    let package_dir = opts.layout
-        .slot_dir(key)
-        .join("node_modules")
-        .join(key.name.to_string());
     add_package(packages, id, package_dirs, &package_dir, dependencies, opts.modules_dir);
     let Some(loose_index) = loose_index.as_mut() else { return };
     if let Some(modules_dir) = get_node_modules_path(&package_dir) {
@@ -266,10 +279,10 @@ fn add_metadata_only_package(
 ) {
     let id = key.to_string();
     let package_dir = || {
-        opts.layout
-            .slot_dir(key)
-            .join("node_modules")
-            .join(key.name.to_string())
+        pnpm_fs::join_slash_separated_path(
+            &opts.layout.slot_dir(key).join("node_modules"),
+            &key.name.to_string(),
+        )
     };
     accum.packages
         .entry(id.clone())

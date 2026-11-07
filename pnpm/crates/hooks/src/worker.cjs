@@ -1,12 +1,33 @@
 const readline = require('node:readline');
-const { pathToFileURL } = require('node:url');
 let mod = null;
 let loadErr = null;
 let nextCallbackId = 0;
 const pendingCallbacks = new Map();
+// stdout carries the protocol. Output the pnpmfile writes there itself goes
+// to the log of the preResolution call it was written from, or nowhere.
+const { AsyncLocalStorage } = require('node:async_hooks');
+const writeProtocol = process.stdout.write.bind(process.stdout);
+const outputForwarder = new AsyncLocalStorage();
+process.stdout.write = (chunk, encoding, callback) => {
+  const forwardOutput = outputForwarder.getStore();
+  if (forwardOutput !== undefined) {
+    for (const line of String(chunk).split('\n')) {
+      if (line.trim() !== '') forwardOutput(line.trim());
+    }
+  }
+  const done = typeof encoding === 'function' ? encoding : callback;
+  if (typeof done === 'function') done();
+  return true;
+};
+class BadReadPackageResultError extends Error {
+  constructor(message) {
+    super(message + " Hook imported via " + pnpmfilePath);
+    this.code = "ERR_PNPM_BAD_READ_PACKAGE_HOOK_RESULT";
+  }
+}
 async function ensureLoaded() {
   if (mod !== null || loadErr !== null) return;
-  try { mod = pnpmfileIsMjs ? await import(pathToFileURL(pnpmfilePath).href) : require(pnpmfilePath); } catch (err) { loadErr = err && err.stack ? err.stack : String(err); }
+  try { mod = await loadPnpmfile(pnpmfilePath); } catch (err) { loadErr = err && err.stack ? err.stack : String(err); }
 }
 const rl = readline.createInterface({ input: process.stdin });
 rl.on('line', (line) => {
@@ -33,12 +54,25 @@ rl.on('line', (line) => {
 });
 async function handle(req) {
   const id = req.id;
-  const send = (obj) => process.stdout.write(JSON.stringify(Object.assign({ id }, obj)) + '\n');
+  const send = (obj) => writeProtocol(JSON.stringify(Object.assign({ id }, obj)) + '\n');
   await ensureLoaded();
   if (loadErr !== null) { send({ err: loadErr }); return; }
   if (req.query === 'hasHooks') { send({ ok: mod != null && mod.hooks != null }); return; }
-  if (req.query === 'hasFilterLog') {
-    send({ ok: mod != null && mod.hooks != null && typeof mod.hooks.filterLog === 'function' });
+  if (req.query === 'definedHooks') {
+    const hooks = mod != null && mod.hooks != null ? mod.hooks : {};
+    send({ ok: req.names.filter((name) => typeof hooks[name] === 'function') });
+    return;
+  }
+  if (req.query === 'hasReadPackage') {
+    send({ ok: mod != null && mod.hooks != null && typeof mod.hooks.readPackage === 'function' });
+    return;
+  }
+  if (req.query === 'hasAfterAllResolved') {
+    send({ ok: mod != null && mod.hooks != null && typeof mod.hooks.afterAllResolved === 'function' });
+    return;
+  }
+  if (req.query === 'hasPreResolution') {
+    send({ ok: mod != null && mod.hooks != null && typeof mod.hooks.preResolution === 'function' });
     return;
   }
   try {
@@ -129,6 +163,14 @@ async function handle(req) {
             callBuiltin('localTarball', handle, resolution, options),
           remoteTarball: (handle, resolution, options) =>
             callBuiltin('remoteTarball', handle, resolution, options),
+          gitHostedTarball: (handle, resolution, options) =>
+            callBuiltin('gitHostedTarball', handle, resolution, options),
+          directory: (handle, resolution, options) =>
+            callBuiltin('directory', handle, resolution, options),
+          git: (handle, resolution, options) =>
+            callBuiltin('git', handle, resolution, options),
+          binary: (handle, resolution, options) =>
+            callBuiltin('binary', handle, resolution, options),
         });
       }
       const res = await fetcher[req.method](...args);
@@ -149,16 +191,36 @@ async function handle(req) {
       pkg.optionalDependencies = pkg.optionalDependencies ?? {};
       pkg.peerDependencies = pkg.peerDependencies ?? {};
       const newPkg = await fn(pkg, context);
-      if (!newPkg) {
-        throw new Error("readPackage hook did not return a package manifest object. Hook imported via " + pnpmfilePath);
+      if (!newPkg || typeof newPkg !== "object" || Array.isArray(newPkg)) {
+        throw new BadReadPackageResultError("readPackage hook did not return a package manifest object.");
       }
-      for (const dep of ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"]) {
-        const v = newPkg[dep];
-        if (v != null && (typeof v !== "object" || Array.isArray(v))) {
-          throw new Error("readPackage hook returned package manifest object's property '" + dep + "' must be an object. Hook imported via " + pnpmfilePath);
-        }
+      validatePackageDependencies(newPkg);
+      let response;
+      let serializedPkg;
+      try {
+        response = JSON.stringify({ id, ok: newPkg });
+        serializedPkg = JSON.parse(response).ok;
+      } catch {
+        throw new BadReadPackageResultError("readPackage hook did not return a serializable package manifest object.");
       }
-      send({ ok: newPkg });
+      if (!serializedPkg || typeof serializedPkg !== "object" || Array.isArray(serializedPkg)) {
+        throw new BadReadPackageResultError("readPackage hook did not return a package manifest object.");
+      }
+      validatePackageDependencies(serializedPkg);
+      writeProtocol(response + '\n');
+    } else if (req.hook === 'preResolution') {
+      // pnpm passes the lockfile objects themselves and ignores what the hook
+      // returns, so only changes made to these two objects in place count.
+      const ctx = req.payload;
+      const { wantedLockfile, currentLockfile } = ctx;
+      if (typeof fn === 'function') {
+        const logger = {
+          info: (m) => send({ log: String(m) }),
+          warn: (m) => send({ log: String(m), level: 'warn' }),
+        };
+        await outputForwarder.run((line) => send({ log: line }), () => fn(ctx, logger));
+      }
+      send({ ok: { wantedLockfile, currentLockfile } });
     } else if (req.hook === 'beforePacking') {
       if (typeof fn !== 'function') { send({ ok: req.payload }); return; }
       const newPkg = await fn(req.payload, req.dir, context);
@@ -171,6 +233,29 @@ async function handle(req) {
       send({ ok: res === undefined ? null : res });
     }
   } catch (err) {
-    send({ err: err && err.stack ? err.stack : String(err) });
+    if (err instanceof BadReadPackageResultError) {
+      send({ err: err.message, code: err.code });
+    } else {
+      send({ err: err && err.stack ? err.stack : String(err) });
+    }
+  }
+}
+
+function describePackage(pkg) {
+  if (typeof pkg.name !== "string" || !pkg.name) return "an unnamed package";
+  return typeof pkg.version === "string" && pkg.version ? pkg.name + "@" + pkg.version : pkg.name;
+}
+
+function validatePackageDependencies(pkg) {
+  for (const dep of ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"]) {
+    const v = pkg[dep];
+    if (v != null && (typeof v !== "object" || Array.isArray(v))) {
+      throw new BadReadPackageResultError("readPackage hook returned package manifest object's property '" + dep + "' must be an object.");
+    }
+    for (const [name, range] of Object.entries(v ?? {})) {
+      if (typeof range !== "string") {
+        throw new BadReadPackageResultError("readPackage hook returned an invalid range for '" + name + "' in the '" + dep + "' of " + describePackage(pkg) + ". Expected a string, got " + (range === null ? "null" : typeof range) + ". To remove the dependency, delete the property.");
+      }
+    }
   }
 }

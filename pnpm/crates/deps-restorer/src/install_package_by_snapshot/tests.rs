@@ -4,6 +4,8 @@ mod store;
 
 mod runtimes;
 
+mod variants;
+
 mod links;
 
 mod workspace;
@@ -16,7 +18,7 @@ mod installation;
 
 mod reporting;
 
-use super::{InstallPackageBySnapshotError, host_platform_selector};
+use super::InstallPackageBySnapshotError;
 use pnpm_config::Config;
 use pnpm_lockfile::{LockfileResolution, PackageKey};
 
@@ -133,6 +135,14 @@ async fn run_snapshot_install_with_session(
             custom_fetcher_session: Some(session),
         },
         ctx: &crate::InstallContext {
+            caches: crate::InstallCaches {
+                logged_methods: &logged_methods,
+                swap_lock: None,
+                git_source_cache: &pnpm_git_fetcher::GitSourceCache::default(),
+                materialized_graph: std::sync::Arc::default(),
+                dir_clone_cache: None,
+            },
+
             linker: crate::ModuleLinkerContext {
                 layout: &layout,
                 kind: pnpm_config::NodeLinker::Hoisted,
@@ -143,14 +153,11 @@ async fn run_snapshot_install_with_session(
             requester: "/project",
 
             allow_build_policy: &allow_build_policy,
-
-            logged_methods: &logged_methods,
-            git_source_cache: &pnpm_git_fetcher::GitSourceCache::default(),
         },
 
         skipped: &skipped,
         include_optional_dependencies: true,
-        runtime_platform_selector: &host_platform_selector(),
+        variant_platforms: &crate::platform_selection::VariantPlatforms::host(),
 
         defer_link: false,
         link_concurrency_probe: None,

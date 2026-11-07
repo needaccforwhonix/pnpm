@@ -1,6 +1,7 @@
 use crate::SkippedSnapshots;
 use indexmap::IndexMap;
 use pnpm_lockfile::{PackageKey, ProjectSnapshot, SnapshotEntry};
+use pnpm_package_manifest::DependencyGroup;
 use pnpm_patching::ExtendedPatchInfo;
 use std::collections::{HashMap, HashSet};
 
@@ -14,23 +15,24 @@ use std::collections::{HashMap, HashSet};
 /// `binding.gyp` / `.hooks/`).
 ///
 /// `patches` is the per-snapshot lookup map produced by
-/// `InstallFrozenLockfile::run` from
-/// [`pnpm_patching::resolve_and_group`] + per-snapshot
-/// [`pnpm_patching::get_patch_info`]: keys are peer-stripped
-/// [`PackageKey`]s, values are the matched
-/// [`pnpm_patching::ExtendedPatchInfo`]. `None` when no
-/// `patchedDependencies` is configured. Presence of a key here makes
+/// `InstallFrozenLockfile::run`. Presence of a key here makes
 /// the snapshot a build candidate even when `requires_build` is false.
+///
+/// `dependency_groups` are the groups this install includes — the
+/// `--prod` / `--dev` / `--no-optional` selection. A package reachable
+/// only through an excluded group never enters the graph, so its
+/// lifecycle scripts do not run. `None` walks every group.
 #[must_use]
 pub fn build_graph(
     requires_build: &HashMap<PackageKey, bool>,
     patches: Option<&HashMap<PackageKey, ExtendedPatchInfo>>,
     snapshots: &HashMap<PackageKey, SnapshotEntry>,
     importers: &HashMap<String, ProjectSnapshot>,
+    dependency_groups: Option<&[DependencyGroup]>,
     skipped: &SkippedSnapshots,
 ) -> IndexMap<PackageKey, Vec<PackageKey>> {
     let children = build_children_map(snapshots);
-    let root_dep_paths = collect_root_dep_paths(importers, snapshots);
+    let root_dep_paths = collect_root_dep_paths(importers, snapshots, dependency_groups);
 
     let mut nodes_to_build_set: HashSet<PackageKey> = HashSet::new();
     let mut nodes_to_build: Vec<PackageKey> = Vec::new();
@@ -97,15 +99,23 @@ fn build_children_map(
     children
 }
 
-/// Gather snapshot keys for every direct dependency declared by an importer.
+/// Every group an importer can declare a direct dependency in.
+/// `peerDependencies` is not one of them: a peer is satisfied out of the
+/// dependent's own subtree, never installed as a root.
+const ALL_ROOT_DEPENDENCY_GROUPS: [DependencyGroup; 3] =
+    [DependencyGroup::Prod, DependencyGroup::Optional, DependencyGroup::Dev];
+
+/// Gather snapshot keys for the direct dependencies importers declare in
+/// `dependency_groups`, or in every group when that is `None`.
 ///
-/// Iterates `dependencies`, `devDependencies`, and `optionalDependencies` of
-/// every importer. Keys whose constructed snapshot key is not in `snapshots`
-/// are dropped silently (e.g. workspace links that are not separate packages).
+/// Keys whose constructed snapshot key is not in `snapshots` are dropped
+/// silently (e.g. workspace links that are not separate packages).
 fn collect_root_dep_paths(
     importers: &HashMap<String, ProjectSnapshot>,
     snapshots: &HashMap<PackageKey, SnapshotEntry>,
+    dependency_groups: Option<&[DependencyGroup]>,
 ) -> Vec<PackageKey> {
+    let groups = dependency_groups.unwrap_or(&ALL_ROOT_DEPENDENCY_GROUPS);
     let mut seen: HashSet<PackageKey> = HashSet::new();
     // `link:` deps don't live in the virtual store — they're per-importer
     // directory symlinks — so they are not snapshot roots. For aliased deps,
@@ -113,16 +123,7 @@ fn collect_root_dep_paths(
     // importer-map key.
     let mut roots: Vec<PackageKey> = importers
         .values()
-        .flat_map(|snapshot| {
-            [
-                snapshot.dependencies.as_ref(),
-                snapshot.optional_dependencies.as_ref(),
-                snapshot.dev_dependencies.as_ref(),
-            ]
-            .into_iter()
-            .flatten()
-            .flatten()
-        })
+        .flat_map(|snapshot| snapshot.dependencies_by_groups(groups.iter().copied()))
         .filter_map(|(name, spec)| spec.version.resolved_key(name))
         .filter(|key| snapshots.contains_key(key))
         .filter(|key| seen.insert(key.clone()))
@@ -159,9 +160,7 @@ struct GetSubgraphCtx<'a> {
 /// A node is a candidate when `requires_build` is set OR when an entry
 /// for the peer-stripped key is present in `patches` — *unless* the
 /// node is in `skipped`, in which case its virtual-store slot was never
-/// created so neither the requires-build nor patch path can run. A
-/// skipped snapshot never enters the build graph, so a child reachable
-/// only through a skipped edge is excluded too.
+/// created so neither the requires-build nor patch path can run.
 ///
 /// Returns whether *any* of the entry nodes (or their subtrees) needs to build.
 fn get_subgraph_to_build(

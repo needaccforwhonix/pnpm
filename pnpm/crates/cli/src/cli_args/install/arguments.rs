@@ -41,8 +41,24 @@ pub struct InstallLockfileArgs {
     pub ignore_manifest_check: bool,
 }
 
+impl InstallLockfileArgs {
+    /// `--frozen-lockfile` / `--no-frozen-lockfile` as typed on the command
+    /// line, or `None` when neither spelling was.
+    pub(crate) fn frozen_flag(&self) -> Option<bool> {
+        if self.frozen {
+            Some(true)
+        } else if self.no_frozen {
+            Some(false)
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, clap::Args)]
 pub struct LockfileUpdateArgs {
+    #[clap(flatten)]
+    pub dedupe: crate::cli_args::install_options::AutoDedupeArgs,
     /// Fold every per-branch lockfile (`pnpm-lock.<branch>.yaml`, written
     /// under the `gitBranchLockfile` setting) into `pnpm-lock.yaml` and
     /// delete them.
@@ -100,10 +116,11 @@ pub struct InstallMaterializationArgs {
     /// Show what an install would change without writing anything to disk.
     #[clap(long = "dry-run")]
     pub dry_run: bool,
-    /// Reinstall every package the lockfile names: relink packages an
-    /// earlier install already materialized, and install optional
-    /// dependencies whose `cpu` / `os` / `libc` / `engines` don't match
-    /// the host instead of skipping them.
+    /// Reinstall every package the lockfile names, relinking packages an
+    /// earlier install already materialized. Optional dependencies whose
+    /// `cpu` / `os` / `libc` don't match the host stay skipped unless
+    /// `forceIgnoresPlatform` is set. To install them for other
+    /// platforms, use `--os` / `--cpu` / `--libc`.
     #[clap(long)]
     pub force: bool,
     /// Run the install already requested by `verifyDepsBeforeRun` without
@@ -129,4 +146,9 @@ pub struct InstallMaterializationArgs {
     /// read-only store.
     #[clap(long = "no-frozen-store", overrides_with = "frozen_store")]
     pub no_frozen_store: bool,
+    /// Package names allowed to run lifecycle (build) scripts during this
+    /// install, appended to `allowBuilds`. Prefix a name with `!` to deny
+    /// its scripts instead. May be repeated.
+    #[clap(long = "allow-build")]
+    pub allow_build: Vec<String>,
 }

@@ -10,6 +10,7 @@ use super::{
     capture::CapturedScript,
     paths::{check_ancestors, check_input_directories, validate_relative_path},
 };
+use crate::process::Command;
 use inputs::{HashedFile, compile_globs};
 use miette::IntoDiagnostic;
 use pnpm_config::TaskSettings;
@@ -22,7 +23,6 @@ use std::{
     collections::HashMap,
     env, fs, io,
     path::{Path, PathBuf},
-    process::Command,
     sync::{Arc, Mutex},
 };
 use wax::{
@@ -64,10 +64,43 @@ pub struct TaskCache {
     /// Per-project tracked-file hashes, shared by every task of the
     /// project: enumeration and hashing run once, per-task input specs
     /// filter the shared list.
-    project_files: Mutex<HashMap<PathBuf, ProjectInputHashes>>,
+    project_files: Mutex<HashMap<PathBuf, ProjectFiles>>,
 }
 
-/// Submodule inputs have no complete hash list and require cache bypass.
+/// A project's file set, or why it has none.
+enum ProjectFiles {
+    Hashed(Arc<Vec<HashedFile>>),
+    Unavailable(InputsUnavailable),
+}
+
+/// Why a project has no enumerable file set, which leaves its tasks without
+/// a cache key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputsUnavailable {
+    /// Submodule inputs have no complete hash list and require cache
+    /// bypass. Deliberate and silent: a submodule's own contents are not
+    /// the project's to hash.
+    Submodules,
+    /// Git cannot enumerate the project's files: the project is outside a
+    /// work tree, or `git` is not installed. The input contract makes the
+    /// default input set the project's Git-tracked and untracked, unignored
+    /// files, so there is no set to hash and the tasks bypass the cache — the
+    /// same bypass a submodule input gets. Unlike the submodule case, this one
+    /// is reported: a project Git does not cover is usually an accident the
+    /// user can fix.
+    NoGit,
+}
+
+impl ProjectFiles {
+    fn hashes(&self) -> ProjectInputHashes {
+        match self {
+            Self::Hashed(files) => Some(Arc::clone(files)),
+            Self::Unavailable(_) => None,
+        }
+    }
+}
+
+/// The project's tracked-file hashes, or `None` when it has no file set.
 type ProjectInputHashes = Option<Arc<Vec<HashedFile>>>;
 
 /// One entry of a task's last-outputs record: a file the previous run or
@@ -108,10 +141,9 @@ impl TaskCache {
             .output()
             .ok()
             .filter(|output| output.status.success())
-            .map_or_else(
-                || "no-node".to_string(),
-                |output| String::from_utf8_lossy(&output.stdout).trim().to_string(),
-            );
+            .map(|output| output.stdout)
+            .map(|stdout| String::from_utf8_lossy(&stdout).trim().to_string())
+            .unwrap_or_else(|| "no-node".to_string());
         Ok(TaskCache {
             tasks_dir,
             state_dir,
@@ -208,6 +240,21 @@ impl TaskCache {
             }
         }
         self.write_output_record(task_id, &record)
+    }
+
+    /// Publish an entry that `fill` writes into an empty staging directory,
+    /// the way [`Self::store`] publishes one. An entry already under `key`
+    /// is kept.
+    pub fn import(&self, key: &str, fill: impl FnOnce(&Path) -> io::Result<()>) -> io::Result<()> {
+        let entry_dir = self.entry_dir(key);
+        let parent = entry_dir.parent().expect("cache entry parent");
+        fs::create_dir_all(parent)?;
+        let staging = tempfile::Builder::new().prefix(".import-").tempdir_in(parent)?;
+        fill(staging.path())?;
+        match fs::rename(staging.path(), &entry_dir) {
+            Err(_) if entry_dir.exists() => Ok(()),
+            result => result,
+        }
     }
 
     fn matches_snapshot(&self, key: &str, expected: &StoredTask) -> io::Result<bool> {

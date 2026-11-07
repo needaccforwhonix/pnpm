@@ -12,6 +12,7 @@ mod optional_dependencies;
 
 mod behavior;
 
+mod auto_dedupe;
 mod lockfile_reuse;
 
 mod version_selection;
@@ -163,6 +164,7 @@ impl Resolver for ProjectRelativeWorkspaceResolver {
                     manifest: Some(std::sync::Arc::new(
                         serde_json::json!({ "name": "shared", "version": "1.0.0" }),
                     )),
+                    non_deprecated_alternative: None,
                 },
             }))
         })
@@ -206,6 +208,7 @@ fn fake_result(
             latest: Some(version.to_string()),
             published_at: published_at.map(str::to_string),
             manifest: Some(std::sync::Arc::new(manifest)),
+            non_deprecated_alternative: None,
         },
     }
 }
@@ -245,7 +248,7 @@ fn importer_opts(
             auto_install_peers_from_highest_match: false,
             resolve_peers_from_workspace_root: false,
             dedupe_peers: false,
-            dedupe_peer_dependents: true,
+            dedupe_peer_dependents: crate::PeerDependentsDedupe::On,
         },
         links: crate::PeerLinkOptions {
             exclude_links_from_lockfile: false,
@@ -259,6 +262,7 @@ fn importer_opts(
             pick_lowest_direct: false,
             subdep_published_by: published_by,
             catalogs: pnpm_catalogs_types::Catalogs::new(),
+            catalogs_dir: None,
             catalog_server: false,
         },
         hooks: crate::ManifestTransformHooks {
@@ -277,7 +281,7 @@ fn workspace_opts(pick_lowest_direct: bool, time_based: bool) -> WorkspaceResolv
         peers: crate::WorkspacePeerResolutionOptions {
             dedupe_peers: false,
             dedupe_injected_deps: false,
-            dedupe_peer_dependents: false,
+            dedupe_peer_dependents: crate::PeerDependentsDedupe::Off,
             resolve_peers_from_workspace_root: false,
             exclude_links_from_lockfile: false,
             lockfile_dir: std::path::PathBuf::from("/lockfile-dir"),
@@ -298,6 +302,7 @@ fn workspace_opts(pick_lowest_direct: bool, time_based: bool) -> WorkspaceResolv
         reuse: crate::WorkspaceLockfileReuse {
             lockfile: None,
             subtrees: true,
+            dedupe: crate::UpdateTargets::default(),
             scope: crate::UpdateReuseScope::All,
             scopes_by_importer: BTreeMap::new(),
             depth: crate::UpdateDepth::UNLIMITED,
@@ -306,19 +311,13 @@ fn workspace_opts(pick_lowest_direct: bool, time_based: bool) -> WorkspaceResolv
     }
 }
 
-/// Drive [`fn@resolve_workspace`] through the adversarial interleaving
-/// of <https://github.com/pnpm/pnpm/issues/13567>.
-///
-/// Both importers depend on `shared@1.0.0`, whose children context is
-/// deterministically owned by the root importer (same depth, lower
-/// importer order). Delaying the root's `shared` resolution lets
-/// `pkg-b` reuse its locked `shared` subtree first — a transient walk
-/// that resolves the pinned `dep@<pinned_dep_version>` before losing
-/// the children context to the root, whose fresh walk resolves
-/// `dep@^1.0.0` to whatever `dep_results` maps it to. The pinned
-/// version is then unreachable, so the peer-hoist pickers deciding
-/// `host`'s missing `dep` peer must never see it; each caller asserts
-/// that for its peer shape.
+/// Drive [`fn@resolve_workspace`] through the arrangement of
+/// <https://github.com/pnpm/pnpm/issues/13567>: `pkg-b`'s reuse of a
+/// locked `shared` subtree brings `dep@<pinned_dep_version>` into the
+/// shared maps, while the walk that owns `shared@1.0.0`'s children
+/// resolves `dep@^1.0.0` through `dep_results` instead. The pinned
+/// version ends up unreachable, and each caller asserts that the
+/// peer-hoist pickers deciding `host`'s missing `dep` peer never see it.
 async fn resolve_with_transient_shared_walk(
     host_manifest: serde_json::Value,
     pinned_dep_version: &str,
@@ -375,7 +374,7 @@ async fn resolve_with_transient_shared_walk(
         importer_opts(std::path::PathBuf::from("/repo").join(&importer.id), None)
     })
     .await
-    .expect("resolve workspace under the adversarial interleaving")
+    .expect("resolve workspace in the transient-walk arrangement")
 }
 
 /// [`RecordingResolver`] with one artificially slow entry: its resolve
@@ -494,13 +493,21 @@ impl Resolver for FailingAliasResolver {
 fn optional_failure_fixture(
     failure: FailureShape,
 ) -> (tempfile::TempDir, PackageManifest, FailingAliasResolver) {
+    optional_failure_fixture_with_specifier(failure, "^1.0.0")
+}
+
+/// [`optional_failure_fixture`] with `broken` declared as `specifier`.
+fn optional_failure_fixture_with_specifier(
+    failure: FailureShape,
+    specifier: &str,
+) -> (tempfile::TempDir, PackageManifest, FailingAliasResolver) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let path = tmp.path().join("package.json");
     let json = serde_json::json!({
         "name": "root",
         "version": "0.0.0",
         "dependencies": { "kept": "^1.0.0" },
-        "optionalDependencies": { "broken": "^1.0.0" },
+        "optionalDependencies": { "broken": specifier },
     });
     std::fs::write(&path, serde_json::to_string(&json).unwrap()).expect("write package.json");
     let manifest = PackageManifest::from_path(path).expect("parse package.json");
@@ -691,6 +698,7 @@ impl Resolver for OverlapRecordingResolver {
                         "name": alias,
                         "version": "1.0.0",
                     }))),
+                    non_deprecated_alternative: None,
                 },
                 alias: Some(alias),
             }))
@@ -750,7 +758,8 @@ fn table_entry(name: &str, manifest: serde_json::Value) -> ((String, String), Re
 /// barrier lifts.
 struct WarmupProbeResolver {
     table: HashMap<(String, String), ResolveResult>,
-    calls: Mutex<Vec<(String, String)>>,
+    /// `(alias, range, project dir)` of every call, in order.
+    calls: Mutex<Vec<(String, String, std::path::PathBuf)>>,
     /// `(held, release)`: resolving `held` completes only once `release`
     /// has been requested.
     gate: Option<(String, String)>,
@@ -772,8 +781,19 @@ impl WarmupProbeResolver {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(a, r)| a == alias && r == range)
+            .filter(|(a, r, _)| a == alias && r == range)
             .count()
+    }
+
+    /// The project directories of the calls for `alias@range`, in order.
+    fn callers_of(&self, alias: &str, range: &str) -> Vec<std::path::PathBuf> {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(a, r, _)| a == alias && r == range)
+            .map(|(_, _, dir)| dir.clone())
+            .collect()
     }
 }
 
@@ -781,14 +801,14 @@ impl Resolver for WarmupProbeResolver {
     fn resolve<'a>(
         &'a self,
         wanted: &'a WantedDependency,
-        _opts: &'a ResolveOptions,
+        opts: &'a ResolveOptions,
     ) -> ResolveFuture<'a> {
         let alias = wanted.alias.clone().unwrap_or_default();
         let range = wanted.bare_specifier.clone().unwrap_or_default();
         self.calls
             .lock()
             .unwrap()
-            .push((alias.clone(), range.clone()));
+            .push((alias.clone(), range.clone(), opts.project.project_dir.clone()));
         let result = self.table
             .get(&(alias.clone(), range))
             .cloned();

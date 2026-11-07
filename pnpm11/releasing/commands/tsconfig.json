@@ -25,6 +25,9 @@
       "path": "../../bins/resolver"
     },
     {
+      "path": "../../building/policy"
+    },
+    {
       "path": "../../catalogs/config"
     },
     {
@@ -97,7 +100,13 @@
       "path": "../../installing/commands"
     },
     {
+      "path": "../../installing/deps-resolver"
+    },
+    {
       "path": "../../lockfile/fs"
+    },
+    {
+      "path": "../../lockfile/peer-edges"
     },
     {
       "path": "../../lockfile/types"

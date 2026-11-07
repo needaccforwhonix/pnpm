@@ -44,7 +44,7 @@ snapshots:
 #[tokio::test]
 async fn rejects_semver_key_backed_by_non_http_tarball() {
     // A file: tarball under a semver key is not registry-backed and the npm
-    // verifier skips non-http(s) tarballs, so the shape pass must reject it.
+    // verifier skips non-HTTP and non-HTTPS tarballs, so the shape pass must reject it.
     let lockfile = parse(
         "lockfileVersion: '9.0'
 
@@ -108,5 +108,83 @@ snapshots:
     )
     .await
     .expect_err("uppercased git-host tarball must be rejected");
+    assert!(matches!(err, VerifyError::ResolutionShapeMismatch { .. }), "got {err:?}");
+}
+
+#[tokio::test]
+async fn accepts_semver_key_backed_by_custom_resolution() {
+    let lockfile = parse(
+        "lockfileVersion: '9.0'
+
+importers:
+
+  .:
+    dependencies:
+      acme:
+        specifier: ^1.0.0
+        version: 1.0.0
+
+packages:
+
+  acme@1.0.0:
+    resolution: {type: 'custom:e2e', integrity: sha512-deadbeef}
+
+snapshots:
+
+  acme@1.0.0: {}
+",
+    );
+    verify_lockfile_resolutions::<SilentReporter>(
+        &lockfile,
+        &[],
+        &VerifyLockfileResolutionsOptions::default(),
+    )
+    .await
+    .expect("custom resolution under a semver key must be accepted");
+}
+
+#[tokio::test]
+async fn rejects_semver_key_whose_variations_fallback_is_a_non_http_tarball() {
+    // A host that no variant matches installs the fallback, so a `file:`
+    // fallback is no more registry-backed than a `file:` resolution.
+    let lockfile = parse(
+        "lockfileVersion: '9.0'
+
+importers:
+
+  .:
+    dependencies:
+      acme:
+        specifier: ^1.0.0
+        version: 1.0.0
+
+packages:
+
+  acme@1.0.0:
+    resolution:
+      type: variations
+      variants:
+        - resolution:
+            integrity: sha512-deadbeef
+            tarball: 'file:///tmp/evil.tgz'
+          targets:
+            - any: true
+        - resolution: {integrity: sha512-deadbeef}
+          targets:
+            - os: linux
+              cpu: x64
+
+snapshots:
+
+  acme@1.0.0: {}
+",
+    );
+    let err = verify_lockfile_resolutions::<SilentReporter>(
+        &lockfile,
+        &[],
+        &VerifyLockfileResolutionsOptions::default(),
+    )
+    .await
+    .expect_err("a file: variant that targets any under a semver key must be rejected");
     assert!(matches!(err, VerifyError::ResolutionShapeMismatch { .. }), "got {err:?}");
 }

@@ -1,7 +1,10 @@
 #[cfg(windows)]
 pub(super) use windows::ensure_workspace_directory_windows;
 
-use super::{IntoDiagnostic, Path, PathBuf, Result, fs, io};
+#[cfg(any(unix, windows))]
+use super::fs;
+use super::{IntoDiagnostic, Path, PathBuf, Result, io};
+#[cfg(any(unix, windows))]
 use miette::WrapErr;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,6 +27,11 @@ pub(super) fn ensure_workspace_directory(
     #[cfg(unix)]
     {
         ensure_workspace_directory_unix(root_dir.to_path_buf(), components)
+    }
+    #[cfg(target_os = "wasi")]
+    {
+        let _ = (root_dir, components);
+        wasi::unsupported().into_diagnostic()
     }
     #[cfg(windows)]
     {
@@ -93,6 +101,7 @@ fn open_or_create_directory_at(
     }
 }
 
+#[cfg(any(unix, windows))]
 fn accept_existing_directory(error: io::Error) -> io::Result<()> {
     match error.kind() {
         // Lost the race with a concurrent install; its directory is as good as ours.
@@ -186,13 +195,13 @@ pub(super) fn write_workspace_file(
     use std::os::{fd::AsRawFd as _, unix::ffi::OsStrExt as _, unix::fs::PermissionsExt as _};
 
     let destination = std::ffi::CString::new(std::ffi::OsStr::new(name).as_bytes())?;
-    let (temporary, mut file) = create_workspace_temporary(directory, name)?;
+    let (temporary, mut file) = create_workspace_temporary(directory, name, mode)?;
     let result = (|| {
         file.write_all(bytes)?;
         if let Some(mode) = mode {
             file.set_permissions(fs::Permissions::from_mode(mode))?;
         }
-        file.sync_all()?;
+        pnpm_fs::sync_file(&file)?;
         // SAFETY: both names are valid C strings and both directory descriptors
         // refer to the same live, pinned directory.
         if unsafe {
@@ -299,7 +308,7 @@ fn move_occupant_aside(
 
     let ignored_name = format!(
         ".ignored_{name}-{}-{}",
-        std::process::id(),
+        pnpm_fs::process_id(),
         MANAGED_TEMP_ID.fetch_add(1, Ordering::Relaxed),
     );
     let ignored = std::ffi::CString::new(ignored_name.as_bytes())?;
@@ -369,12 +378,13 @@ pub(super) fn force_workspace_symlink(
 fn create_workspace_temporary(
     directory: &ManagedDirectory,
     name: &str,
+    existing_mode: Option<u32>,
 ) -> io::Result<(std::ffi::CString, fs::File)> {
     use std::os::fd::AsRawFd as _;
     loop {
         let temporary_name = format!(
             ".{name}.pnpm-{}-{}",
-            std::process::id(),
+            pnpm_fs::process_id(),
             MANAGED_TEMP_ID.fetch_add(1, Ordering::Relaxed),
         );
         let temporary = std::ffi::CString::new(temporary_name.as_bytes())?;
@@ -385,7 +395,10 @@ fn create_workspace_temporary(
                 directory.handle.as_raw_fd(),
                 temporary.as_ptr(),
                 libc::O_WRONLY | libc::O_CLOEXEC | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
-                0o600,
+                // A new file gets the umask mode, as any new project file does. A
+                // replacement starts at the existing mode, so its contents are never
+                // readable by more users than the file it replaces.
+                existing_mode.map_or(0o666, |mode| mode & 0o777),
             )
         };
         match file_from_descriptor(descriptor) {
@@ -398,3 +411,8 @@ fn create_workspace_temporary(
 
 #[cfg(windows)]
 mod windows;
+
+#[cfg(target_os = "wasi")]
+mod wasi;
+#[cfg(target_os = "wasi")]
+pub(super) use wasi::{force_workspace_symlink, read_workspace_file, write_workspace_file};

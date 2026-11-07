@@ -4,7 +4,7 @@ use std::{
 };
 
 use pipe_trait::Pipe;
-use pnpm_network::{AuthHeaders, ThrottledClient};
+use pnpm_network::{AuthHeaders, ThrottledClient, normalize_registry_url};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -52,7 +52,7 @@ pub struct Package {
 
     /// Last `ETag` the registry returned when this manifest was
     /// fetched. Threaded into `If-None-Match` on the next
-    /// conditional GET by the cached metadata fetcher (Phase 5).
+    /// conditional GET by the cached metadata fetcher.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub etag: Option<String>,
 
@@ -223,7 +223,8 @@ impl Package {
         auth_headers: &AuthHeaders,
     ) -> Result<Self, RegistryError> {
         let encoded_name = pnpm_network::encode_package_name(name);
-        let url = format!("{registry}{encoded_name}"); // TODO: use reqwest URL directly
+        let normalized = normalize_registry_url(registry);
+        let url = format!("{normalized}{encoded_name}"); // TODO: use reqwest URL directly
         let network_error = |error| NetworkError { error, url: url.clone() };
         // Hold the semaphore permit across send + body consumption so the
         // socket-bound stays effective under concurrent fan-out. See the

@@ -14,13 +14,12 @@
 //! store, which is exactly pnpm's `resolvedFrom === 'store'` gate, so the sweep
 //! runs after any populating import.
 
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-};
+use std::path::Path;
 
 #[cfg(target_os = "macos")]
-use std::{ffi::OsStr, process::Command};
+use crate::process::Command;
+#[cfg(target_os = "macos")]
+use std::{ffi::OsStr, path::PathBuf};
 
 #[cfg(target_os = "macos")]
 const QUARANTINE_ATTR: &str = "com.apple.quarantine";
@@ -41,10 +40,7 @@ const MAX_ARG_BYTES: usize = 100_000;
 /// just placed under `dir_path`. The relative entry paths come from the indexed
 /// `cas_paths`, so the targets are `dir_path.join(entry)`. A no-op off macOS.
 #[cfg(target_os = "macos")]
-pub fn remove_quarantine_from_native_binaries(
-    dir_path: &Path,
-    cas_paths: &HashMap<String, PathBuf>,
-) {
+pub fn remove_quarantine_from_native_binaries(dir_path: &Path, cas_paths: &pnpm_fs::CasPaths) {
     let native_binaries: Vec<PathBuf> = cas_paths
         .keys()
         .filter(|entry| is_native_binary(entry))
@@ -54,11 +50,7 @@ pub fn remove_quarantine_from_native_binaries(
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn remove_quarantine_from_native_binaries(
-    _dir_path: &Path,
-    _cas_paths: &HashMap<String, PathBuf>,
-) {
-}
+pub fn remove_quarantine_from_native_binaries(_dir_path: &Path, _cas_paths: &pnpm_fs::CasPaths) {}
 
 #[cfg(target_os = "macos")]
 fn is_native_binary(entry: &str) -> bool {
@@ -94,7 +86,7 @@ fn remove_quarantine_from_chunk(file_paths: &[&Path]) {
     match output {
         Ok(output) if output.status.success() => {}
         Ok(output) => {
-            // `xattr -d` exits non-zero when a file simply has no quarantine
+            // `xattr -d` exits non-zero when a file has no quarantine
             // xattr ("No such xattr"), the common case, and reports "No such
             // file" for entries the importer legitimately dropped or renamed.
             // Surface only errors that are not of those kinds.

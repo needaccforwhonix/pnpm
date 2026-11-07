@@ -13,11 +13,13 @@
 
 pub(crate) use allow_builds::{add_allow_build, add_undecided_allow_build, prune_allow_builds};
 pub(crate) use catalogs::{CatalogReferences, add_catalogs, remove_unused_catalogs};
+pub(crate) use permissions::{remove_allow_build, set_permission};
 pub(crate) use policies::{
     prune_minimum_release_age_excludes, prune_trust_policy_excludes, set_audit_ignore_ghsas,
     set_minimum_release_age_excludes,
 };
 pub(crate) use scanning::{Inline, document_root_is_inline, has_unsupported_inline_value};
+pub(crate) use skills_dirs::set_skills_dirs;
 pub(crate) use spacing::uses_blank_line_style;
 
 use std::{
@@ -38,9 +40,7 @@ use crate::{
 
 /// Upsert one `name → specifier` entry into the top-level
 /// `configDependencies:` block, creating the block if absent. Returns
-/// whether anything changed. The entry value is a clean specifier; the
-/// resolved integrity lives in the env lockfile, so this only ever
-/// writes the `configDependencies` map in `pnpm-workspace.yaml`.
+/// whether anything changed.
 pub(crate) fn add_config_dependency(
     manifest: &mut Manifest,
     name: &str,
@@ -137,7 +137,6 @@ fn drop_omitted_patches(
 
 /// Upsert one `selector → specifier` entry into the top-level `overrides:`
 /// block, creating the block if absent. Returns whether anything changed.
-/// Used by `pacquet link` and (one entry at a time) by `pnpm audit --fix`.
 pub(crate) fn add_overrides(
     manifest: &mut Manifest,
     selector: &str,
@@ -161,7 +160,7 @@ pub(crate) fn add_overrides(
 /// Delete the given `selectors` from the top-level `overrides:` block,
 /// dropping the whole block when nothing remains. Selectors absent from the
 /// block are ignored. Returns whether anything changed. The inverse of
-/// [`add_overrides`]; used by `pacquet unlink`.
+/// [`add_overrides`].
 pub(crate) fn remove_overrides(manifest: &mut Manifest, selectors: &[String]) -> bool {
     const BLOCK: &str = "overrides";
     let present: Vec<String> = match manifest.overrides.as_ref() {
@@ -302,8 +301,7 @@ fn upsert_top_level_entry(
 
 /// Set the top-level `key` to `value` (a non-null JSON value), inserting the
 /// block when absent and replacing it when present. Returns whether anything
-/// changed — a deep-equal current value is a no-op. Used by `pnpm config set`
-/// for arbitrary `pnpm-workspace.yaml` / `config.yaml` keys.
+/// changed — a deep-equal current value is a no-op.
 ///
 /// The replace path removes the old block and re-inserts the new one at the
 /// reorder position (rather than an in-place value patch), so the same code
@@ -332,8 +330,7 @@ pub(crate) fn set_top_level_field(
 }
 
 /// Remove the top-level `key`. Returns whether anything changed (false when the
-/// key is absent). Used by `pnpm config delete` and by `pnpm config set` when
-/// the cast value is null/undefined.
+/// key is absent).
 pub(crate) fn remove_top_level_field(manifest: &mut Manifest, key: &str) -> bool {
     if !manifest.document.keys
         .iter()
@@ -477,22 +474,30 @@ mod catalogs;
 mod policies;
 
 mod sequences;
-use sequences::{reconcile_sequence_items, render_top_level_sequence, upsert_sequence_entry};
+use sequences::{
+    detect_sequence_indent, reconcile_sequence_items, render_top_level_sequence,
+    upsert_sequence_entry,
+};
 
 mod allow_builds;
 use allow_builds::render_bool;
 
 mod mapping;
 use mapping::{
-    replace_bool_value_at, replace_value_at, upsert, write_entry_at, write_rendered_entry_at,
+    replace_value_at, replace_value_text_at, upsert, write_entry_at, write_named_subblock,
+    write_rendered_entry_at,
 };
+
+mod permissions;
+
+mod skills_dirs;
 
 mod scanning;
 
 use scanning::{
-    Line, Mapping, TopLevelSpan, comment_start, leading_comment_start, lines, locate,
-    locate_mapping, locate_sequence, mapping_keys, structural_colon_index, structural_indent,
-    top_level_key_line, top_level_span,
+    Line, Mapping, TopLevelSpan, comment_start, is_sequence_item_line, is_top_level_block_boundary,
+    is_top_level_key, leading_comment_start, lines, locate, locate_mapping, locate_sequence,
+    mapping_keys, structural_colon_index, structural_indent, top_level_key_line, top_level_span,
 };
 
 mod spacing;

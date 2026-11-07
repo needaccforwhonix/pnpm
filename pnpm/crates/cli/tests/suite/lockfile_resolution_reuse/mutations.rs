@@ -59,7 +59,7 @@ fn adding_and_removing_an_ignored_optional_dependency_uses_the_safe_path() {
     let wanted = pnpm_lockfile::Lockfile::load_wanted_from_dir(&workspace)
         .expect("load updated wanted lockfile")
         .expect("updated wanted lockfile");
-    let current = pnpm_lockfile::Lockfile::load_current_from_virtual_store_dir(&workspace.join(
+    let current = pnpm_lockfile::Lockfile::load_current_from_install_state_dir(&workspace.join(
         "node_modules/.pnpm",
     ))
     .expect("load current lockfile")
@@ -566,7 +566,7 @@ fn a_remove_keeps_the_specifiers_a_project_rewriting_pnpmfile_recorded() {
 }
 
 #[test]
-fn a_frozen_install_tolerates_the_importer_of_a_removed_workspace_project() {
+fn a_frozen_install_skips_the_importer_of_an_absent_workspace_project() {
     let CommandTempCwd { workspace, root, npmrc_info, .. } =
         CommandTempCwd::init().add_mocked_registry();
     let AddMockedRegistry { mock_instance, .. } = npmrc_info;
@@ -576,14 +576,14 @@ fn a_frozen_install_tolerates_the_importer_of_a_removed_workspace_project() {
         .assert()
         .success();
 
+    // A Docker build context can leave a project out (pnpm/pnpm#16453).
     fs::remove_dir_all(workspace.join("packages/b")).expect("remove the member");
 
-    // pnpm's importer-set gate lives in the auto-frozen branch, which an
-    // explicit `--frozen-lockfile` short-circuits past.
     pacquet_at(&workspace)
         .with_args(["install", "--frozen-lockfile"])
         .assert()
         .success();
+    assert!(!workspace.join("packages/b").exists(), "the frozen install recreated packages/b");
 
     drop((root, mock_instance));
 }
@@ -699,6 +699,68 @@ fn add_command_reuses_a_locked_version_without_resolving() {
             .join("dep-of-pkg-with-1-dep")
             .exists(),
         "the added dependency is linked into node_modules",
+    );
+
+    drop((root, mock_instance));
+}
+
+#[test]
+fn promoting_the_locked_version_through_a_range_skips_resolution() {
+    let CommandTempCwd { workspace, root, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({
+            "dependencies": { "@pnpm.e2e/pkg-with-1-dep": "100.0.0" }
+        })
+        .to_string(),
+    )
+    .expect("write package.json");
+    pacquet_at(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+
+    let assert = pacquet_at(&workspace)
+        .with_args(["add", "@pnpm.e2e/dep-of-pkg-with-1-dep@^100.0.0"])
+        .assert()
+        .success();
+    assert!(
+        String::from_utf8_lossy(&assert.get_output().stdout)
+            .contains("Lockfile is up to date, resolution step is skipped"),
+        "a range that picks the only locked version needs no resolution",
+    );
+
+    drop((root, mock_instance));
+}
+
+#[test]
+fn readding_the_locked_version_through_a_range_skips_resolution() {
+    let CommandTempCwd { workspace, root, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({
+            "dependencies": { "@pnpm.e2e/dep-of-pkg-with-1-dep": "^100.1.0" }
+        })
+        .to_string(),
+    )
+    .expect("write package.json");
+    pacquet_at(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+
+    let assert = pacquet_at(&workspace)
+        .with_args(["add", "@pnpm.e2e/dep-of-pkg-with-1-dep@^100.0.0"])
+        .assert()
+        .success();
+    assert!(
+        String::from_utf8_lossy(&assert.get_output().stdout)
+            .contains("Lockfile is up to date, resolution step is skipped"),
+        "a range that picks the locked version needs no resolution",
     );
 
     drop((root, mock_instance));

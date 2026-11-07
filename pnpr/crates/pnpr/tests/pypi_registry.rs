@@ -1,20 +1,17 @@
 //! The Python package index surface: the legacy upload API, the Simple API
 //! in both renderings, file downloads, and proxying an upstream index.
 
-// `#[path]` rather than the `tests/common/mod.rs` layout, which the
-// Perfectionist dylint forbids.
-#[path = "common/ecosystem.rs"]
-mod common;
-
+use crate::{ecosystem as common, tokens::issue_token};
 use axum::{
     body::Body,
     http::{Request, StatusCode, header},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use common::{HostedSource, PUBLIC_URL, body_bytes, find_file, mixed_router_config, sha256_hex};
-use pnpr::{AuthState, Config, Ecosystem, recover_publish_journal, router_with_auth};
+use pnpr::{AuthState, Config, Ecosystem, router_with_auth};
+use pnpr_storage::layout::{blob_segment, write_local_layout_marker};
 use serde_json::{Value, json};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -100,10 +97,10 @@ fn get(path: &str, accept: Option<&str>) -> Request<Body> {
 async fn uploads_a_wheel_and_serves_the_simple_pages_and_the_file() {
     let tmp = TempDir::new().unwrap();
     let auth = AuthState::in_memory();
-    let token = auth.tokens.issue("alice").await.unwrap();
+    let token = issue_token(&auth, "alice").await;
     let app =
         router_with_auth(pypi_config(tmp.path().to_path_buf(), "http://upstream.invalid/"), auth);
-    let wheel = b"PK\x03\x04 pretend wheel".to_vec();
+    let wheel = common::python_wheel("demo-pkg", "1.0.0");
     let filename = "demo_pkg-1.0.0-py3-none-any.whl";
 
     let response = app
@@ -113,16 +110,13 @@ async fn uploads_a_wheel_and_serves_the_simple_pages_and_the_file() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert!(
-        tmp.path()
-            .join("python/demo-pkg")
-            .join(filename)
-            .is_file(),
-    );
-    assert!(
-        std::fs::read_dir(tmp.path().join(".pnpr-journal"))
-            .unwrap()
-            .next()
-            .is_none(),
+        pnpr_fixtures::read_hosted_file(
+            tmp.path(),
+            ("python", pnpr_storage::Ecosystem::Pypi),
+            "demo-pkg",
+            filename,
+        )
+        .is_some(),
     );
 
     // PEP 691 JSON, with the file URL pointing back at this registry.
@@ -217,14 +211,16 @@ async fn uploads_a_wheel_and_serves_the_simple_pages_and_the_file() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(body_bytes(response.into_body()).await, wheel);
 
-    // The named form is caller-scoped and points file URLs at itself.
+    // The named form of a public project stays cacheable and points file
+    // URLs at itself.
     let response = app
         .clone()
         .oneshot(get("/pypi/~internal/simple/demo-pkg/", Some(JSON)))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response.headers()[header::CACHE_CONTROL], "private, no-store");
+    assert!(!response.headers().contains_key(header::CACHE_CONTROL));
+    assert_eq!(response.headers()[header::VARY], "Accept");
     let page: Value = serde_json::from_slice(&body_bytes(response.into_body()).await).unwrap();
     assert_eq!(
         page["files"][0]["url"],
@@ -247,10 +243,10 @@ async fn uploads_a_wheel_and_serves_the_simple_pages_and_the_file() {
 async fn upload_is_authenticated_and_validated() {
     let tmp = TempDir::new().unwrap();
     let auth = AuthState::in_memory();
-    let token = auth.tokens.issue("alice").await.unwrap();
+    let token = issue_token(&auth, "alice").await;
     let app =
         router_with_auth(pypi_config(tmp.path().to_path_buf(), "http://upstream.invalid/"), auth);
-    let wheel = b"wheel bytes".to_vec();
+    let wheel = common::python_wheel("demo-pkg", "1.0.0");
     let filename = "demo_pkg-1.0.0-py3-none-any.whl";
     let good = wheel_upload("demo-pkg", "1.0.0", filename, &wheel);
 
@@ -442,7 +438,10 @@ async fn proxies_a_simple_page_and_verified_downloads_through_an_upstream() {
     }
     page_mock.assert_async().await;
     file_mock.assert_async().await;
-    assert!(find_file(&tmp.path().join(".pnpr-cache"), filename).is_some(), "file is cached");
+    assert!(
+        find_file(&tmp.path().join(".pnpr-cache"), &blob_segment("requests", filename)).is_some(),
+        "file is cached",
+    );
 
     // A file the page does not list is never fetched.
     let response = app
@@ -515,7 +514,7 @@ async fn an_upstream_without_the_json_api_is_a_gateway_error_and_a_bad_hash_is_n
         .await
         .unwrap();
     assert!(axum::body::to_bytes(response.into_body(), usize::MAX).await.is_err());
-    assert!(find_file(&tmp.path().join(".pnpr-cache"), filename).is_none());
+    assert!(find_file(&tmp.path().join(".pnpr-cache"), &blob_segment("lying", filename)).is_none());
 }
 
 #[tokio::test]
@@ -542,81 +541,6 @@ async fn anonymous_uploads_are_rejected_before_reading_the_body() {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-}
-
-#[tokio::test]
-async fn conflicting_object_store_upload_does_not_publish_metadata_or_leave_staged_bytes() {
-    use object_store::{ObjectStoreExt, memory::InMemory, path::Path as ObjectPath};
-    use pnpr::HostedStoreConfig;
-    use std::sync::Arc;
-
-    let tmp = TempDir::new().unwrap();
-    let store = Arc::new(InMemory::new());
-    let filename = "demo_pkg-1.0.0-py3-none-any.whl";
-    let object = ObjectPath::from(format!("python/demo-pkg/{filename}"));
-    store
-        .put(&object, axum::body::Bytes::from_static(b"winning artifact").into())
-        .await
-        .unwrap();
-    let mut config = pypi_config(tmp.path().to_path_buf(), "http://upstream.invalid/");
-    config.storage.hosted_backend = HostedStoreConfig::ObjectStore {
-        store: Arc::<InMemory>::clone(&store),
-        prefix: String::new(),
-    };
-    let auth = AuthState::in_memory();
-    let token = auth.tokens.issue("alice").await.unwrap();
-    let app = router_with_auth(config, auth);
-    let response = app
-        .clone()
-        .oneshot(upload_request(
-            Some(&token),
-            wheel_upload("demo-pkg", "1.0.0", filename, b"losing artifact"),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-    assert_eq!(
-        store
-            .get(&object)
-            .await
-            .unwrap()
-            .bytes()
-            .await
-            .unwrap(),
-        "winning artifact",
-    );
-    assert_eq!(
-        app.oneshot(get("/pypi/simple/demo-pkg/", Some(JSON))).await
-            .unwrap()
-            .status(),
-        StatusCode::NOT_FOUND,
-    );
-    fn staged_files(path: &Path) -> Vec<PathBuf> {
-        let mut staged = Vec::new();
-        for entry in std::fs::read_dir(path).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                staged.extend(staged_files(&path));
-            } else if path
-                .file_name()
-                .is_some_and(|name| name.to_string_lossy().contains(".tmp."))
-            {
-                staged.push(path);
-            }
-        }
-        staged
-    }
-    // The losing bytes are cleaned up only once removing the journal entry is
-    // known to have reached the disk, and a journal entry that comes back
-    // needs them to re-detect the conflict. Windows offers no way to confirm
-    // that, so there they stay.
-    let staged = staged_files(tmp.path());
-    if cfg!(unix) {
-        assert_eq!(staged, Vec::<PathBuf>::new());
-    } else {
-        assert_eq!(staged.len(), 1, "{staged:?}");
-        assert_eq!(std::fs::read(&staged[0]).unwrap(), b"losing artifact");
     }
 }
 
@@ -682,12 +606,18 @@ async fn upstream_file_hosts_must_be_approved_by_the_operator() {
 #[tokio::test]
 async fn hosted_downloads_reject_files_absent_from_publication_metadata() {
     let tmp = TempDir::new().unwrap();
-    let package_dir = tmp.path().join("python/demo-pkg");
-    tokio::fs::create_dir_all(&package_dir).await.unwrap();
+    write_local_layout_marker(tmp.path()).unwrap();
     let orphan = "demo_pkg-1.0.0-py3-none-any.whl";
-    tokio::fs::write(package_dir.join(orphan), b"unpublished wheel").await.unwrap();
+    // Stored and mapped, but absent from the project's document.
+    pnpr_fixtures::write_hosted_file(
+        tmp.path(),
+        ("python", pnpr_storage::Ecosystem::Pypi),
+        ("demo-pkg", ""),
+        orphan,
+        b"unpublished wheel",
+    );
     let auth = AuthState::in_memory();
-    let token = auth.tokens.issue("alice").await.unwrap();
+    let token = issue_token(&auth, "alice").await;
     let app =
         router_with_auth(pypi_config(tmp.path().to_path_buf(), "http://upstream.invalid/"), auth);
     let orphan_path = format!("/pypi/files/demo-pkg/{orphan}");
@@ -703,7 +633,12 @@ async fn hosted_downloads_reject_files_absent_from_publication_metadata() {
         .clone()
         .oneshot(upload_request(
             Some(&token),
-            wheel_upload("demo-pkg", "2.0.0", published, b"published wheel"),
+            wheel_upload(
+                "demo-pkg",
+                "2.0.0",
+                published,
+                &common::python_wheel("demo-pkg", "2.0.0"),
+            ),
         ))
         .await
         .unwrap();
@@ -719,115 +654,7 @@ async fn hosted_downloads_reject_files_absent_from_publication_metadata() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(body_bytes(response.into_body()).await, b"published wheel");
+    assert_eq!(body_bytes(response.into_body()).await, common::python_wheel("demo-pkg", "2.0.0"));
 }
 
-/// The on-disk state a crash between staging an uploaded file and recording
-/// it in the project document leaves behind: the staged tmp file plus the
-/// sealed journal entry that says where it belongs.
-fn fabricate_crashed_upload(storage: &Path, filename: &str, wheel: &[u8]) -> PathBuf {
-    let project_dir = storage.join("python/demo-pkg");
-    std::fs::create_dir_all(&project_dir).unwrap();
-    let tmp_path = project_dir.join(format!("{filename}.tmp.999.0"));
-    std::fs::write(&tmp_path, wheel).unwrap();
-
-    let txn_dir = storage.join(".pnpr-journal").join("0000000000000001-999-0");
-    std::fs::create_dir_all(&txn_dir).unwrap();
-    let document = json!({
-        "name": "demo-pkg",
-        "files": [{
-            "filename": filename,
-            "hashes": { "sha256": sha256_hex(wheel) },
-            "yanked": false,
-            "size": wheel.len(),
-        }],
-    });
-    std::fs::write(txn_dir.join("document-0.json"), serde_json::to_vec(&document).unwrap())
-        .unwrap();
-    let manifest = json!({
-        "packages": [{
-            "name": "demo-pkg",
-            "ecosystem": "pypi",
-            "org": "python",
-            "document_file": "document-0.json",
-            "blobs": [{ "filename": filename, "tmp_path": tmp_path }],
-        }],
-    });
-    std::fs::write(txn_dir.join("manifest.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
-    std::fs::write(txn_dir.join("commit"), b"").unwrap();
-    tmp_path
-}
-
-/// Both halves land, so the store never holds a file that no Simple API page
-/// mentions.
-#[tokio::test]
-async fn a_crashed_upload_is_completed_on_startup() {
-    let tmp = TempDir::new().unwrap();
-    let storage = tmp.path().to_path_buf();
-    let config = pypi_config(storage.clone(), "http://upstream.invalid/");
-    let wheel = b"PK\x03\x04 crashed wheel".to_vec();
-    let filename = "demo_pkg-1.0.0-py3-none-any.whl";
-    let tmp_path = fabricate_crashed_upload(&storage, filename, &wheel);
-
-    recover_publish_journal(&config).await.unwrap();
-
-    assert!(!tmp_path.exists(), "the staged file should be promoted away");
-    assert!(
-        std::fs::read_dir(storage.join(".pnpr-journal"))
-            .unwrap()
-            .next()
-            .is_none(),
-    );
-    let app = router_with_auth(config, AuthState::in_memory());
-    let response = app
-        .clone()
-        .oneshot(get("/pypi/simple/demo-pkg/", Some(JSON)))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let page: Value = serde_json::from_slice(&body_bytes(response.into_body()).await).unwrap();
-    assert_eq!(page["files"][0]["filename"], filename);
-    assert_eq!(page["files"][0]["hashes"]["sha256"], sha256_hex(&wheel));
-    let response = app
-        .oneshot(get(&format!("/pypi/files/demo-pkg/{filename}"), None))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(body_bytes(response.into_body()).await, wheel);
-}
-
-/// Applying a sealed transaction adds its file to the document as it stands
-/// rather than to the one the crashed upload read.
-#[tokio::test]
-async fn a_crashed_upload_keeps_what_was_uploaded_while_it_was_down() {
-    let tmp = TempDir::new().unwrap();
-    let storage = tmp.path().to_path_buf();
-    let auth = AuthState::in_memory();
-    let token = auth.tokens.issue("alice").await.unwrap();
-    let config = pypi_config(storage.clone(), "http://upstream.invalid/");
-    let published = "demo_pkg-2.0.0-py3-none-any.whl";
-    let response = router_with_auth(config.clone(), auth)
-        .oneshot(upload_request(
-            Some(&token),
-            wheel_upload("demo-pkg", "2.0.0", published, b"published while down"),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    fabricate_crashed_upload(&storage, "demo_pkg-1.0.0-py3-none-any.whl", b"crashed wheel");
-
-    recover_publish_journal(&config).await.unwrap();
-
-    let response = router_with_auth(config, AuthState::in_memory())
-        .oneshot(get("/pypi/simple/demo-pkg/", Some(JSON)))
-        .await
-        .unwrap();
-    let page: Value = serde_json::from_slice(&body_bytes(response.into_body()).await).unwrap();
-    let filenames: Vec<&str> = page["files"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|file| file["filename"].as_str().unwrap())
-        .collect();
-    assert_eq!(filenames, vec![published, "demo_pkg-1.0.0-py3-none-any.whl"]);
-}
+mod recovery;

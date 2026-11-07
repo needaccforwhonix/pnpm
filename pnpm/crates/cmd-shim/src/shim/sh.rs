@@ -1,33 +1,54 @@
-use super::{Path, ScriptRuntime, normalize_node_path_env_var, relative_target};
+#[cfg(not(windows))]
+use super::relocatable::{ShNodePathEntry, sh_node_path_entries};
+#[cfg(any(windows, test))]
+use super::{NodePathEnvVar, normalize_node_path_env_var};
+use super::{
+    Path, ScriptRuntime, relative_target,
+    relocatable::{BASEDIR_ABS_PRELUDE, is_within_root, marker_target, shim_target_markers},
+    sh_single_quote,
+};
 use std::fmt::Write as _;
 
 /// Generate the Unix shell-shim contents for `target_path`, written to
 /// `shim_path`. `node_path` entries (empty for a plain shim) become the
 /// cmd-shim `NODE_PATH` export block.
+///
+/// A shim inside `relocatable_root` names its target marker and every
+/// `NODE_PATH` entry inside that root relative to its own directory, so the
+/// tree keeps working after the root moves. `None`, or any root on Windows,
+/// writes the absolute paths `@zkochan/cmd-shim` writes.
+///
+/// A relative target is spelled from the shim's physical directory, so the
+/// shim still finds it when run through a symlinked package directory, such
+/// as `node_modules/vite/node_modules/.bin`. The relative path is computed
+/// from `shim_path`, which has to lie in that physical directory for the two
+/// to line up.
 #[must_use]
 pub fn generate_sh_shim(
     target_path: &Path,
     shim_path: &Path,
     runtime: Option<&ScriptRuntime>,
     node_path: &[String],
+    relocatable_root: Option<&Path>,
 ) -> String {
-    let mut sh = String::from(SH_SHIM_HEADER);
-    write_sh_node_path(&mut sh, node_path);
-
+    let shim_dir = shim_path.parent().unwrap_or_else(|| Path::new(""));
     let sh_target = relative_target(target_path, shim_path);
     let absolute = Path::new(&sh_target).is_absolute();
-    let quoted = QuotedTarget {
-        posix: if absolute {
-            format!(r#""{sh_target}""#)
-        } else {
-            format!(r#""$basedir/{sh_target}""#)
-        },
-        windows: if absolute {
-            format!(r#""{sh_target}""#)
-        } else {
-            format!(r#""$basedir_win/{sh_target}""#)
-        },
-    };
+    let mut sh = String::from(SH_SHIM_HEADER);
+    let physical_basedir = !absolute || is_within_root(relocatable_root, shim_dir, shim_dir);
+    if physical_basedir {
+        sh.push_str(BASEDIR_ABS_PRELUDE);
+    }
+    sh.push_str(SH_SHIM_PLATFORM);
+    #[cfg(windows)]
+    write_sh_node_path(&mut sh, node_path, true);
+    #[cfg(not(windows))]
+    write_sh_node_path_entries(
+        &mut sh,
+        &sh_node_path_entries(node_path, shim_dir, relocatable_root),
+    );
+
+    let quoted = QuotedTarget::new(&sh_target, absolute, physical_basedir);
 
     match runtime {
         Some(ScriptRuntime { prog: Some(prog), args }) => {
@@ -35,7 +56,7 @@ pub fn generate_sh_shim(
         }
         // The trailing `exit $?` is unreachable after the `exec`. It is
         // emitted anyway because upstream emits it, which is what keeps
-        // the two stacks' shims byte-identical.
+        // shims outside a relocatable root byte-identical to upstream's.
         runtime_opt => {
             let args = runtime_opt.map_or("", |runtime| runtime.args.as_str());
             let quoted_target = &quoted.posix;
@@ -43,7 +64,8 @@ pub fn generate_sh_shim(
         }
     }
 
-    writeln!(sh, "# {}", shim_target_marker(&target_path.to_string_lossy())).unwrap();
+    let marker = marker_target(target_path, &sh_target, shim_dir, relocatable_root);
+    writeln!(sh, "# {}", shim_target_marker(&marker)).unwrap();
     sh
 }
 
@@ -54,42 +76,122 @@ struct QuotedTarget {
     windows: String,
 }
 
+impl QuotedTarget {
+    fn new(sh_target: &str, absolute: bool, physical_basedir: bool) -> Self {
+        Self {
+            posix: if absolute {
+                sh_single_quote(sh_target)
+            } else if physical_basedir {
+                format!(r#""$basedir_abs"/{}"#, sh_single_quote(sh_target))
+            } else {
+                format!(r#""$basedir"/{}"#, sh_single_quote(sh_target))
+            },
+            windows: if absolute {
+                sh_single_quote(sh_target)
+            } else {
+                format!(r#""$basedir_win"/{}"#, sh_single_quote(sh_target))
+            },
+        }
+    }
+}
+
 /// Prepend the shim's own `node_modules` directories to `NODE_PATH`, when the
 /// linker asked for any.
-fn write_sh_node_path(sh: &mut String, node_path: &[String]) {
-    let sh_node_path = normalize_node_path_env_var(node_path).posix;
-    if sh_node_path.is_empty() {
+///
+/// A shim generated on Windows (`windows_host`) runs under shells that disagree
+/// on the path form, so it picks one when it runs: Cygwin and MSYS start the
+/// native Windows `node`, which reads `;`-separated Windows paths (MSYS would
+/// otherwise move `/mnt/c/...` under its own install directory), while WSL
+/// reads the `/mnt` form.
+#[cfg(any(windows, test))]
+pub(super) fn write_sh_node_path(sh: &mut String, node_path: &[String], windows_host: bool) {
+    let NodePathEnvVar { win32, posix } = normalize_node_path_env_var(node_path, windows_host);
+    if posix.is_empty() {
         return;
     }
+    if !windows_host {
+        let posix = sh_single_quote(&posix);
+        writeln!(
+            sh,
+            "if [ -z \"$NODE_PATH\" ]; then\n  export NODE_PATH={posix}\nelse\n  export NODE_PATH={posix}:\"$NODE_PATH\"\nfi",
+        )
+        .unwrap();
+        return;
+    }
+    let win32 = sh_single_quote(&win32);
+    let posix = sh_single_quote(&posix);
     writeln!(
         sh,
-        "if [ -z \"$NODE_PATH\" ]; then\n  export NODE_PATH=\"{sh_node_path}\"\nelse\n  export NODE_PATH=\"{sh_node_path}:$NODE_PATH\"\nfi",
+        "if [ -n \"$msys\" ]; then\n  new_node_path={win32}\n  node_path_sep=';'\nelse\n  new_node_path={posix}\n  node_path_sep=':'\nfi\nif [ -z \"$NODE_PATH\" ]; then\n  export NODE_PATH=\"$new_node_path\"\nelse\n  export NODE_PATH=\"$new_node_path$node_path_sep$NODE_PATH\"\nfi",
     )
     .unwrap();
 }
 
-/// Emit the `exec` block for a target with a script runtime, wrapping it in an
-/// MSYS branch when `cmd` switches need escaping there.
+#[cfg(not(windows))]
+fn write_sh_node_path_entries(sh: &mut String, entries: &[ShNodePathEntry]) {
+    if entries.is_empty() {
+        return;
+    }
+    // Adjacent literal entries share one quoted word, so a shim without a
+    // relocatable entry is byte-identical to the one pnpm 11 writes.
+    let posix = entries
+        .chunk_by(|left, right| {
+            matches!((left, right), (ShNodePathEntry::Literal(_), ShNodePathEntry::Literal(_)))
+        })
+        .map(quote_sh_node_path_run)
+        .collect::<Vec<_>>()
+        .join(":");
+    writeln!(
+        sh,
+        "if [ -z \"$NODE_PATH\" ]; then\n  export NODE_PATH={posix}\nelse\n  export NODE_PATH={posix}:\"$NODE_PATH\"\nfi",
+    )
+    .unwrap();
+}
+
+/// One shell word for `run`: a single relocatable entry, or adjacent literal
+/// entries joined with `:`.
+#[cfg(not(windows))]
+fn quote_sh_node_path_run(run: &[ShNodePathEntry]) -> String {
+    if let [ShNodePathEntry::RelativeToBasedir(path)] = run {
+        return format!(r#""$basedir_abs"/{}"#, sh_single_quote(path));
+    }
+    let literals = run
+        .iter()
+        .map(ShNodePathEntry::path)
+        .collect::<Vec<_>>();
+    sh_single_quote(&literals.join(":"))
+}
+
+/// Emit the `exec` block for a target with a script runtime, preceded by the
+/// MSYS exclusion of the `cmd` switch in `args`.
 fn write_sh_runtime_exec(sh: &mut String, prog: &str, args: &str, quoted: &QuotedTarget) {
     let prog_base = strip_exe_suffix(prog).unwrap_or(prog);
     let prog_has_exe = prog_base.len() != prog.len();
     let prog_exe = if prog_has_exe { prog.to_string() } else { format!("{prog}.exe") };
-    let exec = |exec_args: &str| {
-        sh_exec_block(&ShExec { prog, prog_exe: &prog_exe, prog_has_exe, quoted }, exec_args)
+    let args = if prog_base.eq_ignore_ascii_case("cmd") {
+        let (args, cmd_switch) = upper_case_cmd_switch(args);
+        if let Some(cmd_switch) = cmd_switch {
+            write_msys_cmd_switch_exclusion(sh, cmd_switch);
+        }
+        args
+    } else {
+        args.to_string()
     };
-    let msys_args = prog_base
-        .eq_ignore_ascii_case("cmd")
-        .then(|| escape_msys_cmd_switches(args))
-        .filter(|escaped_args| escaped_args != args);
-    let Some(msys_args) = msys_args else {
-        sh.push_str(&exec(args));
-        return;
-    };
+    sh.push_str(&sh_exec_block(&ShExec { prog, prog_exe: &prog_exe, prog_has_exe, quoted }, &args));
+}
+
+/// Exclude `cmd_switch` from MSYS argument conversion, which otherwise turns
+/// `/C` into a drive path and leaves cmd.exe interactive. The caller's own
+/// exclusions follow it. Unlike a doubled `//C`, the switch reaches cmd.exe
+/// intact whether conversion is on or off.
+///
+/// An entry excludes every argument that starts with it, case-sensitively, so
+/// the switch is upper case: a `/c` entry would also exclude a drive path such
+/// as `/c/Users`.
+fn write_msys_cmd_switch_exclusion(sh: &mut String, cmd_switch: &str) {
     writeln!(
         sh,
-        "if [ -n \"$msys\" ]; then\n{}else\n{}fi",
-        indent_shell_block(&exec(&msys_args)),
-        indent_shell_block(&exec(args)),
+        "if [ -n \"$msys\" ]; then\n  export MSYS2_ARG_CONV_EXCL=\"{cmd_switch}${{MSYS2_ARG_CONV_EXCL:+;$MSYS2_ARG_CONV_EXCL}}\"\nfi",
     )
     .unwrap();
 }
@@ -125,9 +227,12 @@ fn sh_exec_block(exec: &ShExec<'_>, exec_args: &str) -> String {
         return block;
     }
     let sh_long_prog = format!(r#""$basedir/{prog}""#);
+    // On Cygwin and MSYS, the program on PATH is usually a native Windows
+    // one, such as node.exe. Cygwin doesn't convert POSIX path arguments for
+    // it, so it gets the win32 form of the target.
     writeln!(
         block,
-        "if [ -n \"$exe\" ] && [ -x {sh_long_prog_exe} ]; then\n  exec {sh_long_prog_exe} {exec_args} {quoted_target_win} \"$@\"\nelif [ -x {sh_long_prog} ]; then\n  exec {sh_long_prog} {exec_args} {quoted_target} \"$@\"\nelif command -v {prog} >/dev/null 2>&1; then\n  exec {prog} {exec_args} {quoted_target} \"$@\"\nelif [ -n \"$exe\" ] && command -v {prog_exe} >/dev/null 2>&1; then\n  exec {prog_exe} {exec_args} {quoted_target_win} \"$@\"\nelse\n  exec {prog} {exec_args} {quoted_target} \"$@\"\nfi",
+        "if [ -n \"$exe\" ] && [ -x {sh_long_prog_exe} ]; then\n  exec {sh_long_prog_exe} {exec_args} {quoted_target_win} \"$@\"\nelif [ -x {sh_long_prog} ]; then\n  exec {sh_long_prog} {exec_args} {quoted_target} \"$@\"\nelif [ -n \"$msys\" ] && command -v {prog} >/dev/null 2>&1; then\n  exec {prog} {exec_args} {quoted_target_win} \"$@\"\nelif command -v {prog} >/dev/null 2>&1; then\n  exec {prog} {exec_args} {quoted_target} \"$@\"\nelif [ -n \"$exe\" ] && command -v {prog_exe} >/dev/null 2>&1; then\n  exec {prog_exe} {exec_args} {quoted_target_win} \"$@\"\nelse\n  exec {prog} {exec_args} {quoted_target} \"$@\"\nfi",
     )
     .unwrap();
     block
@@ -137,11 +242,37 @@ const SH_SHIM_HEADER: &str = r#"#!/bin/sh
 # Resolve $0 through symlinks so basedir is the shim's real directory.
 # Cap hops at the kernel's ELOOP limit so a cycle cannot hang the shim.
 #
-# A shim runs with node_modules/.bin at the front of PATH, so readlink, sed, and
-# uname go through `command -p`, which searches the system default path instead.
-# A dependency's bin cannot stand in for one of them and take over the shim
-# before it reaches its target. Directories come from `${link%/*}`, which needs
-# no helper at all.
+# A shim runs with node_modules/.bin at the front of PATH, so readlink, sed,
+# and printf go through `command -p`, which searches the system default path
+# instead. A dependency's bin cannot stand in for one of them and take over the
+# shim before it reaches its target. Directories come from `${link%/*}`, which
+# needs no helper at all.
+#
+# Under Cygwin and MSYS every helper a shim runs is another Windows process, so
+# the header runs one only where shell syntax cannot do the job.
+#
+# A helper the default path lacks, as in a Nix build sandbox, comes from PATH
+# instead, with node_modules and relative entries dropped from it.
+caller_path_set=${PATH+set}
+caller_path=${PATH-}
+helper_path=
+rest=$caller_path:
+while [ -n "$rest" ]; do
+  dir=${rest%%:*}
+  rest=${rest#*:}
+  case "$dir" in
+    */node_modules/*|*/node_modules) ;;
+    /*) helper_path=${helper_path:+$helper_path:}$dir ;;
+  esac
+done
+# An empty PATH searches the current directory.
+PATH=${helper_path:-/}
+# A helper comes from PATH only when /usr/bin and /bin lack it and PATH has it.
+# `command -p -v` cannot tell, because the bash 3.2 that macOS ships as sh
+# answers it from PATH. `[ -x ]` also fails where a sandbox denies the file.
+run_helper() {
+  if [ -x "/usr/bin/$1" ] || [ -x "/bin/$1" ] || ! command -v "$1" >/dev/null 2>&1; then command -p "$@"; else command "$@"; fi
+}
 link="$0"
 # `${link%/*}` needs a separator to strip. A bare name came from a PATH lookup
 # and stands for a file in the current directory.
@@ -152,28 +283,45 @@ esac
 hops=0
 while [ -L "$link" ] && [ "$hops" -lt 40 ]; do
   hops=$((hops+1))
-  target=$(command -p readlink "$link")
+  target=$(run_helper readlink "$link")
   case "$target" in
     /*) link="$target" ;;
     *)  link="${link%/*}/$target" ;;
   esac
 done
-basedir=$(echo "$link" | command -p sed -e 's,\\,/,g')
+case "$link" in
+  *\\*) basedir=$(run_helper printf '%s\n' "$link" | run_helper sed -e 's,\\,/,g') ;;
+  *) basedir=$link ;;
+esac
 basedir="${basedir%/*}"
-basedir_win="$basedir"
+"#;
+
+/// The rest of the header, after the optional [`BASEDIR_ABS_PRELUDE`]: the
+/// Windows-form `$basedir_win` and the executable suffix for Cygwin, MinGW,
+/// MSYS, and WSL2.
+const SH_SHIM_PLATFORM: &str = r#"basedir_win="$basedir"
 exe=""
 msys=""
 
-case `command -p uname -a` in
+# /proc/version starts with the system name `uname -a` reports, and reading it
+# starts no process. Systems without it, such as macOS, take no branch.
+os=
+{ read -r os < /proc/version; } 2> /dev/null || :
+case "$os" in
   *CYGWIN*|*MINGW*|*MSYS*)
-    if command -v cygpath > /dev/null 2>&1; then
+    if converted=$(command -p cygpath -w "$basedir" 2>/dev/null) && [ -n "$converted" ]; then
+      basedir_win="$converted"
+    elif command -v cygpath > /dev/null 2>&1; then
       basedir_win=`cygpath -w "$basedir"`
     fi
     exe=".exe"
     msys="true"
   ;;
   *WSL2*)
-    if command -v wslpath > /dev/null 2>&1; then
+    if converted=$(command -p wslpath -w "$basedir" 2>/dev/null) && [ -n "$converted" ]; then
+      basedir_win="$converted"
+      exe=".exe"
+    elif command -v wslpath > /dev/null 2>&1; then
       basedir_win="$(wslpath -w "$basedir" 2> /dev/null)"
       if [ $? -ne 0 ] || [ -z "$basedir_win" ]; then
         basedir_win="$basedir"
@@ -183,42 +331,45 @@ case `command -p uname -a` in
     fi
   ;;
 esac
+if [ -n "$caller_path_set" ]; then PATH=$caller_path; else unset PATH; fi
 
 "#;
 
-fn indent_shell_block(script: &str) -> String {
-    script
-        .split('\n')
-        .map(|line| if line.is_empty() { String::new() } else { format!("  {line}") })
-        .collect::<Vec<_>>()
-        .join("\n")
+/// `args` with its first standalone `/C` or `/K` switch in upper case, and
+/// that switch. cmd.exe reads its switches case-insensitively and everything
+/// after that switch as the command to run, which keeps its own spelling.
+pub(super) fn upper_case_cmd_switch(args: &str) -> (String, Option<&'static str>) {
+    let mut offset = 0;
+    for piece in args.split_inclusive(char::is_whitespace) {
+        let arg = piece.trim_end_matches(char::is_whitespace);
+        let cmd_switch = if arg.eq_ignore_ascii_case("/C") {
+            "/C"
+        } else if arg.eq_ignore_ascii_case("/K") {
+            "/K"
+        } else {
+            offset += piece.len();
+            continue;
+        };
+        let upper_cased = format!("{}{cmd_switch}{}", &args[..offset], &args[offset + arg.len()..]);
+        return (upper_cased, Some(cmd_switch));
+    }
+    (args.to_owned(), None)
 }
 
-pub(super) fn escape_msys_cmd_switches(args: &str) -> String {
-    let mut escaped = String::with_capacity(args.len());
-    let mut chars = args.char_indices();
-    let mut at_boundary = true;
-
-    while let Some((_, ch)) = chars.next() {
-        if ch == '/' && at_boundary {
-            let mut lookahead = chars.clone();
-            if let Some((_, switch @ ('C' | 'c' | 'K' | 'k'))) = lookahead.next()
-                && lookahead.next().is_none_or(|(_, next)| next.is_whitespace())
-            {
-                escaped.push('/');
-                escaped.push('/');
-                escaped.push(switch);
-                chars.next();
-                at_boundary = false;
-                continue;
-            }
-        }
-
-        escaped.push(ch);
-        at_boundary = ch.is_whitespace();
-    }
-
-    escaped
+/// Whether an already-on-disk POSIX shim hands `cmd` a doubled switch such as
+/// `//C`, which cmd.exe reads as no switch when MSYS argument conversion is
+/// off. The target marker still matches such a shim, so a warm reinstall
+/// checks for the doubled switch to replace it.
+#[must_use]
+pub fn is_sh_shim_msys_cmd_switch_doubled(shim_content: &str) -> bool {
+    shim_content
+        .lines()
+        .any(|line| {
+            line.trim_start().starts_with("exec ")
+                && line
+                    .split_whitespace()
+                    .any(|arg| matches!(arg, "//C" | "//c" | "//K" | "//k"))
+        })
 }
 
 pub(super) fn strip_exe_suffix(prog: &str) -> Option<&str> {
@@ -228,45 +379,93 @@ pub(super) fn strip_exe_suffix(prog: &str) -> Option<&str> {
         .then(|| &prog[..suffix_start])
 }
 
-/// Trailing `# cmd-shim-target=<rel>` marker. [`is_shim_pointing_at`]
-/// reads it to detect whether an existing shim already targets the same
-/// source without re-parsing its body, short-circuiting warm reinstalls.
+/// Trailing `# cmd-shim-target=<target>` marker, naming the target relative
+/// to the shim inside a relocatable root and absolutely otherwise.
+/// [`is_shim_pointing_at`] reads it to detect whether an existing shim
+/// already targets the same source without re-parsing its body,
+/// short-circuiting warm reinstalls.
 fn shim_target_marker(target: &str) -> String {
-    format!("cmd-shim-target={}", target.replace('\\', "/"))
+    format!("cmd-shim-target={}", normalize_sh_path(target))
 }
 
-/// Whether an already-on-disk shim targets `target_path`. The check looks
-/// for the trailing marker line so the header text never has to be
-/// byte-identical between cmd-shim versions.
+fn normalize_sh_path(path: &str) -> String {
+    if cfg!(windows) { path.replace('\\', "/") } else { path.to_owned() }
+}
+
+/// Whether an already-on-disk shim at `shim_path` targets `target_path`. The
+/// check looks for the trailing marker line so the header text never has to
+/// be byte-identical between cmd-shim versions. A relative marker resolves
+/// against the shim's directory.
 #[must_use]
-pub fn is_shim_pointing_at(shim_content: &str, target_path: &Path) -> bool {
-    is_shim_carrying_target(shim_content, &target_path.to_string_lossy())
+pub fn is_shim_pointing_at(shim_content: &str, shim_path: &Path, target_path: &Path) -> bool {
+    let target = normalize_sh_path(&target_path.to_string_lossy());
+    let normalized_target =
+        normalize_sh_path(&super::lexical_normalize(target_path).to_string_lossy());
+    let rel_target = relative_target(target_path, shim_path);
+    shim_target_markers(shim_content)
+        .any(|marker| {
+            marker == target || marker == normalized_target || marker == rel_target || {
+                let normalized_marker = super::lexical_normalize(Path::new(marker));
+                let normalized_marker = normalized_marker.to_string_lossy();
+                normalize_sh_path(&normalized_marker) == normalized_target
+            }
+        })
 }
 
 /// The line the header resolves `readlink` through. Taken verbatim from
 /// [`SH_SHIM_HEADER`], which
 /// `generate_sh_shim_header_carries_the_hardened_helper_line` pins, so the
 /// header cannot drift away from what [`is_sh_shim_hardened`] looks for.
-pub(super) const SH_SHIM_HARDENED_HELPER_LINE: &str = r#"  target=$(command -p readlink "$link")"#;
+pub(super) const SH_SHIM_HARDENED_HELPER_LINE: &str = r#"  target=$(run_helper readlink "$link")"#;
 
-/// Whether an already-on-disk POSIX shim resolves its shell helpers off the
-/// system default path rather than the caller's `PATH`.
+/// The line the header prints `$link` through to convert its backslashes,
+/// reached only when `$link` has one. Pinned the same way as
+/// [`SH_SHIM_HARDENED_HELPER_LINE`].
+pub(super) const SH_SHIM_PATH_PRINTF_LINE: &str =
+    r#"  *\\*) basedir=$(run_helper printf '%s\n' "$link" | run_helper sed -e 's,\\,/,g') ;;"#;
+
+/// The line the header converts `$basedir` through on Cygwin, MinGW, and MSYS.
+/// Taken verbatim from [`SH_SHIM_PLATFORM`] and pinned the same way as
+/// [`SH_SHIM_HARDENED_HELPER_LINE`].
+pub(super) const SH_SHIM_CYGPATH_LINE: &str = r#"    if converted=$(command -p cygpath -w "$basedir" 2>/dev/null) && [ -n "$converted" ]; then"#;
+
+/// The line the header converts `$basedir` through on WSL2. Taken verbatim from
+/// [`SH_SHIM_PLATFORM`] and pinned the same way as
+/// [`SH_SHIM_HARDENED_HELPER_LINE`].
+pub(super) const SH_SHIM_WSLPATH_LINE: &str = r#"    if converted=$(command -p wslpath -w "$basedir" 2>/dev/null) && [ -n "$converted" ]; then"#;
+
+/// The line that keeps `node_modules` entries out of the `PATH` the helpers
+/// resolve through. Pinned the same way as [`SH_SHIM_HARDENED_HELPER_LINE`].
+pub(super) const SH_SHIM_HELPER_PATH_FILTER_LINE: &str = "    */node_modules/*|*/node_modules) ;;";
+
+/// The line that picks a helper from the default path only when a file there
+/// can be executed. Pinned the same way as [`SH_SHIM_HARDENED_HELPER_LINE`].
+pub(super) const SH_SHIM_HELPER_DEFAULT_PATH_LINE: &str = r#"  if [ -x "/usr/bin/$1" ] || [ -x "/bin/$1" ] || ! command -v "$1" >/dev/null 2>&1; then command -p "$@"; else command "$@"; fi"#;
+
+/// Whether an already-on-disk POSIX shim has the header a warm reinstall can
+/// leave in place.
 ///
-/// A shim runs with `node_modules/.bin` at the front of `PATH`, so a shim
-/// written before the helpers moved to `command -p` can be redirected by a
-/// dependency that ships a bin named `readlink`, `sed`, or `uname`. Its target
-/// has not moved, so nothing else about it looks stale, and a warm reinstall
-/// consults this to replace it anyway.
+/// The trailing target marker does not describe the header, so a shim whose
+/// target has not moved can still need replacing. A shim runs with
+/// `node_modules/.bin` at the front of `PATH`, where a dependency's own bins
+/// live: a header that resolves a helper there can be redirected, and one that
+/// pipes `$0` through `echo` loses the backslashes of a Windows-form path.
+/// Every pinned line has to be present, and a missing one means the next
+/// install rewrites the shim.
 #[must_use]
 pub fn is_sh_shim_hardened(shim_content: &str) -> bool {
-    shim_content
-        .lines()
-        .any(|line| line == SH_SHIM_HARDENED_HELPER_LINE)
-}
-
-fn is_shim_carrying_target(shim_content: &str, target: &str) -> bool {
-    let marker = format!("# {}", shim_target_marker(target));
-    shim_content
-        .lines()
-        .any(|line| line == marker)
+    [
+        SH_SHIM_HARDENED_HELPER_LINE,
+        SH_SHIM_PATH_PRINTF_LINE,
+        SH_SHIM_CYGPATH_LINE,
+        SH_SHIM_WSLPATH_LINE,
+        SH_SHIM_HELPER_PATH_FILTER_LINE,
+        SH_SHIM_HELPER_DEFAULT_PATH_LINE,
+    ]
+    .iter()
+    .all(|pinned| {
+        shim_content
+            .lines()
+            .any(|line| line == *pinned)
+    })
 }

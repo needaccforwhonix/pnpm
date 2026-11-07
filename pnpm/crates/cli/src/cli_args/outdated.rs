@@ -1,19 +1,5 @@
 //! `pacquet outdated` — report direct dependencies that have a newer
 //! version available.
-//!
-//! The detection half — [`collect_outdated`] — is shared with
-//! `update --interactive`, which gathers the same "what has a newer
-//! version" list before prompting. The two callers differ only in which
-//! registry version counts as the comparison [`TargetVersion`]: `outdated`
-//! compares against the absolute newest (`latest` tag, or the highest
-//! in-range version under `--compatible`), while `update` compares against
-//! the version a bump would move to.
-//!
-//! Scope vs. pnpm: pacquet loads the *wanted* lockfile, so there is no
-//! separate *current* lockfile to diff against — a dependency's `current`
-//! and `wanted` versions are always equal, and the "missing (wanted X)"
-//! state pnpm shows for a resolved-but-not-installed dependency does not
-//! arise.
 
 pub(crate) mod query;
 
@@ -28,44 +14,48 @@ use crate::{
     State,
     cli_args::{
         catalogs::configured_catalogs,
+        ecosystem_deps::{
+            EcosystemFilterKind, declared_ecosystem_dep_names, patterns_for_ecosystem,
+            requires_ecosystem_lockfile,
+        },
         install::resolve_bool_override,
-        recursive::{AutoExcludeRoot, discover_workspace_projects, select_recursive_projects},
+        recursive::discover_workspace_projects,
+        release_notes::UpgradeNotes,
         sanitize::sanitize_inline,
     },
 };
 use clap::{Args, ValueEnum};
+use filters::OutdatedFilters;
 use miette::IntoDiagnostic;
 use node_semver::Version;
 use owo_colors::Stream;
 use pnpm_catalogs_protocol_parser::parse_catalog_protocol;
 use pnpm_catalogs_resolver::{
-    CatalogResolutionResult, WantedDependency as CatalogWantedDependency, resolve_from_catalog,
+    CatalogAnchor, CatalogResolutionResult, WantedDependency as CatalogWantedDependency,
+    resolve_from_catalog,
 };
 use pnpm_catalogs_types::Catalogs;
 use pnpm_config::Config;
+use pnpm_config_parse_overrides::parse_overrides_iter;
 use pnpm_github_actions as github_actions;
 use pnpm_lockfile::Lockfile;
 use pnpm_matcher::{Matcher, create_matcher};
 use pnpm_network::ThrottledClient;
-use pnpm_package_manager::{PickPolicy, create_configured_npm_resolver};
+use pnpm_package_manager::{PickPolicy, VersionsOverrider, create_configured_registry_resolver};
 use pnpm_package_manifest::{DependencyGroup, PackageManifest};
 use pnpm_reporter::Reporter;
-use pnpm_resolving_npm_resolver::{InMemoryPackageMetaCache, NpmResolver};
+use pnpm_resolving_default_resolver::DefaultResolver;
 use pnpm_resolving_resolver_base::{
     LatestQuery, ResolveOptions, WantedDependency as ResolverWantedDependency,
 };
-
 use render::{
     render_json, render_list, render_recursive_json, render_recursive_list, render_recursive_table,
     render_table, sort_outdated, sort_workspace_outdated, write_output,
 };
 use std::{borrow::Cow, collections::HashMap, io::Write, path::PathBuf, sync::Arc};
-use workspace::{
-    DependentProject, OutdatedInWorkspace, ProjectOutdatedInputs, isolated_global_config,
-    loaded_lockfile, no_lockfile_error, project_dir, recursive_project_inputs, workspace_outdated,
-};
+use workspace::{OutdatedInWorkspace, loaded_lockfile, no_lockfile_error, project_dir};
 
-/// Output format for `pacquet outdated`.
+/// Output format for `pnpm outdated`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum OutdatedFormat {
     Table,
@@ -73,7 +63,7 @@ pub enum OutdatedFormat {
     Json,
 }
 
-/// `--prod` / `--dev` / `--no-optional` for `pacquet outdated`.
+/// `--prod` / `--dev` / `--no-optional` for `pnpm outdated`.
 #[derive(Debug, Args)]
 pub struct OutdatedDependencyOptions {
     /// Check only "dependencies" and "optionalDependencies".
@@ -109,7 +99,7 @@ impl OutdatedDependencyOptions {
     }
 }
 
-/// `pacquet outdated [<pkg> ...]`.
+/// `pnpm outdated [<pkg> ...]`.
 #[derive(Debug, Args)]
 pub struct OutdatedArgs {
     /// Restrict the check to dependencies whose name matches one of these
@@ -151,6 +141,10 @@ pub struct OutdatedOutputArgs {
     /// sorts by the size of the version change, then by name.
     #[clap(long, value_enum)]
     pub sort_by: Option<SortBy>,
+    /// Print the release notes between the current and the latest version
+    /// of each package, from registries declared with `serverType: pnpr`.
+    #[clap(long)]
+    pub notes: bool,
 }
 
 /// Sort order for the outdated report.
@@ -159,10 +153,6 @@ pub enum SortBy {
     Name,
 }
 
-/// Whether `outdated` found any outdated dependency. The CLI harness maps
-/// [`OutdatedOutcome::Outdated`] to a process exit code of `1`, matching
-/// pnpm; returning the outcome (rather than terminating here) keeps
-/// [`OutdatedArgs::run`] composable and process termination in one place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutdatedOutcome {
     UpToDate,
@@ -170,42 +160,30 @@ pub enum OutdatedOutcome {
 }
 
 impl OutdatedArgs {
-    /// Run the check and print the report to stdout. Returns whether any
-    /// dependency was outdated; the caller decides the process exit code.
     pub async fn run<Reporter: self::Reporter>(
         self,
         state: State,
     ) -> miette::Result<OutdatedOutcome> {
         if state.config.recursive {
-            return self.run_recursive::<Reporter>(state).await;
+            return Box::pin(self.run_recursive::<Reporter>(state)).await;
         }
-
         let config = state.config;
         let manifest = &state.manifest;
-        let root = config.workspace_dir.as_deref().unwrap_or_else(|| project_dir(manifest));
-        let importer_id = state.active_importer_id();
-        let lockfile = loaded_lockfile(&state)?;
         let package_patterns = self.package_patterns();
-        let check_packages = self.checks_packages(manifest, &package_patterns);
-        if check_packages && lockfile.is_none() {
+        let filters =
+            OutdatedFilters::validated(&self, config, &package_patterns, [manifest], false)?;
+        let lockfile = loaded_lockfile(&state)?;
+        if self.requires_lockfile(manifest, config, &filters, &package_patterns, lockfile)? {
             return Err(no_lockfile_error(project_dir(manifest)));
         }
-
-        let filters = OutdatedFilters::new(&self, config, &package_patterns);
-        let query = filters.query(self.target_version());
-        let mut outdated = if check_packages {
-            collect_outdated_for_importer(
-                manifest,
-                lockfile,
-                &importer_id,
-                config,
-                &state.http_client,
-                &query,
-            )
-            .await?
-        } else {
-            Vec::new()
-        };
+        let mut outdated = Box::pin(self.collect_single_project_outdated(
+            &state,
+            &filters,
+            package_patterns,
+            lockfile,
+        ))
+        .await?;
+        let root = config.workspace_dir.as_deref().unwrap_or_else(|| project_dir(manifest));
         outdated.extend(
             self.outdated_actions::<Reporter>(
                 config,
@@ -217,20 +195,51 @@ impl OutdatedArgs {
             .into_iter()
             .map(OutdatedPackage::from),
         );
-
-        self.report_outdated(&mut outdated)
+        self.report_outdated(config, &mut outdated).await
     }
 
-    fn report_outdated(&self, outdated: &mut [OutdatedPackage]) -> miette::Result<OutdatedOutcome> {
+    async fn collect_single_project_outdated(
+        &self,
+        state: &State,
+        filters: &OutdatedFilters,
+        package_patterns: Vec<String>,
+        lockfile: Option<&Lockfile>,
+    ) -> miette::Result<Vec<OutdatedPackage>> {
+        if !self.checks_packages(
+            &state.manifest,
+            state.config,
+            &filters.include,
+            &package_patterns,
+        )? {
+            return Ok(Vec::new());
+        }
+        let query = filters.query(self.target_version());
+        let run = OutdatedRun::new(state.config, Arc::clone(&state.http_client), &query)?
+            .with_raw_packages(package_patterns);
+        collect_outdated_for_importer_in_run(
+            &state.manifest,
+            lockfile,
+            &state.active_importer_id(),
+            &query,
+            &run,
+        )
+        .await
+    }
+
+    pub(super) async fn report_outdated(
+        &self,
+        config: &Config,
+        outdated: &mut [OutdatedPackage],
+    ) -> miette::Result<OutdatedOutcome> {
         sort_outdated(outdated, self.output.sort_by);
-        self.write_rendered(outdated)?;
+        let packages: Vec<&OutdatedPackage> = outdated.iter().collect();
+        let notes = self.release_notes(config, &packages).await?;
+        self.write_rendered(outdated, &notes)?;
 
         Ok(if outdated.is_empty() { OutdatedOutcome::UpToDate } else { OutdatedOutcome::Outdated })
     }
 
-    /// The `outdated <pattern>` arguments that select packages rather than
-    /// workflow actions.
-    fn package_patterns(&self) -> Vec<String> {
+    pub(super) fn package_patterns(&self) -> Vec<String> {
         self.packages
             .iter()
             .filter(|selector| !github_actions::is_selector(selector))
@@ -238,46 +247,88 @@ impl OutdatedArgs {
             .collect()
     }
 
-    fn write_rendered(&self, outdated: &[OutdatedPackage]) -> miette::Result<()> {
-        let output = match self.resolve_format() {
+    fn write_rendered(
+        &self,
+        outdated: &[OutdatedPackage],
+        notes: &[Option<UpgradeNotes>],
+    ) -> miette::Result<()> {
+        let format = self.resolve_format();
+        let output = match format {
             OutdatedFormat::Table => render_table(outdated, self.output.long),
             OutdatedFormat::List => render_list(outdated, self.output.long),
             OutdatedFormat::Json => render_json(outdated, self.output.long),
         };
-        write_output(&output)
+        let packages: Vec<&OutdatedPackage> = outdated.iter().collect();
+        write_output(&notes::with_notes(output, format, &packages, notes))
     }
 
-    fn write_recursive_rendered(&self, outdated: &[OutdatedInWorkspace]) -> miette::Result<()> {
-        let output = match self.resolve_format() {
+    async fn write_recursive_rendered(
+        &self,
+        config: &Config,
+        outdated: &[OutdatedInWorkspace],
+    ) -> miette::Result<()> {
+        let format = self.resolve_format();
+        let output = match format {
             OutdatedFormat::Table => render_recursive_table(outdated, self.output.long),
             OutdatedFormat::List => render_recursive_list(outdated, self.output.long),
             OutdatedFormat::Json => render_recursive_json(outdated, self.output.long),
         };
-        write_output(&output)
+        let packages: Vec<&OutdatedPackage> = outdated
+            .iter()
+            .map(|entry| &entry.package)
+            .collect();
+        let notes = self.release_notes(config, &packages).await?;
+        write_output(&notes::with_notes(output, format, &packages, &notes))
     }
 
-    /// `--compatible` reports the newest version the declared range
-    /// still admits; the default reports the newest published one.
-    fn target_version(&self) -> TargetVersion {
+    pub(super) fn target_version(&self) -> TargetVersion {
         if self.compatible { TargetVersion::WithinRange } else { TargetVersion::Latest }
     }
 
-    /// Whether the run inspects lockfile packages at all. An empty
-    /// package manifest requires no lockfile, and neither does a run
-    /// whose selectors name only workflow actions — but the workflows
-    /// are still inspected.
-    fn checks_packages(&self, manifest: &PackageManifest, package_patterns: &[String]) -> bool {
+    fn checks_packages(
+        &self,
+        manifest: &PackageManifest,
+        config: &Config,
+        include: &[DependencyGroup],
+        package_patterns: &[String],
+    ) -> miette::Result<bool> {
         let has_any_dependency = manifest
-            .dependencies([DependencyGroup::Prod, DependencyGroup::Dev, DependencyGroup::Optional])
+            .dependencies(include.iter().copied())
             .next()
-            .is_some();
-        has_any_dependency && (self.packages.is_empty() || !package_patterns.is_empty())
+            .is_some()
+            || !crate::cli_args::engine_deps::declared_engine_deps(manifest, config, include)
+                .is_empty()
+            || !declared_ecosystem_dep_names(project_dir(manifest), config, include)?.is_empty();
+        Ok(has_any_dependency && (self.packages.is_empty() || !package_patterns.is_empty()))
     }
 
-    /// The outdated GitHub Actions of the workflows under `root`. Empty
-    /// unless the run includes dev dependencies and opted in to the
-    /// check.
-    async fn outdated_actions<Reporter: self::Reporter>(
+    fn requires_lockfile(
+        &self,
+        manifest: &PackageManifest,
+        config: &Config,
+        filters: &OutdatedFilters,
+        package_patterns: &[String],
+        lockfile: Option<&Lockfile>,
+    ) -> miette::Result<bool> {
+        if !self.packages.is_empty() && package_patterns.is_empty() {
+            return Ok(false);
+        }
+        let node_patterns = patterns_for_ecosystem(package_patterns, EcosystemFilterKind::Node)?;
+        let checks_node = package_patterns.is_empty() || !node_patterns.is_empty();
+        let query = filters.query(self.target_version());
+        let needs_node_lockfile = checks_node
+            && lockfile.is_none()
+            && manifest
+                .dependencies(filters.include.iter().copied())
+                .any(|(name, spec)| {
+                    !pnpm_tool_protocol::is_tool_specifier(spec) && query.matches_name(name)
+                });
+        let needs_eco_lockfile =
+            requires_ecosystem_lockfile(project_dir(manifest), config, &query, package_patterns)?;
+        Ok(needs_node_lockfile || needs_eco_lockfile)
+    }
+
+    pub(super) async fn outdated_actions<Reporter: self::Reporter>(
         &self,
         config: &Config,
         root: &std::path::Path,
@@ -294,121 +345,11 @@ impl OutdatedArgs {
             self.compatible,
             action_matcher,
             config.update_config.github_actions_server.as_deref(),
+            crate::github_actions::release_age(config)?.as_ref(),
         )
         .await
     }
 
-    async fn run_recursive<Reporter: self::Reporter>(
-        self,
-        state: State,
-    ) -> miette::Result<OutdatedOutcome> {
-        let config = state.config;
-        let workspace_root = config.workspace_dir
-            .clone()
-            .unwrap_or_else(|| state.lockfile_dir().to_path_buf());
-        let (projects, _) = discover_workspace_projects(&workspace_root, config)?;
-        let selection = select_recursive_projects(
-            &projects,
-            config,
-            project_dir(&state.manifest),
-            AutoExcludeRoot::Disabled,
-        )?;
-        let filters = OutdatedFilters::new(&self, config, &self.packages);
-        let query = filters.query(self.target_version());
-
-        // Every project reads the one shared lockfile, or its own.
-        let shared_lockfile =
-            if config.shares_one_lockfile() { loaded_lockfile(&state)? } else { None };
-        let project_inputs = recursive_project_inputs(config, &selection)?;
-        let run = OutdatedRun::new(config, Arc::clone(&state.http_client))?;
-        let mut outdated = workspace_outdated(
-            &ProjectOutdatedInputs {
-                config,
-                lockfile_root: state.lockfile_dir(),
-                shared_lockfile,
-                query: &query,
-                run: &run,
-            },
-            &project_inputs,
-        )
-        .await?;
-
-        outdated.extend(
-            self.workspace_outdated_actions::<Reporter>(config, &workspace_root, &filters.include)
-                .await?,
-        );
-
-        sort_workspace_outdated(&mut outdated);
-        self.write_recursive_rendered(&outdated)?;
-
-        Ok(if outdated.is_empty() { OutdatedOutcome::UpToDate } else { OutdatedOutcome::Outdated })
-    }
-
-    async fn workspace_outdated_actions<Reporter: self::Reporter>(
-        &self,
-        config: &Config,
-        workspace_root: &std::path::Path,
-        include: &[DependencyGroup],
-    ) -> miette::Result<Vec<OutdatedInWorkspace>> {
-        let action_matcher = github_actions::selector_matcher(&self.packages);
-        Ok(self
-            .outdated_actions::<Reporter>(config, workspace_root, include, action_matcher.as_ref())
-            .await?
-            .into_iter()
-            .map(|action| OutdatedInWorkspace {
-                package: OutdatedPackage::from(action),
-                dependents: vec![DependentProject {
-                    name: ".github".to_string(),
-                    location: workspace_root.to_path_buf(),
-                }],
-            })
-            .collect())
-    }
-
-    /// `pnpm outdated -g`: inspect every globally installed package group,
-    /// treating each install dir's `package.json` as a project, and report
-    /// the aggregate.
-    pub async fn run_global(self, config: &'static Config) -> miette::Result<OutdatedOutcome> {
-        let global_pkg_dir = config.global_pkg_dir
-            .clone()
-            .ok_or_else(|| {
-                miette::miette!(
-                    code = "ERR_PNPM_NO_GLOBAL_BIN_DIR",
-                    "Unable to find the global packages directory"
-                )
-            })?;
-        let config = isolated_global_config(config);
-        let filters = OutdatedFilters::new(&self, config, &self.packages);
-        let query = filters.query(self.target_version());
-
-        let mut outdated = Vec::new();
-        let global_packages = pnpm_global::scan_global_packages(&global_pkg_dir)
-            .map_err(|err| miette::miette!("failed to scan global packages: {err}"))?;
-        for pkg in global_packages {
-            let state = State::init(pkg.install_dir.join("package.json"), config, false)
-                .map_err(|err| miette::Report::new(err).wrap_err("initialize global state"))?;
-            outdated.extend(
-                collect_outdated(
-                    &state.manifest,
-                    loaded_lockfile(&state)?,
-                    config,
-                    &state.http_client,
-                    &query,
-                )
-                .await?,
-            );
-        }
-
-        sort_outdated(&mut outdated, self.output.sort_by);
-        self.write_rendered(&outdated)?;
-
-        Ok(if outdated.is_empty() { OutdatedOutcome::UpToDate } else { OutdatedOutcome::Outdated })
-    }
-
-    /// Collapse the `--format` flag and its `--no-table` / `--json`
-    /// shorthands into one format. The shorthands win over an explicit
-    /// `--format`, with `--json` taking precedence over `--no-table`,
-    /// mirroring pnpm's shorthand expansion order.
     fn resolve_format(&self) -> OutdatedFormat {
         if self.output.json {
             OutdatedFormat::Json
@@ -420,33 +361,8 @@ impl OutdatedArgs {
     }
 }
 
-/// The dependency groups and the name matchers one outdated query walks.
-struct OutdatedFilters {
-    include: Vec<DependencyGroup>,
-    match_names: Option<Matcher>,
-    ignore_names: Option<Matcher>,
-}
-
-impl OutdatedFilters {
-    fn new(args: &OutdatedArgs, config: &Config, package_patterns: &[String]) -> Self {
-        Self {
-            include: args.dependency_options.include(config.optional),
-            match_names: (!package_patterns.is_empty()).then(|| create_matcher(package_patterns)),
-            ignore_names: ignored_dependencies_matcher(config),
-        }
-    }
-
-    fn query(&self, target_version: TargetVersion) -> OutdatedQuery<'_> {
-        OutdatedQuery {
-            target_version,
-            include_direct: &self.include,
-            match_names: self.match_names.as_ref(),
-            ignore_names: self.ignore_names.as_ref(),
-            include_deprecated: true,
-        }
-    }
-}
-
+mod filters;
+mod notes;
 #[cfg(test)]
 mod tests;
 

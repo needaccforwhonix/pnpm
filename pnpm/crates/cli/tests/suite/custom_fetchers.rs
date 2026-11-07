@@ -1,11 +1,15 @@
 //! Custom fetchers on fresh and frozen CLI installs.
 
+mod directory;
+
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
 use pnpm_testing_utils::{
     bin::{AddMockedRegistry, CommandTempCwd},
     command_env::CommandTestExt,
+    diagnostics::assert_diagnostic_contains,
     fixtures::{minimal_tarball, sha512_integrity},
+    git_repo::GitRepoFixture,
 };
 use std::{fs, path::Path, process::Command};
 
@@ -73,10 +77,10 @@ fn installed_version(workspace: &Path) -> String {
 fn custom_fetcher_delegates_a_custom_typed_resolution_on_fresh_and_frozen_installs() {
     let CommandTempCwd { root, workspace, npmrc_info, .. } =
         CommandTempCwd::init().add_mocked_registry();
-    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    let AddMockedRegistry { mock_instance, cache_dir, .. } = npmrc_info;
 
     write_manifest(&workspace, "^100.0.0");
-    fs::write(workspace.join(".pnpmfile.cjs"), custom_type_pnpmfile(&mock_instance.url(), true))
+    fs::write(workspace.join(".pnpmfile.cjs"), custom_type_pnpmfile(mock_instance.url(), true))
         .expect("write pnpmfile");
     pacquet_at(&workspace)
         .with_arg("install")
@@ -90,11 +94,118 @@ fn custom_fetcher_delegates_a_custom_typed_resolution_on_fresh_and_frozen_instal
     );
 
     fs::remove_dir_all(workspace.join("node_modules")).expect("remove node_modules");
+    fs::remove_dir_all(&cache_dir).expect("remove cache_dir");
     pacquet_at(&workspace)
         .with_args(["install", "--frozen-lockfile"])
         .assert()
         .success();
     assert_eq!(installed_version(&workspace), "100.1.0");
+    drop((root, mock_instance));
+}
+
+#[test]
+fn custom_fetcher_runs_once_when_resolution_fetches_archive_without_manifest() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+
+    write_manifest(&workspace, "^100.0.0");
+    let pnpmfile = format!(
+        r"const fs = require('node:fs');
+const path = require('node:path');
+const counterFile = path.join(__dirname, 'fetch-count.txt');
+
+module.exports = {{
+  resolvers: [{{
+    canResolve (wanted) {{ return wanted.alias === '@pnpm.e2e/dep-of-pkg-with-1-dep'; }},
+    async resolve () {{
+      const response = await fetch('{url}@pnpm.e2e%2Fdep-of-pkg-with-1-dep');
+      const picked = (await response.json()).versions['100.1.0'];
+      return {{
+        id: '@pnpm.e2e/dep-of-pkg-with-1-dep@100.1.0',
+        resolution: {{ tarball: picked.dist.tarball }},
+      }};
+    }},
+  }}],
+  fetchers: [{{
+    canFetch (pkgId) {{ return pkgId.includes('dep-of-pkg-with-1-dep'); }},
+    async fetch (cafs, resolution, opts, fetchers) {{
+      let count = 0;
+      try {{ count = parseInt(fs.readFileSync(counterFile, 'utf8'), 10) || 0; }} catch (_) {{}}
+      fs.writeFileSync(counterFile, String(count + 1));
+      return {{ delegate: {{ tarball: resolution.tarball, integrity: resolution.integrity }} }};
+    }},
+  }}],
+}};
+",
+        url = mock_instance.url(),
+    );
+    fs::write(workspace.join(".pnpmfile.cjs"), pnpmfile).expect("write pnpmfile");
+
+    pacquet_at(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+
+    assert_eq!(installed_version(&workspace), "100.1.0");
+    let counter = fs::read_to_string(workspace.join("fetch-count.txt")).expect("read counter");
+    assert_eq!(
+        counter.trim(),
+        "1",
+        "custom fetcher should execute only once across resolution and install",
+    );
+
+    drop((root, mock_instance));
+}
+
+#[test]
+fn custom_fetcher_runs_once_when_resolver_returns_url_id() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+
+    write_manifest(&workspace, "^100.0.0");
+    let pnpmfile = format!(
+        r"const fs = require('node:fs');
+const path = require('node:path');
+const counterFile = path.join(__dirname, 'fetch-count.txt');
+
+module.exports = {{
+  resolvers: [{{
+    canResolve (wanted) {{ return wanted.alias === '@pnpm.e2e/dep-of-pkg-with-1-dep'; }},
+    async resolve () {{
+      const response = await fetch('{url}@pnpm.e2e%2Fdep-of-pkg-with-1-dep');
+      const picked = (await response.json()).versions['100.1.0'];
+      return {{
+        id: picked.dist.tarball,
+        resolution: {{ tarball: picked.dist.tarball }},
+      }};
+    }},
+  }}],
+  fetchers: [{{
+    canFetch () {{ return true; }},
+    async fetch (cafs, resolution, opts, fetchers) {{
+      let count = 0;
+      try {{ count = parseInt(fs.readFileSync(counterFile, 'utf8'), 10) || 0; }} catch (_) {{}}
+      fs.writeFileSync(counterFile, String(count + 1));
+      return {{ delegate: {{ tarball: resolution.tarball, integrity: resolution.integrity }} }};
+    }},
+  }}],
+}};
+",
+        url = mock_instance.url(),
+    );
+    fs::write(workspace.join(".pnpmfile.cjs"), pnpmfile).expect("write pnpmfile");
+
+    pacquet_at(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+
+    assert_eq!(installed_version(&workspace), "100.1.0");
+    let counter = fs::read_to_string(workspace.join("fetch-count.txt")).expect("read counter");
+    assert_eq!(counter.trim(), "1", "custom fetcher should execute only once when id is a URL");
+
     drop((root, mock_instance));
 }
 
@@ -105,7 +216,7 @@ fn custom_typed_resolution_without_a_fetcher_fails_the_install() {
     let AddMockedRegistry { mock_instance, .. } = npmrc_info;
 
     write_manifest(&workspace, "100.0.0");
-    fs::write(workspace.join(".pnpmfile.cjs"), custom_type_pnpmfile(&mock_instance.url(), false))
+    fs::write(workspace.join(".pnpmfile.cjs"), custom_type_pnpmfile(mock_instance.url(), false))
         .expect("write pnpmfile");
 
     let output = pacquet_at(&workspace)
@@ -128,7 +239,7 @@ fn ignore_pnpmfile_skips_the_custom_fetcher_on_fetch() {
     let AddMockedRegistry { mock_instance, .. } = npmrc_info;
 
     write_manifest(&workspace, "100.0.0");
-    fs::write(workspace.join(".pnpmfile.cjs"), custom_type_pnpmfile(&mock_instance.url(), true))
+    fs::write(workspace.join(".pnpmfile.cjs"), custom_type_pnpmfile(mock_instance.url(), true))
         .expect("write pnpmfile");
     pacquet_at(&workspace)
         .with_arg("install")
@@ -161,7 +272,7 @@ fn ignore_pnpmfile_skips_the_custom_resolver_on_install() {
     let AddMockedRegistry { mock_instance, .. } = npmrc_info;
 
     write_manifest(&workspace, "100.0.0");
-    fs::write(workspace.join(".pnpmfile.cjs"), custom_type_pnpmfile(&mock_instance.url(), true))
+    fs::write(workspace.join(".pnpmfile.cjs"), custom_type_pnpmfile(mock_instance.url(), true))
         .expect("write pnpmfile");
 
     pacquet_at(&workspace)
@@ -202,9 +313,9 @@ fn a_configured_pnpmfile_that_is_missing_names_itself() {
         .assert()
         .failure();
     let stderr = String::from_utf8_lossy(&output.get_output().stderr);
-    assert!(stderr.contains("ERR_PNPM_PNPMFILE_NOT_FOUND"), "stderr: {stderr}");
-    assert!(stderr.contains("is not found"), "stderr: {stderr}");
-    assert!(stderr.contains("absent.cjs"), "stderr: {stderr}");
+    assert_diagnostic_contains(&stderr, "ERR_PNPM_PNPMFILE_NOT_FOUND");
+    assert_diagnostic_contains(&stderr, "is not found");
+    assert_diagnostic_contains(&stderr, "absent.cjs");
     drop((metadata, original));
 }
 
@@ -624,6 +735,23 @@ fn custom_fetchers_cannot_replace_locked_integrity_or_return_unverified_files() 
             "incompatible url",
         ),
         (
+            "git callback under a locked integrity",
+            "return fetchers.git(cafs, { repo: 'https://example.invalid/repo.git', commit: '0'.repeat(40) }, opts);".to_string(),
+            "locked archive integrity",
+        ),
+        (
+            "binary callback changes integrity",
+            format!(
+                "return fetchers.binary(cafs, {{ url: resolution.tarball.replace('original.tgz', 'changed.tgz'), integrity: {changed_integrity}, bin: {{}}, archive: 'tarball' }}, opts);",
+            ),
+            "locked archive integrity",
+        ),
+        (
+            "native callback given an unsupported option",
+            "return fetchers.binary(cafs, { url: resolution.tarball, integrity: resolution.integrity, bin: {}, archive: 'tarball' }, { ...opts, ignoreFilePattern: 'bin' });".to_string(),
+            "do not support ignorefilepattern",
+        ),
+        (
             "fabricated map",
             "return { filesMap: new Map([['package.json', path.join(__dirname, 'package.json')]]), requiresBuild: false };".to_string(),
             "not verified by a native tarball fetcher",
@@ -651,7 +779,8 @@ fn custom_fetchers_cannot_replace_locked_integrity_or_return_unverified_files() 
 
         let output = pacquet_at(&workspace).with_arg("install").assert().failure();
         let stderr = String::from_utf8_lossy(&output.get_output().stderr);
-        assert!(stderr.to_ascii_lowercase().contains(error), "{name}: {stderr}");
+        eprintln!("{name}");
+        assert_diagnostic_contains(&stderr.to_ascii_lowercase(), error);
         assert!(
             !workspace.join("node_modules/fetcher-pkg/package.json").exists(),
             "{name} imported unverified content",
@@ -660,4 +789,211 @@ fn custom_fetchers_cannot_replace_locked_integrity_or_return_unverified_files() 
         original.assert();
         custom.assert();
     }
+}
+
+#[test]
+fn native_git_hosted_tarball_and_binary_fetchers_install_the_locked_archive() {
+    for (name, fetch) in [
+        (
+            "gitHostedTarball",
+            "fetchers.gitHostedTarball(cafs, { tarball: resolution.tarball.replace('original.tgz', 'custom.tgz') }, opts)",
+        ),
+        (
+            "binary",
+            "fetchers.binary(cafs, { url: resolution.tarball.replace('original.tgz', 'custom.tgz'), integrity: resolution.integrity, bin: {}, archive: 'tarball' }, opts)",
+        ),
+    ] {
+        let CommandTempCwd { root, workspace, .. } = CommandTempCwd::init();
+        let mut registry = mockito::Server::new();
+        let tarball = minimal_tarball("fetcher-pkg", "1.0.0");
+        let (metadata, original) =
+            mock_fetcher_package(&mut registry, Some(&sha512_integrity(&tarball)));
+        let custom = registry
+            .mock("GET", "/custom.tgz")
+            .with_body(tarball)
+            .expect(2)
+            .create();
+        configure_fetcher_project(&workspace, &registry.url(), Some("configured.cjs"));
+        let body = format!(
+            "fs.appendFileSync(path.join(__dirname, 'calls'), 'fetch\\n');\n    const result = await {fetch};\n    assert.ok(result.filesMap.has('package.json'));\n    return result;",
+        );
+        fs::write(workspace.join("configured.cjs"), fetcher_pnpmfile(&body))
+            .expect("write native fetcher");
+
+        for frozen in [false, true] {
+            reset_before_frozen_install(frozen, root.path(), &workspace);
+            pacquet_at(&workspace)
+                .with_args(install_args(frozen))
+                .assert()
+                .success();
+            let installed: serde_json::Value = serde_json::from_slice(
+                &fs::read(workspace.join("node_modules/fetcher-pkg/package.json"))
+                    .expect("read installed package"),
+            )
+            .expect("parse installed package");
+            assert_eq!(installed["version"], "1.0.0", "{name}, frozen={frozen}");
+        }
+        metadata.assert();
+        original.assert();
+        custom.assert();
+    }
+}
+
+#[test]
+fn native_git_fetch_at_resolution_is_reused_by_the_install_pass() {
+    let CommandTempCwd { root, workspace, .. } = CommandTempCwd::init();
+    let repo = GitRepoFixture::init(root.path(), "fetcher-pkg");
+    repo.write_file("package.json", r#"{"name":"fetcher-pkg","version":"1.0.0"}"#);
+    let commit = repo.commit("init");
+    let mut registry = mockito::Server::new();
+    let (metadata, original) = mock_fetcher_package(&mut registry, None);
+    configure_fetcher_project(&workspace, &registry.url(), Some("configured.cjs"));
+    let body = format!(
+        "fs.appendFileSync(path.join(__dirname, 'calls'), 'fetch\\n');\n    return fetchers.git(cafs, {{ repo: {repo}, commit: '{commit}' }}, opts);",
+        repo = serde_json::to_string(&repo.file_url()).unwrap(),
+    );
+    fs::write(workspace.join("configured.cjs"), fetcher_pnpmfile(&body))
+        .expect("write git fetcher");
+
+    pacquet_at(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+    let installed: serde_json::Value = serde_json::from_slice(
+        &fs::read(workspace.join("node_modules/fetcher-pkg/package.json"))
+            .expect("read installed package"),
+    )
+    .expect("parse installed package");
+    assert_eq!(installed["version"], "1.0.0");
+    assert_eq!(fs::read_to_string(workspace.join("calls")).expect("read fetcher trace"), "fetch\n");
+    metadata.assert();
+    original.assert();
+}
+
+#[test]
+fn native_git_fetcher_ignores_a_hook_supplied_store_index_key() {
+    assert_native_git_fetcher_ignores_a_hook_supplied_store_index_key(NativeGitFetcher::Git);
+}
+
+#[test]
+fn native_git_hosted_tarball_fetcher_ignores_a_hook_supplied_store_index_key() {
+    assert_native_git_fetcher_ignores_a_hook_supplied_store_index_key(
+        NativeGitFetcher::GitHostedTarball,
+    );
+}
+
+#[derive(Clone, Copy)]
+enum NativeGitFetcher {
+    Git,
+    GitHostedTarball,
+}
+
+fn assert_native_git_fetcher_ignores_a_hook_supplied_store_index_key(
+    fetcher_kind: NativeGitFetcher,
+) {
+    use pnpm_store_dir::{StoreDir, StoreIndex, store_index_key};
+    use pnpm_testing_utils::git_repo::GitRepoFixture;
+
+    let CommandTempCwd { root, workspace, .. } = CommandTempCwd::init();
+    let mut registry = mockito::Server::new();
+    let victim_tarball = minimal_tarball("index-victim", "1.0.0");
+    let victim_integrity = sha512_integrity(&victim_tarball);
+    let victim_metadata = registry
+        .mock("GET", "/index-victim")
+        .with_header("content-type", "application/json")
+        .with_body(
+            serde_json::json!({
+                "name": "index-victim",
+                "dist-tags": { "latest": "1.0.0" },
+                "versions": {
+                    "1.0.0": {
+                        "name": "index-victim",
+                        "version": "1.0.0",
+                        "dist": {
+                            "tarball": format!("{}/victim.tgz", registry.url()),
+                            "integrity": victim_integrity,
+                        },
+                    },
+                },
+            })
+            .to_string(),
+        )
+        .expect_at_least(1)
+        .create();
+    let victim_archive = registry
+        .mock("GET", "/victim.tgz")
+        .with_body(victim_tarball)
+        .create();
+    let git_hosted_tarball_archive = match fetcher_kind {
+        NativeGitFetcher::GitHostedTarball => Some(
+            registry
+                .mock("GET", "/git-hosted.tgz")
+                .with_body(minimal_tarball("fetcher-pkg", "1.0.0"))
+                .create(),
+        ),
+        NativeGitFetcher::Git => None,
+    };
+    let (fetcher_metadata, original) = mock_fetcher_package(&mut registry, None);
+    configure_fetcher_project(&workspace, &registry.url(), Some("configured.cjs"));
+    fs::write(workspace.join("package.json"), r#"{"dependencies":{"index-victim":"1.0.0"}}"#)
+        .expect("write victim manifest");
+    fs::write(workspace.join("configured.cjs"), "module.exports = { fetchers: [] };\n")
+        .expect("write empty pnpmfile");
+    pacquet_at(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+
+    let store_dir = StoreDir::from(workspace.join("../store"));
+    let victim_key = store_index_key(&victim_integrity, "index-victim@1.0.0");
+    let victim_before = StoreIndex::open_readonly_in(&store_dir)
+        .expect("open store index")
+        .get(&victim_key)
+        .expect("read victim row")
+        .expect("victim row exists");
+    let fetcher = match fetcher_kind {
+        NativeGitFetcher::GitHostedTarball => format!(
+            "fetchers.gitHostedTarball(cafs, {{ tarball: {url}, gitHosted: true }}, {{ ...opts, filesIndexFile: {victim_key} }})",
+            url = serde_json::to_string(&format!("{}/git-hosted.tgz", registry.url())).unwrap(),
+            victim_key = serde_json::to_string(&victim_key).unwrap(),
+        ),
+        NativeGitFetcher::Git => {
+            let repo = GitRepoFixture::init(root.path(), "fetcher-pkg");
+            repo.write_file("package.json", r#"{"name":"fetcher-pkg","version":"1.0.0"}"#);
+            repo.write_file("index.js", "module.exports = true\n");
+            let commit = repo.commit("init");
+            format!(
+                "fetchers.git(cafs, {{ repo: {repo}, commit: {commit} }}, {{ ...opts, filesIndexFile: {victim_key} }})",
+                repo = serde_json::to_string(&repo.file_url()).unwrap(),
+                commit = serde_json::to_string(&commit).unwrap(),
+                victim_key = serde_json::to_string(&victim_key).unwrap(),
+            )
+        }
+    };
+    fs::write(
+        workspace.join("package.json"),
+        r#"{"dependencies":{"index-victim":"1.0.0","fetcher-pkg":"1.0.0"}}"#,
+    )
+    .expect("write install manifest");
+    fs::write(workspace.join("configured.cjs"), fetcher_pnpmfile(&format!("return {fetcher};")))
+        .expect("write native fetcher");
+
+    pacquet_at(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+
+    let index = StoreIndex::open_readonly_in(&store_dir).expect("open store index");
+    assert_eq!(index.get(&victim_key).expect("read victim row"), Some(victim_before));
+    let git_key = pnpm_store_dir::git_hosted_store_index_key("fetcher-pkg@1.0.0", true);
+    let git_row = index
+        .get(&git_key)
+        .expect("read git row")
+        .expect("git row exists");
+    assert_eq!(git_row.manifest.as_ref().unwrap()["name"], "fetcher-pkg");
+
+    victim_metadata.assert();
+    fetcher_metadata.assert();
+    original.assert();
+    drop((root, victim_archive, git_hosted_tarball_archive));
 }

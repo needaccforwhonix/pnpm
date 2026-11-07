@@ -3,7 +3,8 @@
 
 use crate::read_package_json;
 use pnpm_cmd_shim::{
-    FsReadFile, FsWalkFiles, Host, PackageBinSource, get_bins_from_package_manifest,
+    Command, FsReadDir, FsReadFile, FsWalkFiles, Host, PackageBinSource,
+    get_bins_from_package_manifest,
 };
 use pnpm_fs::is_symlink_or_junction;
 use pnpm_package_manifest::{PackageManifestError, parse_manifest_bytes};
@@ -61,8 +62,7 @@ pub struct InstalledGlobalPackage {
 ///
 /// A missing directory yields an empty list; any other read error (e.g.
 /// permission denied) is surfaced so callers don't mistake an unreadable
-/// global dir for "no global packages." Only `ENOENT` returns `[]`; every
-/// other error propagates.
+/// global dir for "no global packages."
 pub fn scan_global_packages(global_dir: &Path) -> io::Result<Vec<GlobalPackageInfo>> {
     let entries = match std::fs::read_dir(global_dir) {
         Ok(entries) => entries,
@@ -139,11 +139,20 @@ fn installed_packages(
         .collect()
 }
 
-/// The bin names installed by a group (deduplicated).
+/// The bins installed by a group, including their executable paths.
 ///
-/// Every declared dependency manifest must be readable and valid. Returning
-/// a partial set would make destructive callers mistake unknown ownership for
-/// an unowned bin.
+/// A group whose `node_modules` is wholly absent owns no bins, and neither
+/// does a declared dependency whose directory under `node_modules` is absent,
+/// a link left dangling by a pruned store included: no bin can resolve
+/// through a directory that is not there. Every dependency directory that
+/// does exist must hold a readable, valid manifest: returning a partial set
+/// would make destructive callers mistake unknown ownership for an unowned
+/// bin.
+pub fn get_installed_bins(info: &GlobalPackageInfo) -> Result<Vec<Command>, PackageManifestError> {
+    get_installed_bins_with_fs::<Host>(info)
+}
+
+/// The bin names installed by a group (deduplicated). See [`get_installed_bins`].
 pub fn get_installed_bin_names(
     info: &GlobalPackageInfo,
 ) -> Result<Vec<String>, PackageManifestError> {
@@ -154,22 +163,58 @@ fn get_installed_bin_names_with_fs<Sys>(
     info: &GlobalPackageInfo,
 ) -> Result<Vec<String>, PackageManifestError>
 where
-    Sys: FsReadFile + FsWalkFiles,
+    Sys: FsReadFile + FsWalkFiles + FsReadDir,
+{
+    Ok(get_installed_bins_with_fs::<Sys>(info)?
+        .into_iter()
+        .map(|bin| bin.name)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect())
+}
+
+fn get_installed_bins_with_fs<Sys>(
+    info: &GlobalPackageInfo,
+) -> Result<Vec<Command>, PackageManifestError>
+where
+    Sys: FsReadFile + FsWalkFiles + FsReadDir,
 {
     let modules_dir = info.install_dir.join("node_modules");
-    let mut bins = BTreeSet::new();
+    if !dir_exists::<Sys>(&modules_dir)? {
+        return Ok(Vec::new());
+    }
+    let mut bins = Vec::new();
     for (alias, _) in &info.dependencies {
         let dep_dir = modules_dir.join(alias);
         let manifest_path = dep_dir.join("package.json");
-        let bytes = Sys::read_file(&manifest_path)
-            .map_err(|source| PackageManifestError::Read { path: manifest_path.clone(), source })?;
+        let bytes = match Sys::read_file(&manifest_path) {
+            Ok(bytes) => bytes,
+            Err(source) => {
+                // Probing after the read rather than before also covers a
+                // link pruned while the scan runs.
+                if source.kind() == io::ErrorKind::NotFound && !dir_exists::<Sys>(&dep_dir)? {
+                    continue;
+                }
+                return Err(PackageManifestError::Read { path: manifest_path, source });
+            }
+        };
         let manifest = parse_manifest_bytes(&bytes)
             .map_err(|source| PackageManifestError::Parse { path: manifest_path, source })?;
-        for command in get_bins_from_package_manifest::<Sys>(&manifest, &dep_dir) {
-            bins.insert(command.name);
-        }
+        bins.extend(get_bins_from_package_manifest::<Sys>(&manifest, &dep_dir));
     }
-    Ok(bins.into_iter().collect())
+    Ok(bins)
+}
+
+/// Whether `dir` is there to be listed. Only `NotFound` reads as absent;
+/// every other error surfaces, so unreadable ownership is never mistaken
+/// for unowned. Probing through the capability rather than `std::fs` keeps
+/// a fake that models a readable tree on the per-manifest paths.
+fn dir_exists<Sys: FsReadDir>(dir: &Path) -> Result<bool, PackageManifestError> {
+    match Sys::read_dir(dir).map(|_| ()) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(PackageManifestError::Read { path: dir.to_path_buf(), source }),
+    }
 }
 
 /// Read the directly-installed packages of an install directory as

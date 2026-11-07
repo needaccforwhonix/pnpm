@@ -1,19 +1,27 @@
-//! Recursive-run integration tests. The build scripts run through
-//! pacquet's `sh -c` executor, so the whole file is gated to Unix —
-//! same as the single-package `run` tests.
-#![cfg(unix)]
+//! Recursive-run integration tests.
+//!
+//! The package scripts are Node programs rather than shell one-liners, so
+//! the same body reaches `sh -c` and `cmd /d /s /c` alike. Only the two
+//! process-group tests stay Unix-only, and they say so where they sit.
 
+use crate::_utils::{
+    CHILD_DEADLINE, append_line_script, wait_for_child, wait_for_marker_script, write_marker_script,
+};
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
+use pnpm_cmd_shim::ScriptRuntime;
+#[cfg(unix)]
+use pnpm_cmd_shim::generate_sh_shim;
+#[cfg(windows)]
+use pnpm_cmd_shim::{CmdShimBatch, generate_cmd_shim};
 use pnpm_testing_utils::bin::CommandTempCwd;
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     fs,
-    os::unix::fs::PermissionsExt,
     path::Path,
-    process::Command,
-    time::{Duration, Instant},
+    process::{Command, Stdio},
+    time::Duration,
 };
 
 /// Write a `pnpm-workspace.yaml` listing `names` as packages, plus a
@@ -33,11 +41,37 @@ fn write_workspace(workspace: &Path, manifests: &[(&str, Value)]) {
     }
 }
 
-fn write_executable(path: &Path, body: &str) {
-    fs::write(path, body).expect("write executable");
-    let mut perms = fs::metadata(path).expect("stat executable").permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(path, perms).expect("chmod +x");
+/// Place a runnable `name` in `bin_dir` whose program is the Node source
+/// `body`, standing in for an installed dependency's bin on `PATH`.
+///
+/// The launcher beside the program comes from the generators pnpm links
+/// real bins with, so each platform gets the shape its script runner
+/// looks for: an `sh` shim outside Windows, a `.cmd` one on it, which is
+/// what `cmd` resolves through `PATHEXT`.
+fn write_node_bin(bin_dir: &Path, name: &str, body: &str) {
+    fs::create_dir_all(bin_dir).expect("create the bin directory");
+    let target = bin_dir.join(format!("{name}.cjs"));
+    fs::write(&target, body).expect("write the bin program");
+    let node = ScriptRuntime { prog: Some("node".to_owned()), args: String::new() };
+
+    #[cfg(windows)]
+    {
+        let shim = bin_dir.join(format!("{name}.cmd"));
+        let contents = generate_cmd_shim(&target, &shim, Some(&node), &[], CmdShimBatch::Kept);
+        fs::write(&shim, contents).expect("write the cmd shim");
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let shim = bin_dir.join(name);
+        let contents = generate_sh_shim(&target, &shim, Some(&node), &[], None);
+        fs::write(&shim, contents).expect("write the sh shim");
+        let mut perms = fs::metadata(&shim).expect("stat the shim").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&shim, perms).expect("make the shim executable");
+    }
 }
 
 /// Map each summary entry to `(basename, status)` so assertions don't
@@ -65,16 +99,15 @@ fn summary_statuses(workspace: &Path) -> HashMap<String, String> {
         .collect()
 }
 
-/// A package whose `build` script writes a marker via a *relative* path
-/// (`touch ran.txt`), so it lands in the script's working directory.
-/// Tests assert the marker appears under the package's own root, which
-/// only holds if each script runs with cwd == its package root rather
-/// than the workspace root.
+/// A package whose `build` script writes a marker at a *relative* path,
+/// so it lands in the script's working directory. Tests assert the marker
+/// appears under the package's own root, which only holds if each script
+/// runs with cwd == its package root rather than the workspace root.
 fn build_writes_marker(name: &str) -> Value {
     json!({
         "name": name,
         "version": "1.0.0",
-        "scripts": { "build": "touch ran.txt" },
+        "scripts": { "build": write_marker_script("ran.txt") },
     })
 }
 
@@ -85,27 +118,46 @@ fn build_appends_run_order(name: &str) -> Value {
     json!({
         "name": name,
         "version": "1.0.0",
-        "scripts": { "build": format!("echo {name} >> ../order.log") },
+        "scripts": { "build": append_line_script(name, "../order.log") },
     })
 }
 
+/// The command a package script runs to take part in the overlap probe
+/// [`write_concurrency_probe`] writes.
+pub const CONCURRENCY_PROBE_COMMAND: &str = "node ../track-concurrency.cjs";
+
+/// `mkdir` is the lock each run claims its slot with, because it fails
+/// rather than succeeding twice.
+///
+/// The claim is sampled repeatedly rather than once, because two runs
+/// whose starts are further apart than a single sampling delay still
+/// overlap, and one sample apiece can fall either side of that overlap.
 fn write_concurrency_probe(workspace: &Path) {
     fs::write(
-        workspace.join("track-concurrency.sh"),
-        r#"marker=../active-$(basename "$PWD")
-mkdir "$marker"
-sleep 0.2
-set -- ../active-*
-[ -e "$1" ] || set --
-[ "$#" -ge 2 ] && touch ../saw-parallel
-[ "$#" -gt 2 ] && touch ../exceeded-concurrency
-sleep 0.2
-rmdir "$marker"
-"#,
+        workspace.join("track-concurrency.cjs"),
+        r"const fs = require('fs')
+const path = require('path')
+const marker = path.join('..', 'active-' + path.basename(process.cwd()))
+fs.mkdirSync(marker)
+const until = Date.now() + 600
+const sample = () => {
+  const active = fs.readdirSync('..').filter((entry) => entry.startsWith('active-'))
+  if (active.length >= 2) fs.writeFileSync('../saw-parallel', '')
+  if (active.length > 2) fs.writeFileSync('../exceeded-concurrency', '')
+  if (Date.now() < until) setTimeout(sample, 20)
+  else fs.rmdirSync(marker)
+}
+setTimeout(sample, 20)
+",
     )
     .expect("write concurrency probe");
 }
 
+/// A script that records its own process group and its parent's, for the
+/// tests that pin which group a script runs in. POSIX-only: Windows has
+/// no process groups to compare, and pnpm keeps children in a job object
+/// there instead.
+#[cfg(unix)]
 fn process_group_probe() -> &'static str {
     r#"child_group=$(ps -o pgid= -p $$ | tr -d ' ')
 parent_group=$(ps -o pgid= -p $PPID | tr -d ' ')
@@ -197,9 +249,9 @@ fn recursive_lifecycle_aliases_use_recursive_run_options() {
             "name": name,
             "version": "1.0.0",
             "scripts": {
-                "test": "touch test-ran.txt",
-                "start": "touch start-ran.txt",
-                "stop": "touch stop-ran.txt",
+                "test": write_marker_script("test-ran.txt"),
+                "start": write_marker_script("start-ran.txt"),
+                "stop": write_marker_script("stop-ran.txt"),
             },
         })
     };
@@ -249,7 +301,7 @@ fn recursive_run_settings_only_workspace_enumerates_root_only() {
         json!({
             "name": "root",
             "version": "1.0.0",
-            "scripts": { "build": "touch root-ran.txt" },
+            "scripts": { "build": write_marker_script("root-ran.txt") },
         })
         .to_string(),
     )
@@ -264,7 +316,7 @@ fn recursive_run_settings_only_workspace_enumerates_root_only() {
         json!({
             "name": "preact",
             "version": "10.10.2",
-            "scripts": { "build": "touch vendored-ran.txt" },
+            "scripts": { "build": write_marker_script("vendored-ran.txt") },
         })
         .to_string(),
     )
@@ -281,6 +333,46 @@ fn recursive_run_settings_only_workspace_enumerates_root_only() {
     assert!(
         !nested.join("vendored-ran.txt").exists(),
         "settings-only workspace manifests must not recursively enumerate vendored packages",
+    );
+
+    drop(root);
+}
+
+/// A `**` pattern must not reach a project under a dot-prefixed directory
+/// (pnpm/pnpm#16250). The CLI hands discovery its managed directories,
+/// which is the walk this pins; the crate's unit tests pass none by default.
+#[test]
+fn recursive_run_skips_projects_under_dot_directories() {
+    let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+    fs::write(workspace.join("pnpm-workspace.yaml"), "packages:\n  - '**'\n")
+        .expect("write pnpm-workspace.yaml");
+    let visible = workspace.join("pkgs/visible");
+    let hidden = workspace.join(".cache/hidden");
+    for (dir, name) in [(&visible, "visible"), (&hidden, "hidden")] {
+        fs::create_dir_all(dir).expect("create project dir");
+        fs::write(
+            dir.join("package.json"),
+            json!({
+                "name": name,
+                "version": "1.0.0",
+                "scripts": { "build": write_marker_script("ran.txt") },
+            })
+            .to_string(),
+        )
+        .expect("write package.json");
+    }
+
+    pacquet
+        .with_arg("-r")
+        .with_arg("run")
+        .with_arg("build")
+        .assert()
+        .success();
+
+    assert!(visible.join("ran.txt").exists(), "the visible project's build should run");
+    assert!(
+        !hidden.join("ran.txt").exists(),
+        "a project under a dot directory must not be a workspace project",
     );
 
     drop(root);
@@ -306,7 +398,7 @@ fn workspace_root_run_selection(start_dir: &str, filter: Option<&str>) -> Vec<St
         json!({
             "name": "root",
             "version": "1.0.0",
-            "scripts": { "build": "touch root-ran.txt" },
+            "scripts": { "build": write_marker_script("root-ran.txt") },
         })
         .to_string(),
     )
@@ -344,7 +436,7 @@ fn write_workspace_with_root_and_packages(workspace: &Path) {
         json!({
             "name": "root",
             "version": "1.0.0",
-            "scripts": { "build": "touch root-ran.txt" },
+            "scripts": { "build": write_marker_script("root-ran.txt") },
         })
         .to_string(),
     )
@@ -406,7 +498,7 @@ fn recursive_run_no_sort_uses_workspace_order() {
                 json!({
                     "name": "z-app",
                     "version": "1.0.0",
-                    "scripts": { "build": "echo z-app >> ../order.log" },
+                    "scripts": { "build": append_line_script("z-app", "../order.log") },
                     "dependencies": { "a-lib": "workspace:*" },
                 }),
             ),
@@ -442,7 +534,7 @@ fn recursive_run_reads_sort_from_workspace_config() {
                 json!({
                     "name": "app",
                     "version": "1.0.0",
-                    "scripts": { "build": "echo app >> ../order.log" },
+                    "scripts": { "build": append_line_script("app", "../order.log") },
                     "dependencies": { "lib": "workspace:*" },
                 }),
             ),
@@ -474,7 +566,7 @@ fn recursive_run_reads_reverse_from_workspace_config() {
                 json!({
                     "name": "app",
                     "version": "1.0.0",
-                    "scripts": { "build": "echo app >> ../order.log" },
+                    "scripts": { "build": append_line_script("app", "../order.log") },
                     "dependencies": { "lib": "workspace:*" },
                 }),
             ),
@@ -511,16 +603,14 @@ fn recursive_run_reads_reverse_from_workspace_config() {
 fn assert_recursive_run_bail_cancels_in_flight(shell_emulator: bool) {
     let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
     let manifest = |name: &str, body: &str| json!({ "name": name, "version": "1.0.0", "scripts": { "build": body } });
+    // The run ending is the proof: these scripts stop only when cancelled,
+    // and pnpm waits for the scripts it started.
+    let hold_ms = (CHILD_DEADLINE * 2).as_millis();
+    let hold_until_cancelled = r#"node -e "const fs = require('fs'); fs.writeFileSync('ran.txt', ''); setTimeout(() => process.exit(0), Number(process.env.HOLD_MS))""#;
     write_workspace(
         &workspace,
         &[
-            (
-                "a-slow-1",
-                manifest(
-                    "a-slow-1",
-                    r#"node -e "require('fs').writeFileSync('ran.txt', ''); setTimeout(() => {}, 5000)""#,
-                ),
-            ),
+            ("a-slow-1", manifest("a-slow-1", hold_until_cancelled)),
             (
                 "b-fails",
                 manifest(
@@ -528,14 +618,8 @@ fn assert_recursive_run_bail_cancels_in_flight(shell_emulator: bool) {
                     r#"node -e "const fs = require('fs'); const wait = () => fs.existsSync('../a-slow-1/ran.txt') && fs.existsSync('../c-slow-2/ran.txt') ? process.exit(1) : setTimeout(wait, 10); wait()""#,
                 ),
             ),
-            (
-                "c-slow-2",
-                manifest(
-                    "c-slow-2",
-                    r#"node -e "require('fs').writeFileSync('ran.txt', ''); setTimeout(() => {}, 5000)""#,
-                ),
-            ),
-            ("z-queued", manifest("z-queued", "touch ran.txt")),
+            ("c-slow-2", manifest("c-slow-2", hold_until_cancelled)),
+            ("z-queued", manifest("z-queued", &write_marker_script("ran.txt"))),
         ],
     );
     if shell_emulator {
@@ -546,8 +630,8 @@ fn assert_recursive_run_bail_cancels_in_flight(shell_emulator: bool) {
         .expect("enable the shell emulator");
     }
 
-    let start = Instant::now();
-    let output = pacquet
+    let stderr_path = workspace.join("run.stderr");
+    let mut run = pacquet
         .with_args([
             "--workspace-concurrency=3",
             "--no-sort",
@@ -556,17 +640,24 @@ fn assert_recursive_run_bail_cancels_in_flight(shell_emulator: bool) {
             "run",
             "build",
         ])
-        .output()
+        .env("HOLD_MS", hold_ms.to_string())
+        .stdout(Stdio::null())
+        .stderr(fs::File::create(&stderr_path).expect("create the run output"))
+        .spawn()
         .expect("spawn pacquet");
-    let elapsed = start.elapsed();
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let status = wait_for_child(&mut run);
+    let stderr = fs::read_to_string(&stderr_path).expect("read the run output");
     eprintln!("STDERR:\n{stderr}\n");
-    assert!(!output.status.success(), "the failing project should fail the run");
-    eprintln!("recursive run elapsed: {elapsed:?}");
-    assert!(
-        elapsed < Duration::from_secs(4),
-        "bail should interrupt the five-second in-flight scripts",
-    );
+    assert!(!status.success(), "the failing project should fail the run");
+    for name in ["a-slow-1", "c-slow-2"] {
+        assert!(
+            workspace
+                .join(name)
+                .join("ran.txt")
+                .exists(),
+            "{name} must have started, or a `running` summary entry proves nothing",
+        );
+    }
 
     let statuses = summary_statuses(&workspace);
     dbg!(&statuses);
@@ -628,6 +719,84 @@ fn recursive_run_if_present_is_a_noop_when_no_package_has_the_script() {
         .with_arg("lint")
         .assert()
         .success();
+
+    drop(root);
+}
+
+/// A `--filter` that selects no project skips the run with exit 0 and
+/// says so on stdout, as pnpm does. The selector here is `'**'` with the
+/// quotes kept, which is what `cmd.exe` passes for `--filter '**'` in a
+/// package script.
+#[test]
+fn recursive_run_reports_a_filter_that_matched_nothing() {
+    let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+    write_workspace(&workspace, &[("project-1", build_writes_marker("project-1"))]);
+
+    let output = pacquet
+        .with_arg("--filter")
+        .with_arg("'**'")
+        .with_arg("build")
+        .output()
+        .expect("run pacquet");
+
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("No projects matched the filters in"), "stdout: {stdout}");
+    assert!(
+        !workspace
+            .join("project-1")
+            .join("ran.txt")
+            .exists(),
+        "no project is selected",
+    );
+
+    drop(root);
+}
+
+/// The explicit `run` spelling reports the empty selection the same way.
+#[test]
+fn recursive_run_command_reports_a_filter_that_matched_nothing() {
+    let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+    write_workspace(&workspace, &[("project-1", build_writes_marker("project-1"))]);
+
+    let output = pacquet
+        .with_arg("-r")
+        .with_arg("--filter")
+        .with_arg("does-not-exist")
+        .with_arg("run")
+        .with_arg("build")
+        .output()
+        .expect("run pacquet");
+
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("No projects matched the filters in"), "stdout: {stdout}");
+
+    drop(root);
+}
+
+#[test]
+fn recursive_run_silent_suppresses_no_match_notice() {
+    let CommandTempCwd { root, workspace, .. } = CommandTempCwd::init();
+    write_workspace(&workspace, &[("project-1", build_writes_marker("project-1"))]);
+
+    for flag in ["--silent", "--reporter=ndjson"] {
+        let output = Command::cargo_bin("pnpm")
+            .expect("find pacquet binary")
+            .with_current_dir(&workspace)
+            .with_arg("-r")
+            .with_arg("--filter")
+            .with_arg("does-not-exist")
+            .with_arg(flag)
+            .with_arg("run")
+            .with_arg("build")
+            .output()
+            .expect("run pacquet");
+
+        assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(!stdout.contains("No projects matched the filters in"), "stdout: {stdout}");
+    }
 
     drop(root);
 }
@@ -770,9 +939,9 @@ fn recursive_run_runs_pre_and_post_when_enabled() {
                 "name": "project-1",
                 "version": "1.0.0",
                 "scripts": {
-                    "prebuild": "touch pre.txt",
-                    "build": "touch ran.txt",
-                    "postbuild": "touch post.txt",
+                    "prebuild": write_marker_script("pre.txt"),
+                    "build": write_marker_script("ran.txt"),
+                    "postbuild": write_marker_script("post.txt"),
                 },
             }),
         )],
@@ -896,6 +1065,10 @@ mod task_graph;
 
 mod recovery;
 
+mod concurrency;
+
 mod output;
 
 mod environment;
+
+mod required_scripts;

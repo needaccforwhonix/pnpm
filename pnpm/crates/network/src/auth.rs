@@ -17,12 +17,15 @@
 //! `.npmrc`; if it redirects across hosts, no header is attached.
 
 pub use redaction::{
-    hide_auth_information, redact_and_sanitize, redact_and_sanitize_multiline,
+    hide_auth_information, redact_and_sanitize, redact_and_sanitize_multiline, redact_npm_auth_key,
     redact_url_credentials, redact_url_for_display,
 };
 pub use url::{base64_encode, base64_encode_bytes, is_url_secure_for_credentials, nerf_dart};
 
-use crate::token_helper::{TokenHelperRunner, execute_token_helper, run_token_helper_command};
+use crate::{
+    AddressGuard,
+    token_helper::{TokenHelperRunner, execute_token_helper, run_token_helper_command},
+};
 use std::{
     collections::{BTreeMap, HashMap},
     fmt,
@@ -70,6 +73,13 @@ pub trait UpstreamRouteHook: Send + Sync {
         true
     }
 
+    /// The addresses a connection made on this deployment's behalf may
+    /// reach, for connections a caller opens outside the HTTP client, such
+    /// as a `git` subprocess. `None` for hooks with no such policy.
+    fn connect_guard(&self) -> Option<AddressGuard> {
+        None
+    }
+
     /// Classify the metadata cache scope for a fetch to `url` for package
     /// `package` (`None` for non-package fetches). Unlike [`Self::authorize`]
     /// this is a read-only query — it must **not** record into the resolve's
@@ -90,12 +100,10 @@ pub trait UpstreamRouteHook: Send + Sync {
 /// how the route decision reaches the npm resolver's mirror path, in-memory
 /// cache key, and fetch-lock key.
 ///
-/// The pnpm CLI has no route hook, so every fetch is [`Self::Public`] and the
-/// global mirror behaves exactly as before.
+/// The pnpm CLI has no route hook, so every fetch is [`Self::Public`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetadataCacheScope {
-    /// Public route: the shared, global metadata mirror — current behavior,
-    /// shared by every caller.
+    /// Public route: the shared, global metadata mirror.
     Public,
     /// Private route keyed by a private access descriptor. `descriptor_id`
     /// is a filesystem-safe, server-secret-keyed digest that namespaces the
@@ -113,9 +121,7 @@ pub enum MetadataCacheScope {
 /// Construct via [`AuthHeaders::from_parts`], [`AuthHeaders::from_creds_map`],
 /// [`AuthHeaders::from_map`], or [`AuthHeaders::default`] (empty). Look up via
 /// [`AuthHeaders::for_url`].
-/// Memo of resolved `tokenHelper` results keyed by `scope + map key`. Each
-/// entry is a per-key [`OnceLock`] so a resolving subprocess runs without the
-/// shared [`Mutex`] held. Cloning the headers shares the cache.
+/// Memo of resolved `tokenHelper` results keyed by `scope + map key`.
 type TokenHelperCache = Arc<Mutex<HashMap<String, Arc<OnceLock<Option<String>>>>>>;
 
 #[derive(Default, Clone)]
@@ -221,16 +227,8 @@ impl AuthHeaders {
     /// Cargo tokens are bare, and future readers may supply `Basic` or another
     /// registry-defined value. An invalid or unsupported URL is ignored.
     pub fn insert_url_header(&mut self, url: &str, header: String) {
-        let mut terminated;
-        let url = if url.ends_with('/') {
-            url
-        } else {
-            terminated = String::with_capacity(url.len() + 1);
-            terminated.push_str(url);
-            terminated.push('/');
-            &terminated
-        };
-        let uri = nerf_dart(url);
+        let normalized = crate::url_encoding::append_trailing_slash(url.into());
+        let uri = nerf_dart(&normalized);
         if uri.is_empty() {
             return;
         }
@@ -378,9 +376,7 @@ impl AuthHeaders {
         }
     }
 
-    /// Override the runner used to execute `tokenHelper` commands. The
-    /// dependency-injection seam for tests: production leaves it unset
-    /// and spawns real processes.
+    /// Override the runner used to execute `tokenHelper` commands.
     #[must_use]
     pub fn with_token_helper_runner(mut self, runner: TokenHelperRunner) -> Self {
         self.token_helpers.token_helper_runner = Some(runner);
@@ -490,6 +486,12 @@ impl AuthHeaders {
         self.route_hook
             .as_ref()
             .is_none_or(|hook| hook.allows_fetch(url))
+    }
+
+    /// See [`UpstreamRouteHook::connect_guard`].
+    #[must_use]
+    pub fn connect_guard(&self) -> Option<AddressGuard> {
+        self.route_hook.as_ref().and_then(|hook| hook.connect_guard())
     }
 
     /// Record the route for a metadata/tarball fetch that is about to be

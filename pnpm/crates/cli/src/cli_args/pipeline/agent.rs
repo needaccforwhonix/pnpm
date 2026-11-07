@@ -9,11 +9,12 @@
 //! arbitrary workspace code. The child inherits the agent's permissions;
 //! process separation is not a sandbox.
 
+use crate::process::Command;
 use pnpm_crypto_hash::create_short_hash;
+use pnpm_fs::LockMode;
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command,
     time::Duration,
 };
 
@@ -70,13 +71,16 @@ pub fn run_watch(invocation: &WatchInvocation, state_dir: &Path) -> miette::Resu
             .join(repo_basename(&invocation.polling.repo)),
         head_file: agent_dir.join("head"),
     };
-    println!(
+    pnpm_diagnostics::println!(
         "Watching {} ({}) every {}s; checkout: {}",
         invocation.polling.repo,
         invocation.polling.branch,
         invocation.polling.interval.as_secs(),
         dirs.checkout.display(),
     );
+    if pnpm_diagnostics::stdout::reader_closed() {
+        return Ok(());
+    }
     watch_revisions(invocation, &dirs)
 }
 
@@ -84,14 +88,16 @@ fn watch_revisions(invocation: &WatchInvocation, dirs: &AgentDirs) -> miette::Re
     loop {
         let result = poll_and_build(invocation, dirs);
         match result {
-            Ok(Some(revision)) => println!("Built {revision}."),
-            Ok(None) => println!("{} is up to date.", invocation.polling.branch),
+            Ok(Some(revision)) => pnpm_diagnostics::println!("Built {revision}."),
+            Ok(None) => pnpm_diagnostics::println!("{} is up to date.", invocation.polling.branch),
             // A failed poll (the remote is briefly unreachable, a fetch
             // hiccup) must not kill a daemon; the next tick retries.
             Err(error) if invocation.polling.once => return Err(error),
-            Err(error) => eprintln!("[WARN] poll failed: {error}"),
+            Err(error) => pnpm_diagnostics::eprintln!("[WARN] poll failed: {error}"),
         }
-        if invocation.polling.once {
+        // A daemon whose log reader left, as in `pnpm pipeline --watch | head -1`,
+        // stops the way a SIGPIPE would stop it.
+        if invocation.polling.once || pnpm_diagnostics::stdout::reader_closed() {
             return Ok(());
         }
         std::thread::sleep(invocation.polling.interval);
@@ -111,7 +117,7 @@ fn poll_and_build(
         return Ok(None);
     }
     materialize(invocation, dirs, &head)?;
-    println!("New revision {head}; running the pipeline…");
+    pnpm_diagnostics::println!("New revision {head}; running the pipeline…");
     run_pipeline_in_checkout(invocation, dirs, &head, last_built.as_deref())?;
     pnpm_fs::write_atomic(&dirs.head_file, head.as_bytes())
         .map_err(|error| miette::miette!("recording the built revision: {error}"))?;
@@ -122,9 +128,13 @@ fn poll_and_build(
 /// suffix, reduced to the identifier alphabet. Falls back to "checkout"
 /// for a remote it cannot name.
 fn repo_basename(repo: &str) -> String {
+    // A backslash ends a segment of a Windows path and is an ordinary
+    // character in a POSIX file name, so only Windows may split on one.
+    let trailing: &[char] = if cfg!(windows) { &['/', '\\'] } else { &['/'] };
+    let separators: &[char] = if cfg!(windows) { &['/', '\\', ':'] } else { &['/', ':'] };
     let tail = repo
-        .trim_end_matches('/')
-        .rsplit(['/', ':'])
+        .trim_end_matches(trailing)
+        .rsplit(separators)
         .next()
         .unwrap_or_default()
         .trim_end_matches(".git");
@@ -211,7 +221,7 @@ fn run_pipeline_in_checkout(
     revision: &str,
     last_built: Option<&str>,
 ) -> miette::Result<()> {
-    let program = std::env::current_exe()
+    let program = pnpm_executor::current_pnpm_exe()
         .map_err(|error| miette::miette!("cannot locate the pnpm executable: {error}"))?;
     let mut child = Command::new(program);
     child.arg("pipeline");
@@ -260,7 +270,7 @@ fn lock_agent(directory: &Path) -> std::io::Result<fs::File> {
         .create(true)
         .truncate(false)
         .open(directory.join("lock"))?;
-    file.try_lock().map_err(std::io::Error::other)?;
+    pnpm_fs::try_lock_file(&file, LockMode::Exclusive).map_err(std::io::Error::other)?;
     Ok(file)
 }
 

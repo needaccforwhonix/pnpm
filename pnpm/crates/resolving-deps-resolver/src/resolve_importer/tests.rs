@@ -13,6 +13,8 @@ mod optional_peers;
 
 mod locked_peers;
 
+mod hashed_peer_suffix;
+
 use std::{
     str::FromStr,
     sync::{Arc, Mutex},
@@ -193,6 +195,7 @@ fn fake_result(name: &str, version: &str, manifest: serde_json::Value) -> Resolv
             latest: Some(version.to_string()),
             published_at: None,
             manifest: Some(std::sync::Arc::new(manifest)),
+            non_deprecated_alternative: None,
         },
     }
 }
@@ -230,7 +233,7 @@ fn default_opts() -> ResolveImporterOptions {
             auto_install_peers_from_highest_match: false,
             resolve_peers_from_workspace_root: false,
             dedupe_peers: false,
-            dedupe_peer_dependents: true,
+            dedupe_peer_dependents: crate::PeerDependentsDedupe::On,
         },
         links: crate::PeerLinkOptions {
             exclude_links_from_lockfile: false,
@@ -244,6 +247,7 @@ fn default_opts() -> ResolveImporterOptions {
             pick_lowest_direct: false,
             subdep_published_by: None,
             catalogs: pnpm_catalogs_types::Catalogs::new(),
+            catalogs_dir: None,
             catalog_server: false,
         },
         hooks: crate::ManifestTransformHooks {

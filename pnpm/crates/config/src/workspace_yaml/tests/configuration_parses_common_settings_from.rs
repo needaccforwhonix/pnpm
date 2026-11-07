@@ -1,8 +1,10 @@
 use super::{
     AuditLevel, BTreeMap, CASE, ColorMode, Config, ConfigDependency, ConfigDependencyDetail,
-    EnvVar, LoadWorkspaceYamlError, NodeLinker, NodePackageMapType, Path, StoreDir, TrustPolicy,
-    WORKSPACE_MANIFEST_FILENAME, WorkspaceSettings, assert_eq, fs,
+    EnvVar, LoadWorkspaceYamlError, LogLevel, NAMED_UNRECOGNIZED_SETTINGS, NodeLinker,
+    NodePackageMapMode, NodePackageMapSettings, NodePackageMapType, Path, ReporterType, StoreDir,
+    TrustPolicy, WORKSPACE_MANIFEST_FILENAME, WorkspaceSettings, assert_eq, fs,
 };
+use std::fmt::Write as _;
 
 #[test]
 fn parses_common_settings_from_yaml() {
@@ -12,22 +14,34 @@ registry: https://reg.example
 lockfile: false
 autoInstallPeers: true
 dedupePeers: true
+autoDedupe: true
 preferWorkspacePackages: true
 nodeLinker: hoisted
 nodeExperimentalPackageMap: true
 nodePackageMapType: loose
+nodePackageMap:
+  mode: write-only
+  type: loose
 packages:
   - packages/*
 ";
     let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
     assert_eq!(settings.store_dir.as_deref(), Some("../my-store"));
     assert_eq!(settings.registry.as_deref(), Some("https://reg.example"));
-    assert_eq!(settings.lockfile, Some(false));
+    assert_eq!(settings.lockfile, Some(crate::workspace_yaml::LockfileSetting::Enabled(false)));
     assert_eq!(settings.auto_install_peers, Some(true));
     assert_eq!(settings.dedupe_peers, Some(true));
+    assert_eq!(settings.auto_dedupe, Some(true));
     assert_eq!(settings.prefer_workspace_packages, Some(true));
-    assert!(matches!(settings.node_linker, Some(NodeLinker::Hoisted)));
+    assert_eq!(settings.node_linker, Some(NodeLinker::Hoisted.into()));
     assert_eq!(settings.node_experimental_package_map, Some(true));
+    assert_eq!(
+        settings.node_package_map,
+        Some(NodePackageMapSettings {
+            mode: Some(NodePackageMapMode::WriteOnly),
+            map_type: Some(NodePackageMapType::Loose),
+        }),
+    );
     assert_eq!(settings.node_package_map_type, Some(NodePackageMapType::Loose));
 }
 
@@ -37,6 +51,8 @@ fn parity_settings_parse_and_apply() {
         r"
 bail: false
 color: never
+loglevel: error
+reporter: silent
 embedReadme: true
 ignoreWorkspaceRootCheck: true
 optional: false
@@ -56,6 +72,8 @@ useBetaCli: true
 
     assert!(!config.bail);
     assert_eq!(config.color, ColorMode::Never);
+    assert_eq!(config.loglevel, Some(LogLevel::Error));
+    assert_eq!(config.reporter, Some(ReporterType::Silent));
     assert!(config.embed_readme);
     assert!(config.ignore_workspace_root_check);
     assert!(!config.optional);
@@ -75,6 +93,8 @@ fn parity_settings_follow_global_config_key_routing() {
         r"
 bail: false
 color: never
+loglevel: error
+reporter: silent
 embedReadme: true
 ignoreWorkspaceRootCheck: true
 optional: false
@@ -93,6 +113,8 @@ useBetaCli: true
 
     assert_eq!(settings.bail, Some(false));
     assert_eq!(settings.color, Some(ColorMode::Never));
+    assert_eq!(settings.loglevel, Some(LogLevel::Error));
+    assert_eq!(settings.reporter, Some(ReporterType::Silent));
     assert_eq!(settings.optional, Some(false));
     assert_eq!(settings.package_lock, Some(false));
     assert_eq!(settings.shell_emulator, Some(true));
@@ -124,6 +146,46 @@ registry: https://reg.example
     assert!(!config.lockfile);
     assert_eq!(config.registry, "https://reg.example/");
     assert_ne!(before_registry, config.registry);
+}
+
+#[test]
+fn the_lockfile_section_turns_the_lockfile_on() {
+    let settings: WorkspaceSettings =
+        serde_saphyr::from_str("lockfile:\n  includeResolutionSettings: true\n").unwrap();
+    let mut config = Config::new();
+    config.lockfile = false;
+    settings.apply_to(&mut config, Path::new("/irrelevant"));
+    assert!(config.lockfile);
+    assert!(config.lockfile_include_resolution_settings);
+
+    assert!(
+        serde_saphyr::from_str::<WorkspaceSettings>(
+            "lockfile:\n  includeResolutionSetting: true\n"
+        )
+        .is_err(),
+    );
+
+    // A section that leaves the field out resets it.
+    let settings: WorkspaceSettings = serde_saphyr::from_str("lockfile: {}\n").unwrap();
+    settings.apply_to(&mut config, Path::new("/irrelevant"));
+    assert!(!config.lockfile_include_resolution_settings);
+}
+
+#[test]
+fn the_lockfile_section_sets_the_integrity_target() {
+    let settings: WorkspaceSettings =
+        serde_saphyr::from_str("lockfile:\n  integrityTarget: tar\n").unwrap();
+    let mut config = Config::new();
+    settings.apply_to(&mut config, Path::new("/irrelevant"));
+    assert_eq!(config.lockfile_integrity_target, pnpm_lockfile::IntegrityTarget::Tar);
+
+    assert!(
+        serde_saphyr::from_str::<WorkspaceSettings>("lockfile:\n  integrityTarget: tgz\n").is_err(),
+    );
+
+    let settings: WorkspaceSettings = serde_saphyr::from_str("lockfile: {}\n").unwrap();
+    settings.apply_to(&mut config, Path::new("/irrelevant"));
+    assert_eq!(config.lockfile_integrity_target, pnpm_lockfile::IntegrityTarget::Resource);
 }
 
 /// pnpm reads `fetchRetries` / `fetchRetryFactor` /
@@ -178,6 +240,16 @@ userAgent: my-agent/2.0
     assert_eq!(config.fetch_warn_timeout_ms, 20_000);
     assert_eq!(config.fetch_min_speed_ki_bps, 100);
     assert_eq!(config.user_agent, "my-agent/2.0");
+}
+
+#[test]
+fn parses_max_tarball_unpacked_size_into_the_tar_limits() {
+    let mut config = Config::new();
+    assert_eq!(config.tar_limits(), pnpm_tarball::TarLimits::default());
+    let settings: WorkspaceSettings =
+        serde_saphyr::from_str("maxTarballUnpackedSize: 1024\n").unwrap();
+    settings.apply_to(&mut config, Path::new("/irrelevant"));
+    assert_eq!(config.tar_limits(), pnpm_tarball::TarLimits::new(1024));
 }
 
 #[test]
@@ -460,12 +532,7 @@ remoteSideEffectsCache:
 }
 
 /// Lockfile-verification policy keys all live in `pnpm-workspace.yaml`
-/// alongside the rest of the install settings. This test asserts the
-/// camelCase rename + `apply_to` wiring for every new field
-/// introduced by the gate: `cacheDir` (path-resolved against the
-/// workspace dir), `minimumReleaseAge` / `…Exclude` / `…Strict` /
-/// `…IgnoreMissingTime`, and `trustPolicy` / `…Exclude` /
-/// `…IgnoreAfter`.
+/// alongside the rest of the install settings.
 #[test]
 fn parses_supply_chain_policy_settings_from_yaml_and_applies() {
     let yaml = r#"
@@ -604,12 +671,11 @@ fn parses_save_settings_from_yaml_and_applies() {
 }
 
 /// The registry URL is the key here, so the untrusted-environment gate has to
-/// drop the entry rather than expanding a placeholder into a request URL. The
-/// variable resolves, so a dropped entry is distinguishable from one expanded
-/// to an empty string — expanding it is how a token would reach an
-/// attacker-chosen host from a committed pnpm-workspace.yaml.
+/// apply to the key. The variable resolves, so the refusal is distinguishable
+/// from an expansion to an empty string. Expanding it is how a token would
+/// reach an attacker-chosen host from a committed pnpm-workspace.yaml.
 #[test]
-fn drops_a_registry_declaration_whose_url_has_an_env_placeholder() {
+fn refuses_a_registry_declaration_whose_url_has_an_env_placeholder() {
     struct EnvWithToken;
     impl EnvVar for EnvWithToken {
         fn var(name: &str) -> Option<String> {
@@ -623,16 +689,11 @@ registries:
   https://npm.example.com/: {serverType: artifactory}
 ";
     let mut settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
-    settings.substitute_env_untrusted::<EnvWithToken>();
-    let entries = settings.registries.as_ref().expect("registries present");
-    assert_eq!(entries.len(), 1);
-    assert!(entries.contains_key("https://npm.example.com/"));
-    assert!(
-        !entries
-            .keys()
-            .any(|registry| registry.contains("super-secret-token")),
-        "the token must never be expanded into a registry URL: {entries:?}",
-    );
+    let error = settings.substitute_env_untrusted::<EnvWithToken>().unwrap_err();
+    let message = error.to_string();
+    eprintln!("{message}");
+    assert!(matches!(error, crate::LoadWorkspaceYamlError::RegistryEnvNotExpanded { .. }));
+    assert!(!message.contains("super-secret-token"));
 }
 
 #[test]
@@ -706,7 +767,7 @@ fn load_at_ignores_keys_nested_under_a_setting() {
 }
 
 #[test]
-fn rejects_an_unknown_task_setting_field() {
+fn reports_an_unknown_task_setting_field_as_a_key_issue() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(
         dir.path().join(WORKSPACE_MANIFEST_FILENAME),
@@ -714,12 +775,59 @@ fn rejects_an_unknown_task_setting_field() {
     )
     .unwrap();
 
-    let error = WorkspaceSettings::load_at(dir.path()).unwrap_err();
-    assert!(matches!(
-        error,
-        LoadWorkspaceYamlError::UnknownTaskSettingField { ref task, ref field }
-            if task == "build" && field == "dependson"
-    ));
+    let settings = WorkspaceSettings::load_at(dir.path())
+        .expect("load pnpm-workspace.yaml")
+        .expect("pnpm-workspace.yaml is present");
+
+    let reported = &settings.key_issues.unrecognized_task_settings;
+    assert_eq!(reported.named, ["tasks['build'].dependson"]);
+    assert_eq!(reported.total, 1);
+    // The entry held nothing else, so it goes with the field it carried: it
+    // must not reach `pnpm config`, nor stand in for the ordering a task
+    // with no entry keeps.
+    let tasks = settings.tasks.as_ref().expect("the tasks section is present");
+    assert!(tasks.is_empty(), "the entry should be gone: {tasks:?}");
+}
+
+#[test]
+fn a_task_entry_keeps_the_settings_this_version_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join(WORKSPACE_MANIFEST_FILENAME),
+        "packages:\n  - packages/*\ntasks:\n  build:\n    dependsOn: ['^build']\n    laterSetting: 1\n",
+    )
+    .unwrap();
+
+    let settings = WorkspaceSettings::load_at(dir.path())
+        .expect("load pnpm-workspace.yaml")
+        .expect("pnpm-workspace.yaml is present");
+
+    let build = &settings.tasks.as_ref().unwrap()["build"];
+    assert_eq!(build.depends_on.as_deref(), Some(["^build".to_string()].as_slice()));
+    assert!(build.unknown.is_empty());
+    assert_eq!(settings.key_issues.unrecognized_task_settings.total, 1);
+}
+
+#[test]
+fn a_report_names_only_the_first_unrecognized_task_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut fields = String::new();
+    for index in 0..NAMED_UNRECOGNIZED_SETTINGS + 3 {
+        writeln!(fields, "    later{index}: 1").unwrap();
+    }
+    fs::write(
+        dir.path().join(WORKSPACE_MANIFEST_FILENAME),
+        format!("packages:\n  - packages/*\ntasks:\n  build:\n{fields}"),
+    )
+    .unwrap();
+
+    let settings = WorkspaceSettings::load_at(dir.path())
+        .expect("load pnpm-workspace.yaml")
+        .expect("pnpm-workspace.yaml is present");
+
+    let reported = &settings.key_issues.unrecognized_task_settings;
+    assert_eq!(reported.named.len(), NAMED_UNRECOGNIZED_SETTINGS);
+    assert_eq!(reported.total, NAMED_UNRECOGNIZED_SETTINGS + 3);
 }
 
 #[test]
@@ -754,4 +862,121 @@ fn rejects_string_task_concurrency_as_an_invalid_setting() {
         LoadWorkspaceYamlError::InvalidTaskConcurrency { ref task, ref concurrency }
             if task == "build" && concurrency == r#""2""#
     ));
+}
+
+#[test]
+fn parses_task_concurrency_groups() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join(WORKSPACE_MANIFEST_FILENAME),
+        "packages:\n  - packages/*\ntasks:\n  build:\n    concurrencyGroup: cargo\nconcurrencyGroups:\n  cargo: 2\n  node: 4\n",
+    )
+    .unwrap();
+
+    let settings = WorkspaceSettings::load_at(dir.path())
+        .expect("load pnpm-workspace.yaml")
+        .expect("pnpm-workspace.yaml is present");
+
+    assert_eq!(
+        settings.tasks.as_ref().unwrap()["build"].concurrency_group.as_deref(),
+        Some("cargo"),
+    );
+    assert_eq!(
+        settings.concurrency_groups
+            .as_ref()
+            .unwrap()
+            .get("cargo")
+            .copied(),
+        Some(2),
+    );
+    assert_eq!(
+        settings.concurrency_groups
+            .as_ref()
+            .unwrap()
+            .get("node")
+            .copied(),
+        Some(4),
+    );
+}
+
+#[test]
+fn parses_task_priority() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join(WORKSPACE_MANIFEST_FILENAME),
+        "packages:\n  - packages/*\ntasks:\n  build:\n    concurrencyGroup: cargo\n    priority: 10\n  test:\n    concurrencyGroup: cargo\n    priority: -1\n",
+    )
+    .unwrap();
+
+    let settings = WorkspaceSettings::load_at(dir.path())
+        .expect("load pnpm-workspace.yaml")
+        .expect("pnpm-workspace.yaml is present");
+
+    let tasks = settings.tasks.as_ref().unwrap();
+    assert_eq!(tasks["build"].priority, Some(10));
+    assert_eq!(tasks["test"].priority, Some(-1));
+}
+
+#[test]
+fn rejects_a_non_integer_task_priority() {
+    for priority in ["1.5", "'2'", "2147483648"] {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(WORKSPACE_MANIFEST_FILENAME),
+            format!("packages:\n  - packages/*\ntasks:\n  build:\n    priority: {priority}\n"),
+        )
+        .unwrap();
+
+        let error = WorkspaceSettings::load_at(dir.path()).unwrap_err();
+        dbg!(priority, &error);
+        assert!(matches!(
+            error,
+            LoadWorkspaceYamlError::InvalidTaskPriority { ref task, .. }
+                if task == "build"
+        ));
+    }
+}
+
+/// A layer restating one group's limit leaves the other groups as the
+/// layers below set them.
+#[test]
+fn concurrency_groups_merge_across_layers() {
+    let mut config = Config::default();
+    let dir = Path::new("/workspace");
+    for yaml in ["concurrencyGroups:\n  cargo: 2\n  node: 4\n", "concurrencyGroups:\n  cargo: 1\n"]
+    {
+        let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
+        settings.apply_to(&mut config, dir);
+    }
+
+    let limits: Vec<(&str, u32)> = config.concurrency_groups
+        .iter()
+        .map(|(group, limit)| (group.as_str(), *limit))
+        .collect();
+    dbg!(&limits);
+    assert_eq!(limits, vec![("cargo", 1), ("node", 4)]);
+}
+
+/// The group names a slot directory under the state directory, so a name
+/// that could leave it is refused before anything is created.
+#[test]
+fn rejects_a_task_concurrency_group_that_is_not_a_plain_name() {
+    for group in ["../escape", "a/b", "", ".", "..", "with space", "nul", "COM1.x", "trailing."] {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(WORKSPACE_MANIFEST_FILENAME),
+            format!(
+                "packages:\n  - packages/*\ntasks:\n  build:\n    concurrencyGroup: {group:?}\n",
+            ),
+        )
+        .unwrap();
+
+        let error = WorkspaceSettings::load_at(dir.path()).unwrap_err();
+        dbg!(group, &error);
+        assert!(matches!(
+            error,
+            LoadWorkspaceYamlError::InvalidTaskConcurrencyGroup { ref task, group: ref found }
+                if task == "build" && found == group
+        ));
+    }
 }

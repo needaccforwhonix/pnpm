@@ -5,7 +5,7 @@ use miette::Diagnostic;
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
-    fs, io,
+    io,
     path::{Path, PathBuf},
 };
 use wax::Program as _;
@@ -67,6 +67,8 @@ pub enum FindWorkspaceInventoryError {
 /// Ignored directories may be absolute or relative to the inventory root.
 /// Negated package patterns prune matching directories and their descendants.
 /// Positive package patterns do not restrict this inventory; the root is always scanned.
+/// A descendant directory holding `pnpm-workspace.yaml` or a `.git` directory
+/// is a separate checkout and is pruned with its descendants.
 pub fn find_workspace_inventory(
     workspace_root: &Path,
     manifest_basenames: &[&str],
@@ -136,7 +138,7 @@ fn find_workspace_inventory_with(
 }
 
 fn canonical_workspace_root(workspace_root: &Path) -> Result<PathBuf, FindWorkspaceInventoryError> {
-    fs::canonicalize(workspace_root)
+    std::fs::canonicalize(workspace_root)
         .map_err(|source| FindWorkspaceInventoryError::ReadDirectory {
             path: workspace_root.to_path_buf(),
             source,
@@ -171,10 +173,21 @@ fn ignored_paths_under(
     canonical_root: &Path,
     ignored_directories: &[PathBuf],
 ) -> Result<BTreeSet<PathBuf>, FindWorkspaceInventoryError> {
+    ignored_paths_under_with(workspace_root, canonical_root, ignored_directories, |path| {
+        std::fs::canonicalize(path)
+    })
+}
+
+fn ignored_paths_under_with(
+    workspace_root: &Path,
+    canonical_root: &Path,
+    ignored_directories: &[PathBuf],
+    mut canonicalize: impl FnMut(&Path) -> io::Result<PathBuf>,
+) -> Result<BTreeSet<PathBuf>, FindWorkspaceInventoryError> {
     let mut paths = BTreeSet::new();
     for path in ignored_directories {
         let path = workspace_root.join(path);
-        let canonical = match fs::canonicalize(&path) {
+        let canonical = match canonicalize(&path) {
             Ok(path) => path,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(source) => {

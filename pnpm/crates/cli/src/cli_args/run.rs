@@ -1,11 +1,11 @@
 pub(crate) use environment::script_environment;
-pub(crate) use execution::exec_scripts_prepend_node_path;
 pub(super) use execution::{RunContext, get_run_script_commands, run_stages};
+pub(crate) use injected_sync::project_modules_dirs;
 pub(super) use listing::ScriptSelector;
 
 use super::{
-    exec::{ExecArgs, ExecDirs},
-    reporter::{ReporterType, reporter_emit},
+    exec::{ExecArgs, ExecDirs, ExecError},
+    reporter::{ReporterType, reporter_emit, script_output_colors, suppresses_info_output},
 };
 use clap::Args;
 use derive_more::{Display, Error};
@@ -14,16 +14,15 @@ use execution::{
     ScriptOutcome, no_matching_script, run_selected_scripts, script_concurrency, script_extra_env,
     selected_scripts,
 };
+use filter_hint::filter_placement_hint;
 use indexmap::IndexMap;
 
 use listing::{render_project_commands, throw_or_filter_hidden_scripts};
 use miette::{Diagnostic, IntoDiagnostic};
 use pnpm_config::Config;
 use pnpm_executor::{
-    ProcessTracker, RunScript, ScriptExit, ScriptOutput, ScriptsPrependNodePath, exit_like,
-    run_script,
+    ProcessTracker, RunScript, ScriptExit, ScriptOutput, exit_like, interrupt_count, run_script,
 };
-use pnpm_injected_deps_syncer::{SyncInjectedDeps, sync_injected_deps};
 use pnpm_package_manager::{
     make_node_package_map_option, make_node_require_option, package_map_path_for_execution,
     pnp_path_for_execution,
@@ -31,7 +30,8 @@ use pnpm_package_manager::{
 use pnpm_package_manifest::PackageManifest;
 use pnpm_workspace::{ReadProjectManifestOnlyError, read_project_manifest_only};
 use pnpm_workspace_task_scheduler::{ScheduleGraphOptions, TaskCompletion, schedule_graph};
-use regex::Regex;
+use recursive::RecursiveRunOutcome;
+use regress::Regex;
 use serde_json::Value;
 use std::{
     collections::HashMap,
@@ -41,20 +41,20 @@ use std::{
 };
 
 mod environment;
+mod filter_hint;
 mod recursive;
 
 #[derive(Debug, Args)]
 pub struct RunArgs {
     /// A pre-defined package script followed by the arguments passed to
     /// it. When empty, the available scripts are listed.
-    ///
-    /// One positional rather than a script name plus a separate argument
-    /// list, so parsing stops *at* the script name — pnpm puts `run` in
-    /// `SPECIALLY_ESCAPED_CMDS` to the same effect. Every later token
-    /// reaches the script verbatim, including a `--` separator and
-    /// anything shaped like a pnpm flag. Splitting the two lets clap keep
-    /// parsing past the script name, which swallows both
-    /// (pnpm/pnpm#13295). `exec` / `dlx` / `with` take the same shape.
+    // One positional rather than a script name plus a separate argument
+    // list, so parsing stops *at* the script name — pnpm puts `run` in
+    // `SPECIALLY_ESCAPED_CMDS` to the same effect. Every later token
+    // reaches the script verbatim, including a `--` separator and
+    // anything shaped like a pnpm flag. Splitting the two lets clap keep
+    // parsing past the script name, which swallows both
+    // (pnpm/pnpm#13295). `exec` / `dlx` / `with` take the same shape.
     #[clap(trailing_var_arg = true, allow_hyphen_values = true)]
     pub script: Vec<String>,
     /// Avoid exiting with a non-zero exit code when the script is undefined.
@@ -102,6 +102,10 @@ pub enum RunError {
     )]
     AllHidden { scripts: String },
 
+    #[display("Command \"{command}\" not found")]
+    #[diagnostic(code(ERR_PNPM_RECURSIVE_EXEC_FIRST_FAIL), help("{hint}"))]
+    NoScriptOrCommand { command: String, hint: String },
+
     #[display("Missing script start or file server.js")]
     #[diagnostic(code(ERR_PNPM_NO_SCRIPT_OR_SERVER))]
     NoScriptOrServer,
@@ -122,6 +126,19 @@ pub enum RunError {
         )
     )]
     DryRunNotRecursive,
+}
+
+impl RunError {
+    /// Every argument after the script name belongs to the script, so a
+    /// `--filter` there selected no projects.
+    fn no_script(script_name: &str, args: &[String]) -> Self {
+        let not_found = format!(r#"Command "{script_name}" not found."#);
+        let hint = match filter_placement_hint(script_name, args) {
+            Some(placement) => format!("{not_found} {placement}"),
+            None => not_found,
+        };
+        RunError::NoScript { script: script_name.to_owned(), hint }
+    }
 }
 
 impl RunArgs {
@@ -188,10 +205,10 @@ impl RunArgs {
         // Before the manifest is read, so a mistyped command in a
         // directory without a project skips the check instead of
         // spawning a doomed install (see check_deps_status_before_run_at).
-        super::verify_deps::verify_deps_before_run(dir, config, reporter)?;
+        super::verify_deps::verify_deps_before_run(dir, &[dir], config, reporter)?;
         let Some((script_name, args)) = self.script.split_first() else {
             let manifest = read_project_manifest_only(dir).map_err(RunError::Manifest)?;
-            println!("{}", render_project_commands(manifest.value(), None));
+            pnpm_diagnostics::println!("{}", render_project_commands(manifest.value(), None));
             return Ok(());
         };
         let manifest = match read_project_manifest_only(dir) {
@@ -248,13 +265,18 @@ impl RunArgs {
             init_cwd: &init_cwd,
             config,
             extra_env: &extra_env,
-            silent: matches!(reporter, ReporterType::Silent),
+            silent: suppresses_info_output(reporter),
             output: if interleaved {
-                ScriptOutput::Streamed { dep_path: &dep_path, emit: reporter_emit(reporter) }
+                ScriptOutput::Streamed {
+                    dep_path: &dep_path,
+                    emit: reporter_emit(reporter),
+                    color: script_output_colors(),
+                }
             } else {
                 ScriptOutput::Inherit
             },
             process_tracker: process_tracker.as_ref(),
+            emit: reporter_emit(reporter),
         };
         let outcome = ScriptOutcome {
             failures: Mutex::new(Vec::new()),
@@ -276,22 +298,56 @@ impl RunArgs {
         dir: &Path,
         reporter: ReporterType,
     ) -> miette::Result<()> {
-        // A dry run prints what would execute and runs nothing, so it must
-        // not let the dependency verification trigger an install either.
-        if !self.dry_run {
-            super::verify_deps::verify_deps_before_run(dir, config, reporter)?;
+        recursive::run_recursive(self, config, dir, reporter, false).map(drop)
+    }
+
+    /// Like [`Self::run_recursive`], but when no selected project has a
+    /// script the name matches, the command is handed to a recursive
+    /// `exec` over the same selection.
+    pub async fn run_recursive_fallback(
+        &self,
+        config: &Config,
+        dir: &Path,
+        reporter: ReporterType,
+    ) -> miette::Result<()> {
+        match recursive::run_recursive(self, config, dir, reporter, true)? {
+            RecursiveRunOutcome::Done => Ok(()),
+            RecursiveRunOutcome::NoMatchingScript => {
+                ExecArgs {
+                    command: self.script.clone(),
+                    shell_mode: false,
+                    workspace: self.workspace.clone(),
+                }
+                .run_recursive(config, dir, reporter)
+                .await
+            }
         }
-        recursive::run_recursive(
-            self,
-            config,
-            dir,
-            reporter_emit(reporter),
-            matches!(reporter, ReporterType::Ndjson | ReporterType::Silent),
-        )
     }
 }
 
+/// Hand a name that matches no script to `exec`. When `exec` finds no such
+/// command either, the error says where a trailing filter option belongs.
 fn exec_fallback(
+    script_name: &str,
+    args: &[String],
+    dirs: ExecDirs<'_>,
+    config: &Config,
+    reporter: ReporterType,
+) -> miette::Result<()> {
+    let result = exec_script_name(script_name, args, dirs, config, reporter);
+    let Some(hint) = filter_placement_hint(script_name, args) else {
+        return result;
+    };
+    result.map_err(|report| match report.downcast::<ExecError>() {
+        Ok(ExecError::CommandNotFound { command }) => {
+            RunError::NoScriptOrCommand { command, hint }.into()
+        }
+        Ok(error) => error.into(),
+        Err(report) => report,
+    })
+}
+
+fn exec_script_name(
     script_name: &str,
     args: &[String],
     dirs: ExecDirs<'_>,
@@ -317,5 +373,9 @@ fn exec_fallback(
 mod tests;
 
 mod execution;
+
+mod injected_sync;
+
+mod lifecycle_failure;
 
 mod listing;

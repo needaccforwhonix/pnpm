@@ -1,11 +1,12 @@
 use std::{
-    net::{IpAddr, SocketAddr},
+    net::IpAddr,
     sync::LazyLock,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
     extract::{ConnectInfo, FromRequestParts, Request, State},
-    http::{Method, request::Parts},
+    http::{HeaderMap, Method, StatusCode, header, request::Parts},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -15,7 +16,32 @@ use pnpr_auth::TokenRecord;
 use pnpr_error::RegistryError;
 use pnpr_policy::{Identity, PackageRules};
 
-use super::{AppState, PeerAddr, RegistrySource, single_authorization_header};
+use super::{
+    AppState, PeerAddr, RegistrySource, oidc::WorkloadScope,
+    restrictions::check_token_restrictions, single_authorization_header,
+};
+
+#[derive(Clone)]
+pub(super) struct InvalidToken;
+
+/// A password login authenticates independently of the Authorization header.
+#[derive(Clone)]
+pub(super) struct PasswordAuthentication;
+
+/// Whether `headers` carry `Authorization: Bearer <expected>`, for an
+/// endpoint authenticated by a configured secret instead of a user token.
+/// Comparing digests keeps the comparison time independent of how much of
+/// the secret a guess gets right.
+pub(super) fn carries_bearer_secret(headers: &HeaderMap, expected: &str) -> bool {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|sent| {
+            super::ecosystem::sha256_hex(expected.as_bytes())
+                == super::ecosystem::sha256_hex(sent.trim().as_bytes())
+        })
+}
 
 /// What the caller is trying to do with a package. Drives which
 /// rule from the access policy applies.
@@ -43,7 +69,7 @@ impl Action {
 /// once, and the identity a handler sees is the same one the restriction
 /// gate already approved (no second lookup, no policy/identity race).
 #[derive(Clone)]
-pub(super) struct AuthedCaller(pub(super) Identity);
+pub(crate) struct AuthedCaller(pub(super) Identity);
 
 impl<RouterState: Send + Sync> FromRequestParts<RouterState> for AuthedCaller {
     type Rejection = Response;
@@ -66,48 +92,6 @@ impl<RouterState: Send + Sync> FromRequestParts<RouterState> for AuthedCaller {
     }
 }
 
-pub(super) async fn authenticate(
-    State(state): State<AppState>,
-    mut request: Request,
-    next: Next,
-) -> Response {
-    // Copy what resolution needs out of the request before mutating its
-    // extensions below — the header and method borrows can't outlive the
-    // `extensions_mut` call.
-    let header = match single_authorization_header(request.headers()) {
-        Ok(header) => header.map(str::to_owned),
-        Err(err) => return err.into_response(),
-    };
-    let method = request.method().clone();
-    let path = request.uri().path().to_owned();
-    let peer = request
-        .extensions()
-        .get::<ConnectInfo<PeerAddr>>()
-        .map(|info| info.0.0);
-
-    if let Some(raw) = header.as_deref().and_then(token_credentials) {
-        match bearer_token_identity(&state, &raw, &method, &path, peer).await {
-            Ok(Some(identity)) => {
-                request
-                    .extensions_mut()
-                    .insert(AuthedCaller(identity));
-                return next.run(request).await;
-            }
-            Ok(None) => {}
-            Err(response) => return response,
-        }
-    }
-
-    let identity = match resolve_caller(&state, header.as_deref(), &method, &path, peer).await {
-        Ok(identity) => identity,
-        Err(err) => return err.into_response(),
-    };
-    request
-        .extensions_mut()
-        .insert(AuthedCaller(identity));
-    next.run(request).await
-}
-
 /// Authenticate every request once, up front, and stash the resolved
 /// [`Identity`] in request extensions for the handlers (via
 /// [`AuthedCaller`]).
@@ -121,6 +105,127 @@ pub(super) async fn authenticate(
 /// used from any network. Basic-auth and anonymous requests carry no
 /// restriction and are still subject to the per-package access policy in
 /// the handlers; an unknown or revoked bearer token resolves to anonymous.
+pub(super) async fn authenticate(
+    State(state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    // Copy what resolution needs out of the request before mutating its
+    // extensions below — the header and method borrows can't outlive the
+    // `extensions_mut` call.
+    let header = match single_authorization_header(request.headers()) {
+        Ok(header) => header.map(str::to_owned),
+        Err(err) => return err.into_response(),
+    };
+    super::managed_state::refresh_managed_state(&state).await;
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let client_ip = resolve_and_attach_client_ip(&mut request, &state);
+
+    if let Some(raw) = header.as_deref().and_then(token_credentials) {
+        match bearer_token_identity(&state, &raw, &method, &path, client_ip).await {
+            Ok(Some(identity)) => {
+                if let Err(err) = refuse_deprovisioned(&state, &identity) {
+                    return token_failure_response(err.into_response(), header.as_deref());
+                }
+                let caller = AuthedCaller(identity);
+                record_user_on_span(&caller.0);
+                request.extensions_mut().insert(caller.clone());
+                let mut response = next.run(request).await;
+                response.extensions_mut().insert(caller);
+                return token_failure_response(response, header.as_deref());
+            }
+            Ok(None) => {}
+            Err(response) => return token_failure_response(response, header.as_deref()),
+        }
+    }
+
+    let resolved = resolve_caller(&state, header.as_deref(), &method, &path, client_ip).await;
+    let caller = match resolved.and_then(|resolved| {
+        refuse_deprovisioned(&state, &resolved.0)?;
+        Ok(resolved)
+    }) {
+        Ok(resolved) => attach_caller(&mut request, resolved),
+        Err(err) => return token_failure_response(err.into_response(), header.as_deref()),
+    };
+    let mut response = next.run(request).await;
+    response.extensions_mut().insert(caller);
+    token_failure_response(response, header.as_deref())
+}
+
+fn token_failure_response(mut response: Response, header: Option<&str>) -> Response {
+    if response.status() == StatusCode::UNAUTHORIZED
+        && response
+            .extensions()
+            .get::<PasswordAuthentication>()
+            .is_none()
+        && response
+            .extensions()
+            .get::<AuthedCaller>()
+            .is_none_or(|caller| matches!(caller.0, Identity::Anonymous))
+        && header.and_then(token_credentials).is_some()
+    {
+        response.extensions_mut().insert(InvalidToken);
+    }
+    response
+}
+
+/// Record the resolved caller, and a workload's scope, on `request`.
+fn attach_caller(
+    request: &mut Request,
+    (identity, workload): (Identity, Option<WorkloadScope>),
+) -> AuthedCaller {
+    let caller = AuthedCaller(identity);
+    record_user_on_span(&caller.0);
+    request.extensions_mut().insert(caller.clone());
+    if let Some(workload) = workload {
+        request.extensions_mut().insert(workload);
+    }
+    caller
+}
+
+fn record_user_on_span(identity: &Identity) {
+    if let Some(username) = identity.username() {
+        tracing::Span::current().record("user", tracing::field::display(username));
+    } else {
+        tracing::Span::current().record("user", "-");
+    }
+}
+
+fn resolve_and_attach_client_ip(request: &mut Request, state: &AppState) -> Option<IpAddr> {
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<PeerAddr>>()
+        .map(|info| info.0.0.ip());
+    let client_ip = super::resolve_client_ip(
+        peer,
+        request.headers(),
+        &state.inner.config.http.trusted_proxies,
+        state.inner.config.http.trusted_proxy_header,
+    );
+    if let Some(ip) = client_ip {
+        request
+            .extensions_mut()
+            .insert(super::ClientIp(ip));
+    }
+    client_ip
+}
+
+/// Refuse the credentials of a user a SCIM client deprovisioned. Its stored
+/// tokens are already revoked, but a browser session on another replica
+/// lives until that replica reloads the directory.
+pub(super) fn refuse_deprovisioned(
+    state: &AppState,
+    identity: &Identity,
+) -> Result<(), RegistryError> {
+    match identity {
+        Identity::User { username, .. } if super::scim::is_deprovisioned(state, username)? => {
+            Err(RegistryError::Unauthenticated { resource: "a deprovisioned account".to_string() })
+        }
+        _ => Ok(()),
+    }
+}
+
 /// The identity an OCI bearer token carries, or `None` when the credential is
 /// not one of pnpr's own bearer tokens and the ordinary backend lookup should
 /// decide instead.
@@ -129,7 +234,7 @@ async fn bearer_token_identity(
     raw: &str,
     method: &Method,
     path: &str,
-    peer: Option<SocketAddr>,
+    client_ip: Option<IpAddr>,
 ) -> Result<Option<Identity>, Response> {
     let claims = match super::oci::tokens::decode(state, raw) {
         Ok(Some(claims)) => claims,
@@ -145,15 +250,35 @@ async fn bearer_token_identity(
     let Some(parent) = claims.parent.as_ref() else {
         return Ok(Some(Identity::Anonymous));
     };
-    match state.inner.identity.auth.tokens.find_by_key(parent).await {
+    match owned_parent(state, parent).await {
         Ok(Some(record)) => {
-            check_token_restrictions(&record, method, path, peer)
+            check_token_restrictions(&record, method, path, client_ip)
                 .map_err(axum::response::IntoResponse::into_response)?;
+            state.inner.identity.last_used.record(parent, record.last_used_at);
             Ok(Some(Identity::user(record.username)))
         }
         Ok(None) => Err(super::oci::tokens::rejected(state, path, method)),
         Err(err) => Err(err.into_response()),
     }
+}
+
+/// The token an OCI bearer token was issued from, while its owner is still an
+/// account, as [`pnpr_auth::TokenBackend::lookup_record`] requires of a token
+/// sent directly.
+async fn owned_parent(state: &AppState, key: &str) -> Result<Option<TokenRecord>, RegistryError> {
+    let auth = &state.inner.identity.auth;
+    let Some(record) = auth.tokens.find_by_key(key).await? else {
+        return Ok(None);
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if record.expires_at.is_some_and(|exp| exp <= now) {
+        return Ok(None);
+    }
+    let owned = auth.users.password_hash(&record.username).await?.is_some();
+    Ok(owned.then_some(record))
 }
 
 /// Resolve the `Authorization` header to an [`Identity`], hitting the auth
@@ -166,17 +291,18 @@ async fn bearer_token_identity(
 /// error); an unknown token, any other credential shape, and a missing
 /// header all resolve to [`Identity::Anonymous`]. `Err` is a backing-store
 /// failure, surfaced as a 5xx so an outage isn't mistaken for "not
-/// authenticated".
+/// authenticated". Workload credentials also give the [`WorkloadScope`] a
+/// batch commit checks its entries against.
 async fn resolve_caller(
     state: &AppState,
     header: Option<&str>,
     method: &Method,
     path: &str,
-    peer: Option<SocketAddr>,
-) -> Result<Identity, RegistryError> {
+    client_ip: Option<IpAddr>,
+) -> Result<(Identity, Option<WorkloadScope>), RegistryError> {
     if let Some(raw_token) = header.and_then(token_credentials) {
-        if let Some(username) = state.inner.identity.oidc.session(&raw_token)? {
-            return Ok(Identity::user(username));
+        if let Some(user) = state.inner.identity.oidc.session(&raw_token)? {
+            return Ok((super::oidc_groups::session_identity(&state.inner.config, user), None));
         }
         if let Some(jwt) = raw_token.strip_prefix("pnpr_workload_") {
             let workload = state.inner.identity.oidc
@@ -185,19 +311,21 @@ async fn resolve_caller(
                 .ok_or_else(|| RegistryError::Unauthenticated {
                     resource: "OIDC workload credentials".to_string(),
                 })?;
-            super::oidc::check_workload_request(&state.inner.config, &workload, method, path)?;
-            return Ok(Identity::user(workload.identity.username));
+            super::oidc::check_workload_request(&workload, method, path)?;
+            let scope = WorkloadScope::new(&state.inner.config, &workload);
+            return Ok((Identity::user(workload.identity.username), Some(scope)));
         }
         if let Some(record) = state.inner.identity.auth.tokens.lookup_record(&raw_token).await? {
-            check_token_restrictions(&record, method, path, peer)?;
-            return Ok(Identity::user(record.username));
+            check_token_restrictions(&record, method, path, client_ip)?;
+            state.inner.identity.last_used.record_raw(&raw_token, record.last_used_at);
+            return Ok((Identity::user(record.username), None));
         }
     }
     // Anything that is not a pnpr token — a user:password Basic pair, another
     // scheme, or no credentials — carries no request identity. Going through
     // `identify` here would re-run the token lookup and bypass the
     // restriction checks above, so resolve straight to anonymous.
-    Ok(Identity::Anonymous)
+    Ok((Identity::Anonymous, None))
 }
 
 /// The pnpr token an `Authorization` header carries, in any of the shapes
@@ -226,38 +354,6 @@ pub(super) fn token_credentials(header_value: &str) -> Option<String> {
     let decoded = String::from_utf8(decoded).ok()?;
     let (_, password) = decoded.split_once(':')?;
     (!password.is_empty()).then(|| password.to_string())
-}
-
-/// Enforce a bearer token's own restrictions. A read-only token may not
-/// drive a mutating request; a CIDR-pinned token may only be used from a
-/// whitelisted peer (and is refused when the peer address is unavailable,
-/// so the check fails closed).
-fn check_token_restrictions(
-    record: &TokenRecord,
-    method: &Method,
-    path: &str,
-    peer: Option<SocketAddr>,
-) -> Result<(), RegistryError> {
-    if record.readonly && is_write_request(method, path) {
-        return Err(RegistryError::Forbidden {
-            user: record.username.clone(),
-            action: "write with",
-            resource: "a read-only token".to_string(),
-        });
-    }
-    if !record.cidr_whitelist.is_empty() {
-        // The peer address comes from the accepted socket (`ConnectInfo`),
-        // never a client-supplied forwarding header.
-        let allowed = peer.is_some_and(|addr| cidr_whitelist_allows(&record.cidr_whitelist, addr));
-        if !allowed {
-            return Err(RegistryError::Forbidden {
-                user: record.username.clone(),
-                action: "use",
-                resource: "this token from your network address".to_string(),
-            });
-        }
-    }
-    Ok(())
 }
 
 /// The `packages:` rules of the concrete registry a request resolved to.
@@ -294,7 +390,8 @@ pub(super) fn authorize(
     package: &str,
     action: Action,
 ) -> Result<(), RegistryError> {
-    let effective = source_rules(state, source).for_package(package);
+    let rules = source_rules(state, source).snapshot();
+    let effective = rules.for_package(package);
     let list = match action {
         Action::Access => effective.access,
         Action::Publish => effective.publish,
@@ -304,7 +401,7 @@ pub(super) fn authorize(
         return Ok(());
     }
     // Denied: an anonymous caller gets a chance to authenticate (401);
-    // an authenticated caller simply isn't in the allowed set (403).
+    // an authenticated caller isn't in the allowed set (403).
     match identity {
         Identity::Anonymous => {
             Err(RegistryError::Unauthenticated { resource: format!("package {package:?}") })
@@ -314,6 +411,88 @@ pub(super) fn authorize(
             action: action.label(),
             resource: format!("package {package:?}"),
         }),
+        _ => Err(RegistryError::Unauthenticated { resource: format!("package {package:?}") }),
+    }
+}
+
+pub(super) async fn is_package_owner(
+    state: &AppState,
+    identity: &Identity,
+    package: &str,
+    org: Option<&str>,
+    action: Action,
+) -> Result<bool, RegistryError> {
+    let Some(username) = identity.username() else {
+        return Ok(false);
+    };
+    if state.inner.config.identity.admins.contains(username) {
+        return Ok(true);
+    }
+    let Ok(canonical) =
+        pnpr_package_name::CanonicalPackageName::parse(package, pnpr_package_name::Ecosystem::Npm)
+    else {
+        return Ok(false);
+    };
+    let storage = super::hosted_storage(state, org);
+    // An authorization check reads the current document, never a replica's
+    // copy that may predate a maintainer's removal.
+    if let Some(stored) = storage.read_hosted_document_for_update(&canonical).await? {
+        let bytes = stored.bytes;
+        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes)
+            && let Some(maintainers) = val.get("maintainers").and_then(serde_json::Value::as_array)
+        {
+            let is_maintainer = maintainers
+                .iter()
+                .any(|entry| {
+                    entry.get("name").and_then(serde_json::Value::as_str) == Some(username)
+                });
+            return Ok(is_maintainer);
+        }
+        return Ok(false);
+    }
+    if let Some(tombstone) = storage.read_tombstone(&canonical).await? {
+        return Ok(tombstone.maintainers
+            .iter()
+            .any(|maintainer| maintainer == username));
+    }
+    // Brand new package: initial publish claims the package; cannot unpublish nonexistent package
+    Ok(matches!(action, Action::Publish))
+}
+
+pub(super) async fn authorize_package(
+    state: &AppState,
+    identity: &Identity,
+    source: &RegistrySource,
+    package: &str,
+    action: Action,
+    org: Option<&str>,
+) -> Result<(), RegistryError> {
+    let rules = source_rules(state, source).snapshot();
+    let effective = rules.for_package(package);
+    let list = match action {
+        Action::Access => &effective.access,
+        Action::Publish => &effective.publish,
+        Action::Unpublish => &effective.unpublish,
+    };
+    if list.allows(identity) {
+        return Ok(());
+    }
+    if list.references_owners() && identity.is_authenticated() {
+        let is_owner = is_package_owner(state, identity, package, org, action).await?;
+        if list.allows_with_context(identity, is_owner) {
+            return Ok(());
+        }
+    }
+    match identity {
+        Identity::Anonymous => {
+            Err(RegistryError::Unauthenticated { resource: format!("package {package:?}") })
+        }
+        Identity::User { username, .. } => Err(RegistryError::Forbidden {
+            user: username.clone(),
+            action: action.label(),
+            resource: format!("package {package:?}"),
+        }),
+        _ => Err(RegistryError::Unauthenticated { resource: format!("package {package:?}") }),
     }
 }
 
@@ -323,110 +502,4 @@ pub(super) fn authorize(
 pub(super) fn bearer_credentials(header_value: &str) -> Option<&str> {
     let (scheme, credentials) = header_value.trim().split_once(' ')?;
     scheme.eq_ignore_ascii_case("Bearer").then(|| credentials.trim())
-}
-
-/// Whether a request mutates registry state. Every npm and Cargo write
-/// surface (publish, unpublish, dist-tag add/remove, yank, adduser, logout,
-/// token revoke) is a PUT or DELETE; reads and the resolver POSTs are not.
-/// The mutating POSTs are the Python legacy upload API and the start of an
-/// image blob upload, both recognized by their path. A read-only token is
-/// confined to the non-mutating requests.
-pub(super) fn is_write_request(method: &Method, path: &str) -> bool {
-    matches!(*method, Method::PUT | Method::DELETE | Method::PATCH)
-        || (*method == Method::POST && (is_python_upload_path(path) || is_image_upload_path(path)))
-}
-
-/// `POST <v2 base>/<name>/blobs/uploads/` starts a blob upload. The
-/// repository name is many segments, so the tail is what identifies it.
-fn is_image_upload_path(path: &str) -> bool {
-    let Some(rest) = path.trim_end_matches('/').strip_suffix("/blobs/uploads") else {
-        return false;
-    };
-    rest.split('/')
-        .any(|segment| segment == pnpr_oci::API_SEGMENT)
-}
-
-fn is_python_upload_path(path: &str) -> bool {
-    // `/pypi/legacy` or `/pypi/~<name>/legacy`.
-    let mut segments = path.trim_matches('/').split('/');
-    if segments.next() != Some(pnpr_registry::Ecosystem::Pypi.as_str()) {
-        return false;
-    }
-    match (segments.next(), segments.next(), segments.next()) {
-        (Some(upload), None, None) => upload == pnpr_pypi::UPLOAD_PATH,
-        (Some(registry), Some(upload), None) => {
-            super::tilde_registry(registry).is_some() && upload == pnpr_pypi::UPLOAD_PATH
-        }
-        _ => false,
-    }
-}
-
-/// Whether `peer` falls inside any range of a token's CIDR whitelist. An
-/// IPv4-mapped IPv6 peer is normalized to its IPv4 form first, so a
-/// dual-stack listener still matches plain IPv4 ranges.
-pub(super) fn cidr_whitelist_allows(whitelist: &[String], peer: SocketAddr) -> bool {
-    let peer = canonical_ip(peer.ip());
-    whitelist.iter().any(|entry| cidr_contains(entry.trim(), peer))
-}
-
-pub(super) fn canonical_ip(addr: IpAddr) -> IpAddr {
-    match addr {
-        IpAddr::V6(v6) => v6
-            .to_ipv4_mapped()
-            .map_or(IpAddr::V6(v6), IpAddr::V4),
-        v4 @ IpAddr::V4(_) => v4,
-    }
-}
-
-/// Whether `peer` is inside one `addr/prefix` (or bare `addr`) whitelist
-/// entry. A bare address matches only itself; a malformed entry (bad
-/// address, or a non-numeric / out-of-range prefix) matches nothing, so
-/// the restriction fails closed rather than open.
-pub(super) fn cidr_contains(entry: &str, peer: IpAddr) -> bool {
-    let (net, prefix) = match entry.split_once('/') {
-        Some((net, prefix)) => (net.trim(), Some(prefix.trim())),
-        None => (entry, None),
-    };
-    let Ok(net) = net.parse::<IpAddr>() else {
-        return false;
-    };
-    match (net, peer) {
-        (IpAddr::V4(net), IpAddr::V4(peer)) => {
-            let Some(bits) = parse_prefix(prefix, 32) else {
-                return false;
-            };
-            let mask = ipv4_mask(bits);
-            (u32::from(net) & mask) == (u32::from(peer) & mask)
-        }
-        (IpAddr::V6(net), IpAddr::V6(peer)) => {
-            let Some(bits) = parse_prefix(prefix, 128) else {
-                return false;
-            };
-            let mask = ipv6_mask(bits);
-            (u128::from(net) & mask) == (u128::from(peer) & mask)
-        }
-        // Different address families never match.
-        _ => false,
-    }
-}
-
-/// Parse a CIDR prefix length, defaulting to a full-width match (an exact
-/// host) when the entry carried no `/prefix`. `None` for a non-numeric or
-/// too-large value.
-fn parse_prefix(prefix: Option<&str>, max_bits: u8) -> Option<u8> {
-    match prefix {
-        None => Some(max_bits),
-        Some(prefix) => {
-            let bits: u8 = prefix.parse().ok()?;
-            (bits <= max_bits).then_some(bits)
-        }
-    }
-}
-
-fn ipv4_mask(prefix: u8) -> u32 {
-    if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) }
-}
-
-fn ipv6_mask(prefix: u8) -> u128 {
-    if prefix == 0 { 0 } else { u128::MAX << (128 - prefix) }
 }

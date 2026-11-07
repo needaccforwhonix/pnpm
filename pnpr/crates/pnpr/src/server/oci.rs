@@ -10,8 +10,8 @@
 //! that do accept a path in their registry configuration.
 //!
 //! A push is many requests: every blob, then the manifest that references
-//! them. The manifest write is the commit point, and the only part that goes
-//! through the publish journal. A blob nothing references is invisible rather
+//! them. The manifest write is the commit point, and the only part that
+//! commits metadata. A blob nothing references is invisible rather
 //! than half-published, which is what makes the split safe, and why
 //! collecting unreferenced blobs is a job of its own.
 
@@ -23,7 +23,7 @@ pub(super) use publication::{OciPublication, authorize_publication};
 
 mod response;
 use response::{
-    accepted, api_version, created, hosted_manifest_response, insert_header, json,
+    ResponseBody, accepted, api_version, created, hosted_manifest_response, insert_header, json,
     method_not_allowed, no_content, range_not_satisfiable, ranged_blob_response, registry_error,
     server_error, unknown_repository,
 };
@@ -104,13 +104,11 @@ const API_VERSION_HEADER: &str = "docker-distribution-api-version";
 /// on the retry; one that does not have any carries on unauthenticated.
 const CHALLENGE: &str = r#"Basic realm="pnpr""#;
 
-pub(super) fn routes(prefixed: bool) -> Router<AppState> {
+pub(super) fn routes() -> Router<AppState> {
     // The root is this surface's own addition: a client derives the API root
-    // from the image reference's host, so `/v2/` answers there whether or not
-    // the ecosystem is prefixed.
+    // from the image reference's host and cannot be pointed at a prefix.
     let mut bases = vec![String::new()];
-    bases.extend(mount_bases(ECOSYSTEM, prefixed));
-    bases.dedup();
+    bases.extend(mount_bases(ECOSYSTEM));
     let mut router = Router::new();
     for base in bases {
         router = router
@@ -369,7 +367,7 @@ impl Request {
         let (key, source) = self.hosted_source(name)?;
         let org = hosted_read_namespace(&self.state, &self.identity, &source, key.as_str())
             .map_err(Refusal::from)?;
-        let storage = self.state.inner.storage.for_hosted(&org);
+        let storage = self.state.inner.storage.for_hosted(&org, ECOSYSTEM);
         Ok(HostedRepo { key, source, storage })
     }
 
@@ -426,12 +424,6 @@ struct TagList<'listing> {
     tags: Vec<&'listing str>,
 }
 
-/// A refusal on its way to becoming a response, small enough to ride in a
-/// `Result`'s error slot as the response itself is not.
-///
-/// The status is carried rather than re-derived from the code, because a
-/// `RegistryError` has already chosen one, and deriving it back from the spec
-/// code would answer `405` for every error that has no code of its own.
 /// A hosted repository and the storage it is read from.
 struct HostedRepo {
     key: CanonicalPackageName,

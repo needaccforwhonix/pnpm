@@ -3,8 +3,40 @@ use std::time::Duration;
 
 use super::{
     ABBREVIATED_META_CONTENT_TYPE, ACCEPT_ABBREVIATED_DOC, FetchFullMetadataOptions,
-    FetchFullMetadataOutcome, fetch_full_metadata, warn_if_request_is_slow,
+    FetchFullMetadataOutcome, fetch_full_metadata, metadata_response_is_uncacheable,
+    warn_if_request_is_slow,
 };
+
+#[test]
+fn any_cache_control_field_can_forbid_reuse() {
+    use reqwest::header::{CACHE_CONTROL, HeaderMap, HeaderValue};
+
+    let mut headers = HeaderMap::new();
+    headers.append(CACHE_CONTROL, HeaderValue::from_static("public"));
+    headers.append(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    assert!(metadata_response_is_uncacheable(&headers));
+
+    let mut cacheable = HeaderMap::new();
+    cacheable.append(CACHE_CONTROL, HeaderValue::from_static("public, max-age=300"));
+    assert!(!metadata_response_is_uncacheable(&cacheable));
+}
+
+#[test]
+fn cache_control_directives_match_the_typescript_parser() {
+    use reqwest::header::{CACHE_CONTROL, HeaderMap, HeaderValue};
+
+    let is_uncacheable = |value: &'static str| {
+        let mut headers = HeaderMap::new();
+        headers.insert(CACHE_CONTROL, HeaderValue::from_static(value));
+        metadata_response_is_uncacheable(&headers)
+    };
+    assert!(is_uncacheable("max-age=0, private, must-revalidate"));
+    assert!(is_uncacheable("MAX-AGE = 00"));
+    assert!(is_uncacheable("No-Store"));
+    assert!(!is_uncacheable(r#"no-cache="set-cookie""#));
+    assert!(!is_uncacheable("public, max-age=300"));
+    assert!(!metadata_response_is_uncacheable(&HeaderMap::new()));
+}
 
 #[test]
 fn warns_when_metadata_request_exceeds_configured_timeout() {
@@ -40,13 +72,75 @@ fn warns_when_metadata_request_exceeds_configured_timeout() {
     );
 }
 
+/// The time a request waits for a concurrency permit is pnpm's own
+/// queueing, not the registry being slow, so it does not count toward
+/// `fetchWarnTimeoutMs`.
+#[tokio::test]
+async fn time_queued_for_a_permit_does_not_count_as_a_slow_request() {
+    static WARNINGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    fn record_warning(message: &str) {
+        WARNINGS
+            .lock()
+            .expect("warning recorder lock poisoned")
+            .push(message.to_string());
+    }
+
+    let mut server = mockito::Server::new_async().await;
+    let mock = server
+        .mock("GET", "/acme")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"name":"acme","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"acme","version":"1.0.0","dist":{"tarball":"https://registry/acme-1.0.0.tgz","shasum":"0000000000000000000000000000000000000000"}}}}"#,
+        )
+        .create_async()
+        .await;
+    let registry = format!("{}/", server.url());
+    let http_client = ThrottledClient::for_installs(
+        &pnpm_network::ProxyConfig::default(),
+        &pnpm_network::TlsConfig::default(),
+        &pnpm_network::PerRegistryTls::default(),
+        &pnpm_network::NetworkSettings {
+            network_concurrency: 1,
+            fetch_warn_timeout: Duration::from_millis(200),
+            ..pnpm_network::NetworkSettings::default()
+        },
+    )
+    .expect("client builds");
+    http_client.set_warning_handler(record_warning);
+    let auth_headers = AuthHeaders::default();
+    let opts = FetchFullMetadataOptions {
+        registry: &registry,
+        full_metadata: false,
+        etag: None,
+        modified: None,
+        http: crate::MetadataHttpClient {
+            http_client: &http_client,
+            auth_headers: &auth_headers,
+            retry_opts: no_retry_opts(),
+        },
+    };
+
+    let held = http_client.acquire().await;
+    let release_after_the_threshold = async {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        drop(held);
+    };
+    let fetch = fetch_full_metadata("acme", &opts);
+    let (outcome, ()) = tokio::join!(fetch, release_after_the_threshold);
+
+    expect_modified(outcome.expect("server returns 200"));
+    mock.assert_async().await;
+    assert_eq!(*WARNINGS.lock().expect("warning recorder lock poisoned"), Vec::<String>::new());
+}
+
 /// The two constants repeat the media type as separate literals (Rust
 /// cannot build one string const from another without a macro), so
 /// guard against them drifting apart: the `Accept` header must offer
 /// the same media type the response detection recognizes.
 #[test]
 fn accept_header_offers_the_detected_abbreviated_media_type() {
-    assert!(ACCEPT_ABBREVIATED_DOC.starts_with(ABBREVIATED_META_CONTENT_TYPE));
+    assert!(ACCEPT_ABBREVIATED_DOC.contains(ABBREVIATED_META_CONTENT_TYPE));
 }
 
 /// Unwrap a [`FetchFullMetadataOutcome::Modified`], panicking on
@@ -427,6 +521,17 @@ fn to_http_date_converts_iso_8601() {
 }
 
 #[test]
+fn to_http_date_reads_a_date_without_a_time_as_midnight_utc() {
+    assert_eq!(super::to_http_date("2022-01-01").as_deref(), Some("Sat, 01 Jan 2022 00:00:00 GMT"));
+}
+
+#[test]
+fn to_http_date_drops_a_time_before_1970() {
+    assert_eq!(super::to_http_date("1969-12-31"), None);
+    assert_eq!(super::to_http_date("1969-12-31T23:59:59Z"), None);
+}
+
+#[test]
 fn to_http_date_keeps_http_dates() {
     assert_eq!(
         super::to_http_date("Wed, 15 Jan 2025 12:00:00 GMT").as_deref(),
@@ -583,6 +688,111 @@ async fn fetch_full_metadata_encodes_scoped_name() {
     mock.assert_async().await;
 }
 
+/// `acme.json` compressed by the `zstd` CLI:
+///
+/// ```text
+/// cd crates/resolving-npm-resolver/tests/fixtures
+/// zstd --keep --force acme.json
+/// ```
+const ZSTD_PACKUMENT: &[u8] = include_bytes!("../../tests/fixtures/acme.json.zst");
+
+#[tokio::test]
+async fn fetch_full_metadata_decodes_zstd_packuments() {
+    let mut server = mockito::Server::new_async().await;
+    let mock = server
+        .mock("GET", "/acme")
+        .match_header("accept-encoding", mockito::Matcher::Regex(r"\bzstd\b".to_owned()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_header("content-encoding", "zstd")
+        .with_body(ZSTD_PACKUMENT)
+        .expect(1)
+        .create_async()
+        .await;
+
+    let registry = format!("{}/", server.url());
+    let http_client = ThrottledClient::default();
+    let auth_headers = AuthHeaders::default();
+    let opts = FetchFullMetadataOptions {
+        registry: &registry,
+        full_metadata: true,
+        etag: None,
+        modified: None,
+        http: crate::MetadataHttpClient {
+            http_client: &http_client,
+            auth_headers: &auth_headers,
+            retry_opts: no_retry_opts(),
+        },
+    };
+
+    let pkg =
+        expect_modified(fetch_full_metadata("acme", &opts).await.expect("zstd packument decodes"));
+    assert_eq!(pkg.name, "acme");
+    assert_eq!(pkg.published_at("1.0.0"), Some("2025-01-10T08:30:00.000Z"));
+    mock.assert_async().await;
+}
+
+const FULL_DOC_WITH_INSTALL_IRRELEVANT_FIELDS: &str = r#"{
+    "name": "acme",
+    "dist-tags": { "latest": "1.0.0" },
+    "versions": {
+        "1.0.0": {
+            "name": "acme",
+            "version": "1.0.0",
+            "readme": "drop me",
+            "scripts": { "postinstall": "node install.js" },
+            "dependencies": { "bar": "^1.0.0" },
+            "dist": { "tarball": "https://example.test/acme-1.0.0.tgz" }
+        }
+    }
+}"#;
+
+#[tokio::test]
+async fn only_an_abbreviated_request_answered_with_the_full_document_is_normalized() {
+    for (full_metadata, keeps_readme) in [(false, false), (true, true)] {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/acme")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(FULL_DOC_WITH_INSTALL_IRRELEVANT_FIELDS)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let registry = format!("{}/", server.url());
+        let http_client = ThrottledClient::default();
+        let auth_headers = AuthHeaders::default();
+        let opts = FetchFullMetadataOptions {
+            registry: &registry,
+            full_metadata,
+            etag: None,
+            modified: None,
+            http: crate::MetadataHttpClient {
+                http_client: &http_client,
+                auth_headers: &auth_headers,
+                retry_opts: no_retry_opts(),
+            },
+        };
+
+        let pkg = expect_modified(fetch_full_metadata("acme", &opts).await.expect("200 → ok"));
+        let manifest = pkg.versions.get("1.0.0").expect("manifest");
+        assert_eq!(
+            manifest.other.contains_key("readme"),
+            keeps_readme,
+            "full_metadata={full_metadata}",
+        );
+        assert_eq!(
+            manifest.dependencies
+                .as_ref()
+                .and_then(|deps| deps.get("bar"))
+                .map(String::as_str),
+            Some("^1.0.0"),
+        );
+        mock.assert_async().await;
+    }
+}
+
 #[tokio::test]
 async fn fetch_full_metadata_surfaces_decode_failure_distinctly() {
     let mut server = mockito::Server::new_async().await;
@@ -650,4 +860,83 @@ async fn fetch_full_metadata_returns_not_modified_on_304() {
         "expected NotModified, got: {outcome:?}",
     );
     mock.assert_async().await;
+}
+
+/// A registry that accepts each connection, reads the request, writes
+/// `response` (possibly nothing, or a head promising more body than it
+/// sends), and then holds the socket open without sending another byte.
+async fn start_stalled_registry(response: &'static [u8]) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("local address");
+    tokio::spawn(async move {
+        let mut sockets = Vec::new();
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let mut request = [0u8; 4096];
+            let _ = socket.read(&mut request).await;
+            let _ = socket.write_all(response).await;
+            sockets.push(socket);
+        }
+    });
+    format!("http://{address}/")
+}
+
+/// Mirrors the production client's inactivity timeout (`fetchTimeout`
+/// drives `read_timeout`), shortened so the test stalls for milliseconds.
+fn short_read_timeout_client() -> ThrottledClient {
+    let build = |redirect| {
+        reqwest::Client::builder()
+            .no_proxy()
+            .read_timeout(Duration::from_millis(200))
+            .redirect(redirect)
+            .build()
+            .expect("build reqwest client")
+    };
+    ThrottledClient::from_clients(
+        build(reqwest::redirect::Policy::limited(10)),
+        build(reqwest::redirect::Policy::none()),
+    )
+}
+
+async fn fetch_from_stalled_registry(response: &'static [u8]) -> super::FetchMetadataError {
+    let registry = start_stalled_registry(response).await;
+    let http_client = short_read_timeout_client();
+    let auth_headers = AuthHeaders::default();
+    let opts = FetchFullMetadataOptions {
+        registry: &registry,
+        full_metadata: true,
+        etag: None,
+        modified: None,
+        http: crate::MetadataHttpClient {
+            http_client: &http_client,
+            auth_headers: &auth_headers,
+            retry_opts: no_retry_opts(),
+        },
+    };
+    fetch_full_metadata("acme", &opts).await.expect_err("a stalled registry must fail")
+}
+
+#[tokio::test]
+async fn fetch_full_metadata_reports_timeout_when_registry_never_responds() {
+    let err = fetch_from_stalled_registry(b"").await;
+    assert!(
+        matches!(err, super::FetchMetadataError::Network { .. }),
+        "expected Network variant, got: {err:?}",
+    );
+    let rendered = err.to_string();
+    assert!(rendered.contains("timed out"), "timeout must be named, got: {rendered:?}");
+}
+
+#[tokio::test]
+async fn fetch_full_metadata_reports_timeout_when_body_stalls() {
+    let err = fetch_from_stalled_registry(
+        b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 1000\r\n\r\n{\"name\":",
+    )
+    .await;
+    assert!(
+        matches!(err, super::FetchMetadataError::BodyRead { .. }),
+        "expected BodyRead variant, got: {err:?}",
+    );
+    let rendered = err.to_string();
+    assert!(rendered.contains("timed out"), "timeout must be named, got: {rendered:?}");
 }

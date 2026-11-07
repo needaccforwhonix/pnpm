@@ -38,9 +38,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{
-    Action, AppState, AuthedCaller, Identity, RegistrySource, TargetRegistry, authorize,
+    Action, AppState, AuthedCaller, Identity, RegistrySource, TargetRegistry, authorize_package,
     commit_publishes, json_response, not_found, private_no_cache,
-    publishing::{ValidatedPublish, cleanup_tmp_slots, report_unrecorded},
+    publishing::{
+        ValidatedPublish, check_body_name, cleanup_tmp_slots, validate_staged_publish_name,
+    },
     resolve_write_target, stage_publish, validate_publish_doc,
 };
 use pnpr_error::RegistryError;
@@ -48,6 +50,12 @@ use pnpr_package_name::CanonicalPackageName;
 use pnpr_search::percent_decode;
 use pnpr_storage::{DocumentWrite, publish::extract_attachments};
 use std::time::Duration;
+
+pub const STAGED_RECORD_FORMAT_VERSION: u32 = 1;
+
+const fn default_format_version() -> u32 {
+    STAGED_RECORD_FORMAT_VERSION
+}
 
 /// One staged publish's metadata, stored next to the held publish body and
 /// served by the list/view endpoints (without the `registry` field, which is
@@ -62,6 +70,8 @@ use std::time::Duration;
     )
 )]
 struct StagedRecord {
+    #[serde(default = "default_format_version")]
+    format_version: u32,
     id: String,
     package_name: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -215,29 +225,37 @@ async fn serve_staged_publish(
         Ok(value) => value,
         Err(err) => return RegistryError::Json(err).into_response(),
     };
-    let body_name = incoming.get("name").and_then(Value::as_str);
-    if body_name.is_some_and(|body_name| body_name != name.as_str()) {
-        return RegistryError::BadRequest {
-            reason: format!(
-                "package in URL ({:?}) does not match body ({:?})",
-                name.as_str(),
-                body_name.unwrap_or(""),
-            ),
-        }
-        .into_response();
+    if let Err(err) = check_body_name(&name, &incoming) {
+        return err.into_response();
     }
 
     // The same routing + `publish`-rule + attachment validation a direct
     // publish runs; conflicts with already-published versions are checked
     // when the stage is approved, against the registry state at that time.
-    let (validated, _target) =
+    let (validated, target) =
         match validate_publish_doc(state, identity, registry, name, incoming).await {
             Ok(validated) => validated,
             Err(err) => return err.into_response(),
         };
 
+    // Approval publishes the stored body later, as another account, after a
+    // staged archive may have expired: a staged publish carries its archives.
+    if let Some(attachment) = validated.prepared
+        .iter()
+        .find(|prepared| prepared.attachment.staged_integrity().is_some())
+    {
+        return RegistryError::InvalidAttachment {
+            filename: attachment.attachment.filename.clone(),
+            reason: "a publish held for approval carries its archive inline in `data`".to_string(),
+        }
+        .into_response();
+    }
+
     let stage_id = generate_stage_id();
     let record = staged_record(&validated, identity, registry, &stage_id);
+    if let Err(err) = validate_staged_publish_name(state, validated, &target.org).await {
+        return err.into_response();
+    }
 
     if let Err(err) = store_staged(state, &stage_id, body, &record).await {
         return err.into_response();
@@ -291,7 +309,7 @@ async fn serve_staged_list(
             continue;
         }
         // The listing shows only what the caller could publish (and thus
-        // approve); records outside their rights are simply not theirs to see.
+        // approve); records outside their rights are not theirs to see.
         if authorize_staged(state, identity, &record).await.is_err() {
             continue;
         }
@@ -377,7 +395,10 @@ async fn serve_staged_tarball(
     let Some(attachment) = attachments.into_iter().next() else {
         return not_found();
     };
-    let bytes = match BASE64.decode(attachment.data.as_bytes()) {
+    let Some(data) = attachment.inline_data() else {
+        return not_found();
+    };
+    let bytes = match BASE64.decode(data.as_bytes()) {
         Ok(bytes) => bytes,
         Err(err) => {
             return RegistryError::InvalidAttachment {
@@ -430,13 +451,15 @@ async fn authorize_staged(
     let name =
         CanonicalPackageName::parse(&record.package_name, pnpr_package_name::Ecosystem::Npm)?;
     let target = resolve_write_target(state, identity, record.registry.as_deref(), &name)?;
-    authorize(
+    authorize_package(
         state,
         identity,
         &RegistrySource::Hosted(target.source),
         name.as_str(),
         Action::Publish,
+        Some(&target.org),
     )
+    .await
 }
 
 async fn read_staged_record(
@@ -446,7 +469,14 @@ async fn read_staged_record(
     let Some(bytes) = state.inner.storage.read_staged_meta(stage_id).await? else {
         return Ok(None);
     };
-    let record = serde_json::from_slice(&bytes).map_err(RegistryError::Json)?;
+    let record: StagedRecord = serde_json::from_slice(&bytes).map_err(RegistryError::Json)?;
+    if record.format_version > STAGED_RECORD_FORMAT_VERSION {
+        return Err(RegistryError::DocumentFormatTooNew {
+            document: format!("staged record {stage_id}"),
+            format_version: record.format_version,
+            supported_version: STAGED_RECORD_FORMAT_VERSION,
+        });
+    }
     Ok(Some(StoredStagedRecord { bytes, record }))
 }
 

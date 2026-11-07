@@ -1,6 +1,7 @@
 use super::{
-    Arc, BTreeMap, DirectDepVersions, HashSet, PkgName, PkgNameVerPeer, ProjectSnapshot,
-    ResolvedDependencyMap, SnapshotDepRef, SnapshotEntry, TreeCtx, WantedSpec, lock_recoverable,
+    Arc, BTreeMap, DependencySpec, DirectDepVersion, DirectDepVersions, PkgName, PkgNameVerPeer,
+    ProjectSnapshot, ResolvedDependencyMap, SnapshotDepRef, SnapshotEntry, TreeCtx,
+    lock_recoverable,
 };
 
 /// Record the importer direct deps whose manifest specifier differs from
@@ -17,23 +18,34 @@ use super::{
 pub(crate) fn record_changed_direct_deps(
     ctx: &TreeCtx,
     importer_id: &str,
-    wanted: &[WantedSpec],
-) -> HashSet<PkgName> {
-    let lockfile = ctx.workspace.reuse.lockfile.as_deref();
-    let prior = lockfile.and_then(|lockfile| lockfile.importers.get(importer_id));
+    wanted: &[DependencySpec],
+) {
+    let Some(lockfile) = ctx.workspace.reuse.lockfile.as_deref() else {
+        return;
+    };
+    let prior = lockfile.importers.get(importer_id);
     let mut changed = lock_recoverable(&ctx.workspace.versions.changed_direct_deps);
-    let bucket = changed.entry(importer_id.to_string()).or_default();
-    for (alias, spec, _optional, _injected) in wanted {
-        let unchanged = prior
-            .and_then(|importer| importer_dep_specifier(importer, alias))
-            .is_some_and(|recorded| {
-                recorded == spec || catalog_specifier_unchanged(lockfile, recorded, alias, spec)
-            });
-        if !unchanged && let Ok(name) = alias.parse::<PkgName>() {
-            bucket.insert(name);
+    let set = Arc::make_mut(changed.entry(importer_id.to_string()).or_default());
+    for DependencySpec { alias, bare_specifier: spec, .. } in wanted {
+        if !direct_dep_specifier_unchanged(lockfile, prior, alias, spec)
+            && let Ok(name) = alias.parse::<PkgName>()
+        {
+            set.insert(name);
         }
     }
-    bucket.clone()
+}
+
+fn direct_dep_specifier_unchanged(
+    lockfile: &pnpm_lockfile::Lockfile,
+    prior: Option<&ProjectSnapshot>,
+    alias: &str,
+    spec: &str,
+) -> bool {
+    prior
+        .and_then(|importer| importer_dep_specifier(importer, alias))
+        .is_some_and(|recorded| {
+            recorded == spec || catalog_specifier_unchanged(Some(lockfile), recorded, alias, spec)
+        })
 }
 
 /// Whether a `catalog:`-recorded direct dep still resolves to the same
@@ -81,7 +93,9 @@ pub(super) fn importer_dep_specifier<'a>(
 }
 
 /// Store the importer's resolved (parsed) direct-dep versions for the
-/// per-edge stale-pin refresh. See [`crate::resolve_dependency_tree::workspace_ctx::WorkspacePreferredVersions::direct_dep_versions`].
+/// per-edge stale-pin refresh, together with any workspace-wide changed
+/// direct-dep versions for names this importer does not declare directly.
+/// See [`crate::resolve_dependency_tree::workspace_ctx::WorkspacePreferredVersions::direct_dep_versions`].
 ///
 /// [`crate::resolve_dependency_tree::workspace_ctx::WorkspacePreferredVersions::direct_dep_versions`]: crate::resolve_dependency_tree::workspace_ctx::WorkspacePreferredVersions::direct_dep_versions
 pub(in super::super) fn record_direct_dep_versions(
@@ -89,12 +103,33 @@ pub(in super::super) fn record_direct_dep_versions(
     importer_id: &str,
     level: &BTreeMap<String, Vec<String>>,
 ) {
+    let changed_versions =
+        Arc::clone(&lock_recoverable(&ctx.workspace.versions.changed_direct_dep_versions));
     let mut versions = lock_recoverable(&ctx.workspace.versions.direct_dep_versions);
     let by_name = Arc::make_mut(versions.entry(importer_id.to_string()).or_default());
+    extend_parsed_versions(by_name, level, &ctx.workspace.cache.registry_context);
+    for (name, candidates) in changed_versions.iter() {
+        by_name.entry(name.clone()).or_insert_with(|| candidates.clone());
+    }
+}
+
+/// `level` holds resolved key suffixes, so a package from a registry that
+/// declares a prefix arrives as `<prefix>:<version>`.
+fn extend_parsed_versions(
+    by_name: &mut DirectDepVersions,
+    level: &BTreeMap<String, Vec<String>>,
+    registries: &pnpm_lockfile::RegistryContext,
+) {
     for (name, level_versions) in level {
         let bucket = by_name.entry(name.clone()).or_default();
         for version in level_versions {
-            let Ok(parsed) = version.parse::<node_semver::Version>() else { continue };
+            let Some(parsed) = version
+                .parse::<pnpm_lockfile::PkgVerPeer>()
+                .ok()
+                .and_then(|ver_peer| DirectDepVersion::of(name, &ver_peer, registries))
+            else {
+                continue;
+            };
             if !bucket.contains(&parsed) {
                 bucket.push(parsed);
             }
@@ -103,29 +138,81 @@ pub(in super::super) fn record_direct_dep_versions(
 }
 
 /// True when `snapshot` depends on one of this importer's changed direct
-/// deps (see [`crate::resolve_dependency_tree::workspace_ctx::WorkspacePreferredVersions::changed_direct_deps`]).
-///
-/// [`crate::resolve_dependency_tree::workspace_ctx::WorkspacePreferredVersions::changed_direct_deps`]: crate::resolve_dependency_tree::workspace_ctx::WorkspacePreferredVersions::changed_direct_deps
-pub(super) fn reused_parent_has_changed_direct_child(
+/// deps, or on a dependency whose pinned version differs from a version
+/// resolved for a changed direct dep in another importer.
+fn reused_parent_has_changed_direct_child(
     ctx: &TreeCtx,
     snapshot: &SnapshotEntry,
+    scope: ChangedDirectScope,
 ) -> bool {
-    // Copy the (small) changed set out and drop the lock before scanning.
-    let importer_changed = {
-        let changed = lock_recoverable(&ctx.workspace.versions.changed_direct_deps);
-        match changed.get(&ctx.importer.id) {
-            Some(set) if !set.is_empty() => set.clone(),
-            _ => return false,
+    let own_changed = lock_recoverable(&ctx.workspace.versions.changed_direct_deps)
+        .get(&ctx.importer.id)
+        .cloned();
+    let cross_changed = match scope {
+        ChangedDirectScope::EveryImporter => {
+            Some(Arc::clone(&lock_recoverable(&ctx.workspace.versions.changed_direct_dep_versions)))
         }
+        ChangedDirectScope::OwnImporter => None,
     };
-    let depends_on = |map: Option<&std::collections::HashMap<PkgName, SnapshotDepRef>>| {
-        map.is_some_and(|deps| {
-            deps.keys()
-                .any(|name| importer_changed.contains(name))
+    if own_changed.as_ref().is_none_or(|set| set.is_empty())
+        && cross_changed.as_ref().is_none_or(|map| map.is_empty())
+    {
+        return false;
+    }
+    snapshot.dependencies
+        .iter()
+        .chain(snapshot.optional_dependencies.iter())
+        .flatten()
+        .any(|(name, dep_ref)| {
+            own_changed
+                .as_ref()
+                .is_some_and(|set| set.contains(name))
+                || cross_changed
+                    .as_deref()
+                    .is_some_and(|cross| {
+                        cross_importer_changed_version(
+                            cross,
+                            name,
+                            dep_ref,
+                            &ctx.workspace.cache.registry_context,
+                        )
+                    })
         })
+}
+
+fn cross_importer_changed_version(
+    cross_changed: &DirectDepVersions,
+    name: &PkgName,
+    dep_ref: &SnapshotDepRef,
+    registries: &pnpm_lockfile::RegistryContext,
+) -> bool {
+    let (target_name, ver_peer) = match dep_ref {
+        SnapshotDepRef::Plain(ver_peer) => (name, ver_peer),
+        SnapshotDepRef::Alias(key) => (&key.name, &key.suffix),
+        SnapshotDepRef::Link(_) => return false,
     };
-    depends_on(snapshot.dependencies.as_ref())
-        || depends_on(snapshot.optional_dependencies.as_ref())
+    let candidates = match &target_name.scope {
+        None => cross_changed.get(target_name.bare.as_str()),
+        Some(_) => cross_changed.get(&target_name.to_string()),
+    };
+    candidates
+        .zip(DirectDepVersion::of(&target_name.to_string(), ver_peer, registries))
+        .is_some_and(|(versions, pinned)| {
+            versions
+                .iter()
+                .any(|version| {
+                    version.registry == pinned.registry && version.version != pinned.version
+                })
+        })
+}
+
+/// Which importers' changed direct deps the reuse-decline gate counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in super::super) enum ChangedDirectScope {
+    /// Only the importer the snapshot belongs to.
+    OwnImporter,
+    /// Every importer, so a dep another importer changed declines reuse too.
+    EveryImporter,
 }
 
 /// Reuse-decline gate: whether `prior_key`'s prior snapshot depends on a
@@ -134,32 +221,238 @@ pub(in super::super) fn node_depends_on_changed_direct_dep(
     ctx: &TreeCtx,
     prior_key: Option<&PkgNameVerPeer>,
 ) -> bool {
-    prior_key
-        .and_then(|key| {
-            ctx.workspace.reuse.lockfile
-                .as_ref()?
-                .snapshots
-                .as_ref()?
-                .get(key)
-        })
-        .is_some_and(|snapshot| reused_parent_has_changed_direct_child(ctx, snapshot))
+    node_depends_on_changed_direct_dep_with(ctx, prior_key, ChangedDirectScope::EveryImporter)
 }
 
-/// The highest resolved direct-dependency version of `name` strictly
-/// above `pinned` that still satisfies `range`, or `None`. Anchored to
-/// direct deps (the deterministic, resolved-before-the-walk signal).
-/// `direct_versions` is the importer's snapshot, taken once per walked
-/// occurrence as it seeds its children.
+fn node_depends_on_changed_direct_dep_with(
+    ctx: &TreeCtx,
+    prior_key: Option<&PkgNameVerPeer>,
+    scope: ChangedDirectScope,
+) -> bool {
+    let Some(key) = prior_key else {
+        return false;
+    };
+    ctx.workspace.reuse.lockfile
+        .as_ref()
+        .and_then(|lf| lf.snapshots.as_ref()?.get(key))
+        .is_some_and(|snapshot| reused_parent_has_changed_direct_child(ctx, snapshot, scope))
+}
+
+/// The highest resolved direct-dependency version of `name` from the
+/// registry of `pinned`, strictly above it, that still satisfies `range`, or
+/// `None`. Anchored to direct deps (the deterministic,
+/// resolved-before-the-walk signal). `direct_versions` is the importer's
+/// snapshot, taken once per walked occurrence as it seeds its children.
 pub(in super::super) fn higher_direct_dep_version(
     direct_versions: Option<&DirectDepVersions>,
     name: &str,
-    pinned: &node_semver::Version,
+    pinned: &DirectDepVersion,
     range: &node_semver::Range,
 ) -> Option<node_semver::Version> {
     direct_versions?
         .get(name)?
         .iter()
-        .filter(|&version| version > pinned && range.satisfies(version))
+        .filter(|direct| direct.registry == pinned.registry)
+        .map(|direct| &direct.version)
+        .filter(|&version| version > &pinned.version && range.satisfies(version))
         .max()
         .cloned()
 }
+
+/// Resolve any changed direct dependencies up front (when reusing a prior
+/// lockfile) and record their resolved versions into
+/// `changed_direct_dep_versions` before any importer walks its transitive
+/// subtrees.
+pub(crate) async fn preseed_changed_direct_versions<Chain>(
+    ctx: &TreeCtx,
+    resolver: &Chain,
+    wanted: &[DependencySpec],
+    importer_id: &str,
+    parent_pkg_aliases: &Arc<super::ParentPkgAliases>,
+) -> Result<(), super::ResolveDependencyTreeError>
+where
+    Chain: super::Resolver + ?Sized,
+{
+    let Some(lockfile) = ctx.workspace.reuse.lockfile.as_deref() else {
+        return Ok(());
+    };
+    let prior = lockfile.importers.get(importer_id);
+    let resolved = futures_util::future::try_join_all(
+        wanted
+            .iter()
+            .filter(|spec| {
+                !direct_dep_specifier_unchanged(lockfile, prior, &spec.alias, &spec.bare_specifier)
+            })
+            .map(|spec| {
+                preseed_one_changed_direct(
+                    ctx,
+                    resolver,
+                    spec.clone(),
+                    importer_id,
+                    parent_pkg_aliases,
+                )
+            }),
+    )
+    .await?;
+    let mut versions: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (name, version) in resolved.into_iter().flatten() {
+        versions
+            .entry(name)
+            .or_default()
+            .push(version);
+    }
+    if !versions.is_empty() {
+        let mut changed_versions =
+            lock_recoverable(&ctx.workspace.versions.changed_direct_dep_versions);
+        extend_parsed_versions(
+            Arc::make_mut(&mut *changed_versions),
+            &versions,
+            &ctx.workspace.cache.registry_context,
+        );
+    }
+    Ok(())
+}
+
+async fn preseed_one_changed_direct<Chain>(
+    ctx: &TreeCtx,
+    resolver: &Chain,
+    spec: DependencySpec,
+    importer_id: &str,
+    parent_pkg_aliases: &Arc<super::ParentPkgAliases>,
+) -> Result<Option<(String, String)>, super::ResolveDependencyTreeError>
+where
+    Chain: super::Resolver + ?Sized,
+{
+    let resolved = resolve_direct_dependency(
+        ctx,
+        resolver,
+        spec,
+        importer_id,
+        parent_pkg_aliases,
+        DirectResolution::ChangedDirectPreseed,
+    )
+    .await?;
+    Ok(resolved.and_then(|resolved| {
+        resolved.package.name_ver
+            .as_ref()
+            .map(|name_ver| (name_ver.name.to_string(), name_ver.suffix.to_string()))
+    }))
+}
+
+/// What a direct dependency of the importer resolves to, the way
+/// [`super::super::extend_tree`] resolves it, without adding it to the tree.
+/// `None` when it fails to resolve the way a dropped optional dependency
+/// does. The failure is not reported.
+pub(crate) async fn resolve_direct_dependency_detached<Chain>(
+    ctx: &TreeCtx,
+    resolver: &Chain,
+    spec: DependencySpec,
+    importer_id: &str,
+    parent_pkg_aliases: &Arc<super::ParentPkgAliases>,
+) -> Result<
+    Option<Arc<pnpm_resolving_resolver_base::ResolveResult>>,
+    super::ResolveDependencyTreeError,
+>
+where
+    Chain: super::Resolver + ?Sized,
+{
+    resolve_direct_dependency(
+        ctx,
+        resolver,
+        spec,
+        importer_id,
+        parent_pkg_aliases,
+        DirectResolution::Detached,
+    )
+    .await
+}
+
+/// Why a direct dependency is resolved without being added to the tree.
+#[derive(Debug, Clone, Copy)]
+enum DirectResolution {
+    /// To pre-seed the versions of the importer's changed direct
+    /// dependencies.
+    ChangedDirectPreseed,
+    /// To read its manifest, the way [`super::super::extend_tree`] would
+    /// resolve it.
+    Detached,
+}
+
+impl DirectResolution {
+    fn changed_direct_scope(self) -> ChangedDirectScope {
+        match self {
+            DirectResolution::ChangedDirectPreseed => ChangedDirectScope::OwnImporter,
+            DirectResolution::Detached => ChangedDirectScope::EveryImporter,
+        }
+    }
+
+    async fn try_resolve_edge<Chain>(
+        self,
+        ctx: &TreeCtx,
+        resolver: &Chain,
+        wanted: &mut super::WantedDependency,
+        edge: &super::ChildEdge<'_>,
+        prior_key: Option<&PkgNameVerPeer>,
+    ) -> Result<
+        Option<Arc<pnpm_resolving_resolver_base::ResolveResult>>,
+        super::ResolveDependencyTreeError,
+    >
+    where
+        Chain: super::Resolver + ?Sized,
+    {
+        match self {
+            DirectResolution::ChangedDirectPreseed => {
+                super::super::walk::try_resolve_edge_cached(ctx, resolver, wanted, edge, prior_key)
+                    .await
+            }
+            DirectResolution::Detached => {
+                super::super::walk::try_resolve_edge_detached(
+                    ctx, resolver, wanted, edge, prior_key,
+                )
+                .await
+            }
+        }
+    }
+}
+
+async fn resolve_direct_dependency<Chain>(
+    ctx: &TreeCtx,
+    resolver: &Chain,
+    spec: DependencySpec,
+    importer_id: &str,
+    parent_pkg_aliases: &Arc<super::ParentPkgAliases>,
+    purpose: DirectResolution,
+) -> Result<
+    Option<Arc<pnpm_resolving_resolver_base::ResolveResult>>,
+    super::ResolveDependencyTreeError,
+>
+where
+    Chain: super::Resolver + ?Sized,
+{
+    let mut wanted_dep = super::super::wanted_from_spec(spec);
+    let reuse = super::ReuseSource::Importer { importer_id: importer_id.to_string() };
+    let prior_key = reuse.prior_key(ctx, &wanted_dep);
+    let scope = purpose.changed_direct_scope();
+    if ctx.workspace.reuse.subtrees
+        && reuse.allows_reuse()
+        && !node_depends_on_changed_direct_dep_with(ctx, prior_key.as_ref(), scope)
+        && let Some(reused) = super::try_reuse_node(ctx, &wanted_dep, prior_key.as_ref(), 0)
+    {
+        return Ok(Some(Arc::new(reused.result)));
+    }
+    let ancestors = Arc::new(Vec::new());
+    let edge = super::ChildEdge {
+        ancestor_ids: &ancestors,
+        depth: 0,
+        parent_optional: false,
+        reuse,
+        pick_overlay: ctx.options.base.version.preferred_versions_overlay.clone(),
+        parent_dir: None,
+        parent_pkg_aliases,
+        parent_is_workspace: false,
+    };
+    purpose.try_resolve_edge(ctx, resolver, &mut wanted_dep, &edge, prior_key.as_ref()).await
+}
+
+#[cfg(test)]
+mod tests;

@@ -3,6 +3,8 @@ use super::{
     parse_manifest_bytes,
 };
 
+/// Read the installed packages directly under `modules_dir`, including
+/// scoped packages one directory deeper.
 pub fn collect_packages_in_modules_dir<Sys>(
     modules_dir: &Path,
 ) -> Result<Vec<PackageBinSource>, LinkBinsError>
@@ -39,8 +41,6 @@ where
     Ok(packages)
 }
 
-/// Read the installed packages directly under `modules_dir`, including
-/// scoped packages one directory deeper.
 /// Add the packages under one `@scope/` directory.
 ///
 /// Only `NotFound` (and a `@`-prefixed file, which is not a scope directory)
@@ -74,7 +74,7 @@ where
     Ok(())
 }
 
-fn read_package<Sys: FsReadFile>(
+pub(super) fn read_package<Sys: FsReadFile>(
     location: &Path,
 ) -> Result<Option<PackageBinSource>, LinkBinsError> {
     let manifest_path = location.join("package.json");

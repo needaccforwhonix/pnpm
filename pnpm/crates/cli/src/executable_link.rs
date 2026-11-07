@@ -11,6 +11,10 @@ pub(crate) fn replace_executable(src: &Path, dest: &Path) -> std::io::Result<()>
     if same_file::is_same_file(src, dest).unwrap_or(false) {
         return Ok(());
     }
+    // `fs::hard_link` links a symlink itself, not its target. A `src` reached
+    // through a relative symlink, such as Homebrew's `bin/pnpm`, would dangle
+    // at `dest`.
+    let src = &dunce::canonicalize(src)?;
     let staged = staging_path(dest);
     let publish = || {
         // A hard link shares the source's inode, so it is only usable
@@ -33,7 +37,7 @@ pub(crate) fn replace_executable(src: &Path, dest: &Path) -> std::io::Result<()>
                 .create_new(true)
                 .open(&staged)?;
             io::copy(&mut source, &mut output)?;
-            output.sync_all()?;
+            pnpm_fs::sync_file(&output)?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt as _;
@@ -60,7 +64,7 @@ fn staging_path(dest: &Path) -> std::path::PathBuf {
         .into_owned();
     dest.with_file_name(format!(
         ".{file_name}.{}.{}.pacquet-tmp",
-        std::process::id(),
+        pnpm_fs::process_id(),
         STAGED_SEQ.fetch_add(1, Ordering::Relaxed),
     ))
 }
@@ -77,4 +81,28 @@ fn swap_into_place(staged: &Path, dest: &Path) -> std::io::Result<()> {
         }
     }
     fs::rename(staged, dest)
+}
+
+#[cfg(all(test, unix))]
+mod tests;
+
+#[cfg(target_os = "wasi")]
+pub(crate) fn replace_script(contents: &[u8], destination: &Path) -> io::Result<()> {
+    let staged = staging_path(destination);
+    let publish = || {
+        use std::io::Write;
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged)?;
+        output.write_all(contents)?;
+        pnpm_fs::file_mode::make_file_executable(&output)?;
+        pnpm_fs::sync_file(&output)?;
+        drop(output);
+        swap_into_place(&staged, destination)
+    };
+    publish()
+        .inspect_err(|_| {
+            let _ = fs::remove_file(&staged);
+        })
 }

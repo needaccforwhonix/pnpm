@@ -1,17 +1,29 @@
+pub(crate) use integrity::{
+    frozen_tree_intact, hoisted_linker_workspace_links_intact, hoisted_workspace_packages_present,
+};
+
 pub(super) use build_markers::{gvs_build_marker_present, gvs_build_markers_may_require_recovery};
 pub(super) use merge_metadata::{
     current_contains_dep_path, merge_filtered_modules_metadata, merge_pending_builds,
 };
+pub(super) use settings_diff::{refuse_drifted_modules_dir, same_path};
 
 mod build_markers;
 
 mod merge_metadata;
 
+mod settings_diff;
+
+mod integrity;
+
 use super::{
-    BTreeMap, Config, HoistedDependencies, IncludedDependencies, InstallError, LayoutVersion,
-    Lockfile, Modules, ModulesNodeLinker, NodeLinker, PNPM_VERSION, PackageManifest, Path,
+    BTreeMap, Config, HoistedDependencies, Host, IncludedDependencies, InstallError, LayoutVersion,
+    Lockfile, Modules, ModulesNodeLinker, NodeLinker, PNPM_VERSION, PackageManifest, Path, PathBuf,
     write_modules_manifest,
 };
+use pnpm_cmd_shim::bin_dir_is_relocatable;
+use pnpm_package_manifest::{BINDING_GYP, manifest_opts_out_of_gyp_build};
+use rayon::prelude::*;
 
 /// Translate pacquet's [`Config::node_linker`] into the
 /// [`pnpm_modules_yaml::NodeLinker`] enum used on disk. The two
@@ -22,6 +34,7 @@ pub(super) fn map_node_linker(linker: NodeLinker) -> ModulesNodeLinker {
         NodeLinker::Isolated => ModulesNodeLinker::Isolated,
         NodeLinker::Hoisted => ModulesNodeLinker::Hoisted,
         NodeLinker::Pnp => ModulesNodeLinker::Pnp,
+        NodeLinker::Loaded => ModulesNodeLinker::Loaded,
     }
 }
 
@@ -51,159 +64,110 @@ pub(super) fn modules_consistent_with(
     modules.included == included && modules_layout_consistent_with(modules, config, node_linker)
 }
 
-/// The subset of [`modules_consistent_with`] that, when it drifts, requires
-/// **wiping and recreating** `node_modules`. It deliberately excludes
-/// `included`: a `--prod`<->full switch is satisfied by relinking the
-/// newly-selected groups plus the targeted removal of the now-excluded
-/// ones ([`crate::prune_direct_deps_excluded_by_groups`]), not by
-/// deleting the directory. pnpm never purges the root project's
-/// `node_modules` for an included mismatch — its `validateModules` only
-/// does so for non-root importers (the `lockfileDir !== rootDir` check
-/// in `pnpm11/installing/deps-installer/src/install/validateModules.ts`)
-/// — so purging here would destroy the user's own non-pnpm entries (a
-/// vendored directory, stray files) on a routine flag change. The
-/// up-to-date fast path still compares `included` via
-/// [`modules_consistent_with`], so the relink it triggers stays correct.
-/// On-disk probe backing the frozen no-op short-circuit: the
-/// short-circuit skips the materialization walk entirely, so it must
-/// first prove the tree it would skip is still whole — pnpm's headless
-/// path stats every package dir on every run, which is what repairs a
-/// hand-deleted package. One metadata call per snapshot slot plus one
-/// per direct-dep link; any missing entry falls through to the full
-/// frozen path, which re-materializes it (emitting
-/// `pnpm:_broken_node_modules`).
-///
-/// Under a global virtual store the slot paths depend on graph hashes
-/// the short-circuit doesn't compute, and the hoisted linker has no
-/// virtual-store slots; both probe only the importer links.
-pub(super) fn frozen_tree_intact(
-    wanted: &Lockfile,
-    modules: &pnpm_modules_yaml::ModulesLayout,
-    config: &Config,
-    workspace_root: &Path,
-    node_linker: NodeLinker,
-) -> bool {
-    if matches!(node_linker, NodeLinker::Pnp) && !workspace_root.join(crate::PNP_FILENAME).is_file()
-    {
-        return false;
-    }
-    let skipped = crate::SkippedSnapshots::from_strings(&modules.skipped);
-    let probe_slots =
-        !matches!(node_linker, NodeLinker::Hoisted) && !config.enable_global_virtual_store;
-    if probe_slots
-        && let Some(snapshots) = wanted.snapshots.as_ref()
-        && !all_virtual_store_slots_present(snapshots, config, &skipped)
-    {
-        return false;
-    }
-    if !config.symlink {
-        return probe_slots;
-    }
-    importer_symlinks_intact(wanted, modules, config, workspace_root, &skipped)
+/// Whether a tree that moved with its project can be reused at all: only on
+/// unix, where directory links are relative symlinks rather than junctions,
+/// and only for an isolated or hoisted tree outside a global virtual store,
+/// whose links point into a store that registers projects by their path.
+pub(crate) fn tree_may_move(config: &Config, node_linker: NodeLinker) -> bool {
+    cfg!(any(unix, target_os = "wasi"))
+        && !config.enable_global_virtual_store
+        && node_linker != NodeLinker::Pnp
 }
 
-/// Whether every snapshot the lockfile records still has its virtual-store
-/// slot on disk.
-fn all_virtual_store_slots_present(
-    snapshots: &std::collections::HashMap<pnpm_lockfile::PackageKey, pnpm_lockfile::SnapshotEntry>,
+/// Whether a tree that moved with its project keeps working where it is now:
+/// [`tree_may_move`], and every importer, hoist, virtual-store slot and
+/// hoisted-package `.bin` holds only bins that name their paths relative to
+/// themselves, inside [`Config::modules_dir_anchor`].
+pub(crate) fn moved_tree_is_reusable(
     config: &Config,
-    skipped: &crate::SkippedSnapshots,
+    node_linker: NodeLinker,
+    project_manifests: &[(PathBuf, &PackageManifest)],
+    lockfile: &Lockfile,
 ) -> bool {
+    let Some(root) = config.modules_dir_anchor() else { return false };
+    tree_may_move(config, node_linker)
+        && importer_bins_are_relocatable(config, project_manifests, root)
+        && match node_linker {
+            NodeLinker::Hoisted => hoisted_bins_are_relocatable(config, root),
+            _ => virtual_store_bins_are_relocatable(config, lockfile, root),
+        }
+}
+
+fn importer_bins_are_relocatable(
+    config: &Config,
+    project_manifests: &[(PathBuf, &PackageManifest)],
+    root: &Path,
+) -> bool {
+    let modules_dir_name: &std::ffi::OsStr = config.modules_dir_name();
+    bin_dir_is_relocatable(&config.modules_dir.join(".bin"), root)
+        && project_manifests
+            .iter()
+            .filter(|(project_dir, _)| project_dir != root)
+            .all(|(project_dir, _)| {
+                bin_dir_is_relocatable(&project_dir.join(modules_dir_name).join(".bin"), root)
+            })
+}
+
+/// The bins of the packages hoisted into the virtual store, and each slot's
+/// own.
+fn virtual_store_bins_are_relocatable(config: &Config, lockfile: &Lockfile, root: &Path) -> bool {
     let layout = crate::VirtualStoreLayout::legacy(
-        config.virtual_store_dir.clone(),
+        config.virtual_store_dir().to_path_buf(),
         config.virtual_store_dir_max_length as usize,
     );
-    snapshots
-        .keys()
-        .all(|key| {
-            if skipped.contains(key) {
-                return true;
-            }
-            // The name is lockfile-controlled: join it with the same
-            // traversal-rejecting helper the linkers use, and treat a
-            // malformed name as not-intact so the full path's
-            // structural lockfile gate rejects it.
-            let slot_node_modules = layout.slot_dir(key).join("node_modules");
-            match crate::safe_join_modules_dir::safe_join_modules_dir(
-                &slot_node_modules,
-                &key.name.to_string(),
-            ) {
-                Ok(dir) => dir.is_dir(),
-                Err(_) => false,
-            }
-        })
+    bin_dir_is_relocatable(&config.install_state_dir.join("node_modules").join(".bin"), root)
+        && lockfile.snapshots
+            .as_ref()
+            .is_none_or(|snapshots| {
+                snapshots
+                    .par_iter()
+                    .all(|(key, _)| {
+                        slot_bins_are_relocatable(
+                            &layout.slot_dir(key).join("node_modules"),
+                            key,
+                            root,
+                        )
+                    })
+            })
 }
 
-/// Whether every importer's direct dependencies are still symlinked into its
-/// own `node_modules`.
-fn importer_symlinks_intact(
-    wanted: &Lockfile,
-    modules: &pnpm_modules_yaml::ModulesLayout,
-    config: &Config,
-    workspace_root: &Path,
-    skipped: &crate::SkippedSnapshots,
-) -> bool {
-    let groups = crate::prune_direct_deps::selected_groups(modules.included);
-    let modules_dir_name: &std::ffi::OsStr =
-        config.modules_dir.file_name().unwrap_or_else(|| std::ffi::OsStr::new("node_modules"));
-    wanted.importers
+/// The `.bin` dirs the hoisted linker writes inside the packages it placed,
+/// enumerated from the `hoistedLocations` the install recorded. A record that
+/// cannot be read, or a location naming a directory outside the tree, refuses
+/// the move.
+fn hoisted_bins_are_relocatable(config: &Config, root: &Path) -> bool {
+    let Ok(Some(modules)) = pnpm_modules_yaml::read_modules_manifest::<Host>(&config.modules_dir)
+    else {
+        return false;
+    };
+    modules.hoisted_locations
         .iter()
-        .all(|(importer_id, snapshot)| {
-            if crate::symlink_direct_dependencies::validate_importer_id(importer_id).is_err() {
-                return true;
-            }
-            let modules_dir =
-                crate::symlink_direct_dependencies::importer_root_dir(workspace_root, importer_id)
-                    .join(modules_dir_name);
-            crate::symlink_direct_dependencies::direct_dep_names_for_importer(
-                snapshot,
-                groups.iter().copied(),
-                skipped,
-                false,
-            )
-            .iter()
-            .all(|name| direct_dep_link_resolves(&modules_dir, name))
+        .flat_map(BTreeMap::values)
+        .flatten()
+        .all(|location| {
+            let package_dir = root.join(location);
+            pnpm_fs::is_subdir(root, &package_dir)
+                && bin_dir_is_relocatable(&package_dir.join("node_modules").join(".bin"), root)
         })
 }
 
-fn direct_dep_link_resolves(modules_dir: &Path, name: &str) -> bool {
-    match crate::safe_join_modules_dir::safe_join_modules_dir(modules_dir, name) {
-        // `metadata` follows the link, so a dangling direct-dep
-        // symlink (a wiped GVS store, a hand-deleted target)
-        // reads as broken and falls through to the repairing
-        // full path.
-        Ok(link) => std::fs::metadata(link).is_ok(),
-        // A malformed alias never probes the disk; the full
-        // path rejects it with its own typed error.
-        Err(_) => true,
-    }
-}
-
-/// The `validateModules` half pacquet enforces: when the mutation is
-/// not a plain install (upstream `installsOnly === false`), a drift in
-/// the persisted layout settings fails with the upstream `*_DIFF`
-/// error instead of silently recreating the modules directory. Check
-/// order matches upstream `validateModules`. Drift in the fields this
-/// does not cover (store dir, node linker, layout version) still takes
-/// the recreate path.
-pub(super) fn check_modules_settings_diff(
-    modules: &pnpm_modules_yaml::ModulesLayout,
-    config: &Config,
-) -> Result<(), InstallError> {
-    if modules.virtual_store_dir_max_length != config.virtual_store_dir_max_length {
-        return Err(InstallError::VirtualStoreDirMaxLengthDiff);
-    }
-    if normalized_pattern(modules.public_hoist_pattern.as_deref())
-        != normalized_pattern(config.public_hoist_pattern.as_deref())
-    {
-        return Err(InstallError::PublicHoistPatternDiff);
-    }
-    if normalized_pattern(modules.hoist_pattern.as_deref())
-        != normalized_pattern(config.hoist_pattern.as_deref())
-    {
-        return Err(InstallError::HoistPatternDiff);
-    }
-    Ok(())
+/// The `.bin` the install links into the slot's package, and the one next
+/// to the package, which the injected-deps syncer links a package's own
+/// bins into.
+fn slot_bins_are_relocatable(
+    slot_modules_dir: &Path,
+    key: &pnpm_lockfile::PackageKey,
+    root: &Path,
+) -> bool {
+    bin_dir_is_relocatable(&slot_modules_dir.join(".bin"), root)
+        // A malformed lockfile-controlled name fails closed.
+        && crate::safe_join_modules_dir::safe_join_modules_dir(
+            slot_modules_dir,
+            &key.name.to_string(),
+        )
+        .is_ok_and(|package_dir| {
+            bin_dir_is_relocatable(&package_dir.join("node_modules").join(".bin"), root)
+        })
 }
 
 /// Upstream compares patterns with `?? []`: `None` and an empty list
@@ -212,7 +176,20 @@ pub(super) fn normalized_pattern(pattern: Option<&[String]>) -> &[String] {
     pattern.unwrap_or(&[])
 }
 
-pub(super) fn modules_layout_consistent_with(
+/// The subset of [`modules_consistent_with`] that, when it drifts, requires
+/// **wiping and recreating** `node_modules`. It deliberately excludes
+/// `included`: a `--prod`<->full switch is satisfied by relinking the
+/// newly-selected groups plus the targeted removal of the now-excluded
+/// ones ([`crate::prune_direct_deps_excluded_by_groups`]), not by
+/// deleting the directory. pnpm never purges the root project's
+/// `node_modules` for an included mismatch: its `validateModules` only
+/// does so for non-root importers (the `lockfileDir !== rootDir` check
+/// in `pnpm11/installing/deps-installer/src/install/validateModules.ts`)
+/// so purging here would destroy the user's own non-pnpm entries (a
+/// vendored directory, stray files) on a routine flag change. The
+/// up-to-date fast path still compares `included` via
+/// [`modules_consistent_with`], so the relink it triggers stays correct.
+pub(crate) fn modules_layout_consistent_with(
     modules: &pnpm_modules_yaml::ModulesLayout,
     config: &Config,
     node_linker: NodeLinker,
@@ -226,10 +203,7 @@ pub(super) fn modules_layout_consistent_with(
     // Patterns compare normalized (upstream's `?? []`): `None` and an
     // empty list are the same disabled state, so the pair must not read
     // as layout drift — a purge every install for `hoistPattern: []`
-    // projects, and a spurious `*_DIFF` error for `add` / `remove`. A
-    // `virtualStoreOnly` install records empty patterns deliberately, so
-    // it skips the comparison entirely and lets the follow-up install
-    // complete the linking instead of purging.
+    // projects, and a spurious `*_DIFF` error for `add` / `remove`.
     let hoist_patterns_match = modules.virtual_store_only == Some(true)
         || (normalized_pattern(modules.hoist_pattern.as_deref())
             == normalized_pattern(config.hoist_pattern.as_deref())
@@ -239,12 +213,8 @@ pub(super) fn modules_layout_consistent_with(
         && modules.node_linker == Some(map_node_linker(node_linker))
         && hoist_patterns_match
         && modules.virtual_store_dir_max_length == config.virtual_store_dir_max_length
-        && modules.store_dir == config.store_dir.display().to_string()
-        && modules.virtual_store_dir
-            == config
-                .effective_virtual_store_dir()
-                .to_string_lossy()
-                .as_ref()
+        && same_path(Path::new(&modules.store_dir), config.store_dir.root())
+        && same_path(Path::new(&modules.virtual_store_dir), config.virtual_store_dir())
 }
 
 /// Whether `.modules.yaml` records any ignored build that the current
@@ -278,26 +248,35 @@ pub(super) fn has_newly_allowed_ignored_builds(
         .any(|dep_path| policy.check(dep_path.as_str()) == Some(true))
 }
 
-/// Whether the current `allowBuilds` policy withdraws an approval that
-/// `.modules.yaml` recorded, leaving the package undecided again.
+/// Whether the `allowBuilds` entries the previous install recorded differ
+/// from the current setting: an entry flipped between `true` and `false`,
+/// or one added or removed. Placeholder entries the approval scaffold
+/// writes carry no decision and are ignored.
 ///
-/// The counterpart to [`has_newly_allowed_ignored_builds`]: a build the
-/// previous install ran is absent from `ignoredBuilds`, so nothing else
-/// on the frozen no-op fast path notices it is no longer approved
-/// (<https://github.com/pnpm/pnpm/issues/11035>).
-///
-/// Only a withdrawal to *undecided* counts. An entry the user flipped to
-/// an explicit `false` is silently skipped rather than reported, so it
-/// leaves the fast path intact — matching `BuildModules`.
-pub(super) fn has_revoked_allowed_builds(
+/// The counterpart to [`has_newly_allowed_ignored_builds`], which sees an
+/// ignored build the current policy allows. This sees every other move in
+/// the approval set, including the two that leave no trace for anything
+/// else on the frozen no-op fast path to notice: an approval withdrawn,
+/// whose package built last time and so is absent from `ignoredBuilds`
+/// (<https://github.com/pnpm/pnpm/issues/11035>), and a decision flipped
+/// between `true` and `false`, which leaves no ignored entry behind.
+pub(super) fn recorded_allow_builds_differ(
     modules: &pnpm_modules_yaml::ModulesLayout,
     config: &Config,
 ) -> bool {
-    let Some(recorded) = modules.allow_builds.as_ref() else { return false };
-    recorded
-        .iter()
-        .filter(|(_, value)| matches!(value, pnpm_modules_yaml::AllowBuildValue::Bool(true)))
-        .any(|(spec, _)| !config.allow_builds.contains_key(spec))
+    let recorded = || {
+        modules.allow_builds
+            .iter()
+            .flatten()
+            .filter_map(|(spec, value)| match value {
+                pnpm_modules_yaml::AllowBuildValue::Bool(decision) => {
+                    Some((spec.as_str(), decision))
+                }
+                pnpm_modules_yaml::AllowBuildValue::String(_) => None,
+            })
+    };
+    recorded().count() != config.allow_builds.len()
+        || recorded().any(|(spec, decision)| config.allow_builds.get(spec) != Some(decision))
 }
 
 /// The sorted `name@version` keys `.modules.yaml` recorded as ignored
@@ -345,9 +324,7 @@ pub(super) fn unapproved_recorded_ignored_builds(
 /// hoist patterns are `None`, and under `nodeLinker: hoisted` (the
 /// hoisted linker uses `hoisted_locations` instead). Persisting it
 /// lets a subsequent install detect a hoist pattern change and
-/// re-hoist appropriately (the partial-install path tracked at
-/// pnpm/pacquet#433 will consume it; today every install does the
-/// full hoist anyway).
+/// re-hoist appropriately.
 ///
 /// `hoisted_locations` is the per-depPath list of lockfile-relative
 /// directory paths the hoisted linker placed each package at. Empty
@@ -429,7 +406,7 @@ pub(super) fn build_modules_manifest(
             .collect(),
         store_dir: config.store_dir.display().to_string(),
         virtual_store_dir: config
-            .effective_virtual_store_dir()
+            .virtual_store_dir()
             .to_string_lossy()
             .into_owned(),
         virtual_store_dir_max_length: config.virtual_store_dir_max_length,
@@ -447,6 +424,37 @@ pub(super) fn build_modules_manifest(
         ),
         virtual_store_only: config.virtual_store_only.then_some(true),
         ..Default::default()
+    }
+}
+
+/// A rebuild leaves the tree laid out as the previous install left it, so
+/// the manifest it writes keeps the layout settings that install recorded
+/// and a later install still sees a changed setting as drift. A setting the
+/// previous manifest did not record takes the current value.
+pub(super) fn keep_recorded_layout(
+    next: &mut Modules,
+    recorded: &pnpm_modules_yaml::ModulesLayout,
+) {
+    if recorded.node_linker.is_some() {
+        next.node_linker = recorded.node_linker;
+    }
+    if recorded.layout_version.is_some() {
+        next.layout_version = recorded.layout_version;
+    }
+    if let Some(pattern) = &recorded.hoist_pattern {
+        next.hoist_pattern = Some(pattern.clone());
+    }
+    if let Some(pattern) = &recorded.public_hoist_pattern {
+        next.public_hoist_pattern = Some(pattern.clone());
+    }
+    if !recorded.store_dir.is_empty() {
+        next.store_dir.clone_from(&recorded.store_dir);
+    }
+    if !recorded.virtual_store_dir.is_empty() {
+        next.virtual_store_dir.clone_from(&recorded.virtual_store_dir);
+    }
+    if recorded.virtual_store_dir_max_length != 0 {
+        next.virtual_store_dir_max_length = recorded.virtual_store_dir_max_length;
     }
 }
 
@@ -483,19 +491,33 @@ where
     write_modules_manifest::<Sys>(modules_dir, modules).map_err(InstallError::WriteModules)
 }
 
-/// Includes the executor's implicit `node-gyp rebuild` fallback when a
-/// project has `binding.gyp` but no explicit preinstall or install script.
-pub(super) fn project_requires_lifecycle_scripts(
+/// Whether the project defines any of `stages`, counting the executor's
+/// implicit `node-gyp rebuild` fallback for `install` (which is skipped
+/// when the project opts out with `gypfile: false`).
+pub(crate) fn project_requires_lifecycle_scripts(
     project_dir: &Path,
     manifest: &PackageManifest,
+    stages: &[&str],
 ) -> bool {
-    let has_lifecycle_script = pnpm_executor::PROJECT_LIFECYCLE_STAGES
+    let has_lifecycle_script = stages
         .iter()
         .any(|stage| matches!(manifest.script(stage, true), Ok(Some(_))));
     has_lifecycle_script
-        || (matches!(manifest.script("preinstall", true), Ok(None))
-            && matches!(manifest.script("install", true), Ok(None))
-            && project_dir.join("binding.gyp").exists())
+        || (stages.contains(&"install")
+            && project_requires_implicit_gyp_build(project_dir, manifest))
+}
+
+/// Whether the executor's implicit `node-gyp rebuild` applies to the
+/// project's `install` stage: it ships a `binding.gyp`, declares neither
+/// `install` nor `preinstall`, and does not opt out with `gypfile: false`.
+pub(super) fn project_requires_implicit_gyp_build(
+    project_dir: &Path,
+    manifest: &PackageManifest,
+) -> bool {
+    matches!(manifest.script("preinstall", true), Ok(None))
+        && matches!(manifest.script("install", true), Ok(None))
+        && !manifest_opts_out_of_gyp_build(manifest.value())
+        && project_dir.join(BINDING_GYP).exists()
 }
 
 /// Read a string field off a project manifest, returning `None` when
@@ -509,3 +531,6 @@ pub(super) fn manifest_string_field(manifest: &PackageManifest, key: &str) -> Op
         .and_then(|v| v.as_str())
         .map(ToString::to_string)
 }
+
+#[cfg(test)]
+mod tests;

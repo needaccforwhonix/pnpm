@@ -1,7 +1,49 @@
 use super::{
-    AllowBuild, Config, PackageConfigsSetting, PnpmfileSetting, WorkspaceSettings, as_set,
-    global_shims_setting, opt_path, path, side_effects_cache_setting,
+    AllowBuild, Config, MachineSettings, MacosBackupSettings, NodePackageMapSettings,
+    PackageConfigsSetting, PackagePermissions, PnpmfileSetting, SkillsSettings, TrustedSettings,
+    WorkspaceSettings, as_set, global_shims_setting, opt_path, path, side_effects_cache_setting,
 };
+use indexmap::IndexMap;
+
+impl TrustedSettings {
+    /// Every setting at the value `config` resolved it to. See
+    /// [`WorkspaceSettings::from_resolved`].
+    #[must_use]
+    pub fn from_resolved(config: &Config) -> Self {
+        Self {
+            settings: WorkspaceSettings::from_resolved(config),
+            machine: MachineSettings::from_resolved(config),
+        }
+    }
+}
+
+impl MachineSettings {
+    /// [`WorkspaceSettings::from_resolved`] for these settings.
+    #[must_use]
+    pub fn from_resolved(config: &Config) -> Self {
+        Self {
+            ci: Some(config.ci),
+            state_dir: Some(path(&config.state_dir)),
+            scope: config.scope.clone(),
+            // Reported as the user set them; see
+            // `WorkspaceSettings::with_resolved_paths`.
+            global_dir: as_set(config, "globalDir"),
+            global_bin_dir: as_set(config, "globalBinDir"),
+            macos_backup: Some(MacosBackupSettings {
+                exclude_modules_dir: Some(config.macos_backup.exclude_modules_dir),
+                exclude_store_dir: Some(config.macos_backup.exclude_store_dir),
+            }),
+            global_shims: Some(global_shims_setting(config)),
+            tools: Some(config.tools.clone()),
+            symlinked_lockfile_target_dirs: Some(
+                config.symlinked_lockfile_target_dirs
+                    .iter()
+                    .map(|dir| path(dir))
+                    .collect(),
+            ),
+        }
+    }
+}
 
 impl WorkspaceSettings {
     /// Every setting at the value `config` resolved it to, for a consumer
@@ -18,10 +60,7 @@ impl WorkspaceSettings {
     ///   `registriesByScope` / `registriesByPrefix` lookups, `catalog`
     ///   becomes the `default` entry of [`Self::catalogs`], and the build
     ///   allow-lists become one `allowBuilds` record.
-    /// - Deprecated spellings, which report under the canonical one:
-    ///   `maxsockets`, `noproxy`, `updateConfig`, `auditLevel`,
-    ///   `auditConfig`, `cleanupUnusedCatalogs`, `namedRegistries`, and
-    ///   `virtualStoreType`.
+    /// - Deprecated spellings, which report under the canonical one.
     ///
     /// `_auth` stays `None` because a project file may not carry it, and
     /// [`Self::key_issues`] is diagnostics about one file rather than a
@@ -42,11 +81,21 @@ impl WorkspaceSettings {
         }
         let mut settings = identically_named_settings!(read);
 
+        settings.node_linker = Some(crate::NodeLinkerSetting::from_resolved(config));
+        // The deprecated spellings are reported too, so a hook written
+        // against them reads the resolved value. Hooks apply only the keys
+        // they change, so either spelling can be changed.
+        settings.node_package_map = Some(NodePackageMapSettings {
+            mode: Some(config.node_package_map_mode),
+            map_type: Some(config.node_package_map_type),
+        });
+        settings.node_experimental_package_map = Some(config.node_package_map_mode.loads());
+        settings.node_package_map_type = Some(config.node_package_map_type);
         settings = settings.with_resolved_paths(config);
         settings = settings.with_resolved_presence(config);
         settings = settings.with_resolved_scripts(config);
         settings = settings.with_resolved_policy(config);
-        settings = settings.with_resolved_collections(config);
+        settings = settings.with_resolved_collections(config).with_resolved_permissions(config);
         settings
     }
 
@@ -54,7 +103,6 @@ impl WorkspaceSettings {
         Self {
             hoist_pattern: Some(config.hoist_pattern.clone()),
             public_hoist_pattern: Some(config.public_hoist_pattern.clone()),
-            state_dir: Some(path(&config.state_dir)),
             lockfile_dir: opt_path(config.lockfile_dir.as_deref()),
             npmrc_auth_file: opt_path(config.npmrc_auth_file.as_deref()),
             global_pnpmfile: opt_path(config.global_pnpmfile.as_deref()),
@@ -72,8 +120,6 @@ impl WorkspaceSettings {
             modules_dir: as_set(config, "modulesDir"),
             virtual_store_dir: as_set(config, "virtualStoreDir"),
             global_virtual_store_dir: as_set(config, "globalVirtualStoreDir"),
-            global_dir: as_set(config, "globalDir"),
-            global_bin_dir: as_set(config, "globalBinDir"),
 
             // `cacheDir` is one of those settings when a source set it, and
             // the directory pnpm chose for the host when none did, which is
@@ -97,18 +143,20 @@ impl WorkspaceSettings {
             optimistic_repeat_install: as_set(config, "optimisticRepeatInstall"),
             minimum_release_age: as_set(config, "minimumReleaseAge"),
             prefer_symlinked_executables: as_set(config, "preferSymlinkedExecutables"),
-
-            global_shims: Some(global_shims_setting(config)),
+            runtime: as_set(config, "runtime"),
 
             frozen_lockfile: config.frozen_lockfile,
+            provenance: config.provenance,
             git_branch_lockfile: Some(config.use_git_branch_lockfile),
             registry: Some(config.registry.clone()),
-            scope: config.scope.clone(),
             pnpr_server: config.pnpr_server.clone(),
             cargo: Some(config.cargo.clone()),
             python: Some(config.python.clone()),
             remote_side_effects_cache: config.remote_side_effects_cache.clone(),
+            remote_cache: config.remote_cache.as_deref().cloned(),
             reporter_hide_prefix: config.reporter_hide_prefix,
+            loglevel: config.loglevel,
+            reporter: config.reporter,
             max_sockets: config.max_sockets,
             patched_dependencies: config.patched_dependencies.clone(),
             patches_dir: config.patches_dir.clone(),
@@ -125,11 +173,13 @@ impl WorkspaceSettings {
             ignore_scripts: Some(config.ignore_scripts),
             ignore_pnpmfile: Some(config.ignore_pnpmfile),
             git_checks: Some(config.git_checks),
+            git_tag_version: Some(config.git_tag_version),
+            publish_branch: config.publish_branch.clone(),
             engine_strict: Some(config.engine_strict),
+            force_ignores_platform: Some(config.force_ignores_platform),
             node_version: config.node_version.clone(),
             runtime_on_fail: config.runtime_on_fail,
             node_download_mirrors: Some(config.node_download_mirrors.clone()),
-            scripts_prepend_node_path: Some(config.scripts_prepend_node_path),
             script_shell: Some(config.script_shell.clone()),
             node_options: Some(config.node_options.clone()),
             unsafe_perm: Some(config.unsafe_perm),
@@ -146,6 +196,7 @@ impl WorkspaceSettings {
 
     pub(super) fn with_resolved_policy(self, config: &Config) -> Self {
         Self {
+            boot_config: config.boot_config.as_deref().cloned(),
             minimum_release_age_exclude: config.minimum_release_age_exclude.clone(),
             minimum_release_age_ignore_missing_time: Some(
                 config.minimum_release_age_ignore_missing_time,
@@ -164,8 +215,11 @@ impl WorkspaceSettings {
             pm_on_fail: config.pm_on_fail,
             versioning: Some(config.versioning.clone()),
             save_catalog_name: config.save_catalog_name.clone(),
+            tag: config.tag.clone(),
             save_prefix: config.save_prefix.clone(),
+            tag_version_prefix: Some(config.tag_version_prefix.clone()),
             pipeline_base: config.pipeline_base.clone(),
+            concurrency_groups: Some(config.concurrency_groups.clone()),
 
             // `child_concurrency` / `workspace_concurrency` are resolved to
             // a positive count on `Config`, which the settings hold as the
@@ -176,6 +230,28 @@ impl WorkspaceSettings {
             ),
 
             side_effects_cache: Some(side_effects_cache_setting(config)),
+            ..self
+        }
+    }
+
+    /// `permissions` reports the `skills` decisions; the `build` ones
+    /// report under `allowBuilds`.
+    fn with_resolved_permissions(self, config: &Config) -> Self {
+        let mut permissions: IndexMap<String, PackagePermissions> = config
+            .allow_skills
+            .iter()
+            .map(|(name, allowed)| {
+                let entry = PackagePermissions {
+                    skills: Some(allowed.clone()),
+                    ..PackagePermissions::default()
+                };
+                (name.clone(), entry)
+            })
+            .collect();
+        permissions.sort_unstable_keys();
+        Self {
+            permissions: Some(permissions),
+            skills: Some(SkillsSettings { dirs: config.skills_dirs.clone() }),
             ..self
         }
     }
@@ -215,6 +291,8 @@ impl WorkspaceSettings {
                         serde_json::Value::String(hosts.join(","))
                     }
                 }),
+            strict_ssl: config.tls.strict_ssl,
+            local_address: config.tls.local_address.map(|address| address.to_string()),
 
             // `audit` and `update` are the canonical spellings, so the
             // deprecated `auditLevel`, `auditConfig`, and `updateConfig`

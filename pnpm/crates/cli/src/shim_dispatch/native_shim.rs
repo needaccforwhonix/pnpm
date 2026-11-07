@@ -91,7 +91,7 @@ pub(crate) fn install_native_shim(
     name: &str,
     target: &ShimTarget,
 ) -> io::Result<()> {
-    install_native_shim_from(&std::env::current_exe()?, bin_dir, name, target)
+    install_native_shim_from(&pnpm_executor::current_executable()?, bin_dir, name, target)
 }
 
 /// Publish `source` as the shim `name`, recording `target` beside it. The
@@ -115,14 +115,17 @@ pub(crate) fn install_native_shim_from(
     let target_file = target_file_path(bin_dir, name);
     let executable = executable_path(bin_dir, name);
     pnpm_fs::write_atomic(&target_file, &target.encode())?;
-    crate::executable_link::replace_executable(source, &executable)
-        .inspect_err(|_| {
-            // A sidecar without an executable would list as a shim; a sidecar
-            // beside an older executable is a live shim with its new target.
-            if !executable.exists() {
-                let _ = fs::remove_file(&target_file);
-            }
-        })
+    #[cfg(not(target_os = "wasi"))]
+    let published = crate::executable_link::replace_executable(source, &executable);
+    #[cfg(target_os = "wasi")]
+    let published = wasm_shim::publish(source, &executable);
+    published.inspect_err(|_| {
+        // A sidecar without an executable would list as a shim; a sidecar
+        // beside an older executable is a live shim with its new target.
+        if !executable.exists() {
+            let _ = fs::remove_file(&target_file);
+        }
+    })
 }
 
 /// Remove the shim `name` and its sidecar. A missing shim is not an error.
@@ -196,7 +199,7 @@ pub(crate) fn refresh_native_shims(source: &Path, bin_dir: &Path) -> io::Result<
 }
 
 pub(crate) fn migrate_legacy_shims(bin_dir: &Path) -> io::Result<()> {
-    migrate_legacy_shims_from(&std::env::current_exe()?, bin_dir)
+    migrate_legacy_shims_from(&pnpm_executor::current_executable()?, bin_dir)
 }
 
 /// Turn every legacy shim into a native shim, then drop the
@@ -294,7 +297,7 @@ fn executing_dispatcher_bin_dir(shim: &Path) -> Option<PathBuf> {
     let supplied_bin_dir = shim
         .parent()
         .filter(|dir| !dir.as_os_str().is_empty())?;
-    let dispatcher = std::env::current_exe().ok()?;
+    let dispatcher = pnpm_executor::current_executable().ok()?;
     let dispatcher_name = format!("{LEGACY_DISPATCHER_NAME}{}", std::env::consts::EXE_SUFFIX);
     if dispatcher.file_name() != Some(OsStr::new(&dispatcher_name)) {
         return None;
@@ -322,7 +325,7 @@ fn try_migrate_legacy_shims(bin_dir: &Path) {
 }
 
 fn report_shim_error(error: &miette::Report) {
-    eprintln!("pnpm: {error:?}");
+    pnpm_diagnostics::eprintln!("pnpm: {error:?}");
 }
 
 /// Split the machine-generated tail of a `--shim` invocation into the bin
@@ -344,30 +347,67 @@ fn parse_legacy_shim_argv(rest: &[OsString]) -> Option<(&str, &Path, ShimTarget,
     Some((name, Path::new(shim), target, args))
 }
 
-/// Intercept a launch under a shim name. `None` means this is pnpm
-/// itself and the regular CLI should proceed.
-pub(super) fn try_native_dispatch(argv: &[OsString]) -> Option<i32> {
-    let executable = std::env::current_exe().ok()?;
-    let name = shim_name(executable.file_name()?)?;
-    let bin_dir = executable.parent()?;
-    let target = match native_shim_target(bin_dir, &name) {
+/// The native-shim half of [`super::ShimLaunch`]: what the executing
+/// binary's name and sidecar say about this launch, read exactly once.
+pub(super) enum NativeLaunch {
+    /// Not a shim launch; run the CLI.
+    Cli,
+    /// Dispatch to the recorded global target.
+    Dispatch { name: String, bin_dir: PathBuf, target: ShimTarget },
+    /// The launch names a shim whose target cannot be used. The message is
+    /// already formatted for stderr; dispatch prints it and exits 1.
+    Broken(String),
+}
+
+/// Read the sidecar beside the executing binary once. An unreadable target
+/// still dispatches (to an error), so only the absence of a target file
+/// means this is pnpm itself.
+pub(super) fn resolve_native_launch() -> NativeLaunch {
+    let Some(executable) = pnpm_executor::current_executable().ok() else {
+        return NativeLaunch::Cli;
+    };
+    let Some(file_name) = executable.file_name() else {
+        return NativeLaunch::Cli;
+    };
+    let Some(name) = shim_name(file_name) else {
+        return NativeLaunch::Cli;
+    };
+    let Some(bin_dir) = executable.parent().map(Path::to_path_buf) else {
+        return NativeLaunch::Cli;
+    };
+    let target = match native_shim_target(&bin_dir, &name) {
         Ok(Some(target)) => target,
-        Ok(None) => return None,
+        Ok(None) => return NativeLaunch::Cli,
         Err(error) => {
-            eprintln!("pnpm: cannot read the global target of the {name} shim: {error}");
-            return Some(1);
+            return NativeLaunch::Broken(format!(
+                "pnpm: cannot read the global target of the {name} shim: {error}",
+            ));
         }
     };
     if let ShimTarget::Installed(path) = &target
-        && same_file::is_same_file(path, &executable).unwrap_or(false)
+        && is_shim_path(path, &executable)
     {
-        eprintln!("pnpm: the global target of the {name} shim points back at the shim");
-        return Some(1);
+        return NativeLaunch::Broken(format!(
+            "pnpm: the global target of the {name} shim points back at the shim",
+        ));
     }
-    let settings = trusted_shim_settings();
-    let invocation = super::ShimInvocation { name: &name, bin_dir, target: &target };
-    let args = argv.get(1..).unwrap_or_default();
-    Some(dispatch_target(&invocation, args, &settings.shims, &settings.state_dir))
+    NativeLaunch::Dispatch { name, bin_dir, target }
+}
+
+/// Whether running `target` would launch `shim` again. A hard link of the
+/// shim elsewhere does not: launched under its own path it finds no
+/// sidecar and runs the CLI. pnpm's own shim and the `pnpm` bin of its
+/// global package are often hard links of one file.
+fn is_shim_path(target: &Path, shim: &Path) -> bool {
+    // The file identity check is the cheap filter on the launch path; only
+    // the same file can be the shim.
+    if !same_file::is_same_file(target, shim).unwrap_or(false) {
+        return false;
+    }
+    match (dunce::canonicalize(target), dunce::canonicalize(shim)) {
+        (Ok(target), Ok(shim)) => target == shim,
+        _ => false,
+    }
 }
 
 fn executable_path(bin_dir: &Path, name: &str) -> PathBuf {
@@ -398,15 +438,21 @@ fn shim_name(file_name: &OsStr) -> Option<String> {
     Some(file_name.to_str()?.to_string())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 fn encode_os(value: &OsStr) -> Vec<u8> {
+    #[cfg(unix)]
     use std::os::unix::ffi::OsStrExt as _;
+    #[cfg(target_os = "wasi")]
+    use std::os::wasi::ffi::OsStrExt as _;
     value.as_bytes().to_vec()
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "wasi"))]
 fn decode_os(bytes: &[u8]) -> Option<OsString> {
+    #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt as _;
+    #[cfg(target_os = "wasi")]
+    use std::os::wasi::ffi::OsStringExt as _;
     Some(OsString::from_vec(bytes.to_vec()))
 }
 
@@ -434,3 +480,6 @@ fn decode_os(bytes: &[u8]) -> Option<OsString> {
         .is_empty()
         .then_some(value)
 }
+
+#[cfg(target_os = "wasi")]
+mod wasm_shim;

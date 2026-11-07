@@ -11,9 +11,11 @@
 //! Reference (object-hash@3.0.0):
 //! - <https://github.com/puleos/object-hash/blob/v3.0.0/index.js>
 
+pub(crate) use pnpm_process as process;
+
 pub use dep_state::{
     CalcDepStateOptions, DEPENDENCY_SIDE_EFFECTS_INPUT_KEY_PREFIX, DepsGraphNode, DepsStateCache,
-    build_required_dep_paths, calc_dep_state, calc_dep_state_input_key, warm_deps_state_cache,
+    SIDE_EFFECTS_FORMAT_KEY, build_required_dep_paths, calc_dep_state, calc_dep_state_input_key,
 };
 pub use engine_name::{
     detect_node_major, detect_node_version, engine_name, host_arch, host_libc, host_platform,

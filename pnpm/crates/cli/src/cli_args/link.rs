@@ -4,8 +4,9 @@ use derive_more::{Display, Error};
 use indexmap::IndexMap;
 use miette::{Context, Diagnostic};
 use pnpm_config::Config;
-use pnpm_package_manager::{Install, ProjectMutation};
+use pnpm_package_manager::{Install, ProjectMutation, linked_peer_dependencies_warning};
 use pnpm_package_manifest::{DependencyGroup, PackageManifest};
+use pnpm_package_name::is_valid_dependency_alias;
 use pnpm_reporter::Reporter;
 use pnpm_workspace_manifest_writer::set_overrides;
 use std::{
@@ -32,6 +33,13 @@ pub enum LinkError {
         #[error(not(source))]
         name: String,
     },
+
+    #[display(r#"Cannot link "{dir}" under the invalid package name {name:?}"#)]
+    #[diagnostic(
+        code(ERR_PNPM_INVALID_DEPENDENCY_NAME),
+        help(r#"A package is linked under the "name" field of its package.json. That name must be a valid npm package name."#)
+    )]
+    InvalidName { dir: String, name: String },
 }
 
 const DEPENDENCY_FIELDS: [&str; 3] = ["optionalDependencies", "dependencies", "devDependencies"];
@@ -70,10 +78,14 @@ fn already_declared(manifest: &PackageManifest, name: &str) -> bool {
 }
 
 impl LinkArgs {
+    /// `cli_dir` is the directory the command runs in. Relative package
+    /// paths are resolved against it, as a shell would, rather than against
+    /// the directory of the nearest `package.json`.
     pub async fn run<Reporter: self::Reporter + 'static>(
         self,
         config: &'static mut Config,
         manifest_path: PathBuf,
+        cli_dir: &Path,
     ) -> miette::Result<()> {
         self.validate_package_paths()?;
 
@@ -82,14 +94,15 @@ impl LinkArgs {
             .ok_or_else(|| miette::miette!("manifest path has no parent directory"))?
             .to_path_buf();
 
-        let mut manifest = PackageManifest::create_if_needed(manifest_path.clone())
+        // A missing manifest is saved only after every link target resolved.
+        let mut manifest = PackageManifest::load_or_init(manifest_path.clone())
             .wrap_err("reading the project package.json")?;
 
         let root_dir = config.workspace_dir.clone().unwrap_or_else(|| manifest_dir.clone());
 
         let mut new_overrides = IndexMap::<String, String>::new();
         for path_str in &self.package_paths {
-            let (target_dir, package_name) = link_target(&manifest_dir, path_str)?;
+            let (target_dir, package_name, target_manifest) = link_target(cli_dir, path_str)?;
 
             if !already_declared(&manifest, &package_name) {
                 manifest
@@ -100,7 +113,8 @@ impl LinkArgs {
                     )
                     .wrap_err("adding linked dependency to package.json")?;
             }
-            new_overrides.insert(package_name, link_spec(&root_dir, &target_dir));
+            new_overrides.insert(package_name.clone(), link_spec(&root_dir, &target_dir));
+            check_peer_deps::<Reporter>(&package_name, &target_manifest, &manifest_dir);
         }
 
         manifest.save().wrap_err("saving package.json with linked dependencies")?;
@@ -165,18 +179,42 @@ async fn install_linked<Reporter: self::Reporter + 'static>(state: &State) -> mi
     .wrap_err("linking dependencies")
 }
 
-/// The linked package's directory, and the name it is declared under.
-fn link_target(manifest_dir: &Path, path_str: &str) -> miette::Result<(PathBuf, String)> {
+/// The linked package's directory, the name it is declared under, and its manifest.
+fn link_target(
+    cli_dir: &Path,
+    path_str: &str,
+) -> miette::Result<(PathBuf, String, PackageManifest)> {
     let target_path = PathBuf::from(path_str);
     let target_dir =
-        if target_path.is_absolute() { target_path } else { manifest_dir.join(&target_path) };
-    let target_manifest_path = target_dir.join("package.json");
+        if target_path.is_absolute() { target_path } else { cli_dir.join(&target_path) };
+    let target_manifest_path = pnpm_workspace::project_manifest_path(&target_dir);
     let dir_display = target_dir.display();
     let target_manifest = PackageManifest::from_path(target_manifest_path)
-        .map_err(|_| miette::miette!("No package.json found in {}", dir_display))?;
+        .map_err(|error| match error {
+            pnpm_package_manifest::PackageManifestError::NoImporterManifestFound(_) => {
+                miette::miette!("No package.json found in {}", dir_display)
+            }
+            error => miette::Report::new(error),
+        })?;
     let package_name = target_manifest.value()["name"]
         .as_str()
         .ok_or_else(|| miette::miette!("Target package does not have a name field"))?
         .to_string();
-    Ok((target_dir, package_name))
+    if !is_valid_dependency_alias(&package_name) {
+        return Err(LinkError::InvalidName { dir: path_str.to_string(), name: package_name }.into());
+    }
+    Ok((target_dir, package_name, target_manifest))
+}
+
+fn check_peer_deps<Reporter: self::Reporter>(
+    package_name: &str,
+    target_manifest: &PackageManifest,
+    prefix: &Path,
+) {
+    let prefix = prefix.display().to_string();
+    if let Some(warning) =
+        linked_peer_dependencies_warning(package_name, target_manifest.value(), &prefix)
+    {
+        Reporter::emit(&warning);
+    }
 }

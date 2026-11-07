@@ -7,47 +7,55 @@ use crate::{
 };
 use clap::Args;
 use derive_more::{Display, Error};
-use install::{legacy_deploy_preferred_versions, source_pnpmfile_hooks};
+use install::{LegacyDeploySource, source_pnpmfile_hooks};
 use lockfile::{
     ConvertCtx, DeployFiles, create_deploy_files, deployed_workspace_projects,
     load_deploy_lockfile, manifest_dependency_names,
 };
 use miette::{Context, Diagnostic, IntoDiagnostic};
+use path_compare::{ProjectPathKey, is_ancestor_path, is_child_path, same_path};
 use peers::{
-    bind_singleton_peers, omit_peers_of_excluded_dependencies, prune_deploy_lockfile_graph,
+    LinkedWorkspaceProject, bind_singleton_peers, deploy_peer_edges,
+    omit_peers_of_excluded_dependencies, prune_deploy_lockfile_graph,
 };
 use pnpm_config::{Config, NodeLinker, PackageImportMethod};
-use pnpm_directory_fetcher::DirectoryFetcher;
+use pnpm_directory_fetcher::CopyFiles;
 use pnpm_fs::{lexical_normalize, remove_dirent};
 use pnpm_lockfile::{
     DirectoryResolution, ImporterDepVersion, LazyLockfile, Lockfile, LockfileResolution,
-    PackageKey, PackageMetadata, PkgName, PkgNameVerPeer, ProjectSnapshot, ResolvedDependencyMap,
-    ResolvedDependencySpec, SnapshotDepRef, SnapshotEntry, TarballResolution, VersionPart,
-    WantedLockfileSelection,
+    PackageKey, PackageMetadata, PeerSatisfactionEdges, PkgName, PkgNameVerPeer, ProjectSnapshot,
+    ResolvedDependencyMap, ResolvedDependencySpec, SnapshotDepRef, SnapshotEntry,
+    TarballResolution, VersionPart, WantedLockfileSelection,
 };
-use pnpm_lockfile_preferred_versions::get_preferred_versions_from_lockfile_and_manifests;
-use pnpm_package_manager::{ImportIndexedDirOpts, apply_deploy_manifest_hook, import_indexed_dir};
+use pnpm_lockfile_preferred_versions::{
+    DirectSpecs, get_preferred_versions_from_lockfile_and_manifests,
+};
+use pnpm_package_manager::{
+    ImportIndexedDirOpts, apply_deploy_manifest_hook, import_indexed_dir, manifest_has_bin,
+};
 use pnpm_package_manifest::{DependencyGroup, PackageManifest};
 use pnpm_reporter::{LogEvent, LogLevel, PnpmLog, Reporter};
 use pnpm_resolving_resolver_base::PreferredVersions;
 use pnpm_workspace::{Project, WORKSPACE_MANIFEST_FILENAME, importer_id_from_root_dir};
 use resolution::{
-    ResolveBases, convert_package_key, convert_package_metadata, convert_resolved_dependency_spec,
-    convert_snapshot, create_file_url_key, project_snapshot_to_snapshot_entry,
-    validate_lockfile_local_path,
+    ResolveBases, convert_importer_version_to_snapshot_ref, convert_package_key,
+    convert_package_metadata, convert_resolved_dependency_spec, convert_snapshot,
+    create_file_url_key, project_snapshot_to_snapshot_entry,
 };
 use serde_json::{Map, Value};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs, io,
-    io::Write,
     path::{Path, PathBuf},
     sync::{Arc, atomic::AtomicU8},
 };
 use target::{
-    ProjectPathKey, apply_deploy_hook, copy_project, is_ancestor_path, is_child_path,
-    prepare_deploy_dir, relative_path, resolve_target_dir, same_path, validate_deploy_target,
-    write_deploy_files,
+    apply_deploy_hook, copy_project, prepare_deploy_dir, real_deploy_dir, relative_path,
+    resolve_target_dir, validate_deploy_target, write_deploy_files,
+};
+use workspace_manifest::{DeployWorkspaceSettings, deploy_workspace_settings};
+use workspace_project_builds::{
+    NamedProjectRoot, approve_legacy_workspace_project_builds, approve_workspace_project_builds,
 };
 
 #[derive(Debug, Args)]
@@ -112,20 +120,21 @@ enum DeployError {
     #[display("The selected project is missing from pnpm-lock.yaml: {project_id}")]
     #[diagnostic(code(ERR_PNPM_CANNOT_DEPLOY))]
     MissingImporter { project_id: String },
-
-    #[display(
-        "Refusing to deploy unsafe lockfile path {}: path resolves outside workspace {}",
-        path.display(),
-        workspace_dir.display()
-    )]
-    #[diagnostic(code(ERR_PNPM_CANNOT_DEPLOY))]
-    UnsafeLockfilePath { path: PathBuf, workspace_dir: PathBuf },
 }
 
 #[derive(Clone)]
 struct ProjectInfo {
+    /// The project's root as discovered. [`ProjectPathKey`] compares paths
+    /// lossily, so a check that must name this exact directory compares it.
+    root_dir: PathBuf,
+    /// The directory dependents link the project from, when its
+    /// `publishConfig.directory` applies to workspace links.
+    linked_publish_dir: Option<PathBuf>,
     name: Option<String>,
+    has_bin: bool,
     peer_dependencies: Vec<PkgName>,
+    /// The `packages:` entry blocks for the peers the project declares.
+    peer_blocks: pnpm_resolving_deps_resolver::LockfilePeerBlocks,
     /// Names the project declares as prod or optional dependencies. A peer it
     /// depends on itself is already bound by that edge, whether or not the
     /// deploy's group filter kept the edge in the deployed snapshot.
@@ -135,16 +144,23 @@ struct ProjectInfo {
 struct SelectedProject {
     project: Project,
     projects_by_path: HashMap<ProjectPathKey, ProjectInfo>,
+    /// Every named workspace project, in discovery order.
+    workspace_projects: Vec<NamedProjectRoot>,
 }
 
-struct DeployWorkspaceConfig {
-    patched_dependencies: Option<indexmap::IndexMap<String, String>>,
-    allow_builds: HashMap<String, bool>,
+impl SelectedProject {
+    fn project_info(&self, root: &Path) -> Option<&ProjectInfo> {
+        self.projects_by_path.get(&ProjectPathKey::new(root))
+    }
+
+    fn has_bin(&self, root: &Path) -> Option<bool> {
+        self.project_info(root).map(|project| project.has_bin)
+    }
 }
 
 enum DeployInstallMode {
-    Legacy,
-    Shared { workspace_config: DeployWorkspaceConfig },
+    Legacy { workspace_projects: Vec<NamedProjectRoot>, source_lockfile_dir: PathBuf },
+    Shared { workspace_config: Box<DeployWorkspaceSettings> },
 }
 
 impl DeployArgs {
@@ -199,20 +215,21 @@ impl DeployArgs {
         deploy_dir: &Path,
         source_hooks: Option<Arc<dyn pnpm_hooks::PnpmfileHooks>>,
     ) -> miette::Result<()> {
-        apply_deploy_hook(&deploy_dir.join("package.json"))?;
-        let preferred_versions_override = legacy_deploy_preferred_versions::<ReporterT>(
-            config,
-            config.lockfile_dir_for(&selected.project.root_dir),
-        );
+        apply_deploy_hook(deploy_dir, &selected.project.root_dir)?;
+        let source_lockfile_dir = config.lockfile_dir_for(&selected.project.root_dir);
+        let legacy_source = LegacyDeploySource::load::<ReporterT>(config, source_lockfile_dir);
         // Boxed: the install future exceeds clippy's large-future threshold
         // (the captured `Config` is large).
         Box::pin(self.run_install_in_deploy_dir::<ReporterT>(
             config,
             deploy_dir,
-            DeployInstallMode::Legacy,
+            DeployInstallMode::Legacy {
+                workspace_projects: selected.workspace_projects.clone(),
+                source_lockfile_dir: source_lockfile_dir.to_path_buf(),
+            },
             false,
             source_hooks,
-            preferred_versions_override,
+            legacy_source,
         ))
         .await
     }
@@ -237,10 +254,10 @@ impl DeployArgs {
             deploy_dir,
             self.install_args.materialization.force,
         )?;
-        copy_project::<ReporterT>(
+        copy_project(
             &selected.project.root_dir,
             deploy_dir,
-            !config.deploy_all_files,
+            CopyFiles::from_deploy_all_files(config.deploy_all_files),
         )?;
 
         Ok(())
@@ -254,6 +271,7 @@ impl DeployArgs {
         deploy_dir: &Path,
         source_hooks: Option<Arc<dyn pnpm_hooks::PnpmfileHooks>>,
     ) -> miette::Result<SharedDeployOutcome> {
+        let deploy_dir = &real_deploy_dir(deploy_dir)?;
         // The shared lockfile, and the importer ids naming the projects in
         // it, belong to the lockfile dir — which `lockfileDir` can move
         // away from the workspace this deploy selected its project from.
@@ -281,7 +299,7 @@ impl DeployArgs {
         Box::pin(self.run_install_in_deploy_dir::<ReporterT>(
             config,
             deploy_dir,
-            DeployInstallMode::Shared { workspace_config: deploy_files.workspace_config },
+            DeployInstallMode::Shared { workspace_config: Box::new(deploy_files.workspace_config) },
             true,
             source_hooks,
             None,
@@ -316,6 +334,21 @@ fn select_project(
 ) -> miette::Result<SelectedProject> {
     let (projects, _patterns) = discover_workspace_projects(workspace_dir, config)?;
     let projects_by_path = index_projects(&projects);
+    let workspace_projects = projects
+        .iter()
+        .filter_map(|project| {
+            let name = project.manifest
+                .value()
+                .get("name")?
+                .as_str()?
+                .to_string();
+            Some(NamedProjectRoot {
+                name,
+                root_dir: project.root_dir.clone(),
+                linked_publish_dir: linked_publish_dir(project),
+            })
+        })
+        .collect();
 
     let selected_root = {
         let selection =
@@ -331,7 +364,7 @@ fn select_project(
         .into_iter()
         .find(|project| lexical_normalize(&project.root_dir) == selected_root)
         .ok_or(DeployError::NothingToDeploy)?;
-    Ok(SelectedProject { project, projects_by_path })
+    Ok(SelectedProject { project, projects_by_path, workspace_projects })
 }
 
 /// Index the workspace projects by [`ProjectPathKey`]. When two roots compare
@@ -342,14 +375,22 @@ fn index_projects(projects: &[Project]) -> HashMap<ProjectPathKey, ProjectInfo> 
         projects_by_path
             .entry(ProjectPathKey::new(&project.root_dir))
             .or_insert_with(|| ProjectInfo {
+                root_dir: lexical_normalize(&project.root_dir),
+                linked_publish_dir: linked_publish_dir(project),
                 name: project.manifest
                     .value()
                     .get("name")
                     .and_then(Value::as_str)
                     .map(str::to_string),
+                has_bin: manifest_has_bin(Some(project.manifest.value())).is_some(),
                 peer_dependencies: manifest_dependency_names(
                     &project.manifest,
                     &["peerDependencies"],
+                ),
+                peer_blocks: pnpm_resolving_deps_resolver::lockfile_peer_blocks(
+                    &pnpm_resolving_deps_resolver::declared_peer_dependencies(
+                        project.manifest.value(),
+                    ),
                 ),
                 declared_dependencies: manifest_dependency_names(
                     &project.manifest,
@@ -360,6 +401,16 @@ fn index_projects(projects: &[Project]) -> HashMap<ProjectPathKey, ProjectInfo> 
             });
     }
     projects_by_path
+}
+
+fn linked_publish_dir(project: &Project) -> Option<PathBuf> {
+    let root_dir = lexical_normalize(&project.root_dir);
+    let package_dir =
+        lexical_normalize(&pnpm_resolving_npm_resolver::resolve_workspace_package_dir(
+            &root_dir,
+            project.manifest.value(),
+        ));
+    (package_dir != root_dir).then_some(package_dir)
 }
 
 fn warn<ReporterT: Reporter>(prefix: &Path, message: impl Into<String>) {
@@ -375,6 +426,8 @@ mod tests;
 
 mod target;
 
+mod path_compare;
+
 mod resolution;
 
 mod peers;
@@ -382,3 +435,7 @@ mod peers;
 mod lockfile;
 
 mod install;
+
+mod workspace_manifest;
+
+mod workspace_project_builds;

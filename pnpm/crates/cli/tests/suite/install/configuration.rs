@@ -6,6 +6,84 @@ use super::{
 use super::{Pipe, enable_gvs_in_workspace_yaml};
 use assert_cmd::{assert::OutputAssertExt, cargo::CommandCargoExt};
 
+#[test]
+fn install_rejects_a_non_string_dependency_before_writing_a_lockfile() {
+    let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+    fs::write(
+        workspace.join("package.json"),
+        r#"{"name":"invalid-dependency","version":"1.0.0","dependencies":{"is-positive":42}}"#,
+    )
+    .expect("write package.json");
+
+    let output = pacquet
+        .with_args(["install", "--lockfile-only", "--offline", "--ignore-scripts"])
+        .output()
+        .expect("run install");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "install silently dropped is-positive: {stderr}");
+    assert!(stderr.contains("ERR_PNPM_PACKAGE_MANIFEST_INVALID_ATTRIBUTE"), "{stderr}");
+    assert!(stderr.contains("is-positive"), "{stderr}");
+    assert!(!workspace.join("pnpm-lock.yaml").exists());
+
+    drop(root);
+}
+
+#[test]
+fn frozen_install_rejects_a_newly_invalid_dependency() {
+    let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+    fs::write(workspace.join("package.json"), r#"{"name":"fixture","version":"1.0.0"}"#)
+        .expect("write initial package.json");
+    pacquet
+        .with_args(["install", "--lockfile-only", "--offline", "--ignore-scripts"])
+        .assert()
+        .success();
+    fs::write(
+        workspace.join("package.json"),
+        r#"{"name":"fixture","version":"1.0.0","dependencies":{"is-positive":42}}"#,
+    )
+    .expect("write invalid package.json");
+
+    let output = pacquet_in(&workspace)
+        .with_args(["install", "--frozen-lockfile", "--offline", "--ignore-scripts"])
+        .output()
+        .expect("run frozen install");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "frozen install accepted invalid manifest: {stderr}");
+    assert!(stderr.contains("ERR_PNPM_PACKAGE_MANIFEST_INVALID_ATTRIBUTE"), "{stderr}");
+    assert!(stderr.contains("is-positive"), "{stderr}");
+
+    drop(root);
+}
+
+#[test]
+fn read_package_hook_can_repair_a_non_string_dependency() {
+    let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+    fs::write(
+        workspace.join("package.json"),
+        r#"{"name":"fixture","version":"1.0.0","dependencies":{"local-dep":42}}"#,
+    )
+    .expect("write package.json");
+    fs::create_dir(workspace.join("dep")).expect("create local dependency");
+    fs::write(workspace.join("dep/package.json"), r#"{"name":"local-dep","version":"1.0.0"}"#)
+        .expect("write local dependency manifest");
+    fs::write(
+        workspace.join(".pnpmfile.cjs"),
+        "module.exports = { hooks: { readPackage(pkg) { pkg.dependencies['local-dep'] = 'link:./dep'; return pkg } } }",
+    )
+    .expect("write readPackage hook");
+
+    pacquet
+        .with_args(["install", "--lockfile-only", "--offline", "--ignore-scripts"])
+        .assert()
+        .success();
+    let lockfile = fs::read_to_string(workspace.join("pnpm-lock.yaml"))
+        .expect("hook-repaired dependency should be recorded");
+    assert!(lockfile.contains("local-dep:"), "{lockfile}");
+    assert!(lockfile.contains("link:dep"), "{lockfile}");
+
+    drop(root);
+}
+
 /// A build host that appends `--prod=false` to its install command is
 /// asking for devDependencies, the way nopt reads an explicit boolean
 /// value (pnpm/pnpm#14553).
@@ -50,6 +128,95 @@ fn prod_takes_an_explicit_boolean_value() {
     assert!(
         workspace.join("node_modules/@pnpm.e2e/foo/package.json").exists(),
         "the prod dependency must stay installed",
+    );
+
+    drop((root, mock_instance));
+}
+
+/// An explicitly allowed dev-only dependency must not execute its
+/// lifecycle scripts during a production install (pnpm/pnpm#14864).
+#[test]
+fn prod_install_does_not_run_dev_dependency_postinstall() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+
+    // The script's cwd is the package's materialized virtual-store
+    // directory, which a production install is free to leave out entirely.
+    // Writing the marker under `INIT_CWD` puts it at a path that exists
+    // either way, so the assertion below cannot pass just because the
+    // package was never materialized.
+    let dev_pkg = workspace.join("dev-tool");
+    fs::create_dir(&dev_pkg).expect("create the dev dependency directory");
+    fs::write(
+        dev_pkg.join("package.json"),
+        serde_json::json!({
+            "name": "dev-tool",
+            "version": "1.0.0",
+            "scripts": {
+                "postinstall":
+                    r#"node -e "require('fs').writeFileSync(process.env.INIT_CWD + '/dev-postinstall-ran', '')""#,
+            },
+        })
+        .to_string(),
+    )
+    .expect("write the dev dependency manifest");
+
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({
+            "name": "project",
+            "version": "1.0.0",
+            "dependencies": {
+                "@pnpm.e2e/install-script-example": "1.0.0",
+            },
+            "devDependencies": {
+                "dev-tool": "file:./dev-tool",
+            },
+        })
+        .to_string(),
+    )
+    .expect("write package.json");
+
+    // Appended, not written: the harness already pinned `storeDir`,
+    // `cacheDir`, and `enableGlobalVirtualStore` in this file.
+    let workspace_yaml = workspace.join("pnpm-workspace.yaml");
+    let mut yaml = fs::read_to_string(&workspace_yaml).expect("read pnpm-workspace.yaml");
+    yaml.push_str(
+        "allowBuilds:\n  \
+         'dev-tool@file:dev-tool': true\n  \
+         '@pnpm.e2e/install-script-example': true\n",
+    );
+    fs::write(&workspace_yaml, yaml).expect("write pnpm-workspace.yaml");
+
+    pacquet
+        .with_args(["install", "--lockfile-only", "--ignore-scripts"])
+        .assert()
+        .success();
+    pacquet_in(&workspace)
+        .with_args(["install", "--prod", "--frozen-lockfile"])
+        .assert()
+        .success();
+
+    assert!(
+        !workspace.join("dev-postinstall-ran").exists(),
+        "a dev-only package must not run its postinstall during install --prod",
+    );
+    // Without this, the assertion above would also hold for an install
+    // that ran no script at all.
+    assert!(
+        workspace
+            .join(
+                "node_modules/.pnpm/@pnpm.e2e+install-script-example@1.0.0\
+                 /node_modules/@pnpm.e2e/install-script-example/generated-by-install.js",
+            )
+            .exists(),
+        "the prod dependency must run its install script",
     );
 
     drop((root, mock_instance));
@@ -296,7 +463,7 @@ fn install_resolves_env_var_in_user_npmrc_registry() {
 
     eprintln!("Executing command with PACQUET_TEST_REGISTRY set...");
     pacquet
-        .with_env("PACQUET_TEST_REGISTRY", &mocked_registry_url)
+        .with_env("PACQUET_TEST_REGISTRY", mocked_registry_url)
         .with_arg("--npmrc-auth-file")
         .with_arg(user_npmrc_path)
         .with_arg("install")
@@ -312,8 +479,12 @@ fn install_resolves_env_var_in_user_npmrc_registry() {
     drop((root, mock_instance));
 }
 
+/// The project `.npmrc` comes with the repository, so pnpm does not expand
+/// `${VAR}` in its registry URL. Ignoring the URL would resolve every package
+/// from another registry, so the install fails instead, even though the user
+/// `.npmrc` names a registry. <https://github.com/pnpm/pnpm/issues/17762>
 #[test]
-fn install_ignores_env_var_in_project_npmrc_registry() {
+fn install_fails_on_env_var_in_project_npmrc_registry() {
     let CommandTempCwd {
         pacquet,
         root,
@@ -347,17 +518,18 @@ fn install_ignores_env_var_in_project_npmrc_registry() {
     fs::write(&manifest_path, package_json_content.to_string()).expect("write to package.json");
 
     eprintln!("Executing command with PACQUET_TEST_REGISTRY set...");
-    pacquet
+    let assert = pacquet
         .with_env("PACQUET_TEST_REGISTRY", "http://127.0.0.1:9/leaked/")
         .with_arg("--npmrc-auth-file")
         .with_arg(user_npmrc_path)
         .with_arg("install")
         .assert()
-        .success();
-
-    let symlink_path = workspace.join("node_modules/@pnpm.e2e/hello-world-js-bin-parent");
-    let installed = is_symlink_or_junction(&symlink_path).unwrap();
-    assert!(installed, "expected installed symlink/junction at {symlink_path:?}");
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    eprintln!("STDERR:\n{stderr}\n");
+    assert!(stderr.contains("ERR_PNPM_REGISTRY_ENV_NOT_EXPANDED"), "got:\n{stderr}");
+    assert!(!stderr.contains("leaked"), "got:\n{stderr}");
+    assert!(!workspace.join("node_modules").exists());
 
     drop((root, mock_instance));
 }
@@ -367,10 +539,7 @@ fn install_ignores_env_var_in_project_npmrc_registry() {
 /// must materialize packages under the shared
 /// `<store_dir>/v11/links/<scope>/<name>/<version>/<hash>` tree, not
 /// the project-local `node_modules/.pnpm/` legacy layout. Pins the
-/// fix for pnpm/pnpm#11814: before that fix the without-lockfile
-/// path hardcoded `VirtualStoreLayout::legacy`, so the fresh-resolve
-/// install silently fell through to project-local slots even with
-/// GVS opted in.
+/// fix for pnpm/pnpm#11814.
 ///
 /// Also asserts that the project gets registered under
 /// `<store_dir>/v11/projects/`, mirroring the frozen-lockfile branch
@@ -476,4 +645,216 @@ fn virtual_store_only_install_under_pnp_does_not_write_the_loader() {
     );
 
     drop((root, mock_instance, store_dir));
+}
+
+const PROD_DIRECT: (&str, &str) = ("@pnpm.e2e/has-foo-100.1.0-dep-1", "1.0.0");
+/// [`PROD_DIRECT`] pins this exact version as its own dependency, so production
+/// reaches it too and a `--prod` run still has to download it.
+const SHARED: (&str, &str) = ("@pnpm.e2e/foo", "100.1.0");
+const DEV_DIRECT: (&str, &str) = ("@pnpm.e2e/bravo", "1.0.0");
+const DEV_TRANSITIVE: (&str, &str) = ("@pnpm.e2e/bravo-dep", "1.1.0");
+
+/// `pnpm cat-index` exits non-zero with `ERR_PNPM_INVALID_PACKAGE` for a
+/// package that was never fetched, which is what separates a tarball this
+/// install downloaded from one it only resolved.
+fn store_holds(workspace: &std::path::Path, (name, version): (&str, &str)) -> bool {
+    pacquet_in(workspace)
+        .with_args(["cat-index", &format!("{name}@{version}")])
+        .output()
+        .expect("run pnpm cat-index")
+        .status
+        .success()
+}
+
+/// pnpm/pnpm#881. The resolve pass still walks every dependency group, so the
+/// store, not `node_modules`, is where the filter's effect on the fetch shows.
+/// `install::lockfile` covers the other half, that the lockfile keeps recording
+/// every group (pnpm/pnpm#14912).
+fn assert_prod_install_downloads_no_dev_only_package(extra_install_args: &[&str]) {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({
+            "name": "project",
+            "version": "1.0.0",
+            "dependencies": { PROD_DIRECT.0: PROD_DIRECT.1 },
+            "devDependencies": { DEV_DIRECT.0: DEV_DIRECT.1, SHARED.0: SHARED.1 },
+        })
+        .to_string(),
+    )
+    .expect("write package.json");
+
+    let mut args = vec!["install", "--prod"];
+    args.extend_from_slice(extra_install_args);
+    pacquet
+        .with_args(args)
+        .assert()
+        .success();
+
+    // The absence assertions below name an exact version, so a fixture
+    // registry that gained a newer `@pnpm.e2e/bravo-dep` would make them
+    // pass without testing anything. The lockfile records every group, so
+    // it is where the version this graph resolves to can be checked.
+    let lockfile = fs::read_to_string(workspace.join("pnpm-lock.yaml")).expect("read lockfile");
+    assert!(
+        lockfile.contains(&format!("{}@{}", DEV_TRANSITIVE.0, DEV_TRANSITIVE.1)),
+        "the dev-only transitive dependency resolves to some version other than {}@{}",
+        DEV_TRANSITIVE.0,
+        DEV_TRANSITIVE.1,
+    );
+
+    for present in [PROD_DIRECT, SHARED] {
+        assert!(
+            store_holds(&workspace, present),
+            "install --prod {extra_install_args:?} must download {}@{}, which production reaches",
+            present.0,
+            present.1,
+        );
+    }
+    for absent in [DEV_DIRECT, DEV_TRANSITIVE] {
+        assert!(
+            !store_holds(&workspace, absent),
+            "install --prod {extra_install_args:?} downloaded {}@{}, which only a devDependency reaches",
+            absent.0,
+            absent.1,
+        );
+    }
+
+    drop((root, mock_instance));
+}
+
+#[test]
+fn prod_install_downloads_no_dev_only_package() {
+    assert_prod_install_downloads_no_dev_only_package(&[]);
+}
+
+#[test]
+fn prod_install_downloads_no_dev_only_package_with_the_hoisted_linker() {
+    assert_prod_install_downloads_no_dev_only_package(&["--node-linker=hoisted"]);
+}
+
+fn assert_no_optional_install_downloads_no_optional_only_package(extra_install_args: &[&str]) {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({
+            "name": "project",
+            "version": "1.0.0",
+            "dependencies": {
+                "@pnpm.e2e/pkg-with-good-optional": "1.0.0",
+            },
+            "optionalDependencies": {
+                DEV_DIRECT.0: DEV_DIRECT.1,
+            },
+        })
+        .to_string(),
+    )
+    .expect("write package.json");
+
+    let mut args = vec!["install", "--no-optional"];
+    args.extend_from_slice(extra_install_args);
+    pacquet
+        .with_args(args)
+        .assert()
+        .success();
+
+    assert!(
+        store_holds(&workspace, ("@pnpm.e2e/pkg-with-good-optional", "1.0.0")),
+        "install --no-optional must download prod dependency",
+    );
+    assert!(
+        !store_holds(&workspace, DEV_DIRECT),
+        "install --no-optional downloaded {}@{}, which is in optionalDependencies",
+        DEV_DIRECT.0,
+        DEV_DIRECT.1,
+    );
+    assert!(
+        !store_holds(&workspace, ("is-positive", "1.0.0")),
+        "install --no-optional downloaded is-positive@1.0.0, which is an optional dependency of a prod dependency",
+    );
+    assert!(
+        !store_holds(&workspace, DEV_TRANSITIVE),
+        "install --no-optional downloaded {}@{}, which is a transitive dependency of an optional dependency",
+        DEV_TRANSITIVE.0,
+        DEV_TRANSITIVE.1,
+    );
+
+    let lockfile = fs::read_to_string(workspace.join("pnpm-lock.yaml")).expect("read lockfile");
+    assert!(
+        lockfile.contains(&format!("{}@{}", DEV_DIRECT.0, DEV_DIRECT.1)),
+        "the lockfile must retain the optional dependency {DEV_DIRECT:?}",
+    );
+    assert!(
+        lockfile.contains("is-positive@1.0.0"),
+        "the lockfile must retain transitive optional dependency is-positive@1.0.0",
+    );
+
+    // Now test with an existing lockfile on a fresh store (frozen install / repeat install)
+    let CommandTempCwd {
+        pacquet: pacquet2,
+        root: root2,
+        workspace: workspace2,
+        npmrc_info: npmrc_info2,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance: mock_instance2, .. } = npmrc_info2;
+
+    fs::copy(workspace.join("package.json"), workspace2.join("package.json")).unwrap();
+    fs::copy(workspace.join("pnpm-lock.yaml"), workspace2.join("pnpm-lock.yaml")).unwrap();
+
+    let mut frozen_args = vec!["install", "--no-optional", "--frozen-lockfile"];
+    frozen_args.extend_from_slice(extra_install_args);
+    pacquet2
+        .with_args(frozen_args)
+        .assert()
+        .success();
+
+    assert!(
+        store_holds(&workspace2, ("@pnpm.e2e/pkg-with-good-optional", "1.0.0")),
+        "frozen install --no-optional must download prod dependency",
+    );
+    assert!(
+        !store_holds(&workspace2, DEV_DIRECT),
+        "frozen install --no-optional downloaded {}@{}, which is in optionalDependencies",
+        DEV_DIRECT.0,
+        DEV_DIRECT.1,
+    );
+    assert!(
+        !store_holds(&workspace2, ("is-positive", "1.0.0")),
+        "frozen install --no-optional downloaded is-positive@1.0.0, which is an optional dependency of a prod dependency",
+    );
+    assert!(
+        !store_holds(&workspace2, DEV_TRANSITIVE),
+        "frozen install --no-optional downloaded {}@{}, which is a transitive dependency of an optional dependency",
+        DEV_TRANSITIVE.0,
+        DEV_TRANSITIVE.1,
+    );
+
+    drop((root, mock_instance, root2, mock_instance2));
+}
+
+#[test]
+fn no_optional_install_downloads_no_optional_only_package() {
+    assert_no_optional_install_downloads_no_optional_only_package(&[]);
+}
+
+#[test]
+fn no_optional_install_downloads_no_optional_only_package_with_the_hoisted_linker() {
+    assert_no_optional_install_downloads_no_optional_only_package(&["--node-linker=hoisted"]);
 }

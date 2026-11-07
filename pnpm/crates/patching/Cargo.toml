@@ -11,14 +11,17 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-pnpm-git-fetcher = { workspace = true }
+pnpm-fs = { workspace = true }
+pnpm-fs-packlist = { workspace = true }
 pnpm-package-manifest = { workspace = true }
+pnpm-patching-config = { workspace = true }
 
 derive_more = { workspace = true }
 diffy = { workspace = true }
 indexmap = { workspace = true }
 miette = { workspace = true }
 node-semver = { workspace = true }
+pnpm-process = { path = "../process" }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 
@@ -26,6 +29,9 @@ sha2 = { workspace = true }
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }
 text-block-macros = { workspace = true }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

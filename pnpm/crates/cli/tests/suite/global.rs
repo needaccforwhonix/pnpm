@@ -2,16 +2,18 @@
 //! `update -g`, `list -g`). The happy paths need the mocked registry and
 //! create real symlinks / bin shims, so they are Unix-gated.
 
+#[cfg(unix)]
+use crate::_utils::{append_workspace_yaml_key, set_minimum_release_age, without_colors};
 use assert_cmd::cargo::CommandCargoExt;
 use command_extra::CommandExtra;
 #[cfg(unix)]
 use pnpm_testing_utils::bin::AddMockedRegistry;
-use pnpm_testing_utils::{bin::CommandTempCwd, command_env::CommandTestExt};
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    process::Command,
-};
+use pnpm_testing_utils::bin::CommandTempCwd;
+#[cfg(unix)]
+use pnpm_testing_utils::command_env::CommandTestExt;
+#[cfg(unix)]
+use std::path::{Path, PathBuf};
+use std::{fs, process::Command};
 
 /// Create the global bin directory and seed the pnpm home with the mocked
 /// registry / store / cache. A `-g` install anchors its config at the pnpm
@@ -28,7 +30,7 @@ fn prepare_global_home(pnpm_home: &Path, npmrc_info: &AddMockedRegistry) {
     fs::write(
         pnpm_home.join("pnpm-workspace.yaml"),
         format!(
-            "storeDir: {}\ncacheDir: {}\nenableGlobalVirtualStore: false\n",
+            "storeDir: {}\ncacheDir: {}\n",
             npmrc_info.store_dir.display(),
             npmrc_info.cache_dir.display(),
         ),
@@ -36,11 +38,11 @@ fn prepare_global_home(pnpm_home: &Path, npmrc_info: &AddMockedRegistry) {
     .expect("seed the pnpm-home workspace yaml");
 }
 
-/// Build a fresh `pacquet` command in `workspace` with `PNPM_HOME` set and
-/// the global bin directory prepended to `PATH` (so `checkGlobalBinDir`
-/// passes for the mutating commands).
+/// Anchor `command` at `workspace` with `PNPM_HOME` set and the global bin
+/// directory prepended to `PATH` (so `checkGlobalBinDir` passes for the
+/// mutating commands).
 #[cfg(unix)]
-fn global_command(workspace: &Path, pnpm_home: &Path) -> Command {
+fn with_global_env(command: Command, workspace: &Path, pnpm_home: &Path) -> Command {
     // macOS temp paths use `/var` as an alias for `/private/var`, while
     // scanning a hash symlink canonicalizes its install directory. Give the
     // command the canonical fixture home so containment checks compare paths
@@ -58,8 +60,7 @@ fn global_command(workspace: &Path, pnpm_home: &Path) -> Command {
     let global_bin = pnpm_home.join("bin");
     let existing_path = std::env::var("PATH").unwrap_or_default();
     let path = format!("{}:{existing_path}", global_bin.display());
-    Command::cargo_bin("pnpm")
-        .expect("find the pnpm binary")
+    command
         .with_current_dir(workspace)
         .with_env("PNPM_HOME", &pnpm_home)
         .with_env("PATH", path)
@@ -67,6 +68,30 @@ fn global_command(workspace: &Path, pnpm_home: &Path) -> Command {
         .with_env("XDG_CONFIG_HOME", pnpm_home.join("config-home"))
         .with_env("XDG_CACHE_HOME", pnpm_home.join("cache-home"))
         .without_ambient_pnpm_config()
+}
+
+#[cfg(unix)]
+fn global_command(workspace: &Path, pnpm_home: &Path) -> Command {
+    with_global_env(Command::cargo_bin("pnpm").expect("find the pnpm binary"), workspace, pnpm_home)
+}
+
+#[cfg(unix)]
+fn run_global_prompt(
+    workspace: &Path,
+    pnpm_home: &Path,
+    args: &[&str],
+    answer: &str,
+) -> std::process::Output {
+    without_colors(with_global_env(Command::new("python3"), workspace, pnpm_home))
+        .env("CI", "false")
+        .env_remove("GITHUB_ACTION")
+        .env("PNPM_TEST_MINIMUM_RELEASE_AGE_ANSWER", answer)
+        .arg("-c")
+        .arg(include_str!("../fixtures/minimum_release_age_prompt.py"))
+        .arg(env!("CARGO_BIN_EXE_pnpm"))
+        .args(args)
+        .output()
+        .expect("run the interactive global command in a pseudo-terminal")
 }
 
 #[cfg(unix)]
@@ -274,7 +299,7 @@ fn global_add_creates_a_missing_global_bin_dir() {
     fs::write(
         pnpm_home.join("pnpm-workspace.yaml"),
         format!(
-            "storeDir: {}\ncacheDir: {}\nenableGlobalVirtualStore: false\n",
+            "storeDir: {}\ncacheDir: {}\n",
             npmrc_info.store_dir.display(),
             npmrc_info.cache_dir.display(),
         ),
@@ -295,6 +320,94 @@ fn global_add_creates_a_missing_global_bin_dir() {
 
     drop(npmrc_info);
     drop(root);
+}
+
+/// `pnpm add -g node@22.0.0` installs the Node.js runtime, because a bare
+/// tool name names the tool. A Package URL names a package in a registry,
+/// so the global path has to install that package instead — the mark a purl
+/// carries reaches `tool_install_selectors` through the group each request
+/// splits into.
+#[cfg(unix)]
+#[test]
+fn global_add_installs_the_npm_package_a_purl_names() {
+    use assert_cmd::assert::OutputAssertExt;
+
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+
+    let pnpm_home = root.path().join("pnpm-home");
+    let global_pkg_dir = pnpm_home.join("global").join("v11");
+    prepare_global_home(&pnpm_home, &npmrc_info);
+
+    global_command(&workspace, &pnpm_home)
+        .with_args(["add", "-g", "pkg:npm/node@22.0.0"])
+        .assert()
+        .success();
+
+    let links = symlink_entries(&global_pkg_dir);
+    assert_eq!(links.len(), 1, "exactly one cache-keyed hash symlink should exist: {links:?}");
+    let install_dir = global_pkg_dir.join(fs::read_link(&links[0]).expect("read the hash symlink"));
+    let manifest = fs::read_to_string(install_dir.join("package.json"))
+        .expect("read the global group manifest");
+    assert!(manifest.contains(r#""node": "22.0.0""#), "{manifest}");
+    let installed = fs::canonicalize(install_dir.join("node_modules/node"))
+        .expect("resolve the installed node package");
+    let slots = fs::canonicalize(npmrc_info.store_dir.join("v11/links/@/node/22.0.0"))
+        .expect("resolve the node slots");
+    assert!(
+        installed.starts_with(slots),
+        "the npm package the purl names must be the one installed: {installed:?}",
+    );
+
+    drop(npmrc_info);
+    drop(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn global_add_normalizes_bin_parent_segments_and_removes_the_shim() {
+    use assert_cmd::assert::OutputAssertExt;
+
+    for (target, file) in [
+        ("../dist/cli.js", "dist/cli.js"),
+        (r"..\dist\cli.js", "dist/cli.js"),
+        ("../dist/cli:dev.js", "dist/cli:dev.js"),
+    ] {
+        let CommandTempCwd { root, workspace, npmrc_info, .. } =
+            CommandTempCwd::init().add_mocked_registry();
+        let pnpm_home = root.path().join("pnpm-home");
+        prepare_global_home(&pnpm_home, &npmrc_info);
+        let package_dir = root.path().join("tool");
+        fs::create_dir_all(package_dir.join("dist")).unwrap();
+        fs::write(
+            package_dir.join("package.json"),
+            serde_json::json!({
+                "name": "example-tool",
+                "version": "1.0.0",
+                "bin": { "example-tool": target },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(package_dir.join(file), "#!/usr/bin/env node\nconsole.log('internal target')\n")
+            .unwrap();
+        let selector = format!("file:{}", package_dir.display());
+        global_command(&workspace, &pnpm_home)
+            .with_args(["add", "-g", &selector])
+            .assert()
+            .success();
+        let shim = pnpm_home.join("bin/example-tool");
+        Command::new(&shim)
+            .assert()
+            .success()
+            .stdout("internal target\n");
+        global_command(&workspace, &pnpm_home)
+            .with_args(["remove", "-g", "example-tool"])
+            .assert()
+            .success();
+        assert!(!shim.exists());
+        drop((root, npmrc_info));
+    }
 }
 
 /// A global add must materialize the added package's transitive
@@ -323,17 +436,49 @@ fn global_add_materializes_transitive_optional_dependencies() {
     assert_eq!(links.len(), 1, "exactly one cache-keyed hash symlink should exist: {links:?}");
     // The hash symlink's target is relative to the global packages dir.
     let install_dir = global_pkg_dir.join(fs::read_link(&links[0]).expect("read the hash symlink"));
-    let virtual_store = install_dir.join("node_modules").join(".pnpm");
+    let package_dir =
+        fs::canonicalize(install_dir.join("node_modules/@pnpm.e2e/pkg-with-good-optional"))
+            .expect("resolve the installed package");
+    let slot_modules_dir = package_dir
+        .parent()
+        .and_then(Path::parent)
+        .expect("the package sits in its slot's node_modules");
     assert!(
-        virtual_store.join("is-positive@1.0.0").exists(),
-        "the transitive optional dependency must be materialized",
+        slot_modules_dir.join("is-positive/package.json").exists(),
+        "the transitive optional dependency must be materialized and its alias symlink must resolve",
     );
-    assert!(
-        virtual_store
-            .join("@pnpm.e2e+pkg-with-good-optional@1.0.0/node_modules/is-positive/package.json")
-            .exists(),
-        "the optional dependency alias symlink must resolve",
-    );
+
+    drop(npmrc_info);
+    drop(root);
+}
+
+/// A global group's packages live in the global virtual store, where Node
+/// cannot walk up to the group's hidden hoisted modules dir. The bin shim
+/// puts that dir on `NODE_PATH`, so a package that requires a dependency it
+/// does not declare still finds it (a native addon loader requiring its
+/// parent's platform package, for example).
+#[cfg(unix)]
+#[test]
+fn global_bin_resolves_hoisted_dependencies() {
+    use assert_cmd::assert::OutputAssertExt;
+
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let pnpm_home = root.path().join("pnpm-home");
+    prepare_global_home(&pnpm_home, &npmrc_info);
+
+    global_command(&workspace, &pnpm_home)
+        .with_args(["add", "-g", "@pnpm.e2e/bin-requires-hoisted-dep"])
+        .assert()
+        .success();
+
+    let output = Command::new(pnpm_home.join("bin/bin-requires-hoisted-dep"))
+        .current_dir(&workspace)
+        .env_remove("NODE_PATH")
+        .output()
+        .expect("run the installed global bin");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "@pnpm.e2e/dep-of-pkg-with-1-dep\n");
 
     drop(npmrc_info);
     drop(root);
@@ -833,6 +978,49 @@ fn global_interactive_update_without_a_matching_group() {
     drop(root);
 }
 
+/// `--latest` must escape the range saved by a previous global install.
+#[cfg(unix)]
+#[test]
+fn global_update_latest_exceeds_the_saved_range() {
+    use assert_cmd::assert::OutputAssertExt;
+
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry_with_own_storage();
+    let pnpm_home = root.path().join("pnpm-home");
+    prepare_global_home(&pnpm_home, &npmrc_info);
+
+    npmrc_info.set_dist_tag("@pnpm.e2e/multi-version-a", "1.0.0", "latest");
+    global_command(&workspace, &pnpm_home)
+        .with_args(["add", "-g", "@pnpm.e2e/multi-version-a@^1.0.0"])
+        .assert()
+        .success();
+    npmrc_info.set_dist_tag("@pnpm.e2e/multi-version-a", "2.1.0", "latest");
+
+    global_command(&workspace, &pnpm_home)
+        .with_args(["update", "-g", "--latest"])
+        .assert()
+        .success();
+
+    let global_dir = pnpm_home.join("global/v11");
+    let group = pnpm_global::find_global_package(&global_dir, "@pnpm.e2e/multi-version-a")
+        .expect("scan global packages")
+        .expect("find updated group");
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(group.install_dir.join("package.json")).expect("read updated manifest"),
+    )
+    .expect("parse updated manifest");
+    assert_eq!(manifest["dependencies"]["@pnpm.e2e/multi-version-a"].as_str(), Some("^2.1.0"));
+
+    let output = global_command(&workspace, &pnpm_home)
+        .with_args(["list", "-g", "@pnpm.e2e/multi-version-a"])
+        .output()
+        .expect("list updated global package");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("@pnpm.e2e/multi-version-a@2.1.0"), "{stdout}");
+
+    drop((root, npmrc_info));
+}
+
 /// `--latest` resolves the `latest` dist-tag, which can point at an older
 /// release than the one installed — that is what rolled a self-updated pnpm
 /// back in pnpm/pnpm#14270. An update must never move a global package
@@ -872,6 +1060,497 @@ fn global_update_latest_keeps_a_package_that_latest_would_downgrade() {
     drop((root, npmrc_info));
 }
 
+#[cfg(unix)]
+#[test]
+fn unchanged_global_update_reports_already_up_to_date_without_replacing_the_group() {
+    use assert_cmd::assert::OutputAssertExt;
+
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let pnpm_home = root.path().join("pnpm-home");
+    prepare_global_home(&pnpm_home, &npmrc_info);
+
+    global_command(&workspace, &pnpm_home)
+        .with_args(["add", "-g", "@foo/touch-file-one-bin"])
+        .assert()
+        .success();
+    let global_dir = pnpm_home.join("global").join("v11");
+    let links_before: Vec<_> = symlink_entries(&global_dir)
+        .into_iter()
+        .map(|link| {
+            let target = fs::read_link(&link).expect("read global hash link");
+            (link, target)
+        })
+        .collect();
+
+    let output = global_command(&workspace, &pnpm_home)
+        .with_args(["update", "-g"])
+        .output()
+        .expect("run unchanged global update");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Already up to date"), "{stdout}");
+    assert!(!stdout.contains("dependencies:\n+"), "{stdout}");
+    let links_after: Vec<_> = symlink_entries(&global_dir)
+        .into_iter()
+        .map(|link| {
+            let target = fs::read_link(&link).expect("read global hash link");
+            (link, target)
+        })
+        .collect();
+    assert_eq!(links_after, links_before);
+
+    drop((root, npmrc_info));
+}
+
+#[cfg(unix)]
+#[test]
+fn unchanged_global_update_still_approves_a_pending_build() {
+    use assert_cmd::assert::OutputAssertExt;
+
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let pnpm_home = root.path().join("pnpm-home");
+    prepare_global_home(&pnpm_home, &npmrc_info);
+
+    global_command(&workspace, &pnpm_home)
+        .with_args(["add", "-g", "@pnpm.e2e/install-script-example@1.0.0"])
+        .assert()
+        .success();
+    let global_dir = pnpm_home.join("global").join("v11");
+    let install_before =
+        pnpm_global::find_global_package(&global_dir, "@pnpm.e2e/install-script-example")
+            .expect("scan global packages")
+            .expect("find install-script group");
+    let build_artifact = install_before.install_dir.join(
+        "node_modules/@pnpm.e2e/install-script-example/generated-by-install.js",
+    );
+    assert!(!build_artifact.exists());
+
+    let output = global_command(&workspace, &pnpm_home)
+        .with_env("PNPM_AUTO_APPROVE_BUILDS_FOR_TESTS", "1")
+        .with_args(["update", "-g"])
+        .output()
+        .expect("run unchanged global update with pending build approval");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Already up to date"), "{stdout}");
+    assert!(build_artifact.exists());
+    let install_after =
+        pnpm_global::find_global_package(&global_dir, "@pnpm.e2e/install-script-example")
+            .expect("scan global packages")
+            .expect("find install-script group");
+    assert_eq!(install_after.install_dir, install_before.install_dir);
+
+    drop((root, npmrc_info));
+}
+
+/// The resolution is unchanged, so nothing but the vanished tree separates
+/// this group from a current one.
+#[cfg(unix)]
+#[test]
+fn global_update_migrates_the_packages_of_the_previous_layout() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let pnpm_home = root.path().join("pnpm-home");
+    prepare_global_home(&pnpm_home, &npmrc_info);
+    let legacy_dir = pnpm_home.join("global").join("5");
+    let legacy_pkg_dir = legacy_dir
+        .join("node_modules")
+        .join("@foo")
+        .join("touch-file-one-bin");
+    fs::create_dir_all(&legacy_pkg_dir).expect("create the legacy package dir");
+    fs::write(
+        legacy_dir.join("package.json"),
+        r#"{"dependencies":{"@foo/touch-file-one-bin":"^1.0.0","pnpm":"10.0.0"}}"#,
+    )
+    .expect("write the legacy global manifest");
+    fs::write(
+        legacy_pkg_dir.join("package.json"),
+        r#"{"name":"@foo/touch-file-one-bin","version":"1.0.0","bin":"cli.js"}"#,
+    )
+    .expect("write the legacy package manifest");
+    fs::write(legacy_pkg_dir.join("cli.js"), "").expect("write the legacy bin");
+    let stray_bin = pnpm_home.join("touch-file-one-bin");
+    fs::hard_link(legacy_pkg_dir.join("cli.js"), &stray_bin)
+        .expect("link the bin the way pnpm 10 did");
+    let legacy_pnpm_dir = legacy_dir.join("node_modules").join("pnpm");
+    fs::create_dir_all(legacy_pnpm_dir.join("bin")).expect("create the legacy pnpm dir");
+    fs::write(
+        legacy_pnpm_dir.join("package.json"),
+        r#"{"name":"pnpm","version":"10.0.0","bin":{"pnpm":"bin/pnpm.cjs"}}"#,
+    )
+    .expect("write the legacy pnpm manifest");
+    fs::write(legacy_pnpm_dir.join("bin").join("pnpm.cjs"), "").expect("write the legacy pnpm bin");
+    let stray_pnpm_shim = pnpm_home.join("pnpm");
+    fs::write(
+        &stray_pnpm_shim,
+        "#!/bin/sh\nexec node \"$basedir/global/5/node_modules/pnpm/bin/pnpm.cjs\" \"$@\"\n",
+    )
+    .expect("write the pnpm shim the way pnpm 10 did");
+
+    let output = global_command(&workspace, &pnpm_home)
+        .with_args(["update", "-g"])
+        .output()
+        .expect("run global update over the previous layout");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(stdout.contains("Migrating global packages from"), "{stdout}\n{stderr}");
+    let global_dir = pnpm_home.join("global").join("v11");
+    assert!(
+        pnpm_global::find_global_package(&global_dir, "@foo/touch-file-one-bin")
+            .expect("scan global packages")
+            .is_some(),
+        "the legacy package must be installed as a group of the current layout",
+    );
+    let migrated_bin = pnpm_home.join("bin").join("touch-file-one-bin");
+    assert!(migrated_bin.exists(), "the bin must be linked into the current bin dir");
+    assert!(!legacy_dir.exists(), "the previous layout must be removed");
+    assert!(fs::symlink_metadata(&stray_bin).is_err(), "the bin pnpm 10 linked must be removed");
+    assert!(
+        fs::symlink_metadata(&stray_pnpm_shim).is_err(),
+        "the pnpm shim pnpm 10 linked must be removed",
+    );
+
+    let output = global_command(&workspace, &pnpm_home)
+        .with_args(["update", "-g"])
+        .output()
+        .expect("run global update again");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(!stdout.contains("Migrating global packages from"), "{stdout}");
+    assert!(stdout.contains("Already up to date"), "{stdout}\n{stderr}");
+
+    drop((root, npmrc_info));
+}
+
+#[cfg(unix)]
+#[test]
+fn global_update_leaves_a_legacy_package_a_current_group_declares_to_the_update() {
+    use assert_cmd::assert::OutputAssertExt;
+
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let pnpm_home = root.path().join("pnpm-home");
+    prepare_global_home(&pnpm_home, &npmrc_info);
+    global_command(&workspace, &pnpm_home)
+        .with_args(["add", "-g", "@foo/touch-file-one-bin,@foo/no-deps"])
+        .assert()
+        .success();
+    let global_dir = pnpm_home.join("global").join("v11");
+    let group = pnpm_global::find_global_package(&global_dir, "@foo/touch-file-one-bin")
+        .expect("scan global packages")
+        .expect("find the touch-file group");
+    fs::remove_dir_all(group.install_dir.join("node_modules"))
+        .expect("remove the group's node_modules");
+    let legacy_dir = pnpm_home.join("global").join("5");
+    fs::create_dir_all(&legacy_dir).expect("create the legacy dir");
+    fs::write(
+        legacy_dir.join("package.json"),
+        r#"{"dependencies":{"@foo/touch-file-one-bin":"^1.0.0"}}"#,
+    )
+    .expect("write the legacy global manifest");
+
+    let output = global_command(&workspace, &pnpm_home)
+        .with_args(["update", "-g"])
+        .output()
+        .expect("run global update over a declared legacy package");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(!stdout.contains("Migrating global packages from"), "{stdout}");
+    assert!(stdout.contains("Kept"), "the previous layout must wait for the restore: {stdout}");
+    assert!(legacy_dir.exists(), "the previous layout must be kept until the group is restored");
+    let groups = pnpm_global::scan_global_packages(&global_dir).expect("scan global packages");
+    assert_eq!(groups.len(), 1, "the group must be restored, not replaced by a second one");
+    assert!(groups[0].has_alias("@foo/no-deps"), "the sibling must survive the restore");
+    let restored = groups[0].install_dir
+        .join("node_modules")
+        .join("@foo")
+        .join("touch-file-one-bin");
+    assert!(restored.is_dir(), "the update must restore the group's files");
+
+    let output = global_command(&workspace, &pnpm_home)
+        .with_args(["update", "-g"])
+        .output()
+        .expect("run global update again");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(!legacy_dir.exists(), "the previous layout must be removed once the group is restored");
+
+    drop((root, npmrc_info));
+}
+
+#[cfg(unix)]
+#[test]
+fn global_update_restores_group_with_deleted_node_modules() {
+    use assert_cmd::assert::OutputAssertExt;
+
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let pnpm_home = root.path().join("pnpm-home");
+    prepare_global_home(&pnpm_home, &npmrc_info);
+
+    global_command(&workspace, &pnpm_home)
+        .with_args(["add", "-g", "@foo/touch-file-one-bin"])
+        .assert()
+        .success();
+    let global_dir = pnpm_home.join("global").join("v11");
+    let install_before = pnpm_global::find_global_package(&global_dir, "@foo/touch-file-one-bin")
+        .expect("scan global packages")
+        .expect("find the touch-file group");
+    fs::remove_dir_all(install_before.install_dir.join("node_modules"))
+        .expect("remove the group's node_modules");
+
+    let output = global_command(&workspace, &pnpm_home)
+        .with_args(["update", "-g"])
+        .output()
+        .expect("run global update over a removed tree");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(!stdout.contains("Already up to date"), "{stdout}");
+    let install_after = pnpm_global::find_global_package(&global_dir, "@foo/touch-file-one-bin")
+        .expect("scan global packages")
+        .expect("find the touch-file group after update");
+    assert_ne!(install_after.install_dir, install_before.install_dir);
+    // The bin shim reaches its target through the hash link, not through the
+    // install dir it currently resolves to, so that is the path the restored
+    // package has to be reachable by.
+    let shim_target_package =
+        global_dir.join(&install_after.hash).join("node_modules/@foo/touch-file-one-bin");
+    assert!(shim_target_package.is_dir(), "the shim's target package is missing");
+
+    drop((root, npmrc_info));
+}
+
+#[cfg(unix)]
+#[test]
+fn global_update_skips_a_group_whose_file_source_no_longer_exists() {
+    use assert_cmd::assert::OutputAssertExt;
+
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let pnpm_home = root.path().join("pnpm-home");
+    prepare_global_home(&pnpm_home, &npmrc_info);
+    let package_dir = root.path().join("since-deleted");
+    fs::create_dir_all(&package_dir).expect("create local package");
+    fs::write(package_dir.join("package.json"), r#"{ "name": "local-pkg", "version": "1.0.0" }"#)
+        .expect("write local package manifest");
+
+    global_command(&workspace, &pnpm_home)
+        .with_args(["add", "-g", &format!("file:{}", package_dir.display())])
+        .assert()
+        .success();
+    global_command(&workspace, &pnpm_home)
+        .with_args(["add", "-g", "@foo/touch-file-one-bin"])
+        .assert()
+        .success();
+    let global_dir = pnpm_home.join("global").join("v11");
+    let local_before = pnpm_global::find_global_package(&global_dir, "local-pkg")
+        .expect("scan global packages")
+        .expect("find the local group");
+    let registry_before = pnpm_global::find_global_package(&global_dir, "@foo/touch-file-one-bin")
+        .expect("scan global packages")
+        .expect("find the registry group");
+    fs::remove_dir_all(&package_dir).expect("delete the local package");
+    fs::remove_dir_all(registry_before.install_dir.join("node_modules"))
+        .expect("remove the registry group's node_modules");
+
+    let output = global_command(&workspace, &pnpm_home)
+        .with_args(["update", "-g"])
+        .output()
+        .expect("run global update over a deleted file: source");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(stdout.contains("Skipped updating local-pkg"), "{stdout}");
+
+    let local_after = pnpm_global::find_global_package(&global_dir, "local-pkg")
+        .expect("scan global packages")
+        .expect("the skipped group stays installed");
+    assert_eq!(local_after.install_dir, local_before.install_dir);
+    let registry_after = pnpm_global::find_global_package(&global_dir, "@foo/touch-file-one-bin")
+        .expect("scan global packages")
+        .expect("find the registry group after update");
+    assert_ne!(registry_after.install_dir, registry_before.install_dir);
+
+    let output = global_command(&workspace, &pnpm_home)
+        .with_args(["update", "-g", "local-pkg"])
+        .output()
+        .expect("run global update of only the skipped group");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(stdout.contains("Skipped updating local-pkg"), "{stdout}");
+    assert!(!stdout.contains("Already up to date"), "{stdout}");
+
+    drop((root, npmrc_info));
+}
+
+#[cfg(unix)]
+#[test]
+fn global_update_renders_both_changed_groups_with_one_completion_summary() {
+    use assert_cmd::assert::OutputAssertExt;
+
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry_with_own_storage();
+    let pnpm_home = root.path().join("pnpm-home");
+    prepare_global_home(&pnpm_home, &npmrc_info);
+
+    npmrc_info.set_dist_tag("@pnpm.e2e/multi-version-a", "1.0.0", "latest");
+    npmrc_info.set_dist_tag("@pnpm.e2e/multi-version-b", "3.0.0", "latest");
+    global_command(&workspace, &pnpm_home)
+        .with_args(["add", "-g", "@pnpm.e2e/multi-version-a", "@pnpm.e2e/multi-version-b"])
+        .assert()
+        .success();
+    npmrc_info.set_dist_tag("@pnpm.e2e/multi-version-a", "2.1.0", "latest");
+    npmrc_info.set_dist_tag("@pnpm.e2e/multi-version-b", "3.1.0", "latest");
+
+    let output = global_command(&workspace, &pnpm_home)
+        .with_args(["update", "-g", "--latest"])
+        .output()
+        .expect("run two-group global update");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("@pnpm.e2e/multi-version-a"), "{stdout}");
+    assert!(stdout.contains("@pnpm.e2e/multi-version-b"), "{stdout}");
+    assert_eq!(stdout.matches("Done in ").count(), 1, "{stdout}");
+
+    drop((root, npmrc_info));
+}
+
+#[cfg(unix)]
+fn prepare_immature_global_update(workspace: &Path, pnpm_home: &Path) {
+    use assert_cmd::assert::OutputAssertExt;
+
+    global_command(workspace, pnpm_home)
+        .with_args(["add", "-g", "@pnpm.e2e/multi-version-a@1.0.0"])
+        .assert()
+        .success();
+    let global_dir = pnpm_home.join("global").join("v11");
+    let group = pnpm_global::find_global_package(&global_dir, "@pnpm.e2e/multi-version-a")
+        .expect("scan global packages")
+        .expect("find multi-version-a group");
+    let manifest_path = group.install_dir.join("package.json");
+    let manifest = fs::read_to_string(&manifest_path).expect("read the group manifest");
+    let manifest = if manifest.contains(r#""^1.0.0""#) {
+        manifest.replace(r#""^1.0.0""#, r#""^2.1.0""#)
+    } else {
+        manifest.replacen(r#""1.0.0""#, r#""^2.1.0""#, 1)
+    };
+    fs::write(&manifest_path, manifest).expect("write the group manifest");
+    // A cutoff further back than every mock release makes 2.1.0 immature.
+    for dir in [pnpm_home, workspace] {
+        set_minimum_release_age(dir, 60 * 24 * 365 * 100);
+        append_workspace_yaml_key(dir, "minimumReleaseAgeStrict", true);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn global_update_approves_an_immature_version_once_across_its_resolution_passes() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry_with_own_storage();
+    let pnpm_home = root.path().join("pnpm-home");
+    prepare_global_home(&pnpm_home, &npmrc_info);
+    prepare_immature_global_update(&workspace, &pnpm_home);
+
+    let output =
+        run_global_prompt(&workspace, &pnpm_home, &["update", "-g", "--reporter=append-only"], "y");
+    let stdout = String::from_utf8(output.stdout).expect("terminal output is UTF-8");
+    eprintln!("{stdout}");
+    assert!(output.status.success(), "{stdout}");
+    assert_eq!(
+        stdout.matches("the minimumReleaseAge constraint:").count(),
+        1,
+        "the update must ask once, not once per resolution pass",
+    );
+
+    let listed = global_command(&workspace, &pnpm_home)
+        .with_args(["list", "-g"])
+        .output()
+        .expect("run list -g");
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        listed.contains("@pnpm.e2e/multi-version-a@2.1.0"),
+        "the approved version must be installed: {listed}",
+    );
+
+    drop((root, npmrc_info));
+}
+
+#[cfg(unix)]
+#[test]
+fn global_update_aborts_when_the_immature_version_is_not_approved() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry_with_own_storage();
+    let pnpm_home = root.path().join("pnpm-home");
+    prepare_global_home(&pnpm_home, &npmrc_info);
+    prepare_immature_global_update(&workspace, &pnpm_home);
+
+    let output =
+        run_global_prompt(&workspace, &pnpm_home, &["update", "-g", "--reporter=append-only"], "n");
+    let stdout = String::from_utf8(output.stdout).expect("terminal output is UTF-8");
+    eprintln!("{stdout}");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(stdout.contains("ERR_PNPM_MINIMUM_RELEASE_AGE_DENIED"), "{stdout}");
+
+    let listed = global_command(&workspace, &pnpm_home)
+        .with_args(["list", "-g"])
+        .output()
+        .expect("run list -g");
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        listed.contains("@pnpm.e2e/multi-version-a@1.0.0"),
+        "a denied update must not materialize the immature version: {listed}",
+    );
+
+    drop((root, npmrc_info));
+}
+
+#[cfg(unix)]
+#[test]
+fn global_update_requires_approval_for_the_immature_version() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry_with_own_storage();
+    let pnpm_home = root.path().join("pnpm-home");
+    prepare_global_home(&pnpm_home, &npmrc_info);
+    prepare_immature_global_update(&workspace, &pnpm_home);
+
+    let output = global_command(&workspace, &pnpm_home)
+        .with_args(["update", "-g", "--reporter=append-only"])
+        .output()
+        .expect("run global update");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stdout}\n{stderr}");
+    assert!(stderr.contains("ERR_PNPM_NO_MATURE_MATCHING_VERSION"), "{stdout}\n{stderr}");
+
+    let listed = global_command(&workspace, &pnpm_home)
+        .with_args(["list", "-g"])
+        .output()
+        .expect("run list -g");
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        listed.contains("@pnpm.e2e/multi-version-a@1.0.0"),
+        "an unapproved update must not materialize the immature version: {listed}",
+    );
+
+    drop((root, npmrc_info));
+}
+
+#[cfg(unix)]
+mod config_conflicts;
+
 mod shims;
 
 mod ownership;
+
+#[cfg(unix)]
+mod virtual_store;
+
+#[cfg(unix)]
+mod peers;

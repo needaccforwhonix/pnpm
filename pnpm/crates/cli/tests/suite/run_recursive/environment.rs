@@ -1,12 +1,22 @@
+#[cfg(unix)]
+use super::process_group_probe;
 use super::{
-    CommandExtra, CommandTempCwd, PermissionsExt, fs, json, process_group_probe,
-    write_concurrency_probe, write_executable, write_workspace,
+    CONCURRENCY_PROBE_COMMAND, CommandExtra, CommandTempCwd, fs, json, wait_for_marker_script,
+    write_concurrency_probe, write_marker_script, write_node_bin, write_workspace,
 };
+#[cfg(unix)]
+use crate::_utils::terminal::Terminal;
 use assert_cmd::assert::OutputAssertExt;
 
 /// A per-task `concurrency: 1` serializes the scripts just as firmly as a
-/// dependency chain does, so they must stay in pacquet's process group
-/// too — the scheduler never has two of them in flight to keep apart.
+/// dependency chain does, so at a terminal they must stay in pacquet's
+/// process group too — the scheduler never has two of them in flight to
+/// keep apart.
+///
+/// Unix-only by subject: the assertion compares POSIX process groups,
+/// which Windows has no counterpart for — pnpm keeps a script's children
+/// in a job object there instead.
+#[cfg(unix)]
 #[test]
 fn task_concurrency_of_one_keeps_scripts_in_the_foreground_process_group() {
     let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
@@ -39,10 +49,10 @@ fn task_concurrency_of_one_keeps_scripts_in_the_foreground_process_group() {
     )
     .expect("write task settings");
 
-    pacquet
-        .with_args(["-r", "run", "build"])
-        .assert()
-        .success();
+    let terminal = Terminal::open();
+    let mut process = terminal.spawn_foreground(pacquet.with_args(["-r", "run", "build"]));
+    let status = process.wait().expect("wait for pacquet");
+    assert!(status.success(), "pacquet should succeed on the terminal");
 
     let groups =
         fs::read_to_string(workspace.join("process-groups.txt")).expect("read process groups");
@@ -74,7 +84,7 @@ fn recursive_run_respects_workspace_concurrency() {
         json!({
             "name": name,
             "version": "1.0.0",
-            "scripts": { "build": "sh ../track-concurrency.sh" },
+            "scripts": { "build": CONCURRENCY_PROBE_COMMAND },
         })
     };
     write_workspace(
@@ -108,7 +118,7 @@ fn recursive_run_respects_task_concurrency() {
         json!({
             "name": name,
             "version": "1.0.0",
-            "scripts": { "build": "sh ../track-task-concurrency.sh" },
+            "scripts": { "build": "node ../track-task-concurrency.cjs" },
         })
     };
     write_workspace(
@@ -132,18 +142,25 @@ fn recursive_run_respects_task_concurrency() {
         ),
     )
     .expect("write task settings");
-    write_executable(
-        &workspace.join("track-task-concurrency.sh"),
-        r#"if mkdir ../build-active 2>/dev/null; then
-  owns_lock=1
-else
-  touch ../exceeded-task-concurrency
-fi
-sleep 0.2
-touch ran.txt
-[ "$owns_lock" = 1 ] && rmdir ../build-active
-"#,
-    );
+    // `mkdirSync` is the lock: it throws rather than succeeding twice, so
+    // a second task running at the same time records that it overlapped.
+    fs::write(
+        workspace.join("track-task-concurrency.cjs"),
+        r"const fs = require('fs')
+let ownsLock = false
+try {
+  fs.mkdirSync('../build-active')
+  ownsLock = true
+} catch {
+  fs.writeFileSync('../exceeded-task-concurrency', '')
+}
+setTimeout(() => {
+  fs.writeFileSync('ran.txt', '')
+  if (ownsLock) fs.rmdirSync('../build-active')
+}, 200)
+",
+    )
+    .expect("write task concurrency probe");
 
     pacquet
         .with_args(["--workspace-concurrency=3", "-r", "run", "build"])
@@ -218,13 +235,13 @@ fn parallel_before_run_starts_selected_projects_concurrently() {
             "name": name,
             "version": "1.0.0",
             "scripts": {
+                // Announces itself, then waits for its peer to do the
+                // same. Only overlapping runs see each other's marker, so
+                // a serialized pair times out and fails.
                 "build": format!(
-                    "touch ../{name}.started; \
-                     attempts=0; \
-                     while [ ! -f ../{peer}.started ] && [ \"$attempts\" -lt 100 ]; do \
-                       sleep 0.01; attempts=$((attempts + 1)); \
-                     done; \
-                     test -f ../{peer}.started"
+                    "{} && {}",
+                    write_marker_script(&format!("../{name}.started")),
+                    wait_for_marker_script(&format!("../{peer}.started")),
                 ),
             },
         })
@@ -258,8 +275,22 @@ fn parallel_before_run_starts_selected_projects_concurrently() {
     drop(root);
 }
 
+fn write_commitlint_bins(workspace: &std::path::Path, names: &[&str]) {
+    for name in names {
+        let bin_dir = workspace
+            .join(name)
+            .join("node_modules")
+            .join(".bin");
+        write_node_bin(
+            &bin_dir,
+            "commitlint",
+            "require('fs').writeFileSync('bin-ran.txt', process.argv.slice(2).join(' '))\n",
+        );
+    }
+}
+
 #[test]
-fn top_level_fallback_does_not_exec_local_bin_recursively() {
+fn top_level_fallback_execs_local_bin_recursively_when_no_project_has_the_script() {
     let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
     write_workspace(
         &workspace,
@@ -268,25 +299,112 @@ fn top_level_fallback_does_not_exec_local_bin_recursively() {
             ("project-2", json!({ "name": "project-2", "version": "1.0.0", "scripts": {} })),
         ],
     );
+    write_commitlint_bins(&workspace, &["project-1", "project-2"]);
+
+    pacquet
+        .with_args(["-r", "commitlint", "--edit", "msg"])
+        .assert()
+        .success();
+
     for name in ["project-1", "project-2"] {
-        let bin_dir = workspace
-            .join(name)
-            .join("node_modules")
-            .join(".bin");
-        fs::create_dir_all(&bin_dir).expect("create node_modules/.bin");
-        write_executable(&bin_dir.join("commitlint"), "#!/bin/sh\ntouch bin-ran.txt\n");
+        let ran = fs::read_to_string(workspace.join(name).join("bin-ran.txt"))
+            .unwrap_or_else(|err| panic!("{name} local binary should have run: {err}"));
+        assert_eq!(ran, "--edit msg", "{name} local binary should get the arguments");
     }
 
+    drop(root);
+}
+
+#[test]
+fn top_level_fallback_with_filter_execs_local_bin_in_the_selected_project() {
+    let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+    write_workspace(
+        &workspace,
+        &[
+            ("project-1", json!({ "name": "project-1", "version": "1.0.0" })),
+            ("project-2", json!({ "name": "project-2", "version": "1.0.0" })),
+        ],
+    );
+    write_commitlint_bins(&workspace, &["project-1", "project-2"]);
+
+    pacquet
+        .with_args(["--filter", "project-1", "commitlint", "--edit"])
+        .assert()
+        .success();
+
+    let ran = fs::read_to_string(workspace.join("project-1").join("bin-ran.txt"))
+        .expect("the selected project's local binary should have run");
+    assert_eq!(ran, "--edit");
+    assert!(
+        !workspace
+            .join("project-2")
+            .join("bin-ran.txt")
+            .exists(),
+        "a project outside the filter must not run the binary",
+    );
+
+    drop(root);
+}
+
+#[test]
+fn top_level_fallback_execs_local_bin_despite_a_tasks_cycle_through_the_command() {
+    let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+    write_workspace(
+        &workspace,
+        &[(
+            "project-1",
+            json!({ "name": "project-1", "version": "1.0.0", "scripts": { "lint": "echo lint" } }),
+        )],
+    );
+    fs::write(
+        workspace.join("pnpm-workspace.yaml"),
+        concat!(
+            "packages:\n  - project-1\n",
+            "tasks:\n",
+            "  commitlint:\n    dependsOn: ['lint']\n",
+            "  lint:\n    dependsOn: ['commitlint']\n",
+        ),
+    )
+    .expect("write workspace settings");
+    write_commitlint_bins(&workspace, &["project-1"]);
+
+    pacquet
+        .with_args(["-r", "commitlint"])
+        .assert()
+        .success();
+
+    assert!(
+        workspace
+            .join("project-1")
+            .join("bin-ran.txt")
+            .exists(),
+        "the local binary should run, since exec does not follow the tasks declarations",
+    );
+
+    drop(root);
+}
+
+#[test]
+fn explicit_recursive_run_does_not_exec_local_bin() {
+    let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+    write_workspace(
+        &workspace,
+        &[
+            ("project-1", json!({ "name": "project-1", "version": "1.0.0" })),
+            ("project-2", json!({ "name": "project-2", "version": "1.0.0" })),
+        ],
+    );
+    write_commitlint_bins(&workspace, &["project-1", "project-2"]);
+
     let output = pacquet
-        .with_arg("-r")
-        .with_arg("commitlint")
+        .with_args(["-r", "run", "commitlint"])
         .output()
         .expect("spawn pacquet");
-    assert!(!output.status.success(), "recursive shorthand without matching scripts must fail");
+    assert!(!output.status.success(), "an explicit run without matching scripts must fail");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("ERR_PNPM_RECURSIVE_RUN_NO_SCRIPT"),
-        "recursive shorthand must report the recursive no-script error, got: {stderr}",
+        "an explicit run must report the recursive no-script error, got: {stderr}",
     );
     for name in ["project-1", "project-2"] {
         assert!(
@@ -294,7 +412,7 @@ fn top_level_fallback_does_not_exec_local_bin_recursively() {
                 .join(name)
                 .join("bin-ran.txt")
                 .exists(),
-            "{name} local binary must not run from recursive shorthand",
+            "{name} local binary must not run from an explicit run",
         );
     }
 
@@ -321,12 +439,7 @@ fn recursive_run_resolves_local_bin_on_path_per_project() {
     );
     let pkg_root = workspace.join("pkg-with-local-bin");
     let bin_dir = pkg_root.join("node_modules").join(".bin");
-    fs::create_dir_all(&bin_dir).expect("create node_modules/.bin");
-    let script_path = bin_dir.join("say-hi");
-    fs::write(&script_path, "#!/bin/sh\ntouch hi.txt\n").expect("write bin");
-    let mut perms = fs::metadata(&script_path).expect("stat").permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&script_path, perms).expect("chmod +x");
+    write_node_bin(&bin_dir, "say-hi", "require('fs').writeFileSync('hi.txt', '')\n");
 
     pacquet
         .with_arg("-r")

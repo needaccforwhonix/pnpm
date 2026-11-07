@@ -12,14 +12,17 @@ repository.workspace = true
 
 [dependencies]
 pnpm-diagnostics = { workspace = true }
+pnpm-fs = { workspace = true }
 pnpm-package-manifest = { workspace = true }
 
 derive_more = { workspace = true }
-ignore = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+pnpm-fs = { workspace = true }
+proptest = { workspace = true }
+serde = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

@@ -1,9 +1,8 @@
 //! What the non-npm registry surfaces share.
 //!
-//! A multi-ecosystem server uses `/npm/`, `/cargo/`, and `/pypi/`, while a
-//! single-ecosystem server serves that protocol at the root. The registry graph
-//! is consulted for the selected ecosystem only, so one router can front every
-//! ecosystem. This module holds the pieces the Cargo and Python
+//! Each ecosystem answers under its own prefix ([`Ecosystem::base_path`]).
+//! The registry graph is consulted for the selected ecosystem only, so one
+//! router can front every ecosystem. This module holds the pieces the Cargo and Python
 //! surfaces both need: addressing (which registry, which endpoint URL, which
 //! cache headers), the anonymous-readability check, hosted blob downloads,
 //! and the proxy cache for an upstream's metadata documents and artifacts.
@@ -42,28 +41,25 @@ pub(super) fn addressed_registry(
 }
 
 /// The two addresses a surface answers on: the default target, and one named
-/// registry. `prefixed` is whether the ecosystem shares the server, in which
-/// case both sit under `/<ecosystem>`.
+/// registry.
 ///
 /// Route templates rather than URLs — `{registry}` is a path parameter the
 /// [`TargetRegistry`](super::TargetRegistry) extractor reads back.
-pub(super) fn mount_bases(ecosystem: Ecosystem, prefixed: bool) -> [String; 2] {
-    let prefix = if prefixed { format!("/{ecosystem}") } else { String::new() };
+pub(super) fn mount_bases(ecosystem: Ecosystem) -> [String; 2] {
+    let prefix = ecosystem.base_path();
     [prefix.clone(), format!("{prefix}/~{{registry}}")]
 }
 
 /// The URL clients reach the addressed registry at for `ecosystem`, for the
 /// URLs a surface writes into the metadata it serves (a Cargo `config.json`,
-/// a Simple API page). Multi-ecosystem servers include the ecosystem segment;
-/// single-ecosystem servers use `public_url` directly.
+/// a Simple API page).
 pub(super) fn registry_endpoint(
     state: &AppState,
     ecosystem: Ecosystem,
     registry: Option<&str>,
 ) -> String {
     let public_url = state.inner.config.http.public_url.trim_end_matches('/');
-    let base =
-        format!("{public_url}{}", state.inner.config.routing.registries.base_path(ecosystem));
+    let base = format!("{public_url}{}", ecosystem.base_path());
     match registry {
         Some(registry) => format!("{base}/~{registry}"),
         None => base,
@@ -71,12 +67,12 @@ pub(super) fn registry_endpoint(
 }
 
 /// The cache headers a response needs so a shared HTTP cache can never replay
-/// an authenticated response to an anonymous caller. A named registry's
-/// responses are always caller-scoped. The default target's are scoped only
-/// when `package` resolves to a source whose effective per-package access
-/// denies anonymous callers, so a URL that answers differently depending on
-/// `Authorization` says so. A publicly-readable resolution stays cacheable:
-/// the path-less base is the hot install path.
+/// an authenticated response to an anonymous caller. A response is scoped
+/// when `package` resolves, through the addressed registry, to a source whose
+/// effective per-package access denies anonymous callers, so a URL that
+/// answers differently depending on `Authorization` says so. A
+/// publicly-readable resolution stays cacheable on both the path-less base
+/// (the hot install path) and a named one.
 pub(super) fn caller_scoped(
     state: &AppState,
     ecosystem: Ecosystem,
@@ -84,10 +80,8 @@ pub(super) fn caller_scoped(
     package: Option<&str>,
     response: Response,
 ) -> Response {
-    if registry.is_some() {
-        return private_no_cache(response);
-    }
-    match (default_registry_target(state, ecosystem), package) {
+    let target = registry.map(str::to_string).or_else(|| default_registry_target(state, ecosystem));
+    match (target, package) {
         (Some(target), Some(package))
             if resolves_to_private_source(state, &target, ecosystem, package) =>
         {
@@ -136,6 +130,21 @@ pub(super) fn hosted_sources(
         .collect()
 }
 
+/// The upstream registries of `ecosystem` a request through `registry` can land on.
+pub(super) fn upstream_sources(
+    state: &AppState,
+    registry: &str,
+    ecosystem: Ecosystem,
+) -> Vec<String> {
+    let registries = &state.inner.config.routing.registries;
+    registries
+        .sources(registry, ecosystem)
+        .into_iter()
+        .filter(|source| matches!(registries.get(source), Some(Registry::Upstream { .. })))
+        .map(str::to_string)
+        .collect()
+}
+
 /// A hosted blob of `key` through `source`'s read gate, as a download
 /// response; a 404 when the blob is absent.
 pub(super) async fn serve_hosted_blob(
@@ -146,7 +155,10 @@ pub(super) async fn serve_hosted_blob(
     filename: &str,
 ) -> Result<Response, RegistryError> {
     let org = hosted_read_namespace(state, identity, source, key.as_str())?;
-    let blob = state.inner.storage.for_hosted(&org).open_hosted_blob(key, filename).await?;
+    let blob = state.inner.storage
+        .for_hosted(&org, key.ecosystem())
+        .open_hosted_blob(key, filename)
+        .await?;
     Ok(match blob {
         Some((body, len)) => tarball_response(body, len),
         None => not_found(),

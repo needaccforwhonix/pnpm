@@ -42,7 +42,7 @@ impl<'a> ScriptSelector<'a> {
             .filter(|(script, body)| {
                 body.as_str()
                     .is_some_and(|body| !body.is_empty())
-                    && pattern.is_match(script)
+                    && matches_utf16_code_units(pattern, script)
             })
             .map(|(script, _)| script.clone())
             .collect()
@@ -64,8 +64,19 @@ impl<'a> ScriptSelector<'a> {
     }
 }
 
-/// Compile a `/pattern/` script selector, as pnpm's
-/// `tryBuildRegExpFromCommand` does. `Ok(None)` means `command` is not a
+/// Match as an unflagged JavaScript `RegExp` does: over UTF-16 code
+/// units, so `.` matches one half of a surrogate pair.
+fn matches_utf16_code_units(pattern: &Regex, script: &str) -> bool {
+    let code_units: Vec<u16> = script.encode_utf16().collect();
+    pattern
+        .find_from_ucs2(&code_units, 0)
+        .next()
+        .is_some()
+}
+
+/// Compile a `/pattern/` script selector with ECMAScript syntax and
+/// semantics, so lookaround and backreferences work as in a JavaScript
+/// `RegExp`. `Ok(None)` means `command` is not a
 /// regexp literal and addresses a script by name; a pattern the engine
 /// rejects also reads as a plain name, so a mistyped selector surfaces as
 /// the usual "missing script" error rather than a parser diagnostic.
@@ -86,7 +97,7 @@ fn try_build_regex_from_command(command: &str) -> Result<Option<Regex>, RunError
 /// whose only `/` characters are backslash-escaped, and flags drawn from
 /// JavaScript's flag set. The closing delimiter is therefore the last
 /// `/` in the string.
-fn split_regex_literal(command: &str) -> Option<(&str, &str)> {
+pub(super) fn split_regex_literal(command: &str) -> Option<(&str, &str)> {
     let body = command.strip_prefix('/')?;
     let close = body.rfind('/')?;
     let (pattern, flags) = body.split_at(close);

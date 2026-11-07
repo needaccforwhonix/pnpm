@@ -5,10 +5,7 @@
 //! lockfile plus an optional *current* lockfile and runs
 //! `pnpm_real_hoist::hoist` to get the directory shape, then
 //! assembles a [`LockfileToDepGraphResult`] keyed by the computed
-//! absolute directory of every node. Store I/O (`fetching` /
-//! `files_index_file`) is still deferred — those fields are
-//! populated by the linker, which kicks off store fetches when it
-//! has a real consumer for the handles.
+//! absolute directory of every node.
 //!
 //! Unlike the depPath-keyed [`crate::deps_graph`] module (which is
 //! a hashing-side adapter for the build cache), the graph defined
@@ -25,9 +22,11 @@ use presence::{
 };
 
 mod walk;
-use walk::{WalkState, walk_deps};
+use walk::{PackageLocations, WalkState, walk_deps};
 
-use crate::{HoistedLocations, safe_join_modules_dir::InvalidDependencyAliasError};
+use crate::{
+    HoistedLocations, ImporterModulesDirs, safe_join_modules_dir::InvalidDependencyAliasError,
+};
 use derive_more::{Display, Error, From};
 use miette::Diagnostic;
 use pnpm_lockfile::{Lockfile, LockfileResolution, ParsePkgNameVerPeerError, PkgIdWithPatchHash};
@@ -37,7 +36,7 @@ use pnpm_patching::PatchInfo;
 use pnpm_real_hoist::{HoistError, HoistOpts, hoist};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 /// One node in a hoisted-linker dependency graph. Keyed in the
@@ -45,10 +44,7 @@ use std::{
 ///
 /// Omits the store-controller-bound fields (`fetching`,
 /// `files_index_file`) that the walker only learns about once it
-/// fetches the package. Those land in the follow-up sub-slice that
-/// wires the store in; today, this type pins the shape of every
-/// other field so the walker can fill them without churning the
-/// call sites.
+/// fetches the package.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DependenciesGraphNode {
     pub package: HoistedPackageMetadata,
@@ -102,9 +98,7 @@ pub type DependenciesGraph = BTreeMap<PathBuf, DependenciesGraphNode>;
 pub struct DepHierarchy(pub BTreeMap<PathBuf, DepHierarchy>);
 
 /// Per-importer alias → direct-dependency directory. For the
-/// single-importer case the only key is `"."`; workspace support
-/// will add per-importer entries keyed by the importer's
-/// project id.
+/// single-importer case the only key is `"."`.
 pub type DirectDependenciesByImporterId = BTreeMap<String, BTreeMap<String, PathBuf>>;
 
 /// Everything the walker hands back to the install pipeline.
@@ -119,7 +113,7 @@ pub struct LockfileToDepGraphResult {
     pub direct_dependencies_by_importer_id: DirectDependenciesByImporterId,
     /// Outer key is the project root that owns the inner
     /// hierarchy (the workspace root for single-importer
-    /// lockfiles, plus per-project roots once Slice 9 lands).
+    /// lockfiles).
     pub hierarchy: BTreeMap<PathBuf, DepHierarchy>,
     /// Per-depPath list of lockfile-relative directory paths
     /// where the package landed. Round-trips through
@@ -152,34 +146,32 @@ pub struct LockfileToDepGraphResult {
     pub skipped: BTreeSet<String>,
 }
 
-/// Inputs the walker reads from. Carries the subset pacquet needs
-/// for the hoisted-linker path that's actually implemented today.
-/// Fields tied to the still-unported store controller, fetch
-/// concurrency, or workspace project list will be added when their
-/// consumers land.
+/// Inputs the walker reads from.
 #[derive(Debug, Clone)]
 pub struct LockfileToHoistedDepGraphOptions<'a> {
     pub installability: HoistedInstallability,
     pub placement: HoistedPlacementOptions,
-    /// Project / workspace root. Used as the base for relativizing
-    /// `hoisted_locations` entries and for placing the root's
-    /// `node_modules/` directory.
-    pub lockfile_dir: PathBuf,
+    /// Where each importer's dependencies go. Its lockfile directory is
+    /// also the base for relativizing `hoisted_locations` entries. A
+    /// package's own dependencies always go in its `node_modules`.
+    pub modules_dirs: ImporterModulesDirs,
     /// Packages the previous install decided not to fetch
     /// (installability check failed; the package was added here).
     /// The walker skips any depPath in this set without consulting
-    /// the snapshot. Cloned + extended on the way out. The
-    /// hoisted-specific typing is a set of raw `String`s (rather than
-    /// `DepPath`s), so the wrapper here is `BTreeSet<String>`.
+    /// the snapshot. Cloned + extended on the way out.
     pub skipped: BTreeSet<String>,
+    /// When true, no package is reused from the previous install:
+    /// every node is re-materialized whether or not its recorded
+    /// location still holds it.
+    pub force: bool,
     /// When true, suppress the installability check and emit every
     /// dep into the graph regardless of cpu / os / libc / engines.
-    /// Used by the `prev_graph` walk (Slice 4d) where the previous
-    /// lockfile is replayed wholesale to compute orphans — that walk
-    /// passes `force: true` with an empty skip set so
-    /// the diff catches packages that previously installed but
-    /// would now be filtered.
-    pub force: bool,
+    /// Set for `--force` under `forceIgnoresPlatform`, and by the
+    /// `prev_graph` walk where the previous lockfile is replayed
+    /// wholesale to compute orphans — that walk starts from an empty
+    /// skip set so the diff catches packages that previously
+    /// installed but would now be filtered.
+    pub include_incompatible_packages: bool,
 
     /// `hoistedLocations` recorded by the previous install's
     /// `.modules.yaml`. A package the walker places at a directory
@@ -207,10 +199,11 @@ impl Default for LockfileToHoistedDepGraphOptions<'_> {
                 hoisting_limits: pnpm_real_hoist::HoistingLimits::new(),
                 external_dependencies: BTreeSet::new(),
             },
-            lockfile_dir: PathBuf::new(),
+            modules_dirs: ImporterModulesDirs::node_modules(Path::new("")),
 
             skipped: BTreeSet::new(),
             force: false,
+            include_incompatible_packages: false,
 
             // Match the hoister's default-on behavior so a
             // `..Default::default()`-style construction at the call
@@ -221,9 +214,8 @@ impl Default for LockfileToHoistedDepGraphOptions<'_> {
 }
 
 /// Failure modes of [`lockfile_to_hoisted_dep_graph`]. Marked
-/// `#[non_exhaustive]` so adding variants in later sub-slices (the
-/// installability filter, the store-fetch integration) isn't a
-/// breaking API change.
+/// `#[non_exhaustive]` so adding variants isn't a breaking API
+/// change.
 #[derive(Debug, Display, Error, Diagnostic, From)]
 #[non_exhaustive]
 pub enum HoistedDepGraphError {
@@ -265,11 +257,6 @@ pub enum HoistedDepGraphError {
 /// wanted lockfile, plus an optional *current* lockfile to diff
 /// against.
 ///
-/// The store-controller-bound `fetching` / `files_index_file`
-/// fields on each graph node remain default-valued — those are
-/// populated by Slice 5's linker, which kicks off the actual
-/// store fetches when it has a real consumer for the handles.
-///
 /// Multi-importer (workspace) lockfiles are supported: the hoister
 /// ([`pnpm_real_hoist::hoist`]) attaches each non-root importer as
 /// a workspace child of the virtual `.` root when
@@ -299,6 +286,7 @@ pub fn lockfile_to_hoisted_dep_graph(
         {
             let prev_opts = LockfileToHoistedDepGraphOptions {
                 force: true,
+                include_incompatible_packages: true,
                 skipped: BTreeSet::new(),
                 ..opts.clone()
             };
@@ -329,21 +317,19 @@ fn build_dep_graph<'a>(
     };
     let hoister_result = hoist(lockfile, &hoist_opts)?;
 
-    let modules_dir = opts.lockfile_dir.join("node_modules");
     let mut state = WalkState {
         result: LockfileToDepGraphResult { skipped: opts.skipped.clone(), ..Default::default() },
         lockfile,
-        lockfile_dir: &opts.lockfile_dir,
         opts,
         prev_graph,
 
-        pkg_locations_by_pkg_id: BTreeMap::new(),
+        package_locations: PackageLocations::default(),
 
         per_importer_hierarchies: BTreeMap::new(),
         per_importer_direct_deps: BTreeMap::new(),
     };
     let root_deps = hoister_result.dependencies.borrow();
-    let root_hierarchy = walk_deps(&mut state, &modules_dir, &root_deps)?;
+    let root_hierarchy = walk_deps(&mut state, opts.modules_dirs.root(), &root_deps)?;
     drop(root_deps);
     state.into_result(root_hierarchy)
 }
@@ -402,7 +388,7 @@ pub struct HoistedPlacementOptions {
     /// When `true` (the default), every non-root workspace importer
     /// becomes a `Workspace`-kind child of the virtual `.` root in
     /// the hoist tree, and the walker emits per-importer subtrees
-    /// under `<lockfile_dir>/<importer_id>/node_modules`. When
+    /// under each project's modules directory. When
     /// `false`, only the root importer's subtree is emitted (the
     /// hoister also skips adding the workspace children to its
     /// shared tree). Pacquet's `Config::hoist_workspace_packages`

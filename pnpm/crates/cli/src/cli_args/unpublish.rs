@@ -1,16 +1,16 @@
 use super::deprecate::{
-    DEPRECATION_ERROR_BODY_LIMIT, DeprecateContext, DeprecateError, PackageSpec,
-    auth_header_for_registry, fetch_package_meta, package_url, parse_package_spec,
-    registry_for_package, registry_operation_error, registry_operation_failed,
-    registry_write_error, write_error_for_status,
+    DEPRECATION_ERROR_BODY_LIMIT, DeprecateContext, DeprecateError, fetch_package_meta,
+    package_url, parse_package_spec, registry_for_package, registry_operation_error,
+    registry_operation_failed, registry_write_error, write_error_for_status,
 };
+use crate::cli_args::{package_spec::PackageSpec, registry_client::auth_header_for_package};
 use clap::Args;
 use derive_more::{Display, Error};
 use miette::Diagnostic;
 use mutation::{MutationContext, MutationRequest, send_mutation, web_auth_fetch_options};
 use node_semver::{Range, Version};
 use pnpm_config::Config;
-use pnpm_network::{read_limited_body, send_with_retry};
+use pnpm_network::{normalize_registry_url, read_limited_body, send_with_retry};
 use pnpm_network_web_auth::{
     Clock, EnterKeyListener, Host as WebAuthHost, OpenUrl, OtpChallenge, OtpError, OtpSession,
     PromptOtp, Sleep, StdinIsTty, StdoutIsTty, WebAuthFetch, WebAuthFetchOptions,
@@ -65,6 +65,17 @@ pub enum UnpublishError {
     ConfirmRequired {
         #[error(not(source))]
         package_name: String,
+        #[error(not(source))]
+        versions_list: String,
+    },
+
+    #[display(
+        "{spec} matches every published version ({versions_list}).\nRun pnpm unpublish \"{spec}\" --force to remove the whole package from the registry."
+    )]
+    #[diagnostic(code(ERR_PNPM_UNPUBLISH_CONFIRM))]
+    RangeMatchesEveryVersion {
+        #[error(not(source))]
+        spec: String,
         #[error(not(source))]
         versions_list: String,
     },
@@ -146,23 +157,20 @@ impl UnpublishArgs {
         &self,
         config: &Config,
     ) -> miette::Result<String> {
-        let context = DeprecateContext::new(config, self.registry.as_ref(), self.otp.clone())?;
+        let context = DeprecateContext::new(config, self.registry.as_deref(), self.otp.clone())?;
 
         let spec = self.params.first().ok_or(UnpublishError::PackageRequired)?;
-        let PackageSpec {
-            name: package_name,
-            version: version_range,
-        } = parse_package_spec(spec)?;
+        let spec = parse_package_spec(spec)?;
+        let package_name = &spec.name;
 
-        let registry_url = registry_for_package(&context, &package_name);
-        let auth_header = auth_header_for_registry(&context, &registry_url, &package_name);
-        let package_url = package_url(&package_name, &registry_url)?;
+        let registry_url = registry_for_package(&context, package_name);
+        let auth_header = auth_header_for_package(context.config, &registry_url, package_name);
+        let package_url = package_url(package_name, &registry_url)?;
 
         let pkg: Packument =
-            fetch_package_meta(&context, &package_url, auth_header.as_deref(), &package_name)
-                .await?;
+            fetch_package_meta(&context, &package_url, auth_header.as_deref(), package_name).await?;
         if pkg.versions.is_empty() {
-            return Err(DeprecateError::NoVersions { package_name }.into());
+            return Err(DeprecateError::NoVersions { package_name: package_name.clone() }.into());
         }
 
         let mut mutation = MutationContext {
@@ -172,24 +180,48 @@ impl UnpublishArgs {
             session: OtpSession::new(web_auth_fetch_options(config)),
         };
 
-        let Some(range) = version_range else {
-            return self.unpublish_all::<Sys, Reporter>(&mut mutation, &package_url, &pkg).await;
+        self.unpublish_range::<Sys, Reporter>(
+            &mut mutation,
+            &package_url,
+            &registry_url,
+            pkg,
+            &spec,
+        )
+        .await
+    }
+
+    /// Unpublish the versions `spec` names, or the whole package when it
+    /// names no version or its range matches every version.
+    async fn unpublish_range<Sys: UnpublishHost, Reporter: self::Reporter>(
+        &self,
+        mutation: &mut MutationContext<'_>,
+        package_url: &str,
+        registry_url: &str,
+        pkg: Packument,
+        spec: &PackageSpec,
+    ) -> miette::Result<String> {
+        let Some(range) = spec.version.as_deref() else {
+            return self.unpublish_all::<Sys, Reporter>(mutation, package_url, &pkg, None).await;
         };
 
-        let versions_to_unpublish = versions_matching_range(&pkg.versions, &range);
+        let versions_to_unpublish = versions_matching_range(&pkg.versions, range);
         if versions_to_unpublish.is_empty() {
-            return Err(DeprecateError::NoMatchingVersions { version_range: range }.into());
+            return Err(
+                DeprecateError::NoMatchingVersions { version_range: range.to_string() }.into()
+            );
         }
 
         // Removing every version is a full unpublish, protections included.
         if versions_to_unpublish.len() == pkg.versions.len() {
-            return self.unpublish_all::<Sys, Reporter>(&mut mutation, &package_url, &pkg).await;
+            let spec = format!("{}@{range}", spec.name);
+            return self.unpublish_all::<Sys, Reporter>(mutation, package_url, &pkg, Some(&spec))
+                .await;
         }
 
         unpublish_versions::<Sys, Reporter>(
-            &mut mutation,
-            &package_url,
-            &registry_url,
+            mutation,
+            package_url,
+            registry_url,
             pkg,
             &versions_to_unpublish,
         )
@@ -198,21 +230,30 @@ impl UnpublishArgs {
 
     /// Delete the whole packument (`DELETE <package>/-rev/<rev>`). Refused
     /// without `--force`; a 405 from the registry means the package may only
-    /// be deprecated, not removed.
+    /// be deprecated, not removed. `full_range_spec` is the user's spec when
+    /// its range matches every version.
     async fn unpublish_all<Sys: UnpublishHost, Reporter: self::Reporter>(
         &self,
         mutation: &mut MutationContext<'_>,
         package_url: &str,
         pkg: &Packument,
+        full_range_spec: Option<&str>,
     ) -> miette::Result<String> {
         if !self.force {
-            return Err(UnpublishError::ConfirmRequired {
-                package_name: pkg.name.clone(),
-                versions_list: pkg.versions
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", "),
+            let versions_list = pkg.versions
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(match full_range_spec {
+                None => UnpublishError::ConfirmRequired {
+                    package_name: pkg.name.clone(),
+                    versions_list,
+                },
+                Some(spec) => UnpublishError::RangeMatchesEveryVersion {
+                    spec: spec.to_string(),
+                    versions_list,
+                },
             }
             .into());
         }
@@ -269,15 +310,15 @@ async fn unpublish_versions<Sys: UnpublishHost, Reporter: self::Reporter>(
         return Err(registry_write_error(response, "unpublish".to_string()).await.into());
     }
 
-    let registry_origin = registry_origin(registry_url)?;
+    let registry_url = normalize_registry_url(registry_url);
     for tarball in &tarballs {
         // Every delete bumps the packument revision; refetch for the current
         // one like the TypeScript CLI does.
         let updated: Packument =
             fetch_package_meta(mutation.registry, package_url, mutation.auth_header, &pkg.name)
                 .await?;
-        let pathname = tarball_pathname(tarball, registry_url)?;
-        let url = format!("{registry_origin}/{pathname}/-rev/{}", rev_str(updated.rev.as_deref()));
+        let pathname = tarball_pathname(tarball, &registry_url)?;
+        let url = format!("{registry_url}{pathname}/-rev/{}", rev_str(updated.rev.as_deref()));
         let response = send_mutation::<Sys, Reporter>(
             mutation,
             MutationRequest { method: &Method::DELETE, url: &url, json_body: None },
@@ -364,22 +405,17 @@ fn highest_version(versions: &Map<String, Value>) -> Option<String> {
         .map(|(_, ver_str)| ver_str.clone())
 }
 
-/// The `scheme://host[:port]` origin of the registry, which tarball URLs
-/// are deleted relative to.
-fn registry_origin(registry_url: &str) -> miette::Result<String> {
-    reqwest::Url::parse(registry_url)
-        .map(|url| url.origin().ascii_serialization())
-        .map_err(|source| registry_operation_error("build registry URL", source))
-}
-
 /// The tarball's pathname with the registry's own path prefix stripped, so
 /// registries mounted under a path delete the right resource.
 fn tarball_pathname(tarball_url: &str, registry_url: &str) -> miette::Result<String> {
-    let registry_path = reqwest::Url::parse(registry_url)
+    let mut registry_path = reqwest::Url::parse(registry_url)
         .map_err(|source| registry_operation_error("build registry URL", source))?
         .path()
         .trim_start_matches('/')
         .to_string();
+    if !registry_path.is_empty() && !registry_path.ends_with('/') {
+        registry_path.push('/');
+    }
     let tarball_path = reqwest::Url::parse(tarball_url)
         .map_err(|source| registry_operation_error("build tarball URL", source))?
         .path()

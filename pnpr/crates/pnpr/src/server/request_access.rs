@@ -1,6 +1,6 @@
 use super::{
-    AppState, Config, HeaderMap, Identity, Next, Registry, RegistryError, Request, Response, State,
-    Upstream, authentication, header, identify,
+    AppState, Config, HeaderMap, Identity, Next, RegistryError, Request, Response, State, Upstream,
+    authentication, header, identify,
 };
 use axum::response::IntoResponse;
 
@@ -37,42 +37,8 @@ pub(super) fn authorized_upstream<'a>(
     state.inner.proxy.upstreams.get(upstream).ok_or_else(|| RegistryError::NotFound)
 }
 
-pub(super) fn authorized_revision_upstream<'a>(
-    state: &'a AppState,
-    identity: &Identity,
-    registry: &str,
-) -> Result<&'a Upstream, RegistryError> {
-    if !matches!(
-        state.inner.config.routing.registries.get(registry),
-        Some(Registry::Upstream { .. }),
-    ) {
-        return Err(RegistryError::NotFound);
-    }
-    let Some(config) = state.inner.config.routing.upstreams.get(registry) else {
-        return Err(RegistryError::NotFound);
-    };
-    if config.rules.refines_access() {
-        return Err(RegistryError::NotFound);
-    }
-    authorized_upstream(state, identity, registry)
-}
-
-pub(super) fn revision_registry_is_private(state: &AppState, registry: &str) -> bool {
-    state.inner.config.routing.upstreams
-        .get(registry)
-        .is_some_and(|config| config.access.is_some())
-}
-
-pub(super) fn revision_source_registry<'a>(
-    state: &'a AppState,
-    addressed_registry: &str,
-    source: &str,
-) -> Option<&'a str> {
-    if addressed_registry != source {
-        return None;
-    }
-    let config = state.inner.config.routing.upstreams.get(source)?;
-    (!config.rules.refines_access()).then_some(config.url.as_str())
+pub(super) fn revision_source_registry<'a>(state: &'a AppState, source: &str) -> Option<&'a str> {
+    state.inner.config.routing.upstreams.get(source).map(|config| config.url.as_str())
 }
 
 /// The disposable cache namespace for an upstream registry's `/~<name>/` route —
@@ -107,7 +73,10 @@ pub(super) fn upstream_cache_namespace(state: &AppState, upstream: &str) -> Stri
 /// is integrity-verified, so it uses a *stable* namespace
 /// (`~public/<digest-of-registry-name-and-url>`) that is shared across process
 /// restarts.
-pub(super) fn compute_upstream_cache_namespace(config: &Config, upstream: &str) -> String {
+pub(crate) fn compute_upstream_cache_namespace(config: &Config, upstream: &str) -> String {
+    let ecosystem = config.routing.registries.ecosystem(upstream).unwrap_or_default();
+    let local_name = pnpr_registry::Registries::local_name(upstream);
+    let canonical = format!("{ecosystem}/{local_name}");
     let url = config.routing.upstreams
         .get(upstream)
         .map_or("", |upstream_config| upstream_config.url.as_str());
@@ -124,13 +93,13 @@ pub(super) fn compute_upstream_cache_namespace(config: &Config, upstream: &str) 
             pnpr_route::headers_credential_digest(&upstream_config.headers),
         ));
         let digest =
-            pnpr_route::upstream_cache_digest(upstream, epoch, &config.resolution_cache_secret);
+            pnpr_route::upstream_cache_digest(&canonical, epoch, &config.resolution_cache_secret);
         return format!("~upstreams/{digest}");
     }
     // Public registry: a stable, secret-free namespace keyed by the registry name
     // and its origin URL (hashed so a path-unsafe value can't escape the
     // cache root).
-    format!("~public/{}", pnpr_route::credential_digest(&format!("{upstream}\0{url}")))
+    format!("~public/{}", pnpr_route::credential_digest(&format!("{canonical}\0{url}")))
 }
 
 /// Require that an endpoint's caller is authenticated, returning their
@@ -141,9 +110,29 @@ pub(super) fn compute_upstream_cache_namespace(config: &Config, upstream: &str) 
 pub(super) fn require_caller(identity: &Identity, resource: &str) -> Result<String, RegistryError> {
     match identity {
         Identity::User { username, .. } => Ok(username.clone()),
-        Identity::Anonymous => {
+        Identity::Anonymous | _ => {
             Err(RegistryError::Unauthenticated { resource: resource.to_string() })
         }
+    }
+}
+
+/// Require that an endpoint's caller is one of the `auth.admins`: 401 for an
+/// anonymous caller, 403 for anyone else. `action` and `resource` complete
+/// the 403 message.
+pub(super) fn require_admin(
+    state: &AppState,
+    identity: &Identity,
+    action: &'static str,
+    resource: String,
+) -> Result<(), RegistryError> {
+    if state.inner.config.identity.is_admin(identity) {
+        return Ok(());
+    }
+    match identity {
+        Identity::User { username, .. } => {
+            Err(RegistryError::Forbidden { user: username.clone(), action, resource })
+        }
+        Identity::Anonymous | _ => Err(RegistryError::Unauthenticated { resource }),
     }
 }
 
@@ -152,12 +141,20 @@ pub(super) async fn caller_username(
     headers: &HeaderMap,
 ) -> Result<Option<String>, RegistryError> {
     let authorization = single_authorization_header(headers)?;
-    if let Some(raw) = authorization.and_then(authentication::bearer_credentials)
-        && let Some(username) = state.inner.identity.oidc.session(raw)?
+    let username = match authorization.and_then(authentication::bearer_credentials) {
+        Some(raw) if let Some(user) = state.inner.identity.oidc.session(raw)? => {
+            Some(user.username)
+        }
+        _ => identify(authorization, state.inner.identity.auth.tokens.as_ref()).await?,
+    };
+    if let Some(username) = &username
+        && super::scim::is_deprovisioned(state, username)?
     {
-        return Ok(Some(username));
+        return Err(RegistryError::Unauthenticated {
+            resource: "a deprovisioned account".to_string(),
+        });
     }
-    identify(authorization, state.inner.identity.auth.tokens.as_ref()).await
+    Ok(username)
 }
 
 pub(super) async fn require_resolver_caller(
@@ -218,3 +215,6 @@ pub(super) fn single_authorization_header(
             reason: "Authorization header is not valid text".to_string(),
         })
 }
+
+#[cfg(test)]
+mod tests;

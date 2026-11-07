@@ -1,18 +1,28 @@
 pub mod package_configs;
 pub mod registries;
 pub use error::LoadWorkspaceYamlError;
+pub(crate) use includes::read_workspace_document;
+pub use machine::{MachineSettings, TrustedSettings};
+pub(crate) use parse_settings::parse_settings;
+pub use permissions::{
+    PackagePermissions, PermissionCapability, SkillsSettings, decided_permissions,
+};
+pub(crate) use readable::{read_readable_settings, select_settings};
+pub(crate) use sections::deserialize_tools;
 pub use sections::{
-    AllowBuild, AuditSettings, CargoSettings, PackageExtension, PeerDependencyMeta,
-    PeerDependencyRules, PnpmfileSetting, PythonSettings, RemoteSideEffectsCacheSettings,
-    SideEffectsCacheSetting, SideEffectsCacheSettings, TaskSettings, UpdateConfig, UpdateSettings,
+    AllowBuild, AuditSettings, CargoSettings, DEFAULT_CARGO_INDEX_URL, DEFAULT_PYPI_INDEX_URL,
+    DEFAULT_PYTHON_DOWNLOAD_URL, DEFAULT_RUST_DIST_SERVER, LockfileSetting, PackageExtension,
+    PeerDependencyMeta, PeerDependencyRules, PnpmfileSetting, PythonSettings, RemoteCacheSettings,
+    RemoteSideEffectsCacheSettings, SideEffectsCacheSetting, SideEffectsCacheSettings,
+    SkillsPermission, TaskSettings, Tool, ToolSettings, UpdateConfig, UpdateSettings,
     decided_allow_builds,
 };
-pub use settings::WorkspaceSettings;
+pub use settings::{MacosBackupSettings, NodePackageMapSettings, WorkspaceSettings};
 
 use crate::{
     AuditConfig, AuditLevel, CatalogMode, Config, HoistingLimits, InitType, LinkWorkspacePackages,
-    NodeLinker, NodePackageMapType, PackageImportMethod, PmOnFail, ResolutionMode, RuntimeOnFail,
-    SaveWorkspaceProtocol, ScriptsPrependNodePath, TrustPolicy, VerifyDepsBeforeRun,
+    NodeLinkerSetting, NodePackageMapMode, NodePackageMapType, PackageImportMethod, PmOnFail,
+    ResolutionMode, RuntimeOnFail, SaveWorkspaceProtocol, TrustPolicy, VerifyDepsBeforeRun,
     VirtualStoreType,
     api::{EnvVar, GetCurrentDir, GetHomeDir, LinkProbe},
     config_types::is_config_file_key,
@@ -26,16 +36,15 @@ use derive_more::{Display, Error};
 use indexmap::IndexMap;
 use miette::Diagnostic;
 use package_configs::PackageConfigsSetting;
-use pipe_trait::Pipe;
-use pnpm_env_replace::env_replace_lossy;
+use pnpm_env_replace::{SystemEnv, env_replace_lossy, placeholder_ranges};
 use pnpm_network::redact_and_sanitize;
 use pnpm_package_is_installable::SupportedArchitectures;
-use pnpm_store_dir::StoreDir;
+use pnpm_store_dir::{StoreDir, StoreIndexFormat};
 use pnpm_workspace_state::ConfigDependency;
 use registries::RegistryEntry;
 use serde::{Deserialize, Deserializer, de::IgnoredAny};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
     io::{self, ErrorKind},
     path::{Path, PathBuf},
@@ -43,13 +52,18 @@ use std::{
 
 /// The keys of a project's `pnpm-workspace.yaml` that set nothing, bucketed
 /// by why: refused values a project may not contribute, keys naming no
-/// setting any supported pnpm reads, and kebab-case spellings of keys pnpm
-/// only reads in camelCase.
+/// setting any supported pnpm reads, kebab-case spellings of keys pnpm only
+/// reads in camelCase, and the `tasks` entries' fields no supported pnpm
+/// reads.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct WorkspaceKeyIssues {
     pub refused: Vec<String>,
     pub unrecognized: Vec<String>,
     pub non_camel_case: Vec<String>,
+    pub unrecognized_task_settings: UnrecognizedSettings,
+    /// `permissions` capabilities no supported pnpm reads, e.g.
+    /// `permissions['esbuild'].mcp`.
+    pub unrecognized_permissions: UnrecognizedSettings,
 }
 
 impl WorkspaceKeyIssues {
@@ -58,8 +72,26 @@ impl WorkspaceKeyIssues {
         self.refused.is_empty()
             && self.unrecognized.is_empty()
             && self.non_camel_case.is_empty()
+            && self.unrecognized_task_settings.total == 0
+            && self.unrecognized_permissions.total == 0
     }
 }
+
+/// Nested settings no supported pnpm reads: the paths that name them, e.g.
+/// `tasks['build'].dependson`, and how many there are.
+///
+/// Every path repeats the name of the entry it belongs to, so a file naming
+/// one long entry and many fields renders far more text than it contains.
+/// Only the first [`NAMED_UNRECOGNIZED_SETTINGS`] are rendered, which
+/// bounds the report by itself rather than by the file.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct UnrecognizedSettings {
+    pub named: Vec<String>,
+    pub total: usize,
+}
+
+/// How many unrecognized settings a report names one by one.
+pub const NAMED_UNRECOGNIZED_SETTINGS: usize = 10;
 
 /// Basename of the file pnpm reads; exported for test use.
 pub const WORKSPACE_MANIFEST_FILENAME: &str = "pnpm-workspace.yaml";
@@ -75,6 +107,28 @@ fn overlay<Setting>(target: &mut Setting, value: Option<Setting>) {
     }
 }
 
+/// [`overlay`] for the tools, which every layer answers for separately.
+///
+/// The tools are independent of one another, so a workspace naming a Bun
+/// mirror has said nothing about Node.js and must not drop the one the
+/// machine's own config names. The same holds a level down: a layer that
+/// names a tool's release channels has not said where the rest of its
+/// builds come from.
+fn overlay_tools(
+    target: &mut BTreeMap<Tool, ToolSettings>,
+    value: Option<BTreeMap<Tool, ToolSettings>>,
+) {
+    for (tool, named) in value.into_iter().flatten() {
+        let settings = target.entry(tool).or_default();
+        overlay_some(&mut settings.mirror, named.mirror);
+        match (&mut settings.channels, named.channels) {
+            (Some(channels), Some(named)) => channels.extend(named),
+            (channels @ None, named @ Some(_)) => *channels = named,
+            (_, None) => {}
+        }
+    }
+}
+
 /// [`overlay`] for a target that is itself optional: an unset field leaves
 /// whatever the previous layer recorded, including its absence.
 fn overlay_some<Setting>(target: &mut Option<Setting>, value: Option<Setting>) {
@@ -83,7 +137,7 @@ fn overlay_some<Setting>(target: &mut Option<Setting>, value: Option<Setting>) {
     }
 }
 
-/// The dropped keys of a global `config.yaml`, in the four buckets its
+/// The dropped keys of a global `config.yaml`, in the buckets its
 /// warnings report.
 #[derive(Default)]
 struct DroppedKeys {
@@ -163,16 +217,15 @@ impl DroppedKeys {
 macro_rules! identically_named_settings {
     ($mac:ident) => {
         $mac! {
-            bail, ci, update_notifier, color, embed_readme, ignore_workspace_root_check,
+            bail, progress, update_notifier, color, embed_readme, ignore_workspace_root_check,
             optional, package_lock, pending, recursive_install, reverse,
             stream, aggregate_output, use_stderr, ignore_workspace, shell_emulator,
             skip_manifest_obfuscation, sort, use_beta_cli,
             hoist, shamefully_hoist,
-            node_linker, node_experimental_package_map, node_package_map_type,
             symlink, package_import_method, modules_cache_max_age,
             virtual_store_dir_max_length,
             peers_suffix_max_length,
-            lockfile, prefer_frozen_lockfile,
+            prefer_frozen_lockfile,
             deploy_all_files, force_legacy_deploy, shared_workspace_lockfile,
             merge_git_branch_lockfiles, merge_git_branch_lockfiles_branch_pattern,
             offline, prefer_offline,
@@ -185,12 +238,13 @@ macro_rules! identically_named_settings {
             hoist_workspace_packages,
             extend_node_path,
             hoisting_limits, external_dependencies,
-            dedupe_peer_dependents, dedupe_peers,
+            dedupe_peer_dependents, dedupe_peers, auto_dedupe,
             dedupe_direct_deps, dedupe_injected_deps,
-            strict_peer_dependencies, ignore_compatibility_db,
-            resolve_peers_from_workspace_root, verify_store_integrity,
-            strict_store_pkg_content_check, frozen_store,
-            include_workspace_root,
+            strict_peer_dependencies, ignore_compatibility_db, add_missing_peer_types,
+            resolve_peers_from_workspace_root, project_scoped_optional_peers,
+            verify_store_integrity,
+            strict_store_pkg_content_check, frozen_store, store_index_format,
+            include_workspace_root, fail_if_no_match,
             ignore_workspace_cycles, disallow_workspace_cycles,
             verify_deps_before_run,
             block_exotic_subdeps,
@@ -202,14 +256,16 @@ macro_rules! identically_named_settings {
             fetch_retries, fetch_retry_factor,
             fetch_retry_mintimeout, fetch_retry_maxtimeout,
             network_concurrency, fetch_timeout,
-            fetch_warn_timeout_ms, fetch_min_speed_ki_bps, user_agent,
+            fetch_warn_timeout_ms, fetch_min_speed_ki_bps, max_tarball_unpacked_size, user_agent,
+            tag_version_prefix,
+            publish_wait_timeout,
             enable_global_virtual_store,
             virtual_store_only, enable_modules_dir,
             git_shallow_hosts,
             test_pattern, changed_files_ignore_pattern, legacy_dir_filtering,
-            sync_injected_deps_after_scripts,
+            sync_injected_deps_after_scripts, required_scripts,
             resolution_mode, catalog_mode, catalog_prune,
-            minimum_release_age_exclude_prune, save_peer, save_exact,
+            minimum_release_age_exclude_prune, save_peer, save_exact, save_types,
             registry_supports_time_field,
             allowed_deprecated_versions, update_config, peer_dependency_rules,
             enable_pre_post_scripts, dlx_cache_max_age,
@@ -244,18 +300,22 @@ fn global_shims_setting(config: &Config) -> crate::GlobalShimsSetting {
 }
 
 /// Reads and writes as resolved, in the boolean shorthand when they agree
-/// and no remote cache is configured. That is the shape pnpm reports and
-/// the one a hook is likeliest to assign.
+/// and neither a remote cache nor an exclude list is configured. That is
+/// the shape pnpm reports and the one a hook is likeliest to assign.
 fn side_effects_cache_setting(config: &Config) -> SideEffectsCacheSetting {
     let read = config.side_effects_cache_read();
     let write = config.side_effects_cache_write();
-    if read == write && config.remote_side_effects_cache.is_none() {
+    if read == write
+        && config.remote_side_effects_cache.is_none()
+        && config.side_effects_cache_exclude.is_none()
+    {
         SideEffectsCacheSetting::Enabled(read)
     } else {
         SideEffectsCacheSetting::Settings(Box::new(SideEffectsCacheSettings {
             read: Some(read),
             write: Some(write),
             remote: config.remote_side_effects_cache.clone(),
+            exclude: config.side_effects_cache_exclude.clone(),
         }))
     }
 }
@@ -329,6 +389,18 @@ pub fn workspace_root_or(start: &Path) -> PathBuf {
         .unwrap_or_else(|| start.to_path_buf())
 }
 
+/// The camelCase field names of a settings struct, read off its serde
+/// serialization of `default`, which writes every unset field as null.
+pub(crate) fn serialized_field_keys(default: &impl serde::Serialize) -> HashSet<String> {
+    match serde_json::to_value(default) {
+        Ok(serde_json::Value::Object(fields)) => fields
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect(),
+        _ => HashSet::new(),
+    }
+}
+
 fn path(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
@@ -351,15 +423,18 @@ mod sections;
 
 mod validation;
 
+mod permissions;
+
 mod workspace_scope;
 
 mod env;
+use env::expand_home_prefix;
 
 mod environment_values;
 use environment_values::{
-    has_env_placeholder, no_proxy_scalar, normalize_registry_url, substitute_json_string,
-    substitute_optional_inner_string, substitute_optional_string, substitute_optional_string_map,
-    substitute_registry_entries,
+    Placeholder, drop_placeholders, has_env_placeholder, no_proxy_scalar, resolvable_placeholders,
+    resolve_placeholders, substitute_json_string, substitute_optional_inner_string,
+    substitute_optional_string, substitute_optional_string_map, substitute_registry_entries,
 };
 
 mod apply;
@@ -369,6 +444,16 @@ mod resolved;
 mod reset;
 
 mod settings;
+
+mod machine;
+
+mod parse_settings;
+
+mod includes;
+
+mod global;
+
+mod readable;
 
 mod error;
 

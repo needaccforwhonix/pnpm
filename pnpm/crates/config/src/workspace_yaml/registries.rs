@@ -6,11 +6,18 @@
 //! the routes, because a scope resolves to exactly one registry while a
 //! registry serves many.
 
+pub use python::{EcosystemIndex, PythonRegistryRoute};
+
+pub use ecosystems::{Ecosystem, serves_another_ecosystem, take_roles_from_earlier_layers};
+
+pub use env_placeholders::{refuse_env_placeholder_entries, retain_without_env_placeholders};
+
 use super::LoadWorkspaceYamlError;
-use crate::workspace_yaml::{
-    normalize_registry_url, redact_registry_url, registry_url_has_userinfo,
-};
+use crate::workspace_yaml::{redact_registry_url, registry_url_has_userinfo};
+use ecosystems::DeclaredIndexes;
+use indexmap::IndexMap;
 use pnpm_lockfile::{RegistryOptions, RegistryServerType};
+use pnpm_network::normalize_registry_url;
 use serde::{
     Deserialize, Deserializer,
     de::{MapAccess, Visitor, value::MapAccessDeserializer},
@@ -18,6 +25,7 @@ use serde::{
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
+    num::NonZeroUsize,
 };
 
 /// The bare scope standing for the registry that packages resolve from when
@@ -65,19 +73,63 @@ pub struct RegistryDeclaration {
     /// See [`RegistryOptions::supports_time_field`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_time_field: Option<bool>,
+    /// The most requests pnpm keeps in flight to this registry's origin, within
+    /// the overall `networkConcurrency`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_concurrency: Option<NonZeroUsize>,
     /// The scopes routed here, `@`-prefixed. A bare `@` is the scope-less
     /// default registry, the one the `registry` setting names.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scopes: Option<Vec<String>>,
-    /// The bare-specifier prefix this registry answers to, as in
-    /// `"foo": "work:^1.0.0"`.
+    #[serde(flatten)]
+    pub prefixes: RegistryPrefixes,
+    /// Which ecosystem's packages this registry serves. Absent is
+    /// [`Ecosystem::Npm`], so every entry written before there was anything
+    /// else to serve means what it did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prefix: Option<String>,
+    pub ecosystem: Option<Ecosystem>,
+    /// Python package names or trailing-prefix patterns routed exclusively here.
+    /// Omitted, or `*`, declares the default Python index.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packages: Option<Vec<String>>,
     #[serde(flatten)]
     pub unknown: BTreeMap<String, serde_json::Value>,
 }
 
 impl Eq for RegistryDeclaration {}
+
+/// The bare-specifier prefixes that address a registry.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
+pub struct RegistryPrefixes {
+    /// The bare-specifier prefix this registry answers to, as in
+    /// `"foo": "work:^1.0.0"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    /// The other prefixes routed to this registry. A pnpr request carries
+    /// them, `pnpm-workspace.yaml` refuses them: the request names every
+    /// prefix the client resolves, while `prefix` holds the smallest, the one
+    /// lockfile keys carry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+}
+
+impl RegistryPrefixes {
+    fn iter(&self) -> impl Iterator<Item = &str> {
+        self.prefix
+            .as_deref()
+            .into_iter()
+            .chain(self.aliases.iter().map(String::as_str))
+    }
+}
+
+impl RegistryDeclaration {
+    /// The ecosystem this entry serves, with the absent field read as
+    /// [`Ecosystem::Npm`].
+    #[must_use]
+    pub fn ecosystem(&self) -> Ecosystem {
+        self.ecosystem.unwrap_or_default()
+    }
+}
 
 impl<'de> Deserialize<'de> for RegistryEntry {
     fn deserialize<Deser: Deserializer<'de>>(deserializer: Deser) -> Result<Self, Deser::Error> {
@@ -107,7 +159,7 @@ impl<'de> Visitor<'de> for RegistryEntryVisitor {
     }
 }
 
-/// The three lookups the rest of pnpm reads, split out of the declarations.
+/// The lookups the rest of pnpm reads, split out of the declarations.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct RegistryLookups {
     /// Scope-routed URLs, `@`-prefixed and normalized.
@@ -120,6 +172,11 @@ pub struct RegistryLookups {
     /// verifies against.
     pub registries_by_prefix: BTreeMap<String, String>,
     pub registry_options_by_url: BTreeMap<String, RegistryOptions>,
+    /// Ecosystem indexes and their exclusive Python package routes.
+    pub indexes_by_ecosystem: BTreeMap<Ecosystem, Vec<EcosystemIndex>>,
+    /// Per-registry request caps, keyed by normalized registry URL. A cap is
+    /// about the server's origin, so it applies to an index of any ecosystem.
+    pub network_concurrency_by_registry: BTreeMap<String, NonZeroUsize>,
 }
 
 /// The scopes `entries` routes, `@`-prefixed, with the bare `@` among them
@@ -131,7 +188,7 @@ pub struct RegistryLookups {
 /// declaration, and the older `default:` key that [`into_lookups`] reads as
 /// the same thing.
 #[must_use]
-pub fn routed_scopes(entries: &BTreeMap<String, RegistryEntry>) -> BTreeSet<String> {
+pub fn routed_scopes(entries: &IndexMap<String, RegistryEntry>) -> BTreeSet<String> {
     entries
         .iter()
         .flat_map(|(key, entry)| match entry {
@@ -148,7 +205,7 @@ pub fn routed_scopes(entries: &BTreeMap<String, RegistryEntry>) -> BTreeSet<Stri
 
 /// Reject a `registries` map pnpm would otherwise read as something other
 /// than what it says.
-pub fn validate(entries: &BTreeMap<String, RegistryEntry>) -> Result<(), LoadWorkspaceYamlError> {
+pub fn validate(entries: &IndexMap<String, RegistryEntry>) -> Result<(), LoadWorkspaceYamlError> {
     let scope_routes: Vec<&String> = entries
         .iter()
         .filter(|(_, entry)| matches!(entry, RegistryEntry::ScopeRoute(_)))
@@ -173,14 +230,22 @@ pub fn validate(entries: &BTreeMap<String, RegistryEntry>) -> Result<(), LoadWor
         });
     }
 
-    validate_declarations(
-        entries
-            .iter()
-            .filter_map(|(registry, entry)| match entry {
-                RegistryEntry::Declaration(declaration) => Some((registry, declaration)),
-                RegistryEntry::ScopeRoute(_) => None,
-            }),
-    )
+    let declarations = entries
+        .iter()
+        .filter_map(|(registry, entry)| match entry {
+            RegistryEntry::Declaration(declaration) => Some((registry, declaration)),
+            RegistryEntry::ScopeRoute(_) => None,
+        });
+    if let Some((registry, _)) = declarations
+        .clone()
+        .find(|(_, declaration)| !declaration.prefixes.aliases.is_empty())
+    {
+        return Err(LoadWorkspaceYamlError::UnknownRegistryDeclarationField {
+            registry: redact_registry_url(registry),
+            field: "aliases".to_owned(),
+        });
+    }
+    validate_declarations(declarations)
 }
 
 /// The per-declaration half of [`validate`], over declarations alone.
@@ -193,17 +258,21 @@ pub fn validate_declarations<'a>(
 ) -> Result<(), LoadWorkspaceYamlError> {
     let mut routed_scopes: BTreeMap<&'a str, String> = BTreeMap::new();
     let mut declared_prefixes: BTreeSet<&'a str> = BTreeSet::new();
+    let mut indexes = DeclaredIndexes::default();
     for (registry, declaration) in entries {
         validate_declaration_fields(registry, declaration)?;
+        indexes.add(registry, declaration)?;
         let normalized = normalize_registry_url(registry);
         validate_scopes(registry, declaration, &normalized, &mut routed_scopes)?;
-        if let Some(prefix) = declaration.prefix.as_deref()
-            && !declared_prefixes.insert(prefix)
-        {
-            return Err(LoadWorkspaceYamlError::PrefixDeclaredTwice { prefix: prefix.to_owned() });
+        for prefix in declaration.prefixes.iter() {
+            if !declared_prefixes.insert(prefix) {
+                return Err(LoadWorkspaceYamlError::PrefixDeclaredTwice {
+                    prefix: prefix.to_owned(),
+                });
+            }
         }
     }
-    Ok(())
+    indexes.finish()
 }
 
 /// The declaration's own fields: it carries no credential, in a field or in
@@ -268,13 +337,13 @@ fn validate_scopes<'a>(
 /// Split validated declarations into the lookups. Infallible: every rejection
 /// happens in [`validate`], at load time, where the offending file is known.
 #[must_use]
-pub fn into_lookups(entries: BTreeMap<String, RegistryEntry>) -> RegistryLookups {
+pub fn into_lookups(entries: IndexMap<String, RegistryEntry>) -> RegistryLookups {
     let mut lookups = RegistryLookups::default();
-    let mut declarations = BTreeMap::new();
+    let mut declarations = IndexMap::new();
     for (registry, entry) in entries {
         match entry {
             RegistryEntry::ScopeRoute(url) => {
-                let url = normalize_registry_url(&url);
+                let url = normalize_registry_url(&url).into_owned();
                 if registry == "default" {
                     lookups.default_registry = Some(url);
                 } else {
@@ -294,7 +363,7 @@ pub fn into_lookups(entries: BTreeMap<String, RegistryEntry>) -> RegistryLookups
 /// `registries` map is always keyed by URL.
 #[must_use]
 pub fn declarations_into_lookups(
-    entries: BTreeMap<String, RegistryDeclaration>,
+    entries: IndexMap<String, RegistryDeclaration>,
 ) -> RegistryLookups {
     let mut lookups = RegistryLookups::default();
     extend_lookups_with_declarations(&mut lookups, entries);
@@ -303,21 +372,43 @@ pub fn declarations_into_lookups(
 
 fn extend_lookups_with_declarations(
     lookups: &mut RegistryLookups,
-    entries: BTreeMap<String, RegistryDeclaration>,
+    entries: IndexMap<String, RegistryDeclaration>,
 ) {
     for (registry, declaration) in entries {
-        let normalized = normalize_registry_url(&registry);
-        extend_registry_options(lookups, &normalized, &declaration);
-        for scope in declaration.scopes.into_iter().flatten() {
-            if scope == DEFAULT_REGISTRY_SCOPE {
-                lookups.default_registry = Some(normalized.clone());
-            } else {
-                lookups.registries_by_scope.insert(scope, normalized.clone());
-            }
+        let normalized = normalize_registry_url(&registry).into_owned();
+        if let Some(limit) = declaration.network_concurrency {
+            lookups.network_concurrency_by_registry
+                .entry(normalized.clone())
+                .and_modify(|smallest| *smallest = (*smallest).min(limit))
+                .or_insert(limit);
         }
-        if let Some(prefix) = declaration.prefix {
-            lookups.registries_by_prefix.insert(prefix, registry);
+        if !ecosystems::collect_index(&mut lookups.indexes_by_ecosystem, &normalized, &declaration)
+        {
+            extend_npm_routes(lookups, &registry, &normalized, declaration);
         }
+    }
+}
+
+/// The routes and server facts an npm registry declares: which scopes reach
+/// it, which bare-specifier prefix addresses it, and how it lays out tarball
+/// URLs. No other ecosystem has them, which is why an entry that names one is
+/// refused rather than read here.
+fn extend_npm_routes(
+    lookups: &mut RegistryLookups,
+    registry: &str,
+    normalized: &str,
+    declaration: RegistryDeclaration,
+) {
+    extend_registry_options(lookups, normalized, &declaration);
+    for scope in declaration.scopes.into_iter().flatten() {
+        if scope == DEFAULT_REGISTRY_SCOPE {
+            lookups.default_registry = Some(normalized.to_owned());
+        } else {
+            lookups.registries_by_scope.insert(scope, normalized.to_owned());
+        }
+    }
+    for prefix in declaration.prefixes.prefix.into_iter().chain(declaration.prefixes.aliases) {
+        lookups.registries_by_prefix.insert(prefix, registry.to_owned());
     }
 }
 
@@ -351,8 +442,8 @@ fn extend_registry_options(
 /// one, so a registry a prefix addresses without a trailing slash stays the
 /// URL the client resolves against.
 #[must_use]
-pub fn to_declarations(lookups: &RegistryLookups) -> BTreeMap<String, RegistryDeclaration> {
-    let mut declarations: BTreeMap<String, RegistryDeclaration> = BTreeMap::new();
+pub fn to_declarations(lookups: &RegistryLookups) -> IndexMap<String, RegistryDeclaration> {
+    let mut declarations: IndexMap<String, RegistryDeclaration> = IndexMap::new();
     for (scope, registry) in &lookups.registries_by_scope {
         if scope == "default" {
             continue;
@@ -365,24 +456,52 @@ pub fn to_declarations(lookups: &RegistryLookups) -> BTreeMap<String, RegistryDe
             .push(scope.clone());
     }
     for (prefix, registry) in &lookups.registries_by_prefix {
-        declarations.entry(registry.clone()).or_default().prefix = Some(prefix.clone());
+        // The map yields the smallest prefix first: the one the registry's
+        // lockfile keys carry.
+        let prefixes = &mut declarations.entry(registry.clone()).or_default().prefixes;
+        if prefixes.prefix.is_none() {
+            prefixes.prefix = Some(prefix.clone());
+        } else {
+            prefixes.aliases.push(prefix.clone());
+        }
     }
     for (registry, options) in &lookups.registry_options_by_url {
         let declaration = declarations.entry(registry.clone()).or_default();
         declaration.server_type = options.server_type;
         declaration.supports_time_field = options.supports_time_field;
     }
+    ecosystems::extend_with_indexes(&mut declarations, &lookups.indexes_by_ecosystem);
     declarations
 }
 
 /// [`to_declarations`] plus the default registry declared as the bare `@`
-/// scope — the resolved view `pnpm config get registries` prints, where
-/// nothing travels separately.
+/// scope and each registry's `networkConcurrency` — the resolved view
+/// `pnpm config get registries` prints, where nothing travels separately.
+/// A pnpr server receives neither: it does not make the client's requests.
 #[must_use]
 pub fn to_resolved_declarations(
     lookups: &RegistryLookups,
-) -> BTreeMap<String, RegistryDeclaration> {
+) -> IndexMap<String, RegistryDeclaration> {
     let mut declarations = to_declarations(lookups);
+    // A prefix route keeps the URL as written, so one registry can appear
+    // both with and without the trailing slash the cap's key carries. Each
+    // spelling gets the cap.
+    let mut declared_keys: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for declared in declarations.keys() {
+        declared_keys
+            .entry(normalize_registry_url(declared).into_owned())
+            .or_default()
+            .push(declared.clone());
+    }
+    for (registry, limit) in &lookups.network_concurrency_by_registry {
+        let keys = declared_keys
+            .get(registry)
+            .cloned()
+            .unwrap_or_else(|| vec![registry.clone()]);
+        for key in keys {
+            declarations.entry(key).or_default().network_concurrency = Some(*limit);
+        }
+    }
     if let Some(default_registry) = &lookups.default_registry {
         declarations
             .entry(default_registry.clone())
@@ -394,27 +513,18 @@ pub fn to_resolved_declarations(
     declarations
 }
 
-/// Drop the entries whose request destination carries an unexpanded `${VAR}`.
-/// The destination is the value of a scope route and the key of a
-/// declaration, so which half is gated follows the entry's shape.
-pub fn retain_without_env_placeholders(
-    entries: &mut BTreeMap<String, RegistryEntry>,
-    has_env_placeholder: impl Fn(&str) -> bool,
-) {
-    entries.retain(|registry, entry| match entry {
-        RegistryEntry::ScopeRoute(url) => !has_env_placeholder(url),
-        RegistryEntry::Declaration(_) => !has_env_placeholder(registry),
-    });
-}
-
 fn looks_like_registry_url(key: &str) -> bool {
     key.contains("://") || key.starts_with("//")
 }
 
-fn quote_and_join<'a>(values: impl IntoIterator<Item = &'a str>) -> String {
+pub(super) fn quote_and_join<'a>(values: impl IntoIterator<Item = &'a str>) -> String {
     values
         .into_iter()
         .map(|value| format!("{value:?}"))
         .collect::<Vec<_>>()
         .join(", ")
 }
+
+mod ecosystems;
+mod env_placeholders;
+mod python;

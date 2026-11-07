@@ -1,20 +1,24 @@
 use super::{
     BTreeMap, BTreeSet, CmdShimHost, Config, Context, GlobalError, GlobalPackageBinSnapshot,
     GlobalShims, HashMap, HashSet, IntoDiagnostic, LinkBinsOptions, PackageBinSource, Path,
-    ShimTarget, choose_bins, get_installed_bin_names, install_native_shim,
-    link_bins_of_packages_with_excludes, migrate_legacy_shims, read_installed_packages,
-    record_package_manager_shims, remove_native_shim, scan_global_packages,
-    virtual_shim_bins_to_restore, virtual_shim_owner, virtual_shim_restoration_owners,
+    ShimTarget, choose_bins, get_installed_bin_names, install::group_install_state_dir,
+    install_native_shim, link_bins_of_packages_with_excludes, migrate_legacy_shims,
+    read_installed_packages, record_package_manager_shims, remove_native_shim,
+    scan_global_packages, virtual_shim_bins_to_restore, virtual_shim_owner,
+    virtual_shim_restoration_owners,
 };
+use pnpm_deps_restorer::hoisted_node_paths;
+use pnpm_tool_protocol::is_tool_specifier;
 
 /// Link `pkgs`' bins into the global bin dir in the shape selected by the
 /// `globalShims` record: bins of an enabled providing package become
 /// context-aware shims, everything else gets direct shims. The runtime
-/// names only count when actually installed through the `runtime:`
-/// protocol, so an npm package that happens to be called `node` is not
+/// names only count when actually installed through the `tool:` /
+/// `runtime:` protocol, so an npm package that happens to be called `node` is not
 /// elevated.
 pub(super) fn link_global_bins(
     config: &Config,
+    hash_link: &Path,
     pkgs: &[PackageBinSource],
     dependencies: &[(String, String)],
     global_bin_dir: &Path,
@@ -41,7 +45,7 @@ pub(super) fn link_global_bins(
                     && (!pnpm_package_manifest::is_runtime_alias(name)
                         || dependencies
                             .iter()
-                            .any(|(alias, spec)| alias == name && spec.starts_with("runtime:")))
+                            .any(|(alias, spec)| alias == name && is_tool_specifier(spec)))
             })
         });
     migrate_legacy_shims(global_bin_dir).into_diagnostic().wrap_err("migrate the global shims")?;
@@ -58,7 +62,7 @@ pub(super) fn link_global_bins(
             &direct,
             global_bin_dir,
             bins_to_skip,
-            &LinkBinsOptions::default(),
+            &direct_shim_options(config, hash_link),
         )
         .map_err(miette::Report::new)
         .wrap_err("link direct global package bins")?;
@@ -69,6 +73,20 @@ pub(super) fn link_global_bins(
             .wrap_err_with(|| format!("install the {} shim", command.name))?;
     }
     Ok(())
+}
+
+/// Direct shims put the group's hidden hoisted modules dir on `NODE_PATH`,
+/// addressed through `hash_link` like the shim targets. A package in the
+/// global virtual store cannot reach that dir by walking up.
+fn direct_shim_options(config: &Config, hash_link: &Path) -> LinkBinsOptions {
+    LinkBinsOptions {
+        extra_node_paths: hoisted_node_paths(
+            config,
+            config.node_linker,
+            &group_install_state_dir(hash_link),
+        ),
+        ..LinkBinsOptions::default()
+    }
 }
 
 pub(super) fn unprotected_bin_names(
@@ -234,19 +252,25 @@ pub(super) fn restore_virtual_shims(
     Ok(())
 }
 
-/// The set of bin names provided by global package groups other than those
+/// The relevant bin names provided by global package groups other than those
 /// in `exclude_hashes`.
 pub(super) fn bin_names_of_other_groups(
     global_pkg_dir: &Path,
     exclude_hashes: &HashSet<String>,
+    bin_names_to_protect: &HashSet<String>,
 ) -> miette::Result<HashSet<String>> {
+    if bin_names_to_protect.is_empty() {
+        return Ok(HashSet::new());
+    }
     let mut names = HashSet::new();
     for pkg in scan_global_packages(global_pkg_dir).into_diagnostic()? {
         if exclude_hashes.contains(&pkg.hash) {
             continue;
         }
         for bin in get_installed_bin_names(&pkg).map_err(miette::Report::new)? {
-            names.insert(bin);
+            if bin_names_to_protect.contains(&bin) {
+                names.insert(bin);
+            }
         }
     }
     Ok(names)

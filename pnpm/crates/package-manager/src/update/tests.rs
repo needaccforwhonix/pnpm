@@ -1,6 +1,7 @@
 use super::{
-    UpdateError, UpdateOptions, UpdateResources, is_workspace_local_path_specifier,
-    prepare_selected_manifests, reject_versions_of_indirect_update_specs, selected_project_indices,
+    UpdateError, UpdateExplicitGroups, UpdateOptions, UpdateResources,
+    is_workspace_local_path_specifier, prepare_selected_manifests,
+    reject_versions_of_indirect_update_specs, selected_project_indices,
 };
 use crate::update::{
     install::persistence::{apply_bumped_manifest_specs, persist_selected_manifests},
@@ -14,7 +15,7 @@ use pnpm_package_manifest::{DependencyGroup, PackageManifest};
 use pnpm_reporter::SilentReporter;
 use pnpm_workspace::Project;
 use serde_json::json;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use tempfile::tempdir;
 
 /// The update inputs a manifest-preparation test varies, over a leaked
@@ -30,14 +31,19 @@ fn test_update(
             resolved_packages: Box::leak(Box::new(super::ResolvedPackages::default())),
             http_client: Box::leak(Box::new(pnpm_network::ThrottledClient::default())),
             config: Box::leak(Box::new(config)),
-            lockfile: None,
-            lockfile_path: None,
+            lockfile: crate::CommandLockfile::loaded(None, None),
             lockfile_only: false,
-            selection: crate::UpdateSelection { packages, depth: 0, workspace_packages: None },
+            selection: crate::UpdateSelection {
+                packages,
+                depth: 0,
+                workspace_packages: None,
+                interactive: false,
+                targets: None,
+            },
             version: crate::UpdateVersionOptions {
                 latest,
                 patches: false,
-                save_exact: false,
+                range_spec_style: pnpm_registry::RangeSpecStyle::Major,
                 save,
             },
         },
@@ -45,6 +51,7 @@ fn test_update(
             tarball_mem_cache: std::sync::Arc::new(pnpm_tarball::MemCache::default()),
             http_client_arc: std::sync::Arc::new(pnpm_network::ThrottledClient::default()),
             include_direct: vec![DependencyGroup::Prod],
+            explicit_groups: UpdateExplicitGroups::default(),
             supported_architectures: None,
             resolution_observer: None,
         },
@@ -156,16 +163,87 @@ fn a_requested_version_is_recorded_under_the_declared_operator() {
         ("workspace:^", "100.1.0"),
     ] {
         assert_eq!(
-            requested_version_rewrite("100.1.0", previous, RangeSpecStyle::Major),
+            requested_version_rewrite("dep", "100.1.0", previous, RangeSpecStyle::Major),
             expected,
             "rewrite over {previous}",
         );
     }
     assert_eq!(
-        requested_version_rewrite("^100.1.0", "~100.0.0", RangeSpecStyle::Major),
+        requested_version_rewrite("dep", "^100.1.0", "~100.0.0", RangeSpecStyle::Major),
         "^100.1.0",
     );
-    assert_eq!(requested_version_rewrite("next", "^100.0.0", RangeSpecStyle::Major), "next");
+    assert_eq!(requested_version_rewrite("dep", "next", "^100.0.0", RangeSpecStyle::Major), "next");
+}
+
+#[test]
+fn a_requested_version_on_a_node_runtime_declaration_uses_the_runtime_rule() {
+    use pnpm_registry::RangeSpecStyle;
+
+    for (previous, expected) in [
+        ("runtime:^26.8.2", "runtime:^26.9.0"),
+        ("runtime:26.8.2", "runtime:26.9.0"),
+        ("runtime:unknown/^26.8.2", "runtime:unknown/^26.8.2"),
+    ] {
+        assert_eq!(
+            requested_version_rewrite("node", "26.9.0", previous, RangeSpecStyle::Major),
+            expected,
+            "rewrite over {previous}",
+        );
+    }
+    assert_eq!(
+        requested_version_rewrite(
+            "node",
+            "24.0.0-rc.4",
+            "runtime:rc/^24.0.0-rc.3",
+            RangeSpecStyle::Major,
+        ),
+        "runtime:24.0.0-rc.4",
+    );
+    assert_eq!(
+        requested_version_rewrite("node", "^26", "runtime:^26.8.2", RangeSpecStyle::Major),
+        "runtime:^26",
+    );
+    assert_eq!(
+        requested_version_rewrite("node", "runtime:26", "runtime:^26.8.2", RangeSpecStyle::Major),
+        "runtime:26",
+    );
+    assert_eq!(
+        requested_version_rewrite(
+            "node",
+            "runtime:26.9.0",
+            "runtime:^26.8.2",
+            RangeSpecStyle::Major,
+        ),
+        "runtime:^26.9.0",
+    );
+}
+
+/// The deno and bun resolvers normalize a `runtime:` declaration through the
+/// npm resolver's `calc_specifier`, so an exact version keeps the `^` or `~`
+/// operator `previous` already pins while a range or dist-tag is recorded as
+/// asked.
+#[test]
+fn a_requested_version_on_a_deno_or_bun_runtime_declaration_preserves_range_operator() {
+    use pnpm_registry::RangeSpecStyle;
+
+    for alias in ["deno", "bun"] {
+        for (requested, previous, expected) in [
+            ("1.2.5", "runtime:^1.2.0", "runtime:^1.2.5"),
+            ("1.2.5", "runtime:~1.2.0", "runtime:~1.2.5"),
+            ("1.2.5", "runtime:1.2.0", "runtime:1.2.5"),
+            ("^1.3", "runtime:^1.2.0", "runtime:^1.3"),
+            ("1.2.5", "runtime:latest", "runtime:1.2.5"),
+            ("canary", "runtime:latest", "runtime:canary"),
+            ("runtime:1.2.5", "runtime:^1.2.0", "runtime:^1.2.5"),
+            ("runtime:canary", "runtime:latest", "runtime:canary"),
+        ] {
+            assert_eq!(
+                requested_version_rewrite(alias, requested, previous, RangeSpecStyle::Major),
+                expected,
+                "rewrite of {previous} to {requested} under {alias}",
+            );
+        }
+    }
 }
 
 #[test]
@@ -218,8 +296,7 @@ fn a_bumped_range_lands_in_the_group_it_was_read_from() {
     .expect("write package.json");
     let mut manifest = PackageManifest::from_path(package_json).expect("read package.json");
 
-    let bumped =
-        BTreeMap::from([("foo".to_string(), (DependencyGroup::Optional, "^1.2.0".to_string()))]);
+    let bumped = vec![("foo".to_string(), DependencyGroup::Optional, "^1.2.0".to_string())];
     assert!(apply_bumped_manifest_specs::<SilentReporter>(&mut manifest, &bumped, false));
 
     assert_eq!(dependency_specifier_in(&manifest, DependencyGroup::Prod, "foo"), Some("1.0.0"));
@@ -242,8 +319,7 @@ fn a_bump_for_an_undeclared_group_writes_nothing() {
     .expect("write package.json");
     let mut manifest = PackageManifest::from_path(package_json).expect("read package.json");
 
-    let bumped =
-        BTreeMap::from([("foo".to_string(), (DependencyGroup::Dev, "^1.2.0".to_string()))]);
+    let bumped = vec![("foo".to_string(), DependencyGroup::Dev, "^1.2.0".to_string())];
     assert!(!apply_bumped_manifest_specs::<SilentReporter>(&mut manifest, &bumped, false));
 
     assert_eq!(dependency_specifier_in(&manifest, DependencyGroup::Prod, "foo"), Some("1.0.0"));
@@ -361,7 +437,7 @@ async fn selected_update_no_save_skips_a_selector_outside_the_kept_range() {
 
     let packages = ["foo@2.0.0".to_string()];
     let (update, owned) = test_update(config, &packages, false, false);
-    let prepared = prepare_selected_manifests::<SilentReporter>(
+    let mut prepared = prepare_selected_manifests::<SilentReporter>(
         &mut projects,
         &indices,
         dir.path(),
@@ -377,6 +453,37 @@ async fn selected_update_no_save_skips_a_selector_outside_the_kept_range() {
     assert_eq!(dependency_specifier(&projects[0].manifest), "^1.0.0");
     assert!(prepared.persist_indices.is_empty());
     assert!(prepared.catalogs_override.is_none());
+    assert!(prepared.take_seed(update).preferred_versions_override.is_empty());
+}
+
+#[tokio::test]
+async fn selected_update_no_save_keeps_an_override_owned_specifier() {
+    let dir = tempdir().expect("create tempdir");
+    std::fs::write(dir.path().join("pnpm-workspace.yaml"), "packages:\n  - '*'\n")
+        .expect("write workspace manifest");
+    let mut projects = vec![project_with_foo(dir.path(), "a")];
+    let selected_indices = [0];
+    let mut config = Config::new();
+    config.overrides =
+        Some(std::iter::once(("foo@^1.0.0".to_string(), "^2.0.0".to_string())).collect());
+    let packages = ["foo@2.0.1".to_string()];
+    let (update, owned) = test_update(config, &packages, false, false);
+    let mut prepared = prepare_selected_manifests::<SilentReporter>(
+        &mut projects,
+        &selected_indices,
+        dir.path(),
+        update,
+        &owned,
+    )
+    .await
+    .expect("prepare selected manifests");
+
+    // The requested version fits the override, but rewriting the original
+    // declaration would make the scoped override stop matching on the next install.
+    assert_eq!(dependency_specifier(&projects[0].manifest), "^1.0.0");
+    assert_eq!(saved_dependency_specifier(&projects[0].manifest), "^1.0.0");
+    let seed = prepared.take_seed(update);
+    assert!(seed.preferred_versions_override.is_empty());
 }
 
 #[tokio::test]
@@ -512,11 +619,11 @@ fn project_with_foo_specifier(root: &std::path::Path, name: &str, specifier: &st
     }
 }
 
-// A closed port, so any dependency that reaches registry resolution fails
-// loudly instead of hitting the network. Retries are off so that failure is
-// immediate rather than a minute of backoff.
+// An address whose connect fails at once on every OS, so any dependency that
+// reaches registry resolution fails loudly instead of hitting the network.
+// Retries are off so that failure is immediate rather than a minute of backoff.
 fn unroutable_registry_config() -> Config {
-    Config { registry: "http://127.0.0.1:1/".to_string(), fetch_retries: 0, ..Config::new() }
+    Config { registry: "http://0.0.0.0:1/".to_string(), fetch_retries: 0, ..Config::new() }
 }
 
 fn project_without_foo(root: &std::path::Path, name: &str) -> Project {

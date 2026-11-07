@@ -89,6 +89,28 @@ fn decodes_requires_build_true() {
     assert_eq!(decoded.requires_build, Some(true));
 }
 
+/// Fixture: msgpackr with `useRecords: true, moreTypes: true`, packing
+/// ```js
+/// { requiresBuild: false, manifest: undefined, algo: 'sha512',
+///   files: new Map([['a.js', { digest: 'aaa', mode: 0o644, size: 1 }]]) }
+/// ```
+/// pnpm writes such a row for a git-hosted tarball without a `package.json`.
+#[test]
+fn decodes_undefined_manifest_from_msgpackr() {
+    let bytes: [u8; 84] = [
+        0xd4, 0x72, 0x40, 0x94, 0xad, 0x72, 0x65, 0x71, 0x75, 0x69, 0x72, 0x65, 0x73, 0x42, 0x75,
+        0x69, 0x6c, 0x64, 0xa8, 0x6d, 0x61, 0x6e, 0x69, 0x66, 0x65, 0x73, 0x74, 0xa4, 0x61, 0x6c,
+        0x67, 0x6f, 0xa5, 0x66, 0x69, 0x6c, 0x65, 0x73, 0xc2, 0xd4, 0x00, 0x00, 0xa6, 0x73, 0x68,
+        0x61, 0x35, 0x31, 0x32, 0x81, 0xa4, 0x61, 0x2e, 0x6a, 0x73, 0xd4, 0x72, 0x41, 0x93, 0xa6,
+        0x64, 0x69, 0x67, 0x65, 0x73, 0x74, 0xa4, 0x6d, 0x6f, 0x64, 0x65, 0xa4, 0x73, 0x69, 0x7a,
+        0x65, 0xa3, 0x61, 0x61, 0x61, 0xcd, 0x01, 0xa4, 0x01,
+    ];
+    let decoded = decode(&bytes);
+    assert_eq!(decoded.manifest, None);
+    assert_eq!(decoded.requires_build, Some(false));
+    assert_eq!(decoded.files.get("a.js").unwrap().digest, "aaa");
+}
+
 #[test]
 fn decodes_file_without_checked_at() {
     let bytes: [u8; 57] = [
@@ -147,6 +169,7 @@ fn round_trips_plain_msgpack_through_transcoder() {
         files,
         side_effects: None,
         remote_side_effects_quarantine: None,
+        tar_integrity: None,
     };
     let bytes = rmp_serde::to_vec_named(&original).unwrap();
     let transcoded = transcode_to_plain_msgpack(&bytes).unwrap();
@@ -231,10 +254,6 @@ fn rejects_reference_to_unknown_slot() {
 /// appeared in the stream.
 #[test]
 fn plain_positive_fixint_in_slot_range_passes_through() {
-    // [65, 127] — both bytes would be "slot refs" under the old
-    // always-records interpretation and would blow up as
-    // `UnknownSlot`. Under records-mode tracking they're legitimate
-    // positive fixints.
     let input = &[0x92, 0x41, 0x7f][..];
     let out = transcode_to_plain_msgpack(input).unwrap();
     assert_eq!(out, input);
@@ -284,6 +303,7 @@ fn encode_emits_record_header_for_top_level_struct() {
         files: HashMap::new(),
         side_effects: None,
         remote_side_effects_quarantine: None,
+        tar_integrity: None,
     };
     let bytes = encode_package_files_index(&idx).unwrap();
     assert_eq!(&bytes[0..3], &[0xd4, RECORD_DEF_EXT_TYPE, PKG_FILES_INDEX_SLOT]);
@@ -301,6 +321,7 @@ fn encode_roundtrips_single_file() {
         files,
         side_effects: None,
         remote_side_effects_quarantine: None,
+        tar_integrity: None,
     };
     assert_eq!(roundtrip(&original), original);
 }
@@ -319,6 +340,7 @@ fn encode_roundtrips_many_files_sharing_one_slot() {
         files,
         side_effects: None,
         remote_side_effects_quarantine: None,
+        tar_integrity: None,
     };
     let bytes = encode_package_files_index(&original).unwrap();
     let record_def_headers = bytes
@@ -351,6 +373,7 @@ fn encode_handles_fixint_in_slot_range_safely() {
         files,
         side_effects: None,
         remote_side_effects_quarantine: None,
+        tar_integrity: None,
     };
     assert_eq!(roundtrip(&original).files.get("f").unwrap().size, 0x7b);
 }
@@ -367,6 +390,7 @@ fn encode_omits_checked_at_when_none() {
         files,
         side_effects: None,
         remote_side_effects_quarantine: None,
+        tar_integrity: None,
     };
     let bytes = encode_package_files_index(&original).unwrap();
     let needle = b"checkedAt";
@@ -393,6 +417,7 @@ fn encode_allocates_separate_slots_for_distinct_cafs_shapes() {
         files,
         side_effects: None,
         remote_side_effects_quarantine: None,
+        tar_integrity: None,
     };
     let bytes = encode_package_files_index(&original).unwrap();
     let record_def_headers = bytes
@@ -416,6 +441,7 @@ fn encode_requires_build_when_set() {
         files: HashMap::new(),
         side_effects: None,
         remote_side_effects_quarantine: None,
+        tar_integrity: None,
     };
     let roundtripped = roundtrip(&original);
     assert_eq!(roundtripped.requires_build, Some(true));
@@ -431,6 +457,7 @@ fn encode_requires_prepare_when_set() {
         files: HashMap::new(),
         side_effects: None,
         remote_side_effects_quarantine: None,
+        tar_integrity: None,
     };
     let roundtripped = roundtrip(&original);
     assert_eq!(roundtripped.requires_prepare, Some(true));
@@ -456,6 +483,7 @@ fn encode_outer_field_order_matches_msgpackr() {
         files,
         side_effects: None,
         remote_side_effects_quarantine: None,
+        tar_integrity: None,
     };
     let bytes = encode_package_files_index(&idx).unwrap();
     // Find the outer schema bytes: after `d4 72 40` (fixext1 +
@@ -486,6 +514,7 @@ fn encode_omits_requires_build_when_none() {
         files: HashMap::new(),
         side_effects: None,
         remote_side_effects_quarantine: None,
+        tar_integrity: None,
     };
     let bytes = encode_package_files_index(&idx).unwrap();
     let needle = b"requiresBuild";
@@ -520,6 +549,7 @@ fn encode_side_effects_roundtrip() {
         files,
         side_effects: Some(side_effects),
         remote_side_effects_quarantine: None,
+        tar_integrity: None,
     };
     assert_eq!(roundtrip(&original), original);
 }
@@ -564,6 +594,16 @@ fn encode_remote_side_effects_origin_and_quarantine_roundtrip() {
 }
 
 #[test]
+fn tar_integrity_roundtrips() {
+    let original = PackageFilesIndex {
+        algo: "sha512".to_string(),
+        tar_integrity: Some("sha512-tar".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(roundtrip(&original), original);
+}
+
+#[test]
 fn encode_side_effects_with_only_added_omits_deleted_field() {
     let mut added = HashMap::new();
     added.insert("foo.so".to_string(), sample_cafs(42, true));
@@ -580,6 +620,7 @@ fn encode_side_effects_with_only_added_omits_deleted_field() {
         files: HashMap::new(),
         side_effects: Some(side_effects),
         remote_side_effects_quarantine: None,
+        tar_integrity: None,
     };
     let bytes = encode_package_files_index(&original).unwrap();
     assert!(
@@ -616,6 +657,7 @@ fn encode_allocates_separate_slots_for_distinct_side_effects_shapes() {
         files: HashMap::new(),
         side_effects: Some(side_effects),
         remote_side_effects_quarantine: None,
+        tar_integrity: None,
     };
     let bytes = encode_package_files_index(&original).unwrap();
     let record_def_headers = bytes
@@ -663,6 +705,7 @@ fn encode_roundtrips_simple_manifest() {
         files: HashMap::new(),
         side_effects: None,
         remote_side_effects_quarantine: None,
+        tar_integrity: None,
     };
     assert_eq!(roundtrip(&original), original);
 }
@@ -690,6 +733,7 @@ fn encode_record_encodes_nested_objects_in_manifest() {
         files: HashMap::new(),
         side_effects: None,
         remote_side_effects_quarantine: None,
+        tar_integrity: None,
     };
     let bytes = encode_package_files_index(&idx).unwrap();
 
@@ -725,6 +769,7 @@ fn encode_shares_slot_for_same_shaped_nested_objects() {
         files: HashMap::new(),
         side_effects: None,
         remote_side_effects_quarantine: None,
+        tar_integrity: None,
     };
     let bytes = encode_package_files_index(&idx).unwrap();
     let record_defs = bytes
@@ -766,6 +811,7 @@ fn encode_roundtrips_all_json_value_kinds() {
         files: HashMap::new(),
         side_effects: None,
         remote_side_effects_quarantine: None,
+        tar_integrity: None,
     };
     assert_eq!(roundtrip(&idx), idx);
 }
@@ -785,6 +831,7 @@ fn encode_roundtrips_manifest_with_other_fields() {
         files,
         side_effects: None,
         remote_side_effects_quarantine: None,
+        tar_integrity: None,
     };
     assert_eq!(roundtrip(&original), original);
 }

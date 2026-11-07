@@ -38,9 +38,7 @@ use pnpm_reporter::{FetchingProgressMessage, LogEvent};
 /// `CalleeHandled = false`, return value discarded, never blocking.
 pub type OutputSink = ThreadsafeFunction<String, UnknownReturnValue, String, Status, false>;
 
-/// pnpm's default terminal output, rendered by the engine. Mirrors
-/// [`ReporterOptions`] in `index.d.ts`; every field maps onto the option of
-/// the same name in `@pnpm/cli.default-reporter`'s `reportingOptions`.
+/// pnpm's default terminal output, rendered by the engine.
 #[napi(object)]
 #[derive(Default)]
 #[cfg_attr(
@@ -201,10 +199,11 @@ impl NativeRenderer {
             colors,
             renderer_state_options(options, append_only),
         );
-        let throttle = options.throttle_progress.map_or(
-            if append_only { Duration::from_secs(1) } else { Duration::from_millis(200) },
-            |ms| Duration::from_millis(u64::from(ms)),
-        );
+        let throttle = match options.throttle_progress {
+            Some(ms) => Duration::from_millis(u64::from(ms)),
+            None if append_only => Duration::from_secs(1),
+            None => Duration::from_millis(200),
+        };
         NativeRenderer {
             state,
             diff: Diff::new(width.saturating_add(2)),
@@ -295,21 +294,15 @@ fn renderer_width(
     destination: &Destination,
     is_terminal: bool,
 ) -> usize {
-    options.width
-        .map_or_else(
-            || {
-                if is_terminal {
-                    destination
-                        .terminal_columns()
-                        .unwrap_or(82)
-                        .saturating_sub(2)
-                } else {
-                    80
-                }
-            },
-            |width| width as usize,
-        )
-        .max(1)
+    let width = match options.width {
+        Some(width) => width as usize,
+        None if is_terminal => destination
+            .terminal_columns()
+            .unwrap_or(82)
+            .saturating_sub(2),
+        None => 80,
+    };
+    width.max(1)
 }
 
 /// Whether an event is a high-volume progress update that may be dropped

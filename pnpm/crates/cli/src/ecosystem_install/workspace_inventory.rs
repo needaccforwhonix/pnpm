@@ -9,15 +9,17 @@ const IGNORED_DIRECTORY_BASENAMES: &[&str] =
 pub(crate) enum EcosystemManifest {
     Cargo,
     Python,
+    Requirements,
 }
 
 impl EcosystemManifest {
-    const ALL: &[Self] = &[Self::Cargo, Self::Python];
+    const ALL: &[Self] = &[Self::Cargo, Self::Python, Self::Requirements];
 
     const fn basename(self) -> &'static str {
         match self {
             Self::Cargo => "Cargo.toml",
             Self::Python => "pyproject.toml",
+            Self::Requirements => "requirements.txt",
         }
     }
 }
@@ -32,17 +34,9 @@ pub(crate) struct EcosystemWorkspaceInventory {
 
 impl EcosystemWorkspaceInventory {
     pub(crate) fn new(workspace_root: PathBuf, config: &pnpm_config::Config) -> Self {
-        let managed_directories = vec![
-            config.store_dir.root().to_path_buf(),
-            config.cache_dir.clone(),
-            config.state_dir.clone(),
-            config.modules_dir.clone(),
-            config.virtual_store_dir.clone(),
-            config.global_virtual_store_dir.clone(),
-        ];
         Self {
             workspace_root,
-            managed_directories,
+            managed_directories: config.managed_directories(),
             package_patterns: config.workspace_package_patterns.clone().unwrap_or_default(),
             contents: OnceCell::new(),
         }
@@ -77,6 +71,10 @@ impl EcosystemWorkspaceInventory {
         Ok(inventory
             .manifests(manifest.basename())
             .expect("every ecosystem manifest basename is inventoried"))
+    }
+
+    pub(crate) fn workspace_root(&self) -> &std::path::Path {
+        &self.workspace_root
     }
 }
 

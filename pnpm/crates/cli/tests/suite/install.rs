@@ -9,6 +9,7 @@ use pipe_trait::Pipe;
 use pnpm_store_dir::STORE_VERSION;
 use pnpm_testing_utils::{
     bin::{AddMockedRegistry, CommandTempCwd},
+    diagnostics::assert_diagnostic_contains,
     fixtures::{BIG_LOCKFILE, BIG_MANIFEST},
     fs::{bump_mtime, get_all_files, get_all_folders, is_symlink_or_junction},
 };
@@ -107,11 +108,12 @@ fn should_install_dependencies() {
 /// cache, `pnpm-deps-restorer/src/dir_clone_cache.rs`), and their paths
 /// embed a graph hash that varies with the host's Node major — useless
 /// under a platform-shared snapshot, and their files carry package
-/// modes rather than the CAFS `-exec` convention.
+/// modes rather than the CAFS `-exec` convention. Also excludes
+/// `v11/projects/`, whose entry names hash the temporary workspace path.
 fn store_files_outside_links(store_dir: &Path) -> Vec<String> {
     get_all_files(store_dir)
         .into_iter()
-        .filter(|path| !path.starts_with("v11/links/"))
+        .filter(|path| !path.starts_with("v11/links/") && !path.starts_with("v11/projects/"))
         .collect()
 }
 
@@ -152,15 +154,10 @@ fn install_rejects_a_traversal_dependency_name_in_the_manifest() {
     // The fresh-resolve path forwards the resolver's diagnostic
     // transparently, so the rendered envelope carries the canonical
     // `ERR_PNPM_INVALID_DEPENDENCY_NAME` code — matching the frozen path
-    // (see `lockfile_verification.rs`). The offending name is in the
-    // message too, but miette may wrap it across lines at narrow widths,
-    // so assert on the stable code and the unwrapped "invalid name"
-    // phrase instead.
+    // (see `lockfile_verification.rs`).
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    assert!(
-        stderr.contains("ERR_PNPM_INVALID_DEPENDENCY_NAME") && stderr.contains("invalid name"),
-        "stderr must report the invalid-dependency-name code; got:\n{stderr}",
-    );
+    assert_diagnostic_contains(&stderr, "ERR_PNPM_INVALID_DEPENDENCY_NAME");
+    assert_diagnostic_contains(&stderr, "contains a dependency with an invalid name");
     assert!(
         !workspace
             .parent()
@@ -382,7 +379,7 @@ fn should_install_circular_dependencies() {
 }
 
 #[test]
-fn install_preserves_deprecated_lockfile_metadata_when_reusing_resolution() {
+fn install_reports_a_deprecation_without_the_notice_and_keeps_the_metadata_on_reuse() {
     let CommandTempCwd {
         pacquet,
         root,
@@ -404,10 +401,19 @@ fn install_preserves_deprecated_lockfile_metadata_when_reusing_resolution() {
     )
     .expect("write package.json");
 
-    pacquet
+    let assertion = pacquet
         .with_arg("install")
         .assert()
         .success();
+    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("deprecated @pnpm.e2e/deprecated@1.0.0"),
+        "the install should name the deprecated dependency:\n{stdout}",
+    );
+    assert!(
+        !stdout.contains("This package is deprecated."),
+        "the registry's deprecation notice must not reach the terminal:\n{stdout}",
+    );
     let lockfile_path = workspace.join("pnpm-lock.yaml");
     let first = fs::read_to_string(&lockfile_path).expect("read pnpm-lock.yaml");
     assert!(
@@ -534,7 +540,7 @@ fn install_surfaces_catalog_misconfiguration() {
 /// A well-formed range that the registry publishes nothing for is
 /// `ERR_PNPM_NO_MATCHING_VERSION`, not the chain's
 /// `ERR_PNPM_SPEC_NOT_SUPPORTED_BY_ANY_RESOLVER` — the specifier is
-/// supported, the version simply doesn't exist (pnpm/pnpm#13319). The
+/// supported, the version doesn't exist (pnpm/pnpm#13319). The
 /// report also names the latest published release and how to list the
 /// rest, the way the TypeScript CLI does.
 #[test]
@@ -577,6 +583,41 @@ fn install_reports_a_missing_version_as_no_matching_version() {
         flattened.contains(r#"run"pnpmview@pnpm.e2e/hello-world-js-bin-parentversions""#),
         "stderr did not say how to list the published versions: {stderr}",
     );
+
+    drop((root, mock_instance));
+}
+
+/// A specifier with a protocol no resolver supports, such as Yarn's
+/// `patch:`, is `ERR_PNPM_UNSUPPORTED_PROTOCOL` naming the protocol, not a
+/// link to a directory that does not exist
+/// (<https://github.com/pnpm/pnpm/issues/16590>).
+#[test]
+fn install_reports_an_unsupported_protocol() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+
+    let manifest_path = workspace.join("package.json");
+    let package_json_content = serde_json::json!({
+        "dependencies": {
+            "got": "patch:got@npm%3A11.8.2#~/.yarn/patches/got.patch",
+        },
+    });
+    fs::write(&manifest_path, package_json_content.to_string()).expect("write to package.json");
+
+    let output = pacquet
+        .with_arg("install")
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+    eprintln!("stderr={stderr}");
+    assert!(stderr.contains("ERR_PNPM_UNSUPPORTED_PROTOCOL"), "{stderr}");
+    assert!(flatten_report(&stderr).contains(r#"Unsupportedprotocol"patch:""#), "{stderr}");
 
     drop((root, mock_instance));
 }
@@ -738,6 +779,121 @@ fn set_dir_modes(path: &std::path::Path, mode: u32) {
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("set directory mode");
 }
 
+/// The gate exists because `--force` re-materializes every slot, not only
+/// because it bypasses the platform checks.
+#[test]
+fn force_defeats_the_up_to_date_fast_path() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({ "dependencies": { "@foo/no-deps": "1.0.0" } }).to_string(),
+    )
+    .expect("write package.json");
+
+    let run_install = |args: &[&str]| {
+        let assert = pacquet_in(&workspace)
+            .with_env("PNPM_CONFIG_REGISTRY", mock_instance.url())
+            .with_args(args)
+            .assert()
+            .success();
+        String::from_utf8_lossy(&assert.get_output().stdout).into_owned()
+    };
+
+    pacquet
+        .with_env("PNPM_CONFIG_REGISTRY", mock_instance.url())
+        .with_arg("install")
+        .assert()
+        .success();
+    assert!(
+        run_install(&["install"]).contains("Already up to date"),
+        "an unchanged repeat install must take the fast path",
+    );
+    assert!(
+        !run_install(&["install", "--force"]).contains("Already up to date"),
+        "--force must defeat the fast path even though nothing changed",
+    );
+
+    drop((root, mock_instance));
+}
+
+/// Covers <https://github.com/pnpm/pnpm/issues/3445> — repairing a store
+/// blob that was tampered with through a hard link must keep the blob's
+/// inode, so every other hard-linked copy (another project's
+/// `node_modules`) is healed by the same write. Replacing the blob by
+/// rename would leave those copies corrupt.
+///
+/// The scenario needs hardlink import, forced below: with the macOS
+/// default of clone-first (APFS `clonefile`), an edit through
+/// `node_modules` breaks the copy-on-write sharing and never reaches
+/// the store blob, so there is nothing to repair and the second hard
+/// link would point at the clone, not the blob.
+#[cfg(unix)]
+#[test]
+fn force_install_repairs_tampered_store_blob_in_place() {
+    use std::os::unix::fs::MetadataExt;
+
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({ "dependencies": { "is-positive": "1.0.0" } }).to_string(),
+    )
+    .expect("write package.json");
+
+    pacquet
+        .with_env("PNPM_CONFIG_REGISTRY", mock_instance.url())
+        .with_env("PNPM_CONFIG_PACKAGE_IMPORT_METHOD", "hardlink")
+        .with_arg("install")
+        .assert()
+        .success();
+
+    let installed = workspace.join("node_modules/is-positive/index.js");
+    let pristine = fs::read(&installed).expect("read installed file");
+    assert!(
+        fs::metadata(&installed).unwrap().nlink() >= 2,
+        "hardlink import must link the installed file to the store blob",
+    );
+    // A second hard link stands in for another project importing the
+    // same store blob; its inode is the blob's inode.
+    let linked = workspace.join("linked-copy.js");
+    fs::hard_link(&installed, &linked).expect("hard link the store blob");
+    let inode_before = fs::metadata(&linked).unwrap().ino();
+
+    // Edit through the hard link; the edit propagates to the store blob.
+    fs::write(&installed, b"tampered").expect("tamper through the hard link");
+    bump_mtime(&installed);
+
+    pacquet_in(&workspace)
+        .with_env("PNPM_CONFIG_REGISTRY", mock_instance.url())
+        .with_env("PNPM_CONFIG_PACKAGE_IMPORT_METHOD", "hardlink")
+        .with_args(["install", "--force"])
+        .assert()
+        .success();
+
+    assert_eq!(fs::read(&installed).unwrap(), pristine);
+    assert_eq!(fs::read(&linked).unwrap(), pristine, "hard-linked copy must be healed");
+    assert_eq!(
+        fs::metadata(&installed).unwrap().ino(),
+        inode_before,
+        "the reinstalled file must link to the store blob's original inode",
+    );
+
+    drop((root, mock_instance));
+}
+
 /// Trust/policy settings key the lockfile-verification gate, which is
 /// why pnpm records `trustPolicy*` in the workspace state.
 #[test]
@@ -850,3 +1006,7 @@ mod hooks;
 mod lockfile;
 
 mod configuration;
+
+mod time_based_release_age;
+
+mod diagnostics;

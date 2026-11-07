@@ -4,7 +4,7 @@ use super::{
 };
 use crate::PolicyExcludes;
 use pipe_trait::Pipe;
-use pnpm_config::{Config, NodePackageMapType};
+use pnpm_config::{Config, NodePackageMapMode, NodePackageMapType};
 use pnpm_lockfile::{Lockfile, MaybeLazyLockfile};
 use pnpm_modules_yaml::{Host, LayoutVersion, Modules, NodeLinker, read_modules_manifest};
 use pnpm_package_manifest::{DependencyGroup, PackageManifest};
@@ -27,7 +27,12 @@ fn package_map_writer_is_gated_to_supported_pacquet_mode() {
     assert!(!crate::should_write_package_map(&config, pnpm_config::NodeLinker::Isolated));
     assert!(!crate::should_write_hoisted_package_map(&config));
 
-    config.node_experimental_package_map = true;
+    config.node_package_map_mode = NodePackageMapMode::WriteOnly;
+    assert!(crate::should_write_package_map(&config, pnpm_config::NodeLinker::Isolated));
+    assert!(crate::should_write_hoisted_package_map(&config));
+    assert!(!crate::should_write_package_map(&config, pnpm_config::NodeLinker::Pnp));
+
+    config.node_package_map_mode = NodePackageMapMode::Load;
     assert!(crate::should_write_package_map(&config, pnpm_config::NodeLinker::Isolated));
     assert!(!crate::should_write_package_map(&config, pnpm_config::NodeLinker::Hoisted));
     assert!(!crate::should_write_package_map(&config, pnpm_config::NodeLinker::Pnp));
@@ -80,8 +85,8 @@ async fn should_install_dependencies() {
     let mut config = Config::new();
     config.store_dir = store_dir.into();
     config.modules_dir = modules_dir.clone();
-    config.virtual_store_dir = virtual_store_dir.clone();
-    config.registry = mock_instance.url();
+    config.install_state_dir = virtual_store_dir.clone();
+    config.registry = mock_instance.url().to_string();
     let config = config.leak();
 
     Install {
@@ -133,6 +138,8 @@ async fn should_install_dependencies() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<RecordingReporter>()
@@ -272,8 +279,8 @@ async fn install_prunes_surplus_virtual_store_dir() {
     let mut config = Config::new();
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
-    config.registry = mock_instance.url();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
+    config.registry = mock_instance.url().to_string();
     let config = config.leak();
 
     Install {
@@ -321,6 +328,8 @@ async fn install_prunes_surplus_virtual_store_dir() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -336,9 +345,8 @@ async fn install_prunes_surplus_virtual_store_dir() {
     drop((dirs.dir, mock_instance));
 }
 /// Issue [#312](https://github.com/pnpm/pacquet/issues/312): an npm-alias dependency
-/// (`"<key>": "npm:<real>@<range>"`) used to panic during install
-/// because the whole `npm:...` spec was fed to
-/// `node_semver::Range::parse`. Assert that:
+/// (`"<key>": "npm:<real>@<range>"`) must not panic during install.
+/// Assert that:
 ///
 /// * the install completes,
 /// * the virtual-store directory uses the *real* package name, and
@@ -364,8 +372,8 @@ async fn npm_alias_dependency_installs_under_alias_key() {
     let mut config = Config::new();
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
-    config.registry = mock_instance.url();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
+    config.registry = mock_instance.url().to_string();
     let config = config.leak();
 
     Install {
@@ -413,6 +421,8 @@ async fn npm_alias_dependency_installs_under_alias_key() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -437,12 +447,7 @@ async fn npm_alias_dependency_installs_under_alias_key() {
     drop((dirs.dir, mock_instance));
 }
 /// Issue [#312], unversioned variant: `"foo": "npm:bar"` (no `@<range>`)
-/// must default to `latest` without panicking. `resolve_registry_dependency`
-/// turns `"npm:bar"` into `("bar", "latest")`; the previous code then
-/// fed `"latest"` to `package.pinned_version()` which panics because
-/// `node_semver::Range` cannot parse the string. The fix is to route
-/// `"latest"` (and any `PackageTag`-parseable value) through
-/// `PackageVersion::fetch_from_registry` directly.
+/// must default to `latest` without panicking.
 ///
 /// We use the same scoped test package as the pinned-version test above
 /// but omit the `@1.0.0` suffix to trigger the default-to-`latest` path.
@@ -470,8 +475,8 @@ async fn unversioned_npm_alias_defaults_to_latest() {
     let mut config = Config::new();
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
-    config.registry = mock_instance.url();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
+    config.registry = mock_instance.url().to_string();
     let config = config.leak();
 
     Install {
@@ -519,6 +524,8 @@ async fn unversioned_npm_alias_defaults_to_latest() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -567,7 +574,7 @@ pub(super) async fn install_writes_modules_yaml() {
     config.lockfile = false;
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
     config.registries_by_scope.insert(
         "@private".to_string(),
         "https://private.example.com/npm/".to_string(),
@@ -634,6 +641,8 @@ pub(super) async fn install_writes_modules_yaml() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -705,8 +714,8 @@ async fn install_optional_failing_postinstall_dep_via_registry_mock_succeeds() {
     let mut config = Config::new();
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
-    config.registry = mock_instance.url();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
+    config.registry = mock_instance.url().to_string();
     // Allow the transitive `failing-postinstall` build to actually run so
     // the optional-failure tolerance is exercised (an ignored build would
     // instead trip `strictDepBuilds`, which is unrelated to this test).
@@ -758,6 +767,8 @@ async fn install_optional_failing_postinstall_dep_via_registry_mock_succeeds() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -808,7 +819,7 @@ async fn ignore_manifest_check_bypasses_manifest_freshness_gate() {
     let mut config = Config::new();
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
     let config = config.leak();
 
     let lockfile: Lockfile = serde_saphyr::from_str(PARTIAL_INSTALL_LOCKFILE)
@@ -859,6 +870,8 @@ async fn ignore_manifest_check_bypasses_manifest_freshness_gate() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()

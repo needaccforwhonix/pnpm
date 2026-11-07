@@ -3,7 +3,7 @@ use super::super::InstallPackageBySnapshotError;
 #[cfg(unix)]
 use crate::install_package_by_snapshot::fetch::fetch_directory_resolution;
 #[cfg(unix)]
-use pnpm_directory_fetcher::DirectoryFetcherError;
+use pnpm_directory_fetcher::{CopyFiles, DirectoryFetcherError};
 #[cfg(unix)]
 use pnpm_lockfile::DirectoryResolution;
 
@@ -24,7 +24,7 @@ fn directory_resolution_rejects_symlink_escape() {
     let err = fetch_directory_resolution(
         &workspace,
         &DirectoryResolution { directory: "packages/dep".to_string() },
-        false,
+        CopyFiles::AllFiles,
     )
     .expect_err("outside symlink should be rejected");
 
@@ -36,5 +36,32 @@ fn directory_resolution_rejects_symlink_escape() {
             ),
         ),
         "expected path_escape error, got {err:?}",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn directory_resolution_preserves_internal_directory_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let workspace = tmp.path().join("workspace");
+    let package_dir = workspace.join("packages/dep");
+    let sub = package_dir.join("sub");
+    std::fs::create_dir_all(&sub).expect("create sub dir");
+    std::fs::write(sub.join("file.txt"), b"sub content").expect("write sub file");
+    symlink("sub", package_dir.join("link_sub")).expect("create internal directory symlink");
+
+    let (files_map, exists) = fetch_directory_resolution(
+        &workspace,
+        &DirectoryResolution { directory: "packages/dep".to_string() },
+        CopyFiles::AllFiles,
+    )
+    .expect("directory resolution should succeed");
+
+    assert!(exists, "an existing directory must report exists");
+    assert!(
+        files_map.contains_key("link_sub"),
+        "files_map must include internal directory symlink",
     );
 }

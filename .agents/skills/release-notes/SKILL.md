@@ -23,7 +23,8 @@ grouped, what order they appear in, and how the page reads end to end.
 3. That file is the release page. The Rust CLI's GitHub release body is literally
    `tail -n +2 .changeset/changelogs/pacquet@<version>.md` plus the sponsors
    fragment (`.github/workflows/release.yml`), and the same section is composed into
-   the published `CHANGELOG.md` and the release blog post.
+   the published `CHANGELOG.md`. For a stable v11 or v12 release, it also becomes the pnpm.io release page
+   ([DOCUMENTATION.md](../../../DOCUMENTATION.md#release-pages)).
 
 So curate `.changeset/changelogs/<package>@<version>.md` directly, on the release PR
 branch, after the bump has written it. The intents are gone by then, so the composed
@@ -80,7 +81,7 @@ when both are accurate. Say it once, in the entry the reader will find first.
 ## Lead the page
 
 Deno opens a release post with one sentence naming the top few changes: "Deno 1.28
-ships with stabilized npm modules, auto-discovered lock file, a new subprocess API,
+ships with stabilized npm modules, auto-discovered lockfile, a new subprocess API,
 and more." A reader decides from that line whether to read on.
 
 Write that line as a paragraph directly under the `## <version>` heading, before the

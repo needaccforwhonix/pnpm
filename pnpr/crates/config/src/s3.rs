@@ -10,7 +10,7 @@ use super::{
 /// `${ENV}` substitution still runs first, so inline `${...}` values
 /// work too.
 #[derive(Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct S3Settings {
     /// Bucket the hosted packages live in.
     pub bucket: String,

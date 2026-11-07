@@ -13,15 +13,16 @@
 //!   always fetches a host-arch Node.js of the embedded runtime version to
 //!   run `--build-sea`.
 //! - **The runtime install spawns the pacquet binary.** pacquet
-//!   re-invokes itself (`std::env::current_exe()`) running
+//!   re-invokes itself (`pnpm_executor::current_executable()`) running
 //!   `add node@runtime:<version>` with the target `--os` / `--cpu` /
 //!   `--libc` flags into an isolated install directory under the pnpm
 //!   home.
 
+use crate::process::Command;
 use build::{
-    SeaBuild, ad_hoc_sign_mac_binary, ensure_node_runtime, pnpm_home_dir, print_built,
-    reject_non_regular_output_file, reject_non_regular_outputs, resolve_builder_binary,
-    resolve_version, run_command,
+    EmbeddedRuntime, SeaBuild, ad_hoc_sign_mac_binary, ensure_node_runtime, pnpm_home_dir,
+    print_built, reject_non_regular_output_file, reject_non_regular_outputs,
+    resolve_builder_binary, resolve_version, run_command,
 };
 use clap::Args;
 use config::{
@@ -41,7 +42,6 @@ use serde_json::Value;
 use std::{
     fs,
     path::{Component, Path, PathBuf},
-    process::Command,
 };
 
 /// Minimum Node.js version that supports `node --build-sea`.
@@ -54,7 +54,7 @@ const SUPPORTED_OS: &[&str] = &["linux", "darwin", "win32"];
 
 const SUPPORTED_TARGETS: &str = "linux-x64, linux-x64-musl, linux-arm64, linux-arm64-musl, darwin-x64, darwin-arm64, win32-x64, win32-arm64";
 
-/// `pacquet pack-app`: pack a CJS entry file into a standalone executable.
+/// `pnpm pack-app`: pack a CJS entry file into a standalone executable.
 ///
 /// The executable embeds a Node.js binary via the Node.js Single
 /// Executable Applications API. Requires the embedded runtime to be
@@ -271,6 +271,12 @@ pub enum PackAppError {
 
 impl PackAppArgs {
     pub async fn run(self, config: &Config, dir: &Path) -> miette::Result<()> {
+        if cfg!(target_family = "wasm") {
+            return Err(miette::miette!(
+                code = "ERR_PNPM_UNSUPPORTED_RUNTIME",
+                "pnpm pack-app requires a native Node.js executable with single-executable application support. WebContainers cannot run that builder."
+            ));
+        }
         // `pnpm.app` in package.json supplies defaults for every flag. CLI
         // flags win, but `--target` entirely replaces the config list
         // (additive merging would prevent narrowing from the CLI).
@@ -302,14 +308,16 @@ impl PackAppArgs {
         // the serialized format has changed across Node.js minor releases,
         // so a blob produced by a builder of a different version than the
         // embedded runtime fails deserialization at startup.
-        let target_version = resolve_version(config, &requested_node_spec).await?;
+        let runtime = EmbeddedRuntime {
+            build_root,
+            version: resolve_version(config, &requested_node_spec).await?,
+        };
         let build = SeaBuild {
-            builder_bin: resolve_builder_binary(&build_root, &target_version)?,
-            pacquet_bin: std::env::current_exe()
+            builder_bin: resolve_builder_binary(&runtime)?,
+            pacquet_bin: pnpm_executor::current_executable()
                 .into_diagnostic()
                 .wrap_err("resolving the pnpm executable path")?,
-            build_root,
-            target_version,
+            runtime,
             dir,
             output_dir,
             output_name,
@@ -446,8 +454,7 @@ impl SeaBuild<'_> {
     fn build_target(&self, target: &ParsedTarget) -> miette::Result<String> {
         let embedded_node_bin = ensure_node_runtime(
             &self.pacquet_bin,
-            &self.build_root,
-            &self.target_version,
+            &self.runtime,
             &target.platform,
             &target.arch,
             target.libc.as_deref(),
@@ -478,14 +485,12 @@ impl SeaBuild<'_> {
         self.build_sea(&output_file, &embedded_node_bin)?;
 
         ad_hoc_sign_mac_binary(target, &output_file, self.dir)?;
-        Ok(
-            format!(
-                "  {}: {} (Node.js {})",
-                target.raw,
-                output_file.display(),
-                self.target_version,
-            ),
-        )
+        Ok(format!(
+            "  {}: {} (Node.js {})",
+            target.raw,
+            output_file.display(),
+            self.runtime.version,
+        ))
     }
     fn build_sea(&self, output_file: &Path, embedded_node_bin: &Path) -> miette::Result<()> {
         let sea_config = serde_json::json!({

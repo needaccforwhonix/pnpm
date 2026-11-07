@@ -1,12 +1,11 @@
 use super::CreateVirtualStoreError;
 use crate::{
-    install_package_by_snapshot::{runtime_platform_selector, unverified_fetch_is_allowed},
+    install_package_by_snapshot::unverified_fetch_is_allowed, platform_selection::VariantPlatforms,
     store_index_key_for_resolution,
 };
 use pnpm_config::Config;
 use pnpm_lockfile::{
-    LockfileEntries, LockfileResolution, PackageKey, PackageMetadata, PlatformSelector,
-    SnapshotEntry, select_platform_variant,
+    LockfileEntries, LockfileResolution, PackageKey, PackageMetadata, SnapshotEntry,
 };
 use pnpm_store_dir::store_index_key;
 use std::collections::HashMap;
@@ -14,17 +13,30 @@ use std::collections::HashMap;
 pub(super) fn derive_cache_keys(
     config: &Config,
     entries: LockfileEntries<'_>,
+    allow_build_policy: &crate::AllowBuildPolicy,
     supported_architectures: Option<&pnpm_package_is_installable::SupportedArchitectures>,
 ) -> HashMap<PackageKey, Result<SnapshotCacheKey, CreateVirtualStoreError>> {
     let (Some(snapshots), Some(packages)) = (entries.snapshots, entries.packages) else {
         return HashMap::new();
     };
-    let selector = runtime_platform_selector(supported_architectures);
+    let selector = VariantPlatforms::of(supported_architectures);
     snapshots
         .keys()
         .map(|snapshot_key| {
             let cache_key =
-                snapshot_cache_key(snapshot_key, packages, config.ignore_scripts, &selector);
+                snapshot_cache_key(snapshot_key, packages, config.ignore_scripts, &selector)
+                    .map(|mut key| {
+                        if key.is_git_hosted
+                            && allow_build_policy.check(&snapshot_key.without_peer().to_string())
+                                == Some(false)
+                        {
+                            key.value = Some(pnpm_store_dir::git_hosted_store_index_key(
+                                &snapshot_key.without_peer().pkg_id(),
+                                false,
+                            ));
+                        }
+                        key
+                    });
             (snapshot_key.clone(), cache_key)
         })
         .collect()
@@ -63,7 +75,7 @@ pub(super) fn snapshot_cache_key(
     snapshot_key: &PackageKey,
     packages: &HashMap<PackageKey, PackageMetadata>,
     ignore_scripts: bool,
-    runtime_platform_selector: &PlatformSelector,
+    variant_platforms: &VariantPlatforms,
 ) -> Result<SnapshotCacheKey, CreateVirtualStoreError> {
     let metadata_key = snapshot_key.without_peer();
     let metadata = packages
@@ -102,8 +114,8 @@ pub(super) fn snapshot_cache_key(
             // clone + checkout + prepare + packlist work — without
             // this, every git install cold-paths regardless of
             // whether the snapshot is already in `index.db`. `built`
-            // tracks `!ignore_scripts` to match the dispatcher's
-            // write key.
+            // tracks `!ignore_scripts`; `derive_cache_keys` also applies
+            // explicit per-package denials to match the dispatcher.
             Ok(SnapshotCacheKey {
                 value: store_index_key_for_resolution(
                     &metadata.resolution,
@@ -134,7 +146,7 @@ pub(super) fn snapshot_cache_key(
         // is best-effort and the cold path is where errors are
         // raised).
         LockfileResolution::Variations(variations) => {
-            variant_cache_key(variations, runtime_platform_selector, &pkg_id)
+            variant_cache_key(variations, variant_platforms, &pkg_id, !ignore_scripts)
         }
         // Custom resolutions have no built-in warm-cache key — the
         // cold path consults the pnpmfile custom fetchers, and the
@@ -143,6 +155,7 @@ pub(super) fn snapshot_cache_key(
         LockfileResolution::Custom(_) => Ok(SnapshotCacheKey { value: None, is_git_hosted: false }),
     }
 }
+#[derive(Clone)]
 pub(super) struct SnapshotCacheKey {
     pub(super) value: Option<String>,
     pub(super) is_git_hosted: bool,
@@ -168,14 +181,18 @@ pub(super) fn snapshot_deps_equal(current: &SnapshotEntry, wanted: &SnapshotEntr
     maps_equal(current.dependencies.as_ref(), wanted.dependencies.as_ref())
         && maps_equal(current.optional_dependencies.as_ref(), wanted.optional_dependencies.as_ref())
 }
-/// Compare the `integrity` field on two `packages:` entries.
+/// Compare the `integrity` field on two `packages:` entries, including
+/// the one a custom resolution records for its fetcher.
 pub(super) fn integrity_equal(
     current: Option<&PackageMetadata>,
     wanted: Option<&PackageMetadata>,
 ) -> bool {
-    let current_integrity = current.and_then(|meta| meta.resolution.integrity());
-    let wanted_integrity = wanted.and_then(|meta| meta.resolution.integrity());
-    current_integrity == wanted_integrity
+    let current = current.map(|meta| &meta.resolution);
+    let wanted = wanted.map(|meta| &meta.resolution);
+    current.and_then(LockfileResolution::integrity)
+        == wanted.and_then(LockfileResolution::integrity)
+        && current.and_then(LockfileResolution::custom_integrity)
+            == wanted.and_then(LockfileResolution::custom_integrity)
 }
 /// Whether a slot may be served by the macOS directory-clone cache
 /// ([`crate::DirCloneCache`]).
@@ -188,11 +205,10 @@ pub(super) fn integrity_equal(
 ///   stay plain pre-build CAS content;
 /// - mutable local sources, which reuse one slot for changing contents;
 /// - forced re-imports, whose existing slot is known stale;
-/// - any resolution without a checkable integrity. A git dependency
-///   hashes to the same slot whether or not its fetch-time `prepare`
-///   ran (`--ignore-scripts` versus a build-allowed install), so a
-///   cached copy could serve the wrong variant.
-pub(super) fn dir_clone_cacheable(
+/// - any resolution without a checkable integrity, and any whose
+///   integrity does not identify the bytes the slot holds — see
+///   [`integrity_identifies_content`].
+pub(crate) fn dir_clone_cacheable(
     packages: &HashMap<PackageKey, PackageMetadata>,
     snapshot_key: &PackageKey,
     needs_build: bool,
@@ -204,10 +220,24 @@ pub(super) fn dir_clone_cacheable(
         && !force_import
         && packages
             .get(&snapshot_key.without_peer())
+            .filter(|metadata| integrity_identifies_content(&metadata.resolution))
             .and_then(|metadata| metadata.resolution.checkable_integrity())
             .is_some()
 }
-pub(super) fn package_content_changed(
+/// Whether a resolution's recorded `integrity` pins the bytes the
+/// canonical slot would hold — the slot path hashes that integrity and
+/// nothing else, so anything it fails to pin can be served stale.
+///
+/// A `file:` tarball's bytes change under the project's control while
+/// its recorded integrity stands. A git-hosted tarball extracts to
+/// different content depending on whether its fetch-time `prepare` ran
+/// (`--ignore-scripts` versus a build-allowed install), so its slot
+/// could serve the wrong variant.
+fn integrity_identifies_content(resolution: &LockfileResolution) -> bool {
+    let LockfileResolution::Tarball(tarball) = resolution else { return true };
+    !tarball.tarball.starts_with("file:") && !tarball.is_git_hosted()
+}
+pub(crate) fn package_content_changed(
     current_packages: Option<&HashMap<PackageKey, PackageMetadata>>,
     wanted_packages: &HashMap<PackageKey, PackageMetadata>,
     snapshot_key: &PackageKey,
@@ -216,26 +246,74 @@ pub(super) fn package_content_changed(
     let wanted = wanted_packages.get(&snapshot_key.without_peer());
     current.is_some() && !integrity_equal(current, wanted)
 }
+
+/// What the link pass reads to decide a slot's fate: the `packages:`
+/// records it is installing, the previous install's to compare them
+/// against, and whether `--force` settles it outright.
+///
+/// The plan pass's counterpart is [`SnapshotReusePolicy`](super::snapshot_plan::SnapshotReusePolicy); the two `force`
+/// fields mean the same thing at the two phases.
+#[derive(Clone, Copy)]
+pub(super) struct SlotReuse<'a> {
+    pub(super) packages: &'a HashMap<PackageKey, PackageMetadata>,
+    pub(super) current_packages: Option<&'a HashMap<PackageKey, PackageMetadata>>,
+    /// Replace the slot even when its recorded metadata is unchanged.
+    pub(super) force: bool,
+    pub(super) layout: &'a crate::VirtualStoreLayout,
+    pub(super) supported_architectures:
+        Option<&'a pnpm_package_is_installable::SupportedArchitectures>,
+}
+
+impl SlotReuse<'_> {
+    /// Whether an existing slot holds a different artifact than the one
+    /// this install wants, so its completion marker must not be taken
+    /// as proof that the slot is already correct.
+    pub(super) fn must_replace(&self, snapshot_key: &PackageKey) -> bool {
+        self.force
+            || package_content_changed(self.current_packages, self.packages, snapshot_key)
+            || super::linked_archives::slot_holds_other_variant(
+                self.layout,
+                (snapshot_key, self.packages),
+                self.supported_architectures,
+            )
+    }
+}
 pub(super) fn variant_cache_key(
     variations: &pnpm_lockfile::VariationsResolution,
-    runtime_platform_selector: &PlatformSelector,
+    variant_platforms: &VariantPlatforms,
     pkg_id: &str,
+    built: bool,
 ) -> Result<SnapshotCacheKey, CreateVirtualStoreError> {
-    let Some(variant) = select_platform_variant(&variations.variants, runtime_platform_selector)
+    let platform = variant_platforms.for_variations(variations);
+    let no_key = SnapshotCacheKey { value: None, is_git_hosted: false };
+    let Some(selected) = variations
+        .select(platform)
+        .ok()
+        .flatten()
     else {
-        return Ok(SnapshotCacheKey { value: None, is_git_hosted: false });
+        return Ok(no_key);
     };
-    match &variant.resolution {
+    match &selected.resolution {
         LockfileResolution::Binary(binary) => Ok(SnapshotCacheKey {
             value: Some(store_index_key(&binary.integrity.to_string(), pkg_id)),
             is_git_hosted: false,
         }),
-        // Non-`Binary` variant (corrupt lockfile, or a
-        // future shape pacquet doesn't recognise). The
-        // cold path raises the typed
-        // `VariantHasNonBinaryResolution` error; we just
-        // skip the warm key.
-        _ => Ok(SnapshotCacheKey { value: None, is_git_hosted: false }),
+        // A tarball is keyed as a lone tarball resolution is: a git-hosted
+        // one under its built or not-built key, which `derive_cache_keys`
+        // narrows on an explicit build denial, and one the downloader
+        // refuses under no key.
+        resolution @ LockfileResolution::Tarball(tarball) => {
+            tarball_cache_key(tarball, resolution, pkg_id, !built)
+        }
+        // Any archive of a registry package's variants, keyed by its own
+        // digest like any registry archive.
+        resolution @ LockfileResolution::Registry(_) => Ok(SnapshotCacheKey {
+            value: store_index_key_for_resolution(resolution, pkg_id, built),
+            is_git_hosted: false,
+        }),
+        // The cold path raises the typed `UnsupportedVariantResolution`
+        // error; we just skip the warm key.
+        _ => Ok(no_key),
     }
 }
 /// Rejects warm reuse when the downloader would refuse missing integrity.
@@ -246,7 +324,8 @@ pub(super) fn tarball_cache_key(
     pkg_id: &str,
     ignore_scripts: bool,
 ) -> Result<SnapshotCacheKey, CreateVirtualStoreError> {
-    if tarball.integrity.is_none() && !unverified_fetch_is_allowed(&tarball.tarball) {
+    if resolution.checkable_integrity().is_none() && !unverified_fetch_is_allowed(&tarball.tarball)
+    {
         return Ok(SnapshotCacheKey { value: None, is_git_hosted: false });
     }
     Ok(SnapshotCacheKey {

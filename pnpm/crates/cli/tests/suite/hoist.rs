@@ -11,19 +11,14 @@
 //! the registry mock serves; pre-baking a tiny v9 lockfile by hand
 //! would diverge silently the moment a fixture changes.
 //!
-//! Every ported hoist case runs against the real implementation; the
-//! suite has no `known_failures` stubs.
-//!
-//! Workspace install (pnpm/pacquet#431) landed in [#443]. The
-//! [`workspace_hoist_walks_every_importer`] test below covers the
+//! The [`workspace_hoist_walks_every_importer`] test below covers the
 //! basic multi-importer case; `hoistWorkspacePackages` name-links are
 //! covered by [`hoist_workspace_packages_links_projects_by_name`].
-//!
-//! [#443]: https://github.com/pnpm/pacquet/pull/443
-
-#![cfg(unix)] // pnpm CLI: 'program not found' on Windows runners.
 
 pub use _utils::*;
+
+mod external_virtual_store;
+mod peer_workspace_conflicts;
 
 use crate::_utils;
 
@@ -324,8 +319,7 @@ fn public_hoist_bin_is_linked_via_root_bin_dir() {
 /// lockfile, no `--frozen-lockfile`) must lay every dependency out as
 /// a **real directory** flat under the project's `node_modules/`, not
 /// as a symlink into a `.pnpm` virtual store. Closes
-/// [#11871](https://github.com/pnpm/pnpm/issues/11871): the fresh
-/// path used to hard-refuse the combination.
+/// [#11871](https://github.com/pnpm/pnpm/issues/11871).
 ///
 /// Uses `@pnpm.e2e/hello-world-js-bin-parent` (a direct dep) which
 /// pulls in `@pnpm.e2e/hello-world-js-bin` as a transitive — under
@@ -923,9 +917,18 @@ fn should_add_extra_node_paths_to_command_shims() {
 
     let shim = fs::read_to_string(workspace.join("node_modules/.bin/hello-world-js-bin"))
         .expect("read the command shim");
+    // Inside a relocatable root the shim names the entry relative to its
+    // own directory; on Windows `generate_sh_shim` writes the absolute
+    // path `@zkochan/cmd-shim` writes instead.
+    let hoisted_modules_entry = if cfg!(windows) {
+        "/node_modules/.pnpm/node_modules"
+    } else {
+        r#""$basedir_abs"/'../.pnpm/node_modules'"#
+    };
     assert!(
-        shim.contains("node_modules/.pnpm/node_modules"),
-        "the shim must extend NODE_PATH with the hidden hoisted modules dir:\n{shim}",
+        shim.contains(hoisted_modules_entry),
+        "the shim must extend NODE_PATH with the hidden hoisted modules dir \
+         ({hoisted_modules_entry}):\n{shim}",
     );
 
     // The fresh install's own `packages:` rows must record `hasBin` —
@@ -963,7 +966,7 @@ fn should_not_add_extra_node_paths_when_extend_node_path_false() {
     let shim = fs::read_to_string(workspace.join("node_modules/.bin/hello-world-js-bin"))
         .expect("read the command shim");
     assert!(
-        !shim.contains("node_modules/.pnpm/node_modules"),
+        !shim.contains("export NODE_PATH="),
         "`extendNodePath: false` must keep NODE_PATH out of the shim:\n{shim}",
     );
 

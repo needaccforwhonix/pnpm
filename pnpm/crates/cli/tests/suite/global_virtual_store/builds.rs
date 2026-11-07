@@ -1,9 +1,18 @@
+//! The global-virtual-store tests that exercise the build policy.
+
 use super::{
     AddMockedRegistry, CommandExtra, CommandTempCwd, StoreDir, StoreIndex, allow_builds_yaml,
     corrupt_pristine_file, fs, hash_dirs, is_symlink_or_junction, pacquet, pkg_in_slot,
     pkg_version_dir, read_modules_manifest, set_gvs_workspace_yaml, sole_hash_dir, write_manifest,
 };
 use assert_cmd::assert::OutputAssertExt;
+use pnpm_fs::DirLock;
+use pnpm_testing_utils::git_repo::GitRepoFixture;
+use std::{
+    process::{Child, Stdio},
+    thread,
+    time::Duration,
+};
 
 /// TS: `GVS hashes are engine-agnostic for packages not in allowBuilds`
 /// (`globalVirtualStore.ts:132`).
@@ -106,10 +115,8 @@ fn gvs_hashes_are_stable_when_allow_builds_targets_an_unrelated_package() {
     drop((root, mock_instance));
 }
 
-/// TS: `GVS re-links when allowBuilds changes` (`globalVirtualStore.ts:205`),
-/// which is also the `.modules.yaml` half listed under the
-/// "`.modules.yaml` Write And Verify" section of the porting plan: the
-/// approval set the install ran under has to round-trip through
+/// TS: `GVS re-links when allowBuilds changes` (`globalVirtualStore.ts:205`):
+/// the approval set the install ran under has to round-trip through
 /// `.modules.yaml`.
 #[test]
 fn gvs_relinks_when_allow_builds_changes() {
@@ -240,6 +247,50 @@ fn gvs_successful_build_creates_package_directory_with_build_artifacts() {
     drop((root, mock_instance));
 }
 
+/// An install into a fresh `node_modules` runs the build of a slot an earlier
+/// install built when the side-effects cache has nothing to restore for it.
+/// The postinstall writes only into the installing project, so the
+/// side-effects cache row it leaves is empty
+/// ([pnpm/pnpm#17526](https://github.com/pnpm/pnpm/issues/17526)).
+#[test]
+fn gvs_reinstall_builds_a_built_slot_with_nothing_cached() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+
+    let repo = GitRepoFixture::init(root.path(), "hook-installer");
+    repo.write_file(
+        "package.json",
+        &serde_json::json!({
+            "name": "hook-installer",
+            "version": "1.0.0",
+            "scripts": {
+                "postinstall": r#"node -e "require('fs').writeFileSync(require('path').join(process.env.INIT_CWD, 'hook-installed'), '')""#,
+            },
+        })
+        .to_string(),
+    );
+    let spec = repo.git_url_at(&repo.commit("init"));
+    write_manifest(&workspace, &serde_json::json!({ "hook-installer": spec }));
+    set_gvs_workspace_yaml(
+        &workspace,
+        &allow_builds_yaml(&[(&format!("hook-installer@{spec}"), true)]),
+    );
+    let hook = workspace.join("hook-installed");
+
+    for install in ["first", "second"] {
+        pacquet(&workspace)
+            .with_arg("install")
+            .assert()
+            .success();
+        assert!(hook.exists(), "the {install} install did not run the postinstall");
+        fs::remove_file(&hook).expect("remove the postinstall output");
+        fs::remove_dir_all(workspace.join("node_modules")).expect("remove node_modules");
+    }
+
+    drop((root, mock_instance));
+}
+
 /// TS: `GVS: approve-builds scenario — install with no builds, then
 /// reinstall with allowBuilds` (`globalVirtualStore.ts:290`). The
 /// hash-directory move is what makes approval safe: the unbuilt slot stays
@@ -321,14 +372,14 @@ fn gvs_approve_builds_scenario_moves_artifacts_to_a_new_hash_dir() {
     drop((root, mock_instance));
 }
 
-/// TS: `GVS build failure cleans up broken package directory`
+/// TS: `GVS build failure keeps the slot and marks it for a rebuild`
 /// (`globalVirtualStore.ts:338`).
 ///
 /// A GVS hash directory is shared by every project whose dependency graph
-/// hashes to it, so a half-built one must not survive a failed build — the
-/// next install would take the warm path into broken files.
+/// hashes to it, so a failed build must not remove a slot other projects
+/// may already link: <https://github.com/pnpm/pnpm/issues/15568>.
 #[test]
-fn gvs_build_failure_cleans_up_broken_package_directory() {
+fn gvs_build_failure_keeps_the_slot_marked_for_a_rebuild() {
     let CommandTempCwd { root, workspace, npmrc_info, .. } =
         CommandTempCwd::init().add_mocked_registry();
     let AddMockedRegistry { store_dir, mock_instance, .. } = npmrc_info;
@@ -346,16 +397,166 @@ fn gvs_build_failure_cleans_up_broken_package_directory() {
         .failure();
 
     let version_dir = pkg_version_dir(&store_dir, "@pnpm.e2e/failing-postinstall", "1.0.0");
-    if version_dir.exists() {
-        for hash in hash_dirs(&version_dir) {
-            let pkg = pkg_in_slot(&version_dir.join(&hash), "@pnpm.e2e/failing-postinstall");
-            assert!(
-                !pkg.exists(),
-                "the failed build's slot must be removed so the next install re-fetches; \
-                 {pkg:?} survived",
-            );
-        }
+    let pkg = pkg_in_slot(&sole_hash_dir(&version_dir), "@pnpm.e2e/failing-postinstall");
+    assert!(pkg.join("package.json").exists(), "the failed build's slot must stay in place");
+    assert_eq!(
+        fs::read_to_string(pkg.join(".pnpm-needs-build")).expect("read the marker"),
+        "started",
+        "the failed build's slot must be marked for a rebuild",
+    );
+
+    drop((root, mock_instance));
+}
+
+/// TS: `GVS removes an optional dependency whose build failed from its slot`
+/// (`globalVirtualStore.ts`).
+///
+/// The package directory goes, so the parent's link inside its own shared
+/// slot finds nothing, while the failed slot keeps its lock and links.
+#[test]
+fn gvs_removes_an_optional_dependency_whose_build_failed_from_its_slot() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { store_dir, mock_instance, .. } = npmrc_info;
+
+    write_manifest(
+        &workspace,
+        &serde_json::json!({ "@pnpm.e2e/pkg-with-failing-optional-dependency": "1.0.0" }),
+    );
+    set_gvs_workspace_yaml(
+        &workspace,
+        &allow_builds_yaml(&[("@pnpm.e2e/pkg-with-failing-postinstall", true)]),
+    );
+    let failed_version_dir =
+        pkg_version_dir(&store_dir, "@pnpm.e2e/pkg-with-failing-postinstall", "1.0.0");
+    let parent_version_dir =
+        pkg_version_dir(&store_dir, "@pnpm.e2e/pkg-with-failing-optional-dependency", "1.0.0");
+
+    for _ in 0..2 {
+        pacquet(&workspace)
+            .with_arg("install")
+            .assert()
+            .success();
+
+        let failed_slot = sole_hash_dir(&failed_version_dir);
+        assert!(
+            !pkg_in_slot(&failed_slot, "@pnpm.e2e/pkg-with-failing-postinstall").exists(),
+            "the optional dependency whose build failed must be removed from its slot",
+        );
+        let parent_slot = sole_hash_dir(&parent_version_dir);
+        assert!(
+            pkg_in_slot(&parent_slot, "@pnpm.e2e/pkg-with-failing-optional-dependency")
+                .join("package.json")
+                .exists(),
+            "the parent must stay installed",
+        );
+        assert!(
+            !pkg_in_slot(&parent_slot, "@pnpm.e2e/pkg-with-failing-postinstall")
+                .join("package.json")
+                .exists(),
+            "the parent must not resolve the optional dependency whose build failed",
+        );
     }
+
+    drop((root, mock_instance));
+}
+
+/// TS: `rebuild keeps a global virtual store slot whose optional build failed`
+/// (`building/commands/test/build/index.ts`).
+///
+/// A rebuild may re-run the scripts of a slot other projects use with a
+/// working build, so its failure keeps the slot.
+#[test]
+fn gvs_rebuild_keeps_the_slot_whose_optional_build_failed() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { store_dir, mock_instance, .. } = npmrc_info;
+
+    let manifest = serde_json::json!({
+        "optionalDependencies": { "@pnpm.e2e/failing-postinstall": "1.0.0" },
+    });
+    fs::write(workspace.join("package.json"), manifest.to_string()).expect("write package.json");
+    set_gvs_workspace_yaml(
+        &workspace,
+        &allow_builds_yaml(&[("@pnpm.e2e/failing-postinstall", true)]),
+    );
+
+    pacquet(&workspace)
+        .with_args(["install", "--ignore-scripts"])
+        .assert()
+        .success();
+    pacquet(&workspace)
+        .with_arg("rebuild")
+        .assert()
+        .success();
+
+    let version_dir = pkg_version_dir(&store_dir, "@pnpm.e2e/failing-postinstall", "1.0.0");
+    let pkg = pkg_in_slot(&sole_hash_dir(&version_dir), "@pnpm.e2e/failing-postinstall");
+    assert!(pkg.join("package.json").exists(), "a failed rebuild must keep the slot");
+
+    drop((root, mock_instance));
+}
+
+/// <https://github.com/pnpm/pnpm/issues/15568>: installs sharing a GVS slot
+/// must not write into it while another install builds it.
+#[test]
+fn gvs_install_waits_for_another_install_building_the_same_slot() {
+    const PKG: &str = "@pnpm.e2e/pre-and-postinstall-scripts-example";
+
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { store_dir, mock_instance, .. } = npmrc_info;
+
+    write_manifest(&workspace, &serde_json::json!({ PKG: "1.0.0" }));
+    set_gvs_workspace_yaml(&workspace, &allow_builds_yaml(&[(PKG, true)]));
+    pacquet(&workspace)
+        .with_args(["install", "--ignore-scripts"])
+        .assert()
+        .success();
+
+    let hash_dir = sole_hash_dir(&pkg_version_dir(&store_dir, PKG, "1.0.0"));
+    let pkg = pkg_in_slot(&hash_dir, PKG);
+    assert!(pkg.join(".pnpm-needs-build").is_file(), "the deferred build must leave its marker");
+    // As a build that died mid-way leaves the slot, which only a re-import
+    // makes safe to build again.
+    fs::write(pkg.join(".pnpm-needs-build"), "started").expect("mark the slot mid-build");
+    fs::remove_file(pkg.join("README.md")).expect("remove a pristine file");
+
+    let lock = DirLock::acquire(
+        hash_dir.join(".pnpm-build.lock"),
+        Duration::ZERO,
+        Duration::from_mins(30),
+    )
+    .expect("take the slot lock")
+    .expect("the slot lock is free");
+    let mut install = ReapOnDrop(
+        pacquet(&workspace)
+            .with_arg("install")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the install"),
+    );
+
+    thread::sleep(Duration::from_secs(3));
+    let exited = install.0.try_wait().expect("poll the install");
+    eprintln!("install exit status while the slot lock was held: {exited:?}");
+    assert!(exited.is_none(), "the install must wait for the slot lock");
+    assert!(
+        !pkg.join("generated-by-postinstall.js").exists(),
+        "the install must not build the slot while another install holds its lock",
+    );
+    assert!(
+        !pkg.join("README.md").exists(),
+        "the install must not re-import the slot while another install holds its lock",
+    );
+
+    drop(lock);
+    let status = install.0.wait().expect("wait for the install");
+    assert!(status.success(), "the install must finish once the slot lock is released");
+    assert!(pkg.join("generated-by-postinstall.js").exists());
+    assert!(pkg.join("README.md").exists());
+    assert!(!pkg.join(".pnpm-needs-build").exists());
 
     drop((root, mock_instance));
 }
@@ -640,4 +841,138 @@ fn approve_builds_updates_gvs_symlinks_and_runs_builds_at_the_new_hash_dir() {
     );
 
     drop((root, mock_instance));
+}
+
+/// A dependency's build script in a shared slot sees the workspace root's
+/// bins and the privately hoisted bins, as it does with a local virtual store.
+/// This is by design, although the slot hash records neither: `NODE_PATH`
+/// already exposes the root and hoisted `node_modules` to the same scripts,
+/// and builds that run a tool they do not declare would fail without them.
+#[test]
+fn gvs_dependency_build_scripts_see_the_workspace_root_and_hoisted_bins() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { store_dir, mock_instance, .. } = npmrc_info;
+
+    for (name, bin, marker) in [
+        ("tool", "gvs-root-tool", "root-tool-ran"),
+        ("hoisted-tool", "gvs-hoisted-tool", "hoisted-tool-ran"),
+    ] {
+        fs::create_dir_all(workspace.join(name)).expect("mkdir tool");
+        fs::write(
+            workspace.join(name).join("package.json"),
+            serde_json::json!({ "name": name, "version": "1.0.0", "bin": { bin: "cli.js" } })
+                .to_string(),
+        )
+        .expect("write tool package.json");
+        fs::write(
+            workspace.join(name).join("cli.js"),
+            format!("#!/usr/bin/env node\nrequire('fs').writeFileSync('{marker}', '')\n"),
+        )
+        .expect("write tool cli.js");
+    }
+
+    fs::create_dir_all(workspace.join("wrapper")).expect("mkdir wrapper");
+    fs::write(
+        workspace.join("wrapper/package.json"),
+        serde_json::json!({
+            "name": "wrapper",
+            "version": "1.0.0",
+            "dependencies": { "hoisted-tool": "file:../hoisted-tool" },
+        })
+        .to_string(),
+    )
+    .expect("write wrapper/package.json");
+
+    fs::create_dir_all(workspace.join("dep")).expect("mkdir dep");
+    fs::write(
+        workspace.join("dep/package.json"),
+        serde_json::json!({
+            "name": "dep",
+            "version": "1.0.0",
+            "scripts": { "postinstall": "gvs-root-tool && gvs-hoisted-tool" },
+        })
+        .to_string(),
+    )
+    .expect("write dep/package.json");
+
+    write_manifest(
+        &workspace,
+        &serde_json::json!({ "tool": "file:tool", "wrapper": "file:wrapper", "dep": "file:dep" }),
+    );
+    set_gvs_workspace_yaml(&workspace, &allow_builds_yaml(&[("dep@file:dep", true)]));
+
+    pacquet(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+
+    let slot = sole_hash_dir(&pkg_version_dir(&store_dir, "@/dep", "directory"));
+    let dep_dir = pkg_in_slot(&slot, "dep");
+    assert!(dep_dir.join("root-tool-ran").exists(), "the workspace root's bin did not run");
+    assert!(dep_dir.join("hoisted-tool-ran").exists(), "the hoisted bin did not run");
+
+    drop((root, mock_instance));
+}
+
+/// A git dependency's build runs in every global-virtual-store slot of its
+/// commit, not only in the first one. The override moves its dependency, so
+/// the second install links the same commit into a new slot, which reads the
+/// store-index row the first install wrote
+/// ([pnpm/pnpm#17224](https://github.com/pnpm/pnpm/issues/17224)).
+#[test]
+fn gvs_builds_each_slot_of_a_git_dependency() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { store_dir, mock_instance, .. } = npmrc_info;
+
+    let repo = GitRepoFixture::init(root.path(), "native-addon");
+    repo.write_file(
+        "package.json",
+        &serde_json::json!({
+            "name": "native-addon",
+            "version": "1.0.0",
+            "dependencies": { "@pnpm.e2e/dep-of-pkg-with-1-dep": "^100.0.0" },
+            "scripts": { "install": r#"node -e "require('fs').writeFileSync('built', '')""# },
+        })
+        .to_string(),
+    );
+    let spec = repo.git_url_at(&repo.commit("init"));
+    write_manifest(&workspace, &serde_json::json!({ "native-addon": spec }));
+    let allow_builds = allow_builds_yaml(&[(&format!("native-addon@{spec}"), true)]);
+
+    for dependency_version in ["100.0.0", "100.1.0"] {
+        set_gvs_workspace_yaml(
+            &workspace,
+            &format!(
+                "{allow_builds}overrides:\n  '@pnpm.e2e/dep-of-pkg-with-1-dep': {dependency_version}\n",
+            ),
+        );
+        pacquet(&workspace)
+            .with_arg("install")
+            .assert()
+            .success();
+    }
+
+    let version_dir = pkg_version_dir(&store_dir, "native-addon", "1.0.0");
+    let slots = hash_dirs(&version_dir);
+    assert_eq!(slots.len(), 2, "each dependency version must give the git dependency its own slot");
+    for slot in slots {
+        let pkg = pkg_in_slot(&version_dir.join(&slot), "native-addon");
+        assert!(pkg.join("built").exists(), "the slot {slot} was not built");
+        assert!(!pkg.join(".pnpm-needs-build").exists(), "the slot {slot} is still marked unbuilt");
+    }
+
+    drop((root, mock_instance));
+}
+
+/// Kills and reaps a spawned install when a failed assertion unwinds past it,
+/// so it cannot keep writing into the store while later tests run.
+struct ReapOnDrop(Child);
+
+impl Drop for ReapOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }

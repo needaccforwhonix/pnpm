@@ -86,9 +86,12 @@ fn mock_env<'a>(dir: &Path, lockfile: &'a Lockfile) -> PkgInfoEnv<'a> {
         layout: crate::pkg_info::InspectionLayout {
             lockfile_dir: dir.to_path_buf(),
             modules_dir: dir.join("node_modules"),
+            relative_modules_dir: std::path::PathBuf::from("node_modules"),
             virtual_store_dir: dir.join("node_modules/.pnpm"),
             virtual_store_dir_max_length: 120,
             store_dir: None,
+            is_hoisted: false,
+            hoisted_dirs: std::collections::BTreeMap::new(),
         },
     }
 }
@@ -105,7 +108,12 @@ fn include_no_optional() -> IncludedDependencies {
 fn graph_for(lockfile: &Lockfile, roots: &[TreeNodeId]) -> DependencyGraph {
     build_dependency_graph(
         roots,
-        &BuildGraphOptions { lockfile, include: include_no_optional(), only_projects: false },
+        &BuildGraphOptions {
+            lockfile,
+            include: include_no_optional(),
+            only_projects: false,
+            peer_edges: pnpm_lockfile::PeerEdgeOptions::default(),
+        },
     )
 }
 
@@ -781,6 +789,7 @@ fn absurdly_deep_chain_is_capped_instead_of_overflowing_the_stack() {
             lockfile: &lockfile,
             include: include_no_optional(),
             only_projects: false,
+            peer_edges: pnpm_lockfile::PeerEdgeOptions::default(),
         },
     );
     let mut cache = MaterializationCache::new();

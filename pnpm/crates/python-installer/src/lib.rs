@@ -1,32 +1,64 @@
-pub use add::{AddOptions, plan_add};
+// `plan_add`'s install future carries the engine's whole resolve-and-fetch
+// graph; proving it `Send` walks deeper than rustc's default limit.
+#![recursion_limit = "256"]
+
+#[cfg(target_family = "wasm")]
+extern crate pnpm_which as which;
+
+pub(crate) use pnpm_process as process;
+pub(crate) use pnpm_process::asynchronous as async_process;
+
+pub use add::{AddOptions, plan_add, writable_project};
+pub use discovery::{Discovery, PythonProject, discover};
 pub use manifest::DependencySelection;
+pub use outdated::{
+    DeclaredPythonDep, PythonDependencyGroup, declared_dependencies, locked_versions,
+    lockfile_dir_for, project_name, resolve_target_version,
+};
+pub use pep508_rs::PackageName;
+pub use update::{UpdateOptions, plan_update};
+pub use workspace::members::in_declared_workspace;
 
 mod add;
+mod build;
+mod cache;
+mod discovery;
 mod environment;
+mod generation;
 mod host;
+mod interpreter;
 mod lockfile;
 mod manifest;
+mod outdated;
+mod projects;
 mod registry;
+mod requirements;
+mod resolutions;
 mod resolver;
+mod settings;
+mod sources;
+mod targets;
+mod update;
+mod workspace;
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
-use environment::{
-    LockfileInputs, PythonPrepare, ensure_environment_parent, publish_link,
-    validate_environment_link,
-};
+use environment::{Generation, LockfileInputs, PythonPrepare, Shared, publish_link};
+use generation::EnvironmentProject;
 use host::Interpreter;
+use interpreter::{Interpreters, Mismatch};
 use miette::{IntoDiagnostic, Result, WrapErr, bail};
 use pnpm_pnpr_client::{PYPI_ECOSYSTEM, PnprClient, PypiResolveOptions};
 use pnpm_python_resolver::{Inputs, Lockfile};
-use pnpm_reporter::Reporter;
+use pnpm_reporter::{GlobalLog, LogEvent, LogLevel, Reporter};
 use pnpm_store_dir::{StoreIndex, StoreIndexWriter};
 use registry::Registry;
+use settings::{Index, python_index};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs, io,
     path::{Path, PathBuf},
     sync::Arc,
 };
+use targets::Environments;
 
 /// Inputs shared by the Python projects participating in one install plan.
 #[derive(Clone)]
@@ -38,9 +70,13 @@ pub struct InstallOptions {
 }
 
 struct Prepared {
+    /// Where the lockfile and the environment are published.
     root: PathBuf,
+    /// The projects the lockfile answers for: `root` alone, or the
+    /// members sharing the environment at it.
+    members: Vec<PathBuf>,
     lock: String,
-    environment: Option<tempfile::TempDir>,
+    environment: Option<Generation>,
     previous_environment: Option<Option<PathBuf>>,
 }
 
@@ -48,47 +84,81 @@ struct Prepared {
 /// Environment publication and rollback are managed by the install coordinator.
 pub fn plan<Reporter: self::Reporter + 'static>(
     context: InstallOptions,
-    manifests: Vec<PathBuf>,
+    discovery: Discovery,
     selection: DependencySelection,
+    selected: BTreeSet<PathBuf>,
 ) -> pnpm_install_coordinator::InstallTask<'static> {
-    let metadata = manifests
+    let metadata = discovery.workspace
+        .memberships(&selected)
         .iter()
-        .map(|path| path.with_file_name("pylock.toml"))
+        .map(|membership| membership.root.join("pylock.toml"))
         .collect();
     pnpm_install_coordinator::InstallTask::new(
         metadata,
-        prepare::<Reporter>(context, manifests, false, selection),
+        prepare::<Reporter>(context, discovery, false, selection, selected),
     )
+}
+
+/// Say which of the platforms this install prepares for pnpm cannot
+/// resolve Python for.
+///
+/// `supportedArchitectures` is read by the npm side too, where a system
+/// pnpm has no wheel tags for is still a name a package declares, so one
+/// is not an error. It does mean `pylock.toml` covers less than the
+/// workspace says it supports, and saying nothing about that reads as
+/// having covered it.
+fn report_platforms_without_python<Reporter: self::Reporter + 'static>(
+    config: &pnpm_config::Config,
+) {
+    let Some(supported) = config.supported_architectures.as_ref() else {
+        return;
+    };
+    let unnamed = targets::platform_values_without_python(supported);
+    if unnamed.is_empty() {
+        return;
+    }
+    let names = unnamed.join(", ");
+    let message = if targets::declares_platforms(config) {
+        format!("pnpm cannot resolve Python for {names}, so pylock.toml does not cover it.")
+    } else {
+        format!(
+            "supportedArchitectures names no platform pnpm can resolve Python for: {names}. \
+             pylock.toml is resolved for the platform the install runs on.",
+        )
+    };
+    Reporter::emit(&LogEvent::Global(GlobalLog { level: LogLevel::Warn, message }));
 }
 
 async fn prepare<Reporter: self::Reporter + 'static>(
     context: InstallOptions,
-    manifests: Vec<PathBuf>,
+    discovery: Discovery,
     resolve: bool,
     selection: manifest::DependencySelection,
+    selected: BTreeSet<PathBuf>,
 ) -> Result<Vec<Prepared>> {
     let config = context.config;
-    let roots = read_project_manifests(manifests).await?;
-    if roots.is_empty() {
+    if !discovery.has_projects() {
         return Ok(Vec::new());
     }
-    let interpreter: Interpreter =
-        host::run(&config.python.executable, "probe", serde_json::json!({})).await?;
-    let (index, auth) = python_index(config)?;
+    report_platforms_without_python::<Reporter>(config);
+    let Discovery { roots, workspace, .. } = discovery;
+    let index = python_index(config)?;
     config.store_dir.init().into_diagnostic()?;
     let store_index = StoreIndex::shared_for(&config.store_dir, config.frozen_store);
-    let (writer, writer_task) = StoreIndexWriter::spawn_for(&config.store_dir, config.frozen_store);
-    let prepare = PythonPrepare {
+    let (writer, writer_task) = StoreIndexWriter::spawn_for(
+        &config.store_dir,
+        config.frozen_store,
+        config.store_index_format,
+    );
+    let shared = Shared {
         context: &context,
-        interpreter: &interpreter,
         index: &index,
-        auth: &auth,
-        store_index,
-        writer: &writer,
-        resolve,
-        selection,
+        store: environment::ArtifactStore { index: store_index, writer: &writer },
+        asked: environment::Asked { resolve, selection },
+        members: workspace.scopes().clone(),
+        caches: environment::Caches::default(),
     };
-    let result = prepare_projects::<Reporter>(&prepare, roots).await;
+    let result = projects::prepare::<Reporter>(&shared, workspace, roots, &selected).await;
     drop(writer);
     writer_task.await
         .into_diagnostic()
@@ -98,188 +168,124 @@ async fn prepare<Reporter: self::Reporter + 'static>(
     result
 }
 
-async fn prepare_projects<Reporter: self::Reporter + 'static>(
-    prepare: &PythonPrepare<'_>,
-    roots: Vec<(PathBuf, manifest::Manifest)>,
-) -> Result<Vec<Prepared>> {
-    let mut prepared = Vec::new();
-    for (root, manifest) in roots {
-        prepared.push(prepare.project::<Reporter>(root, manifest).await?);
-    }
-    Ok(prepared)
-}
-
-/// The projects among `manifests`: a `pyproject.toml` without a
-/// `[project]` table declares no package of its own.
-async fn read_project_manifests(
-    manifests: Vec<PathBuf>,
-) -> Result<Vec<(PathBuf, manifest::Manifest)>> {
-    let mut roots = Vec::new();
-    for path in manifests {
-        let contents = tokio::fs::read_to_string(&path).await
-            .into_diagnostic()
-            .wrap_err_with(|| format!("read {}", path.display()))?;
-        let manifest = manifest::Manifest::parse(&contents)?;
-        if manifest.project.is_some() {
-            roots.push((
-                path.parent()
-                    .expect("manifest has a parent")
-                    .to_path_buf(),
-                manifest,
-            ));
-        }
-    }
-    Ok(roots)
-}
-
-/// The configured Python index, with any credentials it carries lifted out
-/// of the URL. A repository-selected Python index must not select
-/// user-level npm credentials.
-fn python_index(config: &pnpm_config::Config) -> Result<(url::Url, pnpm_network::AuthHeaders)> {
-    let mut index: url::Url = config.python.index_url.parse().into_diagnostic()?;
-    let mut auth = pnpm_network::AuthHeaders::default().with_secure_transport();
-    if !index.username().is_empty() || index.password().is_some() {
-        let username = pnpm_network::percent_decode_str(index.username());
-        let password = pnpm_network::percent_decode_str(index.password().unwrap_or(""));
-        index
-            .set_username("")
-            .map_err(|()| miette::miette!("invalid Python index URL"))?;
-        index
-            .set_password(None)
-            .map_err(|()| miette::miette!("invalid Python index URL"))?;
-        auth.insert_url_header(
-            index.as_str(),
-            format!("Basic {}", STANDARD.encode(format!("{username}:{password}"))),
-        );
-    }
-    pnpm_python_resolver::validate_url(&index)?;
-    if !index.path().ends_with('/') {
-        index.set_path(&format!("{}/", index.path()));
-    }
-    Ok((index, auth))
-}
-
 impl PythonPrepare<'_> {
-    async fn project<Reporter: self::Reporter + 'static>(
+    async fn projects<Reporter: self::Reporter + 'static>(
         &self,
-        root: PathBuf,
-        manifest: manifest::Manifest,
+        projects: projects::Projects,
     ) -> Result<Prepared> {
-        let config = self.context.config;
-        let project = manifest.project.as_ref().expect("only project manifests were selected");
-        self.check_requires_python(&root, project.requires_python.as_deref())?;
-        let requirements = manifest.requirements(config, manifest::DependencySelection::ALL)?;
-        let inputs = Inputs::new(&requirements, &self.interpreter.target, self.index.as_str());
-        let mut registry = self.registry();
+        let recorded_members = projects.recorded_members();
+        let projects::Projects { root, members, local, rules, .. } = projects;
+        for member in &members {
+            self.check_requires_python(&member.root, member.requires_python())?;
+        }
+        let requirements = projects::Requirements::merged(&members);
+        let (mut registry, mut inputs) = self.configured_registry(&requirements.all, &rules)?;
+        inputs.set_members(recorded_members);
+        workspace::offer(&mut registry.resolution.packages, &local);
         let lock_path = root.join("pylock.toml");
-        let existing =
-            self.replayable_lockfile(&lock_path, &inputs, project.requires_python.as_deref())
-                .await?;
-        let lock = self.lockfile::<Reporter>(
+        let lock = self.project_lock::<Reporter>(
             &mut registry,
             LockfileInputs {
-                existing,
+                existing: None,
                 lock_path: &lock_path,
-                requirements: &requirements,
+                requirements: &requirements.all,
                 inputs,
-                requires_python: project.requires_python.clone(),
+                requires_python: projects::requires_python_of(&members)?,
+                local: Arc::clone(&local),
+                members: &members,
             },
         )
         .await?;
-        let environment = self.environment(
+        let environment = self.environment::<Reporter>(
             &mut registry,
-            &root,
+            EnvironmentProject { root: &root, members: &members, local: &local },
             &lock,
-            &manifest.requirements(config, self.selection)?,
+            &requirements.selected,
         )
         .await?;
         Ok(Prepared {
             root,
+            members: members
+                .into_iter()
+                .map(|member| member.root)
+                .collect(),
             lock: toml::to_string_pretty(&lock).into_diagnostic()?,
             environment,
             previous_environment: None,
         })
     }
 
+    async fn project_lock<Reporter: self::Reporter + 'static>(
+        &self,
+        registry: &mut Registry<'_>,
+        mut inputs: LockfileInputs<'_>,
+    ) -> Result<Lockfile> {
+        inputs.existing = self.replayable_lockfile(
+            inputs.lock_path,
+            &inputs.inputs,
+            inputs.requires_python.as_deref(),
+            &inputs.local,
+        )
+        .await?;
+        self.shared_lockfile::<Reporter>(registry, inputs).await
+    }
+
     fn registry(&self) -> Registry<'_> {
         Registry {
             config: self.context.config,
             client: &self.context.http_client,
-            auth: self.auth.clone(),
-            index: self.index.clone(),
+            index: self.index,
             interpreter: self.interpreter,
+            resolution: registry::Resolution::new(self.interpreter.target.clone()),
             store: pnpm_tarball::ArchiveStoreContext {
                 dir: &self.context.config.store_dir,
-                index: self.store_index.clone(),
-                index_writer: Some(Arc::clone(self.writer)),
+                index: self.store.index.clone(),
+                index_writer: Some(Arc::clone(self.store.writer)),
                 verify_integrity: self.context.config.verify_store_integrity,
                 strict_pkg_content_check: self.context.config.strict_store_pkg_content_check,
                 verified_files_cache: Arc::default(),
                 prefetched_cas_paths: None,
             },
-            packages: pnpm_python_resolver::Packages::new(),
             wheels: BTreeMap::new(),
+            sources: sources::Sources::new(self),
         }
     }
 
-    /// A project that pins an interpreter range cannot be installed with an
-    /// interpreter outside it.
+    /// A project that pins an interpreter range cannot be locked for an
+    /// environment outside it, which for a project that declares none is
+    /// the interpreter running the install.
+    ///
+    /// A declared environment outside the range is a configuration the
+    /// resolution cannot satisfy, so it is reported whatever
+    /// `runtimeOnFail` says. The undeclared environment is the selected
+    /// interpreter, which the selection has already reported on under
+    /// that setting.
     fn check_requires_python(&self, root: &Path, requires_python: Option<&str>) -> Result<()> {
+        if !self.environments.declared && Mismatch::of(self.context.config).bypassed() {
+            return Ok(());
+        }
         let Some(specifiers) = requires_python else {
             return Ok(());
         };
         let specifiers: pep440_rs::VersionSpecifiers = specifiers.parse().into_diagnostic()?;
-        if !specifiers.contains(self.interpreter.target.environment.python_full_version()) {
-            bail!(
-                "{} requires Python {specifiers}, but {} was selected",
-                root.display(),
-                self.interpreter.target.environment.python_full_version(),
-            );
+        for environment in &self.environments.list {
+            let version = environment.target.environment.python_full_version();
+            if !specifiers.contains(version) {
+                bail!(
+                    "{} requires Python {specifiers}, but {version} was selected",
+                    root.display(),
+                );
+            }
         }
         Ok(())
-    }
-
-    /// Install the locked wheels the project selects into a fresh
-    /// environment generation. A lockfile-only run builds none.
-    async fn environment(
-        &self,
-        registry: &mut Registry<'_>,
-        root: &Path,
-        lock: &Lockfile,
-        selected_requirements: &[pep508_rs::Requirement],
-    ) -> Result<Option<tempfile::TempDir>> {
-        if self.context.lockfile_only {
-            return Ok(None);
-        }
-        validate_environment_link(root)?;
-        let generations = root.join(".pnpm/python-envs");
-        ensure_environment_parent(root)?;
-        let environment = tempfile::Builder::new()
-            .prefix("env-")
-            .tempdir_in(&generations)
-            .into_diagnostic()?;
-        registry.packages.candidates.clear();
-        lock.seed(&mut registry.packages)?;
-        let selected = resolver::locked_solution(registry, selected_requirements)?;
-        let wheels = selected
-            .into_iter()
-            .map(|package| &registry.wheels[&package])
-            .collect::<Vec<_>>();
-        host::run::<serde_json::Value>(
-            &self.interpreter.executable,
-            "install",
-            serde_json::json!({"root": environment.path(), "packages": wheels}),
-        )
-        .await?;
-        Ok(Some(environment))
     }
 }
 
 impl pnpm_install_coordinator::PreparedInstall for Prepared {
     fn publish(&mut self) -> Result<()> {
-        if let Some(environment) = &self.environment {
-            self.previous_environment = Some(validate_environment_link(&self.root)?);
-            publish_link(&self.root, environment.path())?;
+        if let Some(generation) = &self.environment {
+            self.previous_environment = Some(generation.store.validate_link(&self.root)?);
+            publish_link(&self.root, generation.directory.path())?;
         }
         let lock_path = self.root.join("pylock.toml");
         let previous = match fs::read_to_string(&lock_path) {
@@ -306,8 +312,8 @@ impl pnpm_install_coordinator::PreparedInstall for Prepared {
     }
 
     fn retain(self: Box<Self>) {
-        if let Some(environment) = self.environment {
-            let _ = environment.keep();
+        if let Some(generation) = self.environment {
+            let _ = generation.directory.keep();
         }
     }
 }
@@ -319,9 +325,14 @@ pub fn execution_paths<'a>(
     if !config.python.enabled {
         return std::borrow::Cow::Borrowed(&config.extra_bin_paths);
     }
-    let mut paths = vec![dir.join(if cfg!(windows) { ".venv/Scripts" } else { ".venv/bin" })];
+    let environment = environment_dir(config.workspace_dir.as_deref(), dir);
+    let mut paths = vec![environment.join(if cfg!(windows) { "Scripts" } else { "bin" })];
     paths.extend(config.extra_bin_paths.iter().cloned());
     std::borrow::Cow::Owned(paths)
+}
+
+fn environment_dir(workspace: Option<&Path>, dir: &Path) -> PathBuf {
+    workspace::members::environment_root_of(workspace, dir).join(".venv")
 }
 
 #[cfg(test)]

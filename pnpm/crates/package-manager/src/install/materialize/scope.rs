@@ -1,46 +1,33 @@
 use super::super::{
-    Arc, BTreeMap, Config, HashSet, InstallError, Lockfile, LogEvent, LogLevel, NodeLinker,
-    PackageManifest, Path, PathBuf, PnpmLog, RebuildOptions, Reporter, ResolutionVerifier,
+    Arc, BTreeMap, Config, HashSet, InstallError, Lockfile, LogEvent, LogLevel, PackageManifest,
+    Path, PathBuf, PnpmLog, RebuildOptions, Reporter, ResolutionVerifier,
     map_frozen_lockfile_error, record_lockfile_verified, verify_lockfile_eagerly,
 };
 
 /// Whether `allowBuilds` moved since the previous install in a way the
-/// hoisted linker must act on: a build it ignored is now allowed, or one
-/// it ran is no longer allowed. Read from the previous `.modules.yaml`;
-/// `false` on a first install.
+/// hoisted linker must act on: a build it ignored is now allowed, or the
+/// approval set it ran under has changed. Read from the previous
+/// `.modules.yaml`; `false` on a first install.
 pub(super) fn allow_builds_changed_since(
     modules_manifest: Option<&pnpm_modules_yaml::ModulesLayout>,
     config: &pnpm_config::Config,
 ) -> bool {
     modules_manifest.is_some_and(|modules| {
         super::super::has_newly_allowed_ignored_builds(modules, config)
-            || super::super::has_revoked_allowed_builds(modules, config)
-            || recorded_allow_builds_differ(modules, config)
+            || super::super::recorded_allow_builds_differ(modules, config)
     })
 }
-/// Whether the `allowBuilds` entries the previous install recorded differ
-/// from the current setting: an entry flipped between `true` and `false`,
-/// or one added or removed. The two predicates above see an ignored build
-/// becoming allowed and an approval being withdrawn; this sees the
-/// remaining transitions, such as an explicit `false` becoming `true`,
-/// which leaves no ignored entry behind to notice. Placeholder entries the
-/// approval scaffold writes carry no decision and are ignored.
-pub(super) fn recorded_allow_builds_differ(
-    modules: &pnpm_modules_yaml::ModulesLayout,
-    config: &pnpm_config::Config,
-) -> bool {
-    let recorded: std::collections::HashMap<&str, bool> = modules.allow_builds
-        .iter()
-        .flatten()
-        .filter_map(|(spec, value)| match value {
-            pnpm_modules_yaml::AllowBuildValue::Bool(decision) => Some((spec.as_str(), *decision)),
-            pnpm_modules_yaml::AllowBuildValue::String(_) => None,
-        })
-        .collect();
-    recorded.len() != config.allow_builds.len()
-        || recorded
-            .iter()
-            .any(|(spec, decision)| config.allow_builds.get(*spec) != Some(decision))
+/// The snapshots the previous install's `.modules.yaml` recorded as
+/// skipped, an optional dependency this host cannot use among them. Empty
+/// on a first install. A lockfile entry says what an install resolved, not
+/// what it put on disk, so this is what separates the two for the previous
+/// install the way [`pnpm_deps_restorer::SkippedSnapshots`] does for this one.
+pub(super) fn previously_skipped(
+    modules_manifest: Option<&pnpm_modules_yaml::ModulesLayout>,
+) -> pnpm_deps_restorer::SkippedSnapshots {
+    modules_manifest.map_or_else(pnpm_deps_restorer::SkippedSnapshots::default, |modules| {
+        pnpm_deps_restorer::SkippedSnapshots::from_strings(&modules.skipped)
+    })
 }
 /// The `name@version` keys the previous install's `.modules.yaml` recorded
 /// as not built, its `ignoredBuilds` and `pendingBuilds`. Empty on a first
@@ -121,6 +108,19 @@ pub(super) fn record_fresh_lockfile_verified(
         resolution_verifiers,
     );
 }
+/// Only a lockfile saved as resolved, which no `afterAllResolved` hook
+/// rewrote, is the output the next deduplicating resolution reproduces.
+pub(super) fn record_auto_dedupe_baseline(
+    result: &crate::InstallWithFreshLockfileResult,
+    baseline: Option<&super::super::auto_dedupe_baseline::AutoDedupeBaseline>,
+) {
+    if result.can_record_lockfile_verification
+        && let Some(baseline) = baseline
+        && let Some(lockfile) = result.wanted_lockfile.as_ref()
+    {
+        baseline.record(lockfile);
+    }
+}
 /// A selected (`--filter`) frozen install verifies the whole lockfile up
 /// front, so nothing is left for the concurrent gate to carry; an unselected
 /// one hands its override straight through.
@@ -155,35 +155,28 @@ pub(super) async fn settle_frozen_verification<'install, Reporter: self::Reporte
 pub(super) fn frozen_project_anchor_ids(
     requested_importer_ids: Option<&HashSet<String>>,
     real_importer_ids: &HashSet<String>,
-    node_linker: NodeLinker,
-    materialization: Option<&crate::MaterializationClosure>,
+    materialization: &crate::MaterializationClosure,
 ) -> HashSet<String> {
     match requested_importer_ids {
-        Some(selected) if matches!(node_linker, NodeLinker::Hoisted) => selected.clone(),
-        Some(_) => materialization
-            .expect("selected install has a materialization closure")
-            .importer_ids
-            .clone(),
+        Some(_) => materialization.importer_ids.clone(),
         None => real_importer_ids.clone(),
     }
 }
-/// The importers a frozen install materializes first. A hoisted linker shares
-/// one tree, so a selected install still has to materialize every importer.
-pub(super) fn initial_materialization_ids(
+/// The importers a frozen install materializes first. Manifest-independent
+/// installs use the entire lockfile. See [`crate::selected_materialization_ids`]
+/// for `hoisted_prior`.
+pub(in crate::install) fn initial_materialization_ids(
     lockfile: &Lockfile,
     requested_importer_ids: Option<&HashSet<String>>,
-    node_linker: NodeLinker,
-) -> Option<HashSet<String>> {
-    let selected = requested_importer_ids?;
-    if matches!(node_linker, NodeLinker::Hoisted) {
-        return Some(
-            lockfile.importers
-                .keys()
-                .cloned()
-                .collect(),
-        );
+    hoisted_prior: Option<&Lockfile>,
+) -> HashSet<String> {
+    match requested_importer_ids {
+        Some(selected) => crate::selected_materialization_ids(lockfile, selected, hoisted_prior),
+        _ => lockfile.importers
+            .keys()
+            .cloned()
+            .collect(),
     }
-    Some(selected.clone())
 }
 /// pnpm's headless installer announces itself whenever it is entered — also
 /// on a cold `node_modules` and on subset (`--filter`) installs — not only

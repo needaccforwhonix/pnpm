@@ -5,6 +5,8 @@
 //! current shell's rc file is edited. The Windows changes are rendered into
 //! the same `old_settings` / `new_settings` shape the POSIX path reports.
 
+pub(super) use posix::{detect_current_shell, render_shell_settings, sh_quote};
+
 mod posix;
 mod windows;
 
@@ -119,14 +121,14 @@ pub(crate) enum PathExtenderError {
         character: char,
     },
 
-    #[display("Currently '{env_name}' is set to '{wanted_value}'")]
+    #[display("Currently '{env_name}' is set to '{current_value}'")]
     #[diagnostic(
         code(ERR_PNPM_BAD_ENV_FOUND),
         help("If you want to override the existing env variable, use the --force option")
     )]
     BadEnvFound {
         env_name: String,
-        wanted_value: String,
+        current_value: String,
     },
 
     #[display("exec chcp failed: {message}")]

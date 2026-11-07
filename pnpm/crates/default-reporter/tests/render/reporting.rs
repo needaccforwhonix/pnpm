@@ -1,10 +1,11 @@
 use super::{
     CWD, Colors, DedupeCheckLog, DependencyType, ExecutionTimeLog, GlobalLog, HookLog,
-    LifecycleLog, LifecycleMessage, LifecycleStdio, LogEvent, LogLevel, MaxLogLevel, Output,
-    PnpmErrorLog, PnpmLog, ReporterOptions, ReporterState, Stage, StatsLog, StatsMessage,
-    added_root_at, added_root_with_latest_at, deprecation, emitted_lines,
-    interleaved_lifecycle_events, linked_root, pnpm_log, progress, progress_at, render, scope,
-    stage_at, state, state_with_options, summary, summary_at, update_check,
+    LifecycleLog, LifecycleMessage, LifecycleStdio, LogEvent, LogLevel, MaxLogLevel,
+    NonDeprecatedAlternative, Output, PnpmErrorLog, PnpmLog, ReporterOptions, ReporterState, Stage,
+    StatsLog, StatsMessage, added_root_at, added_root_with_latest_at, deprecation,
+    deprecation_with_alternative, emitted_lines, interleaved_lifecycle_events, linked_root,
+    pnpm_log, progress, progress_at, render, scope, stage_at, state, state_with_options, summary,
+    summary_at, update_check,
 };
 
 #[test]
@@ -112,6 +113,23 @@ fn moves_fixed_progress_line_to_the_end() {
         ],
     );
     assert_eq!(frame, "[WARN] foo\nProgress: resolved 1, reused 0, downloaded 1, added 0, done");
+}
+
+#[test]
+fn ignores_progress_after_importing_done() {
+    let mut reporter = state(false);
+    let frame = render(
+        &mut reporter,
+        vec![
+            stage_at(CWD, Stage::ResolutionStarted),
+            progress("resolved"),
+            progress("fetched"),
+            stage_at(CWD, Stage::ResolutionDone),
+            stage_at(CWD, Stage::ImportingDone),
+            progress("found_in_store"),
+        ],
+    );
+    assert_eq!(frame, "Progress: resolved 1, reused 0, downloaded 1, added 0, done");
 }
 
 #[test]
@@ -422,10 +440,65 @@ fn hook_log_renders_with_magenta_hook_name() {
 }
 
 #[test]
-fn direct_deprecation_renders_immediately_with_the_message() {
+fn direct_deprecation_renders_immediately_without_the_notice() {
     let mut reporter = state(false);
     let frame = render(&mut reporter, vec![deprecation("express", "0.14.1", 0, CWD)]);
-    assert_eq!(frame, "[WARN] deprecated express@0.14.1: no longer supported");
+    assert_eq!(frame, "[WARN] deprecated express@0.14.1");
+}
+
+/// A git or tarball dependency names itself, so the identifier is filtered
+/// like any other store-derived text before it reaches the terminal.
+/// The version comes from pnpm's own reading of the packument, so unlike the
+/// notice it is safe to print.
+#[test]
+fn direct_deprecation_names_a_version_that_is_not_deprecated() {
+    let mut reporter = state(false);
+    let frame = render(
+        &mut reporter,
+        vec![deprecation_with_alternative(
+            "express",
+            "0.14.1",
+            0,
+            CWD,
+            Some(NonDeprecatedAlternative {
+                version: "4.21.2".to_string(),
+                outside_declared_range: true,
+            }),
+        )],
+    );
+    assert_eq!(
+        frame,
+        "[WARN] deprecated express@0.14.1. 4.21.2 is not deprecated, outside the range you declared.",
+    );
+}
+
+#[test]
+fn direct_deprecation_drops_the_range_clause_when_no_range_was_declared() {
+    let mut reporter = state(false);
+    let frame = render(
+        &mut reporter,
+        vec![deprecation_with_alternative(
+            "express",
+            "0.14.1",
+            0,
+            CWD,
+            Some(NonDeprecatedAlternative {
+                version: "0.14.2".to_string(),
+                outside_declared_range: false,
+            }),
+        )],
+    );
+    assert_eq!(frame, "[WARN] deprecated express@0.14.1. 0.14.2 is not deprecated.");
+}
+
+#[test]
+fn direct_deprecation_strips_control_characters_from_the_identifier() {
+    let mut reporter = state(false);
+    let frame =
+        render(&mut reporter, vec![deprecation("express\u{1b}[2K\rclean", "0.14.1", 0, CWD)]);
+    // The payload stays readable rather than being removed: without the
+    // leading ESC the terminal prints it instead of acting on it.
+    assert_eq!(frame, "[WARN] deprecated express[2Kclean@0.14.1");
 }
 
 /// The event fires for every command; only the ones in pnpm's

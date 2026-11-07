@@ -1,3 +1,5 @@
+pub use selectors::{ParsedSelector, parse_update_param};
+
 pub(crate) use latest::is_workspace_local_path_specifier;
 
 mod install;
@@ -9,7 +11,8 @@ use install::{
 mod prepare;
 use prepare::{
     ReadPackageHook, apply_read_package_hook_to_update_manifest, prepare_manifest,
-    prepare_selected_manifests, update_read_package_hook,
+    prepare_selected_manifests, selection::selection_matches_ignored_direct,
+    update_read_package_hook,
 };
 
 mod workspace;
@@ -29,11 +32,13 @@ use rewrite::{MatchedRewriteInputs, record_matched_direct_update};
 
 mod seed_policy;
 
+mod latest_subtree;
+
 mod selectors;
 use selectors::{parse_selectors, reject_versions_of_indirect_update_specs};
 
 use crate::{
-    CatalogVersionMismatchError, InstallError, ProjectMutation, ResolvedPackages,
+    CatalogVersionMismatchError, CommandLockfile, InstallError, ProjectMutation, ResolvedPackages,
     WorkspaceInstallSelection, catalog_cleanup::WriteWorkspaceCatalogsError,
     package_manifest_prefix, selected_project_indices,
 };
@@ -41,10 +46,11 @@ use derive_more::{Display, Error};
 use miette::Diagnostic;
 use pnpm_catalogs_config::InvalidCatalogsConfigurationError;
 use pnpm_config::Config;
-use pnpm_lockfile::Lockfile;
 use pnpm_network::ThrottledClient;
 use pnpm_package_manifest::{DependencyGroup, PackageManifest, PackageManifestError};
+use pnpm_registry::RangeSpecStyle;
 use pnpm_reporter::Reporter;
+use pnpm_resolving_deps_resolver::UpdateTargets;
 use pnpm_resolving_resolver_base::WorkspacePackages;
 use pnpm_tarball::MemCache;
 use std::{
@@ -55,8 +61,7 @@ use std::{
 
 /// Everything `pacquet update` (alias `up` / `upgrade`) does.
 ///
-/// Runs on pacquet's always-fresh-resolve install path. Its behavior has
-/// two halves:
+/// Runs on pacquet's always-fresh-resolve install path. Its behavior:
 ///
 /// * **Compatible bump** (no `--latest`): the matched names have their
 ///   lockfile pins withheld from the preferred-versions seed
@@ -225,9 +230,21 @@ impl Update<'_> {
             )?;
         }
         let mut latest_chain = None;
-        let Some(prepared) =
-            prepare_manifest::<Reporter>(manifest, update, &owned, None, &mut latest_chain).await?
+        let importer_id =
+            pnpm_workspace::importer_id_from_root_dir(&site.workspace_root, manifest_dir(manifest));
+        let Some(prepared) = prepare_manifest::<Reporter>(
+            manifest,
+            &importer_id,
+            update,
+            &owned,
+            None,
+            &mut latest_chain,
+        )
+        .await?
         else {
+            if selection_matches_ignored_direct(manifest, update, &owned) {
+                return Ok(());
+            }
             return nothing_to_update(
                 update.selection.depth,
                 update.selection.packages,
@@ -267,7 +284,7 @@ impl Update<'_> {
             &owned,
         )
         .await?;
-        if !prepared.any_work {
+        if !prepared.has_work() {
             return Ok(());
         }
         run_prepared_selected_update::<Reporter>(
@@ -283,8 +300,9 @@ pub struct UpdateOptions<'a> {
     pub resolved_packages: &'a ResolvedPackages,
     pub http_client: &'a ThrottledClient,
     pub config: &'static Config,
-    pub lockfile: Option<&'a Lockfile>,
-    pub lockfile_path: Option<&'a Path>,
+    /// The wanted lockfile, as the command reads it and as the
+    /// install it runs needs it.
+    pub lockfile: CommandLockfile<'a>,
     /// `--lockfile-only`: re-resolve and rewrite `pnpm-lock.yaml` without
     /// materializing `node_modules`. Forwarded to the install.
     pub lockfile_only: bool,
@@ -309,6 +327,13 @@ pub struct UpdateSelection<'a> {
     /// are re-pointed at the workspace copies through the `workspace:`
     /// protocol instead of the registry. `None` is a plain update.
     pub workspace_packages: Option<&'a WorkspacePackages>,
+    /// `--interactive`: whether the update was invoked interactively.
+    pub interactive: bool,
+    /// Narrows an update without selectors to the locked versions these
+    /// targets cover, so every other dependency keeps its locked version, as
+    /// pnpm's `updateMatching` does. `None` leaves the choice to
+    /// [`Self::packages`].
+    pub targets: Option<&'a UpdateTargets>,
 }
 
 #[derive(Clone, Copy)]
@@ -320,11 +345,11 @@ pub struct UpdateVersionOptions {
     /// `--patches`: refresh registry revisions while retaining every locked
     /// package version and leaving manifest specifiers unchanged.
     pub patches: bool,
-    /// `--save-exact` / `-E`: write the resolved version without a range
-    /// operator when rewriting the manifest under `--latest`. Only applies
-    /// to dependencies whose current specifier has no recoverable pin; an
-    /// existing `^`/`~`/exact range is preserved over this default.
-    pub save_exact: bool,
+    /// The range operator written when a manifest specifier is rewritten,
+    /// from `--save-exact` and the `saveExact` / `savePrefix` settings. Only
+    /// applies to dependencies whose current specifier has no recoverable
+    /// pin; an existing `^`/`~`/exact range is preserved over this default.
+    pub range_spec_style: RangeSpecStyle,
     /// `--save` (default) / `--no-save`. When `false`, `package.json` on
     /// disk is left untouched, so its specifiers stay authoritative:
     /// `pnpm-lock.yaml` still updates, but only within the ranges the
@@ -334,16 +359,24 @@ pub struct UpdateVersionOptions {
     pub save: bool,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct UpdateExplicitGroups {
+    pub prod: bool,
+    pub dev: bool,
+    pub optional: bool,
+    pub no_optional: bool,
+}
+
 /// The update's owned inputs, consumed by the install it runs.
 pub struct UpdateResources {
     pub tarball_mem_cache: Arc<MemCache>,
     pub http_client_arc: Arc<ThrottledClient>,
     /// Dependency groups the update considers when choosing which direct
     /// dependencies to match, derived from
-    /// `--prod` / `--dev` / `--no-optional`. Note: the *materialized*
-    /// dependency set is always all three groups (the `node_modules`
-    /// layout is unchanged); this only narrows the update scope.
+    /// `--prod` / `--dev` / `--no-optional`.
     pub include_direct: Vec<DependencyGroup>,
+    /// Explicit dependency group flags passed on the CLI.
+    pub explicit_groups: UpdateExplicitGroups,
     /// CLI-merged `supportedArchitectures`, forwarded to the install.
     pub supported_architectures: Option<pnpm_package_is_installable::SupportedArchitectures>,
     /// Sink notified for each resolved tarball package, and the source of
@@ -374,6 +407,7 @@ impl SelectedProjects<'_> {
             project_dependencies: self.project_dependencies,
             ordered_dirs: self.ordered_dirs,
             selected_dirs: self.selected_dirs,
+            edited_dirs: None,
             install_dirs: self.install_dirs,
             active_manifest_is_standin: self.active_manifest_is_standin,
             workspace_cycles: crate::PrecomputedWorkspaceCycles::Unknown,

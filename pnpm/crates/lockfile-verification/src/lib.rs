@@ -10,16 +10,6 @@
 //! This crate is built from two parts: the fan-out runner and the
 //! JSONL stat-and-skip cache.
 //!
-//! Public surface today: [`verify_lockfile_resolutions()`],
-//! [`lockfile_verification_is_cached()`],
-//! [`lockfile_verification_is_cached_by_content()`],
-//! [`verify_lockfile_dependency_names()`],
-//! [`collect_resolution_policy_violations()`], [`hash_lockfile()`],
-//! [`VerifyError`], and [`RenderedViolation`] — the last lets a caller
-//! that resolved violations out-of-process (e.g. the pnpr client
-//! reconstructing them from the server's response) rebuild the same
-//! [`VerifyError`] via [`VerifyError::from_rendered`].
-//!
 //! [`ResolutionVerifier`]: pnpm_resolving_resolver_base::ResolutionVerifier
 
 pub use cache::{
@@ -31,10 +21,10 @@ pub use errors::{RenderedViolation, VerifyError};
 pub use hash_lockfile::hash_lockfile;
 pub use record_lockfile_verified::record_lockfile_verified;
 pub use verify_lockfile_resolutions::{
-    RESOLUTION_SHAPE_MISMATCH_VIOLATION_CODE, VerifyLockfileResolutionsOptions,
+    RESOLUTION_SHAPE_MISMATCH_VIOLATION_CODE, ReplacedEntries, VerifyLockfileResolutionsOptions,
     collect_resolution_policy_violations, lockfile_verification_is_cached,
     lockfile_verification_is_cached_by_content, verify_lockfile_dependency_names,
-    verify_lockfile_resolutions,
+    verify_lockfile_importer_snapshot_links, verify_lockfile_resolutions,
 };
 
 mod cache;
@@ -42,3 +32,8 @@ mod errors;
 mod hash_lockfile;
 mod record_lockfile_verified;
 mod verify_lockfile_resolutions;
+
+#[cfg(target_family = "wasm")]
+pub(crate) use pnpm_wasm_host::process_id;
+#[cfg(not(target_family = "wasm"))]
+pub(crate) use std::process::id as process_id;

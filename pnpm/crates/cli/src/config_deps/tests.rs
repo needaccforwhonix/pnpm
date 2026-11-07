@@ -182,7 +182,7 @@ async fn update_config_null_clears_virtual_store_dir() {
     run_update_config_hooks::<SilentReporter>(&mut config, root.path()).await
         .expect("run updateConfig hook");
 
-    assert_eq!(config.virtual_store_dir, root.path().join("node_modules/.pnpm"));
+    assert_eq!(config.install_state_dir, root.path().join("node_modules/.pnpm"));
     assert!(!config.explicit_settings.contains_key("virtualStoreDir"));
 }
 
@@ -350,6 +350,45 @@ async fn update_config_hook_setting_script_shell_to_null_clears_value() {
     assert_eq!(config.script_shell, None);
 }
 
+#[tokio::test]
+async fn update_config_hook_cannot_read_or_change_macos_backup_policy() {
+    let root = tempfile::tempdir().expect("workspace tempdir");
+    fs::write(root.path().join("pnpm-workspace.yaml"), "\n").expect("write workspace settings");
+    fs::write(
+        root.path().join(".pnpmfile.cjs"),
+        "module.exports = { hooks: { updateConfig (config) { if ('macosBackup' in config) throw new Error('backup policy leaked'); config.macosBackup = { excludeModulesDir: true, excludeStoreDir: true }; return config } } }",
+    )
+    .expect("write pnpmfile");
+    let mut config = Config::default().current::<Host>(root.path()).expect("load configuration");
+    config.macos_backup.exclude_modules_dir = false;
+    config.macos_backup.exclude_store_dir = false;
+
+    run_update_config_hooks::<SilentReporter>(&mut config, root.path()).await
+        .expect("run updateConfig hook");
+
+    assert!(!config.macos_backup.exclude_modules_dir);
+    assert!(!config.macos_backup.exclude_store_dir);
+}
+
+#[tokio::test]
+async fn update_config_hook_cannot_read_or_change_the_symlinked_lockfile_dirs() {
+    let root = tempfile::tempdir().expect("workspace tempdir");
+    fs::write(root.path().join("pnpm-workspace.yaml"), "\n").expect("write workspace settings");
+    fs::write(
+        root.path().join(".pnpmfile.cjs"),
+        "module.exports = { hooks: { updateConfig (config) { if ('symlinkedLockfileTargetDirs' in config) throw new Error('allowed directories leaked'); config.symlinkedLockfileTargetDirs = ['/']; return config } } }",
+    )
+    .expect("write pnpmfile");
+    let mut config = Config::default().current::<Host>(root.path()).expect("load configuration");
+    let allowed_dirs = vec![root.path().join("source")];
+    config.symlinked_lockfile_target_dirs.clone_from(&allowed_dirs);
+
+    run_update_config_hooks::<SilentReporter>(&mut config, root.path()).await
+        .expect("run updateConfig hook");
+
+    assert_eq!(config.symlinked_lockfile_target_dirs, allowed_dirs);
+}
+
 /// `Accept` header the resolver sends for full metadata
 /// (`ACCEPT_FULL_DOC`); only the full packument carries the per-version
 /// `time` map and trust evidence the no-downgrade check reads.
@@ -510,9 +549,10 @@ fn no_downgrade_config(registry: String, cache_dir: &Path) -> Config {
 /// Under `trustPolicy=no-downgrade`, the self-update probe must resolve
 /// against **full** metadata — the same as a regular install — so the
 /// no-downgrade check actually runs. It reaches the full packument (with
-/// `time`), sees the downgrade, and rejects it. If the probe fetched
-/// abbreviated metadata it would instead fail closed with "missing time";
-/// if it skipped the check it would resolve `1.1.0` with no error.
+/// `time`), sees the downgrade, rejects the requested `1.1.0`, and falls
+/// back to `1.0.0` for a range. If the probe fetched abbreviated metadata it
+/// would instead fail closed with "missing time"; if it skipped the check it
+/// would resolve `1.1.0` with no error.
 #[tokio::test]
 async fn resolve_pnpm_version_fetches_full_metadata_and_rejects_a_downgrade() {
     let mut server = mockito::Server::new_async().await;
@@ -533,7 +573,12 @@ async fn resolve_pnpm_version_fetches_full_metadata_and_rejects_a_downgrade() {
     let cache_dir = tempfile::TempDir::new().expect("cache tempdir");
     let config = no_downgrade_config(format!("{}/", server.url()), cache_dir.path());
 
-    let err = resolve_engine_version(&config, "pnpm", "^1.0.0").await
+    let resolved = resolve_engine_version(&config, "pnpm", "^1.0.0").await
+        .expect("a range falls back past the downgrade")
+        .expect("a matching pnpm version resolves");
+    assert_eq!(resolved.version, "1.0.0");
+
+    let err = resolve_engine_version(&config, "pnpm", "1.1.0").await
         .expect_err("a trust downgrade must be rejected");
     let report = format!("{err:?}");
     assert!(
@@ -581,7 +626,7 @@ async fn resolve_pnpm_version_resolves_a_clean_update_under_no_downgrade() {
 /// must NOT let the no-downgrade check settle for abbreviated metadata:
 /// abbreviated still omits the trust evidence, so the check would see none
 /// and miss the downgrade. The probe must fetch full metadata regardless of
-/// `registrySupportsTimeField` and reject the downgrade.
+/// `registrySupportsTimeField` and skip the downgrade.
 #[tokio::test]
 async fn resolve_pnpm_version_forces_full_metadata_for_no_downgrade_despite_registry_time_field() {
     let mut server = mockito::Server::new_async().await;
@@ -594,7 +639,7 @@ async fn resolve_pnpm_version_forces_full_metadata_for_no_downgrade_despite_regi
         .await;
     // Abbreviated here carries `time` (as a `registrySupportsTimeField`
     // registry would) but no trust evidence. If the probe wrongly settled
-    // for it, the downgrade would be missed and resolution would succeed.
+    // for it, the downgrade would be missed and `1.1.0` would resolve.
     let _abbreviated = server
         .mock("GET", "/pnpm")
         .match_header("accept", ACCEPT_ABBREVIATED)
@@ -606,12 +651,12 @@ async fn resolve_pnpm_version_forces_full_metadata_for_no_downgrade_despite_regi
     let mut config = no_downgrade_config(format!("{}/", server.url()), cache_dir.path());
     config.registry_supports_time_field = true;
 
-    let err = resolve_engine_version(&config, "pnpm", "^1.0.0").await
-        .expect_err("the downgrade must be rejected even with registrySupportsTimeField");
-    let report = format!("{err:?}");
-    assert!(
-        report.contains("trust downgrade"),
-        "expected a trust-downgrade rejection, got: {report}",
+    let resolved = resolve_engine_version(&config, "pnpm", "^1.0.0").await
+        .expect("a range falls back past the downgrade")
+        .expect("a matching pnpm version resolves");
+    assert_eq!(
+        resolved.version, "1.0.0",
+        "the downgrade must be skipped even with registrySupportsTimeField",
     );
 }
 
@@ -679,4 +724,119 @@ async fn resolve_pnpm_version_keeps_a_dist_tag_on_the_running_version() {
         .expect("a matching pnpm version resolves");
 
     assert_eq!(resolved.version, PNPM_VERSION);
+}
+
+#[tokio::test]
+async fn update_config_hook_cannot_override_cli_proxy_settings() {
+    let root = tempfile::tempdir().expect("workspace tempdir");
+    fs::write(root.path().join("pnpm-workspace.yaml"), "\n").expect("write workspace settings");
+    fs::write(
+        root.path().join(".pnpmfile.cjs"),
+        "module.exports = { hooks: { updateConfig (config) { config.httpsProxy = 'http://hook-https:8080/'; config.httpProxy = 'http://hook-http:8080/'; config.noProxy = 'hook.example'; return config } } }",
+    )
+    .expect("write pnpmfile");
+    let mut config = Config::default().current::<Host>(root.path()).expect("load configuration");
+    config.apply_proxy_cli_overrides(
+        Some("http://cli-https:8080/"),
+        Some("http://cli-http:8080/"),
+        Some("cli.example"),
+    );
+    config.cli_settings.insert("httpsProxy".to_string());
+    config.cli_settings.insert("httpProxy".to_string());
+    config.cli_settings.insert("noProxy".to_string());
+    config.cli_settings.insert("noproxy".to_string());
+
+    run_update_config_hooks::<SilentReporter>(&mut config, root.path()).await
+        .expect("run updateConfig hook");
+
+    assert_eq!(config.proxy.https_proxy.as_deref(), Some("http://cli-https:8080/"));
+    assert_eq!(config.proxy.http_proxy.as_deref(), Some("http://cli-http:8080/"));
+    assert_eq!(
+        config.proxy.no_proxy,
+        Some(pnpm_network::NoProxySetting::List(vec!["cli.example".to_string()])),
+    );
+}
+
+#[tokio::test]
+async fn update_config_hook_cannot_override_command_cli_flags() {
+    let root = tempfile::tempdir().expect("workspace tempdir");
+    fs::write(root.path().join("pnpm-workspace.yaml"), "\n").expect("write workspace settings");
+    fs::write(
+        root.path().join(".pnpmfile.cjs"),
+        "module.exports = { hooks: { updateConfig (config) { config.optional = true; config.autoDedupe = true; config.frozenStore = true; return config } } }",
+    )
+    .expect("write pnpmfile");
+    let mut config = Config::default().current::<Host>(root.path()).expect("load configuration");
+    config.optional = false;
+    config.auto_dedupe = false;
+    config.frozen_store = false;
+    config.cli_settings.insert("optional".to_string());
+    config.cli_settings.insert("autoDedupe".to_string());
+    config.cli_settings.insert("frozenStore".to_string());
+
+    run_update_config_hooks::<SilentReporter>(&mut config, root.path()).await
+        .expect("run updateConfig hook");
+
+    assert!(!config.optional);
+    assert!(!config.auto_dedupe);
+    assert!(!config.frozen_store);
+}
+
+#[tokio::test]
+async fn update_config_hook_cannot_replace_the_public_hoist_pattern_of_cli_shamefully_hoist() {
+    let root = tempfile::tempdir().expect("workspace tempdir");
+    fs::write(root.path().join("pnpm-workspace.yaml"), "\n").expect("write workspace settings");
+    fs::write(
+        root.path().join(".pnpmfile.cjs"),
+        "module.exports = { hooks: { updateConfig (config) { config.shamefullyHoist = false; config.publicHoistPattern = ['*types*']; return config } } }",
+    )
+    .expect("write pnpmfile");
+    let mut config = Config::default().current::<Host>(root.path()).expect("load configuration");
+    config.explicit_settings.insert("shamefullyHoist".to_string(), true.into());
+    config.apply_shamefully_hoist_derivation();
+    config.cli_settings.insert("shamefullyHoist".to_string());
+
+    run_update_config_hooks::<SilentReporter>(&mut config, root.path()).await
+        .expect("run updateConfig hook");
+
+    assert_eq!(config.public_hoist_pattern, Some(vec!["*".to_string()]));
+}
+
+#[tokio::test]
+async fn update_config_filter_prod_replaces_the_default_filter() {
+    let root = tempfile::tempdir().expect("workspace tempdir");
+    fs::write(root.path().join("pnpm-workspace.yaml"), "\n").expect("write workspace settings");
+    fs::write(
+        root.path().join(".pnpmfile.cjs"),
+        "module.exports = { hooks: { updateConfig (config) { config.filterProd = ['app']; return config } } }",
+    )
+    .expect("write pnpmfile");
+    let mut config = Config::default().current::<Host>(root.path()).expect("load configuration");
+    config.filter = vec!["{.}...".to_string()];
+
+    run_update_config_hooks::<SilentReporter>(&mut config, root.path()).await
+        .expect("run updateConfig hook");
+
+    assert!(config.filter.is_empty());
+    assert_eq!(config.filter_prod, ["app"]);
+}
+
+#[tokio::test]
+async fn update_config_hook_reads_only_command_line_filters() {
+    let root = tempfile::tempdir().expect("workspace tempdir");
+    fs::write(root.path().join("pnpm-workspace.yaml"), "\n").expect("write workspace settings");
+    fs::write(
+        root.path().join(".pnpmfile.cjs"),
+        "module.exports = { hooks: { updateConfig (config) { config.filterProd = [String('filterProd' in config)]; config.filter = [...config.filter, 'hook']; return config } } }",
+    )
+    .expect("write pnpmfile");
+    let mut config = Config::default().current::<Host>(root.path()).expect("load configuration");
+    config.filter = vec!["cli".to_string()];
+    config.cli_settings.insert("filter".to_string());
+
+    run_update_config_hooks::<SilentReporter>(&mut config, root.path()).await
+        .expect("run updateConfig hook");
+
+    assert_eq!(config.filter, ["cli"]);
+    assert_eq!(config.filter_prod, ["false"]);
 }

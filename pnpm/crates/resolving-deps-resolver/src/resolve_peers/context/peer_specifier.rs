@@ -1,6 +1,6 @@
 use super::{
     DepPath, NodeId, Path, PathBuf, PeerId, Range, ResolvePeersOptions, ResolveResult, Version,
-    get_peer_version_range, index_of_dep_path_suffix,
+    get_peer_version_range, index_of_dep_path_suffix, pkg_name,
 };
 
 pub(super) fn version_gte(left: &str, right: &str) -> bool {
@@ -107,39 +107,6 @@ pub(in super::super) fn remap_link_node_id(
     Some(NodeId::leaf(&format!("link:{rel}")))
 }
 
-/// Pull `(name, version)` out of a `ResolveResult` the peer-resolution
-/// stage can hash and compare on.
-///
-/// The npm-registry resolver always fills [`pnpm_resolving_resolver_base::ResolvedPackageInfo::name_ver`],
-/// so the fast path lifts it straight out. The git / tarball / local
-/// resolvers leave it `None` (their canonical name lives in the
-/// fetched manifest, which the resolver doesn't read at resolve
-/// time); for those, fall back to `(alias, id-as-string)`. The peer
-/// graph machinery only ever looks the name up in
-/// [`crate::ResolvedTree::all_peer_dep_names`] — a set built by parsing the
-/// peer dependencies of npm-shaped packages — so the fallback's
-/// "name" will simply miss every lookup, naturally short-circuiting
-/// peer propagation for non-npm packages without panicking on
-/// `name_ver = None`.
-pub(in super::super) fn pkg_name_version(result: &ResolveResult) -> (String, String) {
-    let version = result.package.name_ver
-        .as_ref()
-        .map_or_else(|| result.id.as_str().to_string(), |name_ver| name_ver.suffix.to_string());
-    (pkg_name(result), version)
-}
-
-/// The name half of [`fn@pkg_name_version`], for callers that would
-/// discard the version. `PkgName` holds scope and bare name separately,
-/// so rendering either half allocates.
-pub(in super::super) fn pkg_name(result: &ResolveResult) -> String {
-    if let Some(name_ver) = result.package.name_ver.as_ref() {
-        return name_ver.name.to_string();
-    }
-    result.alias
-        .clone()
-        .unwrap_or_else(|| result.id.as_str().to_string())
-}
-
 /// The `name@version` identity a peer contributes to a depPath's peer suffix.
 ///
 /// A package resolved from a named registry keeps its `<registryName>:` in the
@@ -147,10 +114,14 @@ pub(in super::super) fn pkg_name(result: &ResolveResult) -> String {
 /// registries render one suffix, so two variants of the dependent, each bound
 /// to a different peer artifact, would collapse onto a single depPath.
 ///
-/// Separate from [`pkg_name_version`] on purpose: that version also feeds
-/// semver comparisons, which a qualified string would break.
+/// Separate from [`pkg_name_version`](crate::resolved_tree::pkg_name_version)
+/// on purpose: that version also feeds semver comparisons, which a qualified
+/// string would break.
 pub(in super::super) fn peer_id_pair(result: &ResolveResult) -> PeerId {
-    let (name, version) = pkg_name_version(result);
+    let name = pkg_name(result);
+    let version = result.package.name_ver
+        .as_ref()
+        .map_or_else(|| result.id.as_str().to_string(), |name_ver| name_ver.suffix.to_string());
     let Some(registry_name) = named_registry_of(result) else {
         return PeerId::Pair { name, version };
     };
@@ -170,54 +141,11 @@ pub(in super::super) fn peer_segment_names(dep_path: &DepPath) -> Option<Vec<Str
     let raw = dep_path.as_str();
     let suffix = index_of_dep_path_suffix(raw);
     let peers_index = suffix.peers_index?;
-    let segments = split_peer_suffix_segments(&raw[peers_index..])?;
+    let segments = pnpm_lockfile::split_peer_suffix_segments(&raw[peers_index..])?;
     segments
         .iter()
         .map(|segment| peer_segment_name(segment).map(str::to_string))
         .collect()
-}
-
-/// Splits a peer suffix into its segment bodies. `None` when the suffix is
-/// anything but a flat run of balanced parenthesised groups.
-pub(super) fn split_peer_suffix_segments(suffix: &str) -> Option<Vec<String>> {
-    let mut split = PeerSuffixSplit::default();
-    for (idx, byte) in suffix.as_bytes().iter().enumerate() {
-        split.push_byte(suffix, idx, *byte)?;
-    }
-    (split.depth == 0).then_some(split.segments)
-}
-
-#[derive(Default)]
-pub(super) struct PeerSuffixSplit {
-    pub(super) segments: Vec<String>,
-    pub(super) depth: i32,
-    pub(super) start: Option<usize>,
-}
-
-impl PeerSuffixSplit {
-    pub(super) fn push_byte(&mut self, suffix: &str, idx: usize, byte: u8) -> Option<()> {
-        match byte {
-            b'(' => {
-                if self.depth == 0 {
-                    self.start = Some(idx + 1);
-                }
-                self.depth += 1;
-            }
-            b')' => {
-                self.depth -= 1;
-                if self.depth < 0 {
-                    return None;
-                }
-                if self.depth == 0 {
-                    let start = self.start.take()?;
-                    self.segments.push(suffix[start..idx].to_string());
-                }
-            }
-            _ if self.depth == 0 => return None,
-            _ => {}
-        }
-        Some(())
-    }
 }
 
 pub(super) fn peer_segment_name(segment: &str) -> Option<&str> {
@@ -242,7 +170,7 @@ pub(super) fn peer_segment_name(segment: &str) -> Option<&str> {
 /// `version` is a prerelease and the straight check fails, see whether
 /// the base `MAJOR.MINOR.PATCH` satisfies the range — without pulling
 /// in Yarn's full per-comparator algorithm.
-pub(in super::super) fn satisfies_with_prereleases(version: &str, range: &str) -> bool {
+pub(crate) fn satisfies_with_prereleases(version: &str, range: &str) -> bool {
     let parsed_range = Range::parse(range).ok();
     satisfies_with_parsed_prereleases(version, range, parsed_range.as_ref())
 }

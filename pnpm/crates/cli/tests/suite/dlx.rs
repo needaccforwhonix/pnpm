@@ -3,6 +3,184 @@ use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
 use pnpm_testing_utils::bin::CommandTempCwd;
 
+/// Which directory flag the invocation passes; each one names the
+/// directory the bin is expected to run in.
+#[derive(Debug, Clone, Copy)]
+enum DirFlag {
+    /// `-C ../target`
+    Dir,
+    /// No flag: the bin runs in the invocation directory.
+    None,
+    /// `-w`
+    WorkspaceRoot,
+}
+
+#[test]
+fn dlx_and_create_run_in_cli_directory() {
+    for command in ["dlx", "create"] {
+        for dir_flag in [DirFlag::Dir, DirFlag::None, DirFlag::WorkspaceRoot] {
+            for shell_mode in [false, true] {
+                assert_bin_runs_in_selected_directory(command, dir_flag, shell_mode);
+            }
+        }
+    }
+}
+
+fn assert_bin_runs_in_selected_directory(command: &str, dir_flag: DirFlag, shell_mode: bool) {
+    let CommandTempCwd { mut pacquet, root, workspace, .. } = CommandTempCwd::init();
+    let invoker = workspace.join("invoker");
+    let target = workspace.join("target");
+    let fixture = root.path().join("fixture");
+    for dir in [&invoker, &target, &fixture] {
+        std::fs::create_dir(dir).expect("create fixture directory");
+    }
+    std::fs::write(workspace.join("package.json"), r#"{"name":"project","private":true}"#)
+        .expect("write nearest project manifest");
+    std::fs::write(workspace.join("pnpm-workspace.yaml"), "enableGlobalVirtualStore: false\n")
+        .expect("write workspace config");
+    std::fs::write(
+        fixture.join("package.json"),
+        r#"{"name":"create-cwd-fixture","version":"1.0.0","bin":{"cwd-fixture":"bin.js"}}"#,
+    )
+    .expect("write local package manifest");
+    std::fs::write(
+        fixture.join("bin.js"),
+        "#!/usr/bin/env node\nrequire('fs').writeFileSync('cwd-result.json', JSON.stringify({ cwd: process.cwd(), args: process.argv.slice(2) }));\n",
+    )
+    .expect("write local package bin");
+
+    let (flags, expected_dir): (&[&str], _) = match dir_flag {
+        DirFlag::Dir => (&["-C", "../target"], &target),
+        DirFlag::None => (&[], &invoker),
+        DirFlag::WorkspaceRoot => (&["-w"], &workspace),
+    };
+    let shell_flag: &[&str] = if shell_mode { &["-c"] } else { &[] };
+    pacquet
+        .current_dir(&invoker)
+        .env("PNPM_CONFIG_OFFLINE", "true")
+        .env("PNPM_CONFIG_STORE_DIR", root.path().join("store"))
+        .env("PNPM_CONFIG_CACHE_DIR", root.path().join("cache"))
+        .args(flags)
+        .arg(command)
+        .args(shell_flag)
+        .arg(format!("create-cwd-fixture@file:{}", fixture.display()))
+        .args(["--sentinel", "value", "--dir=unchanged"])
+        .assert()
+        .success();
+
+    let result: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(expected_dir.join("cwd-result.json")).expect("read bin output"),
+    )
+    .expect("parse bin output");
+    assert_eq!(
+        std::fs::canonicalize(result["cwd"].as_str().expect("child working directory"))
+            .expect("resolve child working directory"),
+        std::fs::canonicalize(expected_dir).expect("resolve expected working directory"),
+        "{command}, dir_flag={dir_flag:?}, shell_mode={shell_mode}",
+    );
+    assert_eq!(result["args"], serde_json::json!(["--sentinel", "value", "--dir=unchanged"]));
+    for other in [&invoker, &target, &workspace]
+        .into_iter()
+        .filter(|dir| *dir != expected_dir)
+    {
+        assert!(!other.join("cwd-result.json").exists(), "must not write in {other:?}");
+    }
+    assert!(!fixture.join("cwd-result.json").exists(), "must not run in the installed package");
+    drop(root);
+}
+
+#[test]
+fn dlx_sets_package_manager_environment() {
+    let CommandTempCwd { mut pacquet, root, workspace, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let expected_execpath =
+        std::fs::canonicalize(pacquet.get_program()).expect("resolve pnpm binary");
+    let expected_cwd = std::fs::canonicalize(&workspace).expect("resolve working directory");
+    for name in ["npm_execpath", "npm_node_execpath", "NODE", "INIT_CWD"] {
+        pacquet.env_remove(name);
+    }
+    let output = pacquet
+        .args([
+            "dlx",
+            "--package=@foo/touch-file-one-bin",
+            "node",
+            "-e",
+            "console.log(JSON.stringify(Object.fromEntries(['npm_execpath', 'npm_node_execpath', 'NODE', 'INIT_CWD'].map(key => [key, process.env[key]]))))",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let env: serde_json::Value = serde_json::from_slice(&output).expect("parse child environment");
+    let execpath = env["npm_execpath"].as_str().expect("package manager executable path");
+    assert_eq!(std::fs::canonicalize(execpath).expect("resolve child execpath"), expected_execpath);
+    let init_cwd = env["INIT_CWD"].as_str().expect("initial working directory");
+    assert_eq!(std::fs::canonicalize(init_cwd).expect("resolve child cwd"), expected_cwd);
+    assert_eq!(env["npm_node_execpath"], env["NODE"]);
+    let node_path = env["npm_node_execpath"].as_str().expect("node executable path");
+    assert!(std::path::Path::new(node_path).is_absolute(), "node executable path: {node_path}");
+    drop(root);
+}
+
+#[test]
+fn dlx_clears_inherited_node_environment_without_node_on_path() {
+    let CommandTempCwd { mut pacquet, root, workspace, .. } = CommandTempCwd::init();
+    let node = which::which("node").expect("find node");
+    let empty_path = workspace.join("empty-path");
+    std::fs::create_dir(&empty_path).expect("create empty PATH directory");
+    let fixture = workspace.join("fixture");
+    std::fs::create_dir(&fixture).expect("create package fixture");
+    std::fs::write(fixture.join("package.json"), r#"{"name":"env-fixture","version":"1.0.0"}"#)
+        .expect("write package manifest");
+    let output = pacquet
+        .env("PATH", &empty_path)
+        .env("NODE", "/stale/node")
+        .env("npm_node_execpath", "/stale/node")
+        .arg("dlx").arg(format!("--package=file:{}", fixture.display())).arg(node)
+        .args(["-e", "console.log(JSON.stringify({ NODE: process.env.NODE, npm_node_execpath: process.env.npm_node_execpath }))"])
+        .assert().success().get_output().stdout.clone();
+    let env: serde_json::Value = serde_json::from_slice(&output).expect("parse child environment");
+    assert_eq!(env, serde_json::json!({}));
+    drop(root);
+}
+
+#[test]
+fn dlx_does_not_resolve_node_from_dlx_bin() {
+    let CommandTempCwd { mut pacquet, root, workspace, .. } = CommandTempCwd::init();
+    let expected_node = which::which("node").expect("find real node");
+    let fixture = workspace.join("node-bin-pkg");
+    let fixture_bin = fixture.join("bin");
+    std::fs::create_dir_all(&fixture_bin).expect("create package bin dir");
+    std::fs::write(
+        fixture.join("package.json"),
+        r#"{"name":"fake-node-pkg","version":"1.0.0","bin":{"node":"bin/fake.js"}}"#,
+    )
+    .expect("write manifest");
+    std::fs::write(fixture_bin.join("fake.js"), "console.log('fake')").expect("write bin");
+    let output = pacquet
+        .args([
+            "dlx",
+            &format!("--package=file:{}", fixture.display()),
+            expected_node.to_str().unwrap(),
+            "-e",
+            "console.log(JSON.stringify({ NODE: process.env.NODE, npm_node_execpath: process.env.npm_node_execpath }))",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let env: serde_json::Value = serde_json::from_slice(&output).expect("parse child environment");
+    assert_eq!(env["NODE"], env["npm_node_execpath"]);
+    let node_path = env["NODE"].as_str().expect("node executable path");
+    assert_eq!(
+        std::fs::canonicalize(node_path).unwrap(),
+        std::fs::canonicalize(&expected_node).unwrap(),
+    );
+    drop(root);
+}
+
 /// `pacquet dlx` with no command is an error, mirroring pnpm's dlx, which
 /// prints help and exits non-zero when given neither a command nor a
 /// `--package`.
@@ -66,6 +244,63 @@ fn dlx_installs_and_runs_packages_bin() {
         workspace.join("touch.txt").exists(),
         "the package's bin should run in the process cwd and write `touch.txt`",
     );
+
+    drop(root);
+}
+
+/// Packages built by lifecycle scripts only load on the Node.js major they
+/// were built with, so a dlx cache entry is reused within the major of the
+/// `node` on `PATH` and not across majors.
+#[cfg(unix)]
+#[test]
+fn dlx_does_not_reuse_the_cache_across_node_majors() {
+    use pnpm_testing_utils::command_env::CommandTestExt;
+    use std::{os::unix::fs::PermissionsExt, process::Command};
+
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let real_node = which::which("node").expect("find node");
+    let fake_node_dir = workspace.join("fake-node");
+    std::fs::create_dir(&fake_node_dir).expect("create fake node directory");
+    let fake_node = fake_node_dir.join("node");
+    std::fs::write(
+        &fake_node,
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then echo \"v$FAKE_NODE_VERSION\"; exit 0; fi\nexec \"$REAL_NODE\" \"$@\"\n",
+    )
+    .expect("write fake node");
+    std::fs::set_permissions(&fake_node, std::fs::Permissions::from_mode(0o755))
+        .expect("make fake node executable");
+    let path = std::env::join_paths(
+        std::iter::once(fake_node_dir)
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())),
+    )
+    .expect("join PATH");
+    let fixture = workspace.join("fixture");
+    std::fs::create_dir(&fixture).expect("create package fixture");
+    std::fs::write(
+        fixture.join("package.json"),
+        r#"{"name":"node-major-fixture","version":"1.0.0"}"#,
+    )
+    .expect("write package manifest");
+
+    for node_version in ["22.1.0", "22.2.0", "24.0.0"] {
+        Command::cargo_bin("pnpm")
+            .expect("find the pnpm binary")
+            .with_current_dir(&workspace)
+            .without_ambient_pnpm_config()
+            .with_env("PATH", &path)
+            .with_env("FAKE_NODE_VERSION", node_version)
+            .with_env("REAL_NODE", &real_node)
+            .arg("dlx")
+            .arg(format!("--package=file:{}", fixture.display()))
+            .args(["node", "-e", ""])
+            .assert()
+            .success();
+    }
+
+    let cache_entries =
+        std::fs::read_dir(npmrc_info.cache_dir.join("dlx")).expect("read dlx cache").count();
+    assert_eq!(cache_entries, 2, "one cache entry per Node.js major");
 
     drop(root);
 }
@@ -314,20 +549,94 @@ fn dlx_ignores_an_ambient_workspace_manifest_above_the_cache_dir() {
 /// The real releases are what this runs, because no fixture can stand in
 /// for a package manager — pnpm verifies an engine against npm's
 /// published signature before running it, so the bytes have to be real.
+///
+/// `yarn@tool:4.9.2` is the same request through the `tool:` protocol.
 #[test]
 fn dlx_provisions_a_package_manager_by_name() {
-    let CommandTempCwd { mut pacquet, root, npmrc_info, .. } =
+    for spec in ["yarn@4.9.2", "yarn@tool:4.9.2"] {
+        let CommandTempCwd { mut pacquet, root, npmrc_info, .. } =
+            CommandTempCwd::init().add_mocked_registry();
+
+        let registry_arg = format!("--config.registry={}", npmrc_info.mock_instance.url());
+        let output = pacquet
+            .env("YARN_IGNORE_PATH", "1")
+            .args([registry_arg.as_str(), "dlx", spec, "--version"])
+            .output()
+            .expect("run pacquet dlx");
+        dbg!(spec, &output);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{spec} stderr:\n{stderr}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "4.9.2");
+
+        drop((root, npmrc_info));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn dlx_recovers_ignored_builds() {
+    for (approve, cached) in [(false, false), (true, false), (true, true)] {
+        let CommandTempCwd {
+            mut pacquet,
+            root,
+            workspace,
+            npmrc_info,
+            ..
+        } = CommandTempCwd::init().add_mocked_registry();
+        let caller_yaml = std::fs::read_to_string(workspace.join("pnpm-workspace.yaml"))
+            .expect("read caller settings");
+        pacquet.env_remove("PNPM_AUTO_APPROVE_BUILDS_FOR_TESTS");
+        pacquet.args(["dlx", "@pnpm.e2e/has-bin-and-needs-build"]);
+        if cached {
+            pacquet.assert().success();
+        }
+        if approve {
+            pacquet.env("PNPM_AUTO_APPROVE_BUILDS_FOR_TESTS", "1");
+        }
+        pacquet.assert().success();
+        let cache_entry = std::fs::read_dir(npmrc_info.cache_dir.join("dlx"))
+            .expect("read dlx cache")
+            .next()
+            .unwrap()
+            .unwrap()
+            .path()
+            .join("pkg");
+        let artifact = cache_entry.join("node_modules/.pnpm/@pnpm.e2e+install-script-example@1.0.0/node_modules/@pnpm.e2e/install-script-example/generated-by-install.js");
+        assert_eq!(artifact.exists(), approve);
+        let actual_yaml = std::fs::read_to_string(workspace.join("pnpm-workspace.yaml")).unwrap();
+        eprintln!("CALLER SETTINGS:\n{actual_yaml}\n");
+        assert_eq!(actual_yaml, caller_yaml);
+        if approve {
+            assert!(
+                std::fs::read_to_string(cache_entry.join("pnpm-workspace.yaml"))
+                    .expect("read cache approvals")
+                    .contains("allowBuilds:"),
+            );
+            pacquet.env_remove("PNPM_AUTO_APPROVE_BUILDS_FOR_TESTS");
+            pacquet.assert().success();
+            assert!(artifact.exists());
+        }
+        drop(root);
+    }
+}
+
+/// pnpm's dlx resolves a version-less package to `latest`, so a caller's
+/// `tag` that names no version of the package must not fail the run.
+#[test]
+#[cfg_attr(not(unix), ignore = "dlx bin execution is only exercised on Unix")]
+fn dlx_ignores_the_caller_projects_tag_setting() {
+    let CommandTempCwd { pacquet, root, workspace, .. } =
         CommandTempCwd::init().add_mocked_registry();
+    append_workspace_yaml_key(&workspace, "tag", "no-such-tag");
 
-    let registry_arg = format!("--config.registry={}", npmrc_info.mock_instance.url());
     let output = pacquet
-        .args([registry_arg.as_str(), "dlx", "yarn@4.9.2", "--version"])
-        .output()
-        .expect("run pacquet dlx yarn@4.9.2");
-    dbg!(&output);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "stderr:\n{stderr}");
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "4.9.2");
+        .with_args(["dlx", "@pnpm.e2e/hello-world-js-bin"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
 
-    drop((root, npmrc_info));
+    assert!(String::from_utf8_lossy(&output).contains("Hello world!"));
+    drop(root);
 }

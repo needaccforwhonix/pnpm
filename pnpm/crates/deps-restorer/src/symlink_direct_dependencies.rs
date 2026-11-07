@@ -1,8 +1,16 @@
+pub(crate) use resolve::{fallback_version, link_target_dir};
+
+mod publish;
+use publish::remove_publish_modules_link;
+
 mod report;
 use report::emit_root_added;
 
 mod resolve;
 use resolve::{ResolvedEntry, collect_resolved_entries, collect_resolved_targets};
+
+mod task_groups;
+use task_groups::{importer_modules_parent, importer_task_groups, merge_claimed_bins};
 
 use crate::{SkippedSnapshots, SymlinkPackageError, VirtualStoreLayout, symlink_package};
 use derive_more::{Display, Error};
@@ -33,9 +41,9 @@ use std::{
 /// - Emit one `pnpm:root added` per direct dependency with the
 ///   importer's `rootDir` as the event prefix (a per-project emit).
 ///
-/// The virtual store dir (`config.virtual_store_dir`) stays singular
+/// The virtual store dir (`config.virtual_store_dir()`) stays singular
 /// across the install — only the per-project `node_modules/` and its
-/// symlinks fan out. By default `pnpm_config::default_virtual_store_dir`
+/// symlinks fan out. By default `pnpm_config::default_install_state_dir`
 /// anchors it at `<workspace_root>/node_modules/.pnpm` (matching pnpm),
 /// but the actual location is whatever the resolved `Config` field
 /// holds — `pnpm-workspace.yaml`'s `virtualStoreDir` can move it.
@@ -55,11 +63,16 @@ where
     /// pass reads no `package.json` for a prefetched dep; `None` keeps
     /// every dep on the disk-read fallback.
     pub package_manifests: Option<&'a crate::PackageManifests>,
+    pub package_bins: Option<&'a crate::PackageBins>,
 
     /// Per-snapshot `requiresBuild` flags from the same prefetch,
     /// gating [`Self::package_manifests`] — see
     /// [`crate::link_direct_dep_bins_prefetched`].
     pub requires_build_by_snapshot: Option<&'a crate::RequiresBuildBySnapshot>,
+
+    /// The builds that run after this pass. See
+    /// [`crate::PrefetchedBinLookup::with_scheduled_builds`].
+    pub scheduled_builds: Option<&'a crate::build_modules::ScheduledBuilds<'a>>,
 }
 
 /// Error type of [`SymlinkDirectDependencies`].
@@ -99,6 +112,14 @@ pub enum SymlinkDirectDependenciesError {
         #[error(source)]
         source: SymlinkPackageError,
     },
+
+    #[display("Failed to remove the modules directory link {link:?}: {source}")]
+    #[diagnostic(code(ERR_PNPM_PACKAGE_MANAGER_REMOVE_PUBLISH_MODULES_LINK))]
+    RemovePublishModulesLink {
+        link: PathBuf,
+        #[error(source)]
+        source: std::io::Error,
+    },
 }
 
 impl<DependencyGroupList> SymlinkDirectDependencies<'_, DependencyGroupList>
@@ -107,6 +128,15 @@ where
 {
     /// Execute the subroutine.
     pub fn run<Reporter: self::Reporter>(self) -> Result<(), SymlinkDirectDependenciesError> {
+        self.run_claiming_bins::<Reporter>()
+            .map(|_| ())
+    }
+
+    /// Execute the subroutine and return the command names linked for each
+    /// importer's modules directory.
+    pub fn run_claiming_bins<Reporter: self::Reporter>(
+        self,
+    ) -> Result<crate::ClaimedCommands, SymlinkDirectDependenciesError> {
         // Collect once so the same group order can drive every importer.
         let dependency_groups: Vec<DependencyGroup> = self.dependency_groups.into_iter().collect();
         ImporterPass {
@@ -115,6 +145,7 @@ where
             policy: self.policy,
 
             dependency_groups,
+            workspace_root_real: std::fs::canonicalize(self.context.workspace_root).ok(),
 
             // One bin lookup for the whole pass: the `hasBin` gate and
             // the shim probe memo are importer-invariant.
@@ -122,7 +153,9 @@ where
                 self.graph.packages,
                 self.package_manifests,
                 self.requires_build_by_snapshot,
-            ),
+            )
+            .with_package_bins(self.package_bins)
+            .with_scheduled_builds(self.scheduled_builds),
         }
         .run::<Reporter>()
     }
@@ -135,25 +168,15 @@ struct ImporterPass<'a> {
     pub graph: crate::ImporterDependencyGraph<'a>,
     pub policy: crate::DirectLinkPolicy<'a>,
     dependency_groups: Vec<DependencyGroup>,
+    workspace_root_real: Option<PathBuf>,
     bin_lookup: crate::PrefetchedBinLookup<'a>,
 }
 
 impl ImporterPass<'_> {
-    fn run<Reporter: self::Reporter>(&self) -> Result<(), SymlinkDirectDependenciesError> {
-        // Each importer's modules dir is `<importer_root>/<modules_dir_basename>`.
-        // The `modulesDir` setting is a directory name (a single
-        // component, default `node_modules`) applied uniformly under
-        // every importer. Pacquet stores `config.modules_dir` as a
-        // full path anchored at the workspace root, so peel off the
-        // last component to get the per-importer suffix — that way a
-        // `modulesDir: custom_modules` override in
-        // `pnpm-workspace.yaml` propagates to every importer instead
-        // of leaving the symlink stage stuck on `node_modules` while
-        // other stages (`.modules.yaml` writing, bin linking) use
-        // `config.modules_dir`.
-        let modules_dir_name: &OsStr = self.context.config.modules_dir
-            .file_name()
-            .unwrap_or_else(|| OsStr::new("node_modules"));
+    fn run<Reporter: self::Reporter>(
+        &self,
+    ) -> Result<crate::ClaimedCommands, SymlinkDirectDependenciesError> {
+        let modules_dir_name: &OsStr = self.context.config.modules_dir_name();
 
         // Sorted so the fallible upfront validation below rejects a
         // hostile lockfile on a deterministic importer. `pnpm:root`
@@ -175,19 +198,23 @@ impl ImporterPass<'_> {
         // a serial walk would insert a fork-join barrier per importer
         // between the filesystem batches.
         let task_groups = importer_task_groups(self.context.workspace_root, keys);
-        task_groups
+        let group_results: Vec<Vec<(PathBuf, HashSet<String>)>> = task_groups
             .par_iter()
-            .try_for_each(|group| {
-                group
+            .map(|group| {
+                group.importer_ids
                     .iter()
-                    .try_for_each(|importer_id| {
+                    .map(|importer_id| {
                         self.link_importer::<Reporter>(
                             importer_id,
+                            group.real_dir.as_deref(),
                             modules_dir_name,
                             root_targets.as_ref(),
                         )
                     })
+                    .collect::<Result<Vec<_>, _>>()
             })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(merge_claimed_bins(group_results))
     }
 
     /// `dedupeDirectDeps` short-circuits when there is no root importer
@@ -232,26 +259,34 @@ impl ImporterPass<'_> {
     fn link_importer<Reporter: self::Reporter>(
         &self,
         importer_id: &str,
+        real_dir: Option<&Path>,
         modules_dir_name: &OsStr,
         root_targets: Option<&BTreeMap<String, PathBuf>>,
-    ) -> Result<(), SymlinkDirectDependenciesError> {
+    ) -> Result<(PathBuf, HashSet<String>), SymlinkDirectDependenciesError> {
         // Safe: the task groups were built from `importers.keys()`.
         let project_snapshot = &self.graph.importers[importer_id];
         let project_dir = importer_root_dir(self.context.workspace_root, importer_id);
-        let modules_dir = project_dir.join(modules_dir_name);
+        let modules_parent = importer_modules_parent(
+            self.workspace_root_real.as_deref(),
+            &project_dir,
+            real_dir,
+            importer_id,
+        );
+        let modules_dir = pnpm_fs::lexical_normalize(&modules_parent.join(modules_dir_name));
+        let real_modules_dir = pnpm_fs::symlinked_dir_real_path(modules_parent, &modules_dir);
 
         // Only non-root importers get deduped against root: the
         // root project is linked unfiltered, then each sibling's
         // list is trimmed against what root links.
         let dedupe_against = root_targets.filter(|_| importer_id != ".");
 
-        link_one_importer::<Reporter>(
+        let claimed = link_one_importer::<Reporter>(
             importer_id,
             self.context.layout,
             project_snapshot,
             self.graph.packages,
             &project_dir,
-            &modules_dir,
+            real_modules_dir.as_deref().unwrap_or(&modules_dir),
             self.dependency_groups.iter().copied(),
             self.graph.skipped,
             self.policy.link_only,
@@ -259,7 +294,11 @@ impl ImporterPass<'_> {
             self.context.config.symlink,
             self.context.link_options,
             &self.bin_lookup,
-        )
+        )?;
+        if self.context.config.symlink {
+            remove_publish_modules_link(project_snapshot, &project_dir, &modules_dir)?;
+        }
+        Ok((modules_dir, claimed))
     }
 }
 
@@ -296,55 +335,6 @@ fn root_dedupe_targets(
     targets
 }
 
-/// Partition validated importer keys into the concurrency-safe task
-/// groups the parallel link pass runs.
-///
-/// Distinct keys may alias one directory through the filesystem's own
-/// name folding — case-insensitivity, Unicode normalization (APFS),
-/// Windows short names and trailing dots — and a real pnpm lockfile
-/// can't produce them (project discovery would have collapsed the
-/// directories), but a hostile lockfile can, and two tasks mutating
-/// one `node_modules` would race. Rather than enumerate the folding
-/// rules, ask the filesystem: importers whose project dirs
-/// canonicalize to one path share a group, in the caller's (sorted)
-/// order, keeping the serial pass's deterministic last-writer outcome,
-/// while distinct projects pay one read-only `canonicalize` each. A
-/// project dir that doesn't exist yet has nothing on disk to
-/// canonicalize against — and no string transform can decide which
-/// not-yet-created names the filesystem will later fold together — so
-/// every canonicalization failure lands in one shared serial group.
-/// That costs nothing real: a genuine project's directory always
-/// exists by this point (its manifest was read during project
-/// discovery), so the shared group only ever collects the phantom
-/// importers of a malformed lockfile.
-fn importer_task_groups<'a>(workspace_root: &Path, keys: Vec<&'a str>) -> Vec<Vec<&'a str>> {
-    let mut task_groups: BTreeMap<PathBuf, Vec<&'a str>> = BTreeMap::new();
-    let mut unresolved: Vec<&'a str> = Vec::new();
-    for importer_id in keys {
-        let project_dir = importer_root_dir(workspace_root, importer_id);
-        match std::fs::canonicalize(&project_dir) {
-            Ok(canonical) => task_groups
-                .entry(canonical)
-                .or_default()
-                .push(importer_id),
-            Err(_) => unresolved.push(importer_id),
-        }
-    }
-    let mut task_groups: Vec<Vec<&'a str>> = task_groups.into_values().collect();
-    if !unresolved.is_empty() {
-        task_groups.push(unresolved);
-    }
-    task_groups
-}
-
-/// Reject importer keys that would resolve outside the workspace root.
-///
-/// Pnpm's lockfile spec writes importer keys as POSIX paths relative
-/// to the workspace root (`.` for the root, `packages/web` for a
-/// subproject). Anything else — an absolute POSIX path, a Windows
-/// drive prefix, a `..` segment — is either malformed or hostile, so
-/// surface it as a typed error rather than silently letting
-/// `Path::join` produce an off-workspace path.
 /// Reject a lockfile importer key that cannot be safely joined onto the
 /// lockfile dir: absolute paths, Windows drive prefixes, backslash
 /// separators, and `..` traversal segments. `.` (the root importer) and any
@@ -455,8 +445,6 @@ where
 /// keeps lockfiles written by pacquet and pnpm interchangeable. The
 /// returned path is platform-native (`Path::join` handles the
 /// conversion on Windows).
-/// The on-disk root of the project a lockfile importer ID names, relative
-/// to `workspace_root` (which is normally the lockfile directory).
 #[must_use]
 pub fn importer_root_dir(workspace_root: &Path, importer_id: &str) -> PathBuf {
     if importer_id == "." {
@@ -535,7 +523,7 @@ fn link_one_importer<Reporter: self::Reporter>(
     symlink: bool,
     link_options: &LinkBinsOptions,
     bin_lookup: &crate::PrefetchedBinLookup<'_>,
-) -> Result<(), SymlinkDirectDependenciesError> {
+) -> Result<HashSet<String>, SymlinkDirectDependenciesError> {
     let entries = collect_resolved_entries(
         layout,
         project_snapshot,
@@ -574,20 +562,20 @@ fn link_one_importer<Reporter: self::Reporter>(
     // `<modules_dir>/.bin`. Each entry's `target` is the symlink's
     // destination, so the bin pass gets the resolved location for
     // free.
-    if symlink {
+    let claimed = if symlink {
         let deps = resolved_entry_bins(&entries);
         crate::link_direct_dep_bins_prefetched(modules_dir, &deps, bin_lookup, link_options)
-            .map_err(SymlinkDirectDependenciesError::LinkBins)?;
+            .map_err(SymlinkDirectDependenciesError::LinkBins)?
     } else {
         let locations: Vec<PathBuf> = entries
             .iter()
             .map(|entry| entry.target.clone())
             .collect();
         crate::link_direct_dep_bins_from_locations(modules_dir, &locations, link_options)
-            .map_err(SymlinkDirectDependenciesError::LinkBins)?;
-    }
+            .map_err(SymlinkDirectDependenciesError::LinkBins)?
+    };
 
-    Ok(())
+    Ok(claimed)
 }
 
 fn resolved_entry_bins(entries: &[ResolvedEntry<'_>]) -> Vec<crate::PrefetchedDepBin> {

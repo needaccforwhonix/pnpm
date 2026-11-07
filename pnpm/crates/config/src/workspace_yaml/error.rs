@@ -15,6 +15,7 @@ pub enum LoadWorkspaceYamlError {
         source: io::Error,
     },
     #[display("Failed to parse pnpm-workspace.yaml at {}: {source}", path.display())]
+    #[diagnostic(code(ERR_PNPM_INVALID_SETTING))]
     ParseYaml {
         path: PathBuf,
         #[error(source)]
@@ -74,14 +75,35 @@ pub enum LoadWorkspaceYamlError {
     #[display("The prefix {prefix:?} is declared by two registries")]
     #[diagnostic(code(ERR_PNPM_INVALID_SETTING))]
     PrefixDeclaredTwice { prefix: String },
-    #[display("The \"tasks['{task}'].{field}\" setting is not a known task setting")]
+    /// The registry URL is redacted before it reaches this variant.
+    #[display(r#"The "registries[{registry:?}].{field}" setting is for an npm registry, but the entry serves {ecosystem}"#)]
+    #[diagnostic(
+        code(ERR_PNPM_INVALID_SETTING),
+        help(r#"Scopes, bare-specifier prefixes and server descriptions are npm's. Drop the field, or drop "ecosystem" to declare an npm registry."#)
+    )]
+    EcosystemRegistryDeclaresNpmField { registry: String, ecosystem: String, field: String },
+    /// The registry URL is redacted before it reaches this variant.
+    #[display("The {ecosystem} index {registry:?} is declared twice")]
     #[diagnostic(
         code(ERR_PNPM_INVALID_SETTING),
         help(
-            r#"A task declares "concurrency", "dependsOn", "outputs", "inputs", "env", "cache", or "cargoTargetDir"."#
+            "Two keys that differ only by a trailing slash address the same index. Declare it once."
         )
     )]
-    UnknownTaskSettingField { task: String, field: String },
+    EcosystemIndexDeclaredTwice { ecosystem: String, registry: String },
+    /// The registry URLs are redacted before they reach this variant.
+    #[display("Two Cargo registries are declared: {registries}")]
+    #[diagnostic(
+        code(ERR_PNPM_INVALID_SETTING),
+        help("pnpm resolves Cargo dependencies from one sparse index. Declare the one to use.")
+    )]
+    CargoIndexDeclaredTwice { registries: String },
+    #[display("Invalid Python package routes for {registry:?}: {reason}")]
+    #[diagnostic(code(ERR_PNPM_INVALID_SETTING))]
+    InvalidPythonRegistryPackages { registry: String, reason: String },
+    #[display("The Python package pattern {pattern:?} is routed to two registries: {registries}")]
+    #[diagnostic(code(ERR_PNPM_INVALID_SETTING))]
+    PythonPackageRoutedTwice { pattern: String, registries: String },
     #[display("The \"pipelines['{pipeline}']\" setting contains an entry with no task name")]
     #[diagnostic(code(ERR_PNPM_INVALID_SETTING))]
     EmptyPipelineTaskName { pipeline: String },
@@ -90,6 +112,19 @@ pub enum LoadWorkspaceYamlError {
     )]
     #[diagnostic(code(ERR_PNPM_INVALID_SETTING))]
     InvalidTaskConcurrency { task: String, concurrency: String },
+    #[display(
+        "The \"tasks['{task}'].concurrencyGroup\" setting is not a valid group name: {group:?}"
+    )]
+    #[diagnostic(
+        code(ERR_PNPM_INVALID_SETTING),
+        help(
+            "A group name is one or more letters, digits, '.', '_' or '-', and names a slot directory of its own, so it cannot be '.', '..', a Windows device name, end with '.', or contain a path separator."
+        )
+    )]
+    InvalidTaskConcurrencyGroup { task: String, group: String },
+    #[display("The \"tasks['{task}'].priority\" setting should be an integer, but got {priority}")]
+    #[diagnostic(code(ERR_PNPM_INVALID_SETTING))]
+    InvalidTaskPriority { task: String, priority: String },
     #[display(
         "The \"tasks['{task}'].dependsOn\" setting contains an entry with no task name: {entry:?}"
     )]
@@ -112,14 +147,26 @@ pub enum LoadWorkspaceYamlError {
         )
     )]
     TokenHelperInProjectConfig { key: String },
-    /// An `_auth` credential did not decode as base64. Its whole point is
-    /// to carry `<username>:<password>` base64-encoded, so a value that
-    /// cannot be decoded would otherwise reach the registry as a header
-    /// no server can read — a silent 401 instead of a fixable error.
+    /// A repository-controlled file names a registry whose URL holds a
+    /// `${VAR}` placeholder. pnpm does not expand it there, and dropping the
+    /// URL would resolve the packages it serves from another registry.
+    /// `setting` is redacted before it reaches this variant.
+    #[display(r#"The "{setting}" registry URL in "{file}" contains an environment variable"#)]
+    #[diagnostic(
+        code(ERR_PNPM_REGISTRY_ENV_NOT_EXPANDED),
+        help(
+            "pnpm does not expand environment variables in registry URLs that come from a file committed to the repository. Ignoring the URL would resolve the packages it serves from another registry. Write the URL literally, or move the setting to the global config.yaml."
+        )
+    )]
+    RegistryEnvNotExpanded { setting: String, file: String },
+    /// An `_auth` or `_password` credential did not decode as base64. Both
+    /// exist to carry a base64-encoded value, so a value that cannot be
+    /// decoded would otherwise reach the registry as a credential nobody
+    /// chose — a silent 401 instead of a fixable error.
     #[display("Failed to decode {key} as base64")]
     #[diagnostic(
         code(ERR_PNPM_AUTH_INVALID_BASE64),
-        help("{key} must hold the base64 encoding of <username>:<password>.")
+        help("{key} must contain a base64-encoded {} value", base64_credential_content(key))
     )]
     AuthInvalidBase64 { key: &'static str },
     /// A decoded `_auth` credential held no `:`, so it names no password.
@@ -169,4 +216,30 @@ pub enum LoadWorkspaceYamlError {
         )
     )]
     WorkspaceRemoteSideEffectsTrust { path: PathBuf, prefix: &'static str, field: &'static str },
+
+    /// A machine-only field of `remoteCache` appeared in a committed file —
+    /// see [`RemoteCacheSettings`](crate::workspace_yaml::sections::RemoteCacheSettings).
+    #[display("remoteCache.{field} cannot be set by a workspace ({})", path.display())]
+    #[diagnostic(
+        code(ERR_PNPM_WORKSPACE_REMOTE_CACHE_TRUST),
+        help(
+            "Set it in the global config file or in the environment instead of {}.",
+            path.display(),
+        )
+    )]
+    WorkspaceRemoteCacheTrust { path: PathBuf, field: &'static str },
+
+    #[diagnostic(transparent)]
+    UnexpandedEnvInPath(#[error(source)] crate::UnexpandedWindowsEnvVar),
+
+    #[diagnostic(transparent)]
+    Include(#[error(source)] pnpm_workspace::IncludeError),
+
+    #[display(r#""{setting}" in the settings delegated to "{spec}" is not a pnpm setting"#)]
+    #[diagnostic(code(ERR_PNPM_INVALID_WORKSPACE_INCLUDE))]
+    UnknownDelegatedSetting { spec: String, setting: String },
+}
+
+fn base64_credential_content(key: &str) -> &'static str {
+    if key == "_auth" { "<username>:<password>" } else { "password" }
 }

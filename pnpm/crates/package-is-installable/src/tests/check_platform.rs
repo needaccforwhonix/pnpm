@@ -5,8 +5,8 @@
 //! any global state.
 
 use crate::{
-    SupportedArchitectures, UnsupportedPlatformError, WantedPlatform, WantedPlatformRef,
-    check_platform,
+    ArchitectureAxes, SupportedArchitectures, UnsupportedPlatformError, WantedPlatform,
+    WantedPlatformRef, check_platform,
 };
 
 const PACKAGE_ID: &str = "registry.npmjs.org/foo/1.0.0";
@@ -26,12 +26,9 @@ fn wanted(os: Option<&[&str]>, cpu: Option<&[&str]>, libc: Option<&[&str]>) -> W
     WantedPlatform { os: vec_opt(os), cpu: vec_opt(cpu), libc: vec_opt(libc) }
 }
 
-/// Test-local convenience wrapper. The runtime `check_platform` takes
-/// the wanted axes as `Option<&[String]>` slices so the install hot
-/// path doesn't have to construct a `WantedPlatform` per snapshot;
-/// the tests find it more ergonomic to build one and pass it by
-/// reference, so this wrapper does the `.as_deref()` for each axis
-/// in one place.
+/// Test-local convenience wrapper. The tests find it more ergonomic to
+/// build a `WantedPlatform` and pass it by reference, so this wrapper does
+/// the `.as_deref()` for each axis in one place.
 fn check_platform_w(
     pkg: &str,
     wanted_platform: &WantedPlatform,
@@ -61,7 +58,11 @@ fn supported(
                 .collect()
         })
     }
-    SupportedArchitectures { os: vec_opt(os), cpu: vec_opt(cpu), libc: vec_opt(libc) }
+    SupportedArchitectures::Axes(ArchitectureAxes {
+        os: vec_opt(os),
+        cpu: vec_opt(cpu),
+        libc: vec_opt(libc),
+    })
 }
 
 #[test]

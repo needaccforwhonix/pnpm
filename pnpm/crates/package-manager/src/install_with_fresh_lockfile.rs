@@ -1,7 +1,8 @@
 pub use errors::InstallWithFreshLockfileError;
 pub(crate) use lockfile_build::compute_package_extensions_checksum;
+pub(crate) use manifest_transforms::resolver_manifest_hooks;
 pub(crate) use seed_policy::prefer_requested_version;
-pub use seed_policy::{ImporterUpdateSeedPolicy, UpdateSeedPolicy};
+pub use seed_policy::{ImporterUpdateSeedPolicy, PreferredVersionsOverride, UpdateSeedPolicy};
 
 mod persist;
 use persist::{
@@ -17,6 +18,7 @@ use lockfile_build::{
 };
 
 mod on_disk;
+use crate::install::state_options::ResolveOnly;
 use on_disk::{OnDiskInputs, OnDiskOutput, finish_early_materialization, run_on_disk_phases};
 
 mod plan;
@@ -84,21 +86,6 @@ pub type ResolvedPackages = DashMap<String, watch::Sender<bool>>;
 /// materialize `node_modules`, and emit a brand-new `pnpm-lock.yaml`
 /// reflecting the resolved graph. Caller (see [`crate::Install::run`])
 /// drives this path whenever no `--frozen-lockfile` was requested.
-///
-/// **Brief overview for each package:**
-/// * Resolve every importer's dependency through the [`NpmResolver`][pnpm_resolving_npm_resolver::NpmResolver] chain
-///   (`resolve_workspace` builds the per-importer trees, runs the
-///   cross-importer peer pass, and applies `dedupeInjectedDeps`).
-/// * Fetch a tarball of each resolved package and extract it into the
-///   store directory.
-/// * Import (by reflink, hardlink, or copy) the files from the store
-///   dir to `node_modules/.pacquet/{name}@{version}/node_modules/{name}/`.
-/// * Create dependency symbolic links in
-///   `node_modules/.pacquet/{name}@{version}/node_modules/`.
-/// * Create a symbolic link at `node_modules/{name}`.
-/// * Run the resolved graph through
-///   [`crate::dependencies_graph_to_lockfile()`] to produce a v9
-///   `pnpm-lock.yaml`; the caller writes it to `<lockfile_dir>/pnpm-lock.yaml`.
 #[must_use]
 pub struct InstallWithFreshLockfile<'a> {
     pub(crate) inputs: FreshInputs<'a>,
@@ -143,6 +130,10 @@ pub(crate) struct FreshInstallDrivers<'a> {
 #[derive(Clone, Copy)]
 pub(crate) struct FreshInstallProjects<'a> {
     pub(crate) dependency_groups: &'a [DependencyGroup],
+    /// The groups the install materializes. Unlike [`Self::dependency_groups`],
+    /// it keeps `optional_dependencies` on a `--dev` run, which installs the
+    /// optional dependencies of the packages it installs.
+    pub(crate) included: IncludedDependencies,
     /// Install root, threaded into reporter `requester` fields.
     pub(crate) requester: &'a str,
     /// Lockfile root for the install, used by the resolver chain to
@@ -169,6 +160,7 @@ pub(crate) struct FreshInstallProjects<'a> {
 
 #[derive(Clone, Copy)]
 pub(crate) struct FreshInstallExecution {
+    pub(crate) locked_package_policy: pnpm_resolving_resolver_base::LockedPackagePolicy,
     /// Resolved [`pnpm_config::Config::node_linker`]. Selects the
     /// materialization shape after the virtual store is populated:
     /// under [`NodeLinker::Hoisted`] the freshly-built lockfile is
@@ -176,12 +168,13 @@ pub(crate) struct FreshInstallExecution {
     /// [`crate::link_hoisted_modules()`] instead of the isolated
     /// symlink layout.
     pub(crate) node_linker: NodeLinker,
-    /// When `true`, resolve the graph and write `pnpm-lock.yaml`, then
-    /// return — skipping the tarball prefetch, virtual-store
-    /// materialization, symlinks, hoisting, and bin linking. The store
-    /// stays untouched (no tarball is fetched) — a dry-run resolve pass.
-    /// See [`crate::InstallExecution::lockfile_only`].
-    pub(crate) lockfile_only: bool,
+    /// `Some`: resolve the graph and write `pnpm-lock.yaml`, then return,
+    /// skipping virtual-store materialization, symlinks, hoisting, and bin
+    /// linking. [`ResolveOnly::LockfileOnly`] fetches nothing either (a
+    /// dry-run resolve pass; see [`crate::InstallExecution::lockfile_only`]);
+    /// [`ResolveOnly::FetchIntoStore`] keeps the tarball prefetch on and the
+    /// run waits for those downloads before it returns.
+    pub(crate) resolve_only: Option<ResolveOnly>,
     /// `config.skip_runtimes || --no-runtime`; see
     /// [`crate::add_direct_runtime_skips`].
     pub(crate) skip_runtimes: bool,
@@ -200,9 +193,19 @@ pub(crate) struct FreshInstallExecution {
     /// pnpm's `saveLockfile`: whether the freshly built lockfile may be
     /// written to `<lockfile_dir>/pnpm-lock.yaml`. `false` leaves that
     /// file untouched — the resolved graph is still returned and still
-    /// drives `<virtual_store_dir>/lock.yaml`. See
+    /// drives `<install_state_dir>/lock.yaml`. See
     /// [`crate::Install::run_legacy_deploy`].
     pub(crate) save_lockfile: bool,
+}
+
+impl FreshInstallExecution {
+    pub(crate) fn lockfile_only(self) -> bool {
+        self.resolve_only.is_some()
+    }
+
+    pub(crate) fn fetches_into_store(self) -> bool {
+        self.resolve_only == Some(ResolveOnly::FetchIntoStore)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -217,7 +220,7 @@ pub(crate) struct FreshManifestOptions<'a> {
 #[derive(Clone, Copy)]
 pub(crate) struct FreshPriorInstall<'a> {
     /// What the previous install materialized
-    /// (`<virtual_store_dir>/lock.yaml`). Drives the pre-link
+    /// (`<install_state_dir>/lock.yaml`). Drives the pre-link
     /// [`crate::PruneStaleModules`] reconciliation and the hoisted
     /// linker's previous-graph orphan diff. `None` on a first install.
     pub(crate) lockfile: Option<&'a Lockfile>,
@@ -232,8 +235,12 @@ pub(crate) struct FreshPriorInstall<'a> {
     pub(crate) allow_builds_changed: bool,
     /// See [`pnpm_deps_restorer::PriorHoistedState::unbuilt_builds`].
     pub(crate) unbuilt_builds: &'a crate::UnbuiltBuilds,
+    /// See [`pnpm_deps_restorer::PriorLinkState::previously_skipped`].
+    pub(crate) previously_skipped: &'a pnpm_deps_restorer::SkippedSnapshots,
     /// See [`crate::PruneStaleModules::prune_orphans`].
-    pub(crate) prune_orphans: bool,
+    pub(crate) prune: pnpm_deps_restorer::PruneTreeOptions<'a>,
+    /// See [`pnpm_deps_restorer::PriorMaterialization::relink_every_slot_bin`].
+    pub(crate) relink_every_slot_bin: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -249,17 +256,46 @@ pub(crate) struct FreshLockfileSeeds<'a> {
     /// Intact prior lockfile used to restore unselected projects after a
     /// filtered repair resolves against a sanitized seed.
     pub(crate) merge_wanted: Option<&'a Lockfile>,
+    /// The routes [`Self::wanted`]'s plain keys resolved through, when the
+    /// workspace state recorded them. See
+    /// [`pnpm_lockfile::RegistryContext::locked_registries`].
+    pub(crate) locked_registries: Option<&'a BTreeMap<String, String>>,
 }
 
 impl FreshInputs<'_> {
-    fn included(&self) -> IncludedDependencies {
-        IncludedDependencies {
-            dependencies: self.projects.dependency_groups.contains(&DependencyGroup::Prod),
-            dev_dependencies: self.projects.dependency_groups.contains(&DependencyGroup::Dev),
-            optional_dependencies: self.projects.dependency_groups.contains(
-                &DependencyGroup::Optional,
-            ),
+    /// The direct dependency groups the resolve pass walks.
+    ///
+    /// `pnpm-lock.yaml` describes the manifests, not the `--prod` /
+    /// `--dev` filter the run was invoked under, so a filtered install
+    /// still resolves every group and leaves the filter to
+    /// [`Self::included`], which decides what is materialized
+    /// (pnpm/pnpm#14912). A run that never writes that file owes it
+    /// nothing and resolves only what it installs, keeping the
+    /// deployed virtual store of `pacquet deploy --legacy --prod` free
+    /// of dev dependencies.
+    fn resolved_groups(&self) -> &[DependencyGroup] {
+        if self.execution.save_lockfile {
+            if self.projects.dependency_groups.contains(&DependencyGroup::Peer) {
+                &crate::DIRECT_AND_PEER_GROUPS
+            } else {
+                &crate::DIRECT_GROUPS
+            }
+        } else {
+            self.projects.dependency_groups
         }
+    }
+
+    /// Whether [`Self::resolved_groups`] walked groups this run does not
+    /// install, so the materialization closure has to narrow the graph
+    /// back down to [`Self::included`].
+    fn resolve_widened_groups(&self) -> bool {
+        self.resolved_groups()
+            .iter()
+            .any(|group| !self.projects.dependency_groups.contains(group))
+    }
+
+    fn included(&self) -> IncludedDependencies {
+        self.projects.included
     }
 }
 
@@ -287,14 +323,22 @@ pub(crate) struct OwnedInputs {
     /// disk lookup entirely; `None` (every CLI install) falls back to
     /// [`load_pnpmfile`][pnpm_hooks::finder::load_pnpmfile]. See [`crate::InstallProjects::pnpmfile_hook_override`].
     pub(crate) pnpmfile_hook_override: Option<Arc<dyn pnpm_hooks::PnpmfileHooks>>,
-    /// The pre-resolve verification of the existing lockfile, running in
-    /// the background while this install resolves and materializes. The
-    /// verdict is awaited before bin linking, dependency builds, and the
-    /// lockfile save. See [`crate::LockfileVerificationGate`].
-    pub(crate) lockfile_verification_gate: Option<crate::LockfileVerificationGate>,
+    pub(crate) lockfile: WantedLockfileHandles,
     pub(crate) resolution: crate::ResolutionInputs,
     pub(crate) fetching: crate::install_with_fresh_lockfile::FreshFetchingInputs,
     pub(crate) projects: crate::install_with_fresh_lockfile::FreshProjectInputs,
+}
+
+/// The install's handles on the wanted lockfile: the background verification
+/// of the one on disk, and where a check run sends the one it would write.
+pub(crate) struct WantedLockfileHandles {
+    /// The pre-resolve verification of the existing lockfile, running in
+    /// the background while this install resolves and materializes. See
+    /// [`crate::LockfileVerificationGate`].
+    pub(crate) verification_gate: Option<crate::LockfileVerificationGate>,
+    /// Where a `lockfileCheck` run delivers the wanted lockfile instead of
+    /// writing it. See [`crate::Install::run_lockfile_check`].
+    pub(crate) check_sink: Option<crate::LockfileCheckSink>,
 }
 
 pub(crate) struct FreshFetchingInputs {
@@ -304,6 +348,13 @@ pub(crate) struct FreshFetchingInputs {
     /// each fresh resolution while the install-side per-package call
     /// in `install_subtree` still takes `&MemCache` via deref.
     pub(crate) tarball_mem_cache: Arc<MemCache>,
+    /// Where a run that fetches into the store keeps the prefetch's download
+    /// tasks; `None` for every other run.
+    pub(crate) prefetch_downloads: Option<Arc<crate::PrefetchDownloads>>,
+    /// Where a run that fetches into the store keeps the verification of
+    /// the wanted lockfile's rows it starts while resolving; `None` for
+    /// every other run.
+    pub(crate) store_verification: Option<Arc<crate::StoreVerification>>,
     /// Same client behind an [`Arc`] for the [`NpmResolver`][pnpm_resolving_npm_resolver::NpmResolver], whose
     /// stored `ThrottledClient` outlives any per-call borrow.
     pub(crate) http_client_arc: Arc<ThrottledClient>,
@@ -313,6 +364,8 @@ pub(crate) struct FreshFetchingInputs {
     /// from it to skip duplicate fetches when both touch the same
     /// `(registry, name)`.
     pub(crate) meta_cache: Arc<InMemoryPackageMetaCache>,
+    /// See [`crate::DedicatedProjectInstall::caches`].
+    pub(crate) fetch_caches: Option<pnpm_deps_restorer::SharedFetchCaches>,
 }
 
 pub(crate) struct FreshProjectInputs {
@@ -331,17 +384,14 @@ pub(crate) struct FreshProjectInputs {
     /// `ResolveFromWorkspaceError::WorkspacePackagesNotLoaded` — the
     /// `Cannot resolve package from workspace because opts.workspacePackages is not defined`
     /// behavior.
-    pub(crate) workspace_packages: Option<pnpm_resolving_resolver_base::WorkspacePackages>,
+    pub(crate) workspace_packages: Option<Arc<pnpm_resolving_resolver_base::WorkspacePackages>>,
 }
 
 /// Output of [`InstallWithFreshLockfile::run`].
 ///
 /// Returns the hoist-graph slot the dispatch already consumed plus the
-/// freshly-built [`Lockfile`] (when the writer ran), so the caller can
-/// save it as `<virtual_store_dir>/lock.yaml` after `.modules.yaml`
-/// succeeds — the same ordering the frozen-lockfile path uses to
-/// guarantee a manifest failure can't leave a current-lockfile
-/// pointing at incomplete install state.
+/// freshly-built [`Lockfile`], so the caller can save it as
+/// `<install_state_dir>/lock.yaml` after `.modules.yaml` succeeds.
 #[must_use]
 pub struct InstallWithFreshLockfileResult {
     pub hoisted: pnpm_deps_restorer::InstalledHoistedState,
@@ -351,10 +401,10 @@ pub struct InstallWithFreshLockfileResult {
     /// the resolver's parent chains leave out — but walks only these
     /// importers.
     pub peer_issue_importer_ids: HashSet<String>,
-    /// `Some` when the install resolved a graph that was written to
-    /// `pnpm-lock.yaml`; `None` when the write was skipped (today: only
-    /// `config.lockfile=false`). The caller mirrors the same gate when
-    /// deciding whether to persist the current-lockfile.
+    /// The resolved [`Lockfile`] for the install. Retained in-memory to
+    /// materialize the dependency graph and write `<install_state_dir>/lock.yaml`
+    /// even when disk persistence of the wanted `pnpm-lock.yaml` is skipped
+    /// (`config.lockfile=false` or `save_lockfile=false`).
     pub wanted_lockfile: Option<Lockfile>,
     /// `true` when the wanted lockfile written to disk is the same
     /// typed lockfile returned in [`Self::wanted_lockfile`]. A
@@ -472,29 +522,13 @@ fn deprecation_log_fn<Reporter: self::Reporter>() -> pnpm_resolving_deps_resolve
             pkg_version: deprecation.pkg_version,
             pkg_id: deprecation.pkg_id,
             prefix: deprecation.prefix,
-            deprecated: deprecation.deprecated,
             depth: deprecation.depth,
-        }));
-    })
-}
-
-/// Build one side of the `preResolution` hook's `logger`: each
-/// `logger.info(...)` / `logger.warn(...)` call emits a `pnpm:hook` event at
-/// the given level. `from` is the literal `"pnpmfile"` — pnpm's
-/// `createPreResolutionHookLogger` hardcodes it rather than passing the
-/// pnpmfile path.
-fn pre_resolution_log_fn<Reporter: self::Reporter>(
-    prefix: &Path,
-    level: LogLevel,
-) -> pnpm_hooks::LogFn {
-    let prefix = prefix.to_string_lossy().into_owned();
-    Arc::new(move |message: String| {
-        Reporter::emit(&LogEvent::Hook(HookLog {
-            level,
-            from: "pnpmfile".to_string(),
-            hook: "preResolution".to_string(),
-            message,
-            prefix: prefix.clone(),
+            non_deprecated_alternative: deprecation.non_deprecated_alternative.map(|alt| {
+                pnpm_reporter::NonDeprecatedAlternative {
+                    version: alt.version,
+                    outside_declared_range: alt.outside_declared_range,
+                }
+            }),
         }));
     })
 }
@@ -518,6 +552,9 @@ fn check_patch_usage<Reporter: self::Reporter>(
     applied_patches: &rustc_hash::FxHashSet<String>,
     scope: PatchUsageScope<'_>,
 ) -> Result<(), InstallWithFreshLockfileError> {
+    if !config.shares_one_lockfile() && config.workspace_dir.is_some() {
+        return Ok(());
+    }
     let Some(deps) = patched_dependencies else { return Ok(()) };
     let verify = match scope.selected_importer_ids {
         None => true,

@@ -5,7 +5,7 @@ use super::{
 use crate::InstallPackageBySnapshotError;
 use pnpm_lockfile::{PackageKey, PackageMetadata, PkgName, SnapshotEntry};
 use pnpm_reporter::{LogEvent, LogLevel, ProgressLog, ProgressMessage, Reporter};
-use pnpm_tarball::SharedReportedProgressKeys;
+use pnpm_tarball::{SharedReportedProgressKeys, pending_progress_key};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -15,7 +15,7 @@ pub(super) struct SlotLink<'a> {
     pub source: crate::SlotImportSource<'a>,
     pub(super) snapshot_key: &'a PackageKey,
     pub(super) snapshot: &'a SnapshotEntry,
-    pub(super) cas_paths: &'a HashMap<String, PathBuf>,
+    pub(super) cas_paths: &'a pnpm_fs::CasPaths,
     pub(super) warm_cache_key: Option<&'a str>,
     /// Whether the directory-clone cache may serve this slot — see
     /// [`dir_clone_cacheable`].
@@ -97,12 +97,7 @@ pub(super) fn merge_into_slot_group<'a>(group: &mut SlotDirGroup<'a>, slot: &'a 
         }
     }
 }
-/// How many completed cold snapshots accumulate before a link chunk
-/// runs. Small enough that each chunk's `block_in_place` pause stays in
-/// the low milliseconds; large enough that the rayon pass has real
-/// parallelism to spend it on.
-pub(super) const COLD_LINK_CHUNK: usize = 32;
-/// Build [`SlotLink`]s for one chunk of cold captures and run the
+/// Build [`SlotLink`]s for one batch of cold captures and run the
 /// parallel link pass over them. `template` carries the pass-invariant
 /// fields; its `slots` are ignored.
 pub(super) fn link_cold_chunk<Reporter: self::Reporter>(
@@ -122,20 +117,22 @@ pub(super) fn link_cold_chunk<Reporter: self::Reporter>(
                 snapshot_needs_build_marker(capture.snapshot_key, capture.requires_build);
             SlotLink {
                 source: crate::SlotImportSource {
-                    is_mutable: capture.source_is_mutable,
+                    is_mutable: capture.installed.source_is_mutable,
+                    source_exists: capture.installed.source_exists,
                     force: capture.force_import,
                     build_marker: needs_build.then_some(marker_path).flatten(),
+                    needs_build,
                 },
                 snapshot_key: capture.snapshot_key,
                 snapshot: capture.snapshot,
-                cas_paths: &capture.cas_paths,
+                cas_paths: &capture.installed.cas_paths,
                 warm_cache_key: None,
 
                 dir_clone_cacheable: dir_clone_cacheable(
                     packages,
                     capture.snapshot_key,
                     needs_build,
-                    capture.source_is_mutable,
+                    capture.installed.source_is_mutable,
                     capture.force_import,
                 ),
                 removed_aliases: removed_aliases_for(removed_aliases_by_key, capture.snapshot_key),
@@ -164,19 +161,7 @@ pub(super) fn link_slots_parallel<Reporter: self::Reporter>(
     let groups = group_slots_by_dir(opts.slots, opts.link.layout);
     let link_work =
         || groups.par_iter().try_for_each(|group| link_slot_group::<Reporter>(group, &opts));
-    // Driving the link pass from inside an `async fn` means the
-    // `par_iter` blocks the calling tokio worker for the duration. On
-    // the production multi-thread runtime, `block_in_place` migrates
-    // other futures off this worker so async progress continues; it
-    // panics on the `current_thread` runtime that `#[tokio::test]`
-    // defaults to, so fall back to a plain call there.
-    let on_multi_thread = tokio::runtime::Handle::try_current()
-        .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
-    if on_multi_thread {
-        tokio::task::block_in_place(link_work)?;
-    } else {
-        link_work()?;
-    }
+    crate::block_in_place_if_multi_thread(|| crate::link_pool::in_link_pool(link_work))?;
     tracing::info!(
         target: "pacquet::install::phase",
         phase = "link_slots",
@@ -235,9 +220,25 @@ pub(super) fn emit_group_warm_progress<Reporter: self::Reporter>(
             emit_warm_snapshot_progress::<Reporter>(
                 &slot.snapshot_key.pkg_id(),
                 requester,
-                progress_reported.contains(cache_key),
+                warm_progress_already_reported(progress_reported, cache_key),
             );
         }
+    }
+}
+/// Whether a warm snapshot's store status was already reported.
+///
+/// A key a resolution observer marked pending is claimed atomically, so
+/// peer variants linked by parallel groups report it once and the
+/// observer's deferred report skips it. Other keys are only checked:
+/// ordinary installs report each warm snapshot.
+pub(super) fn warm_progress_already_reported(
+    progress_reported: &SharedReportedProgressKeys,
+    cache_key: &str,
+) -> bool {
+    if progress_reported.contains(&pending_progress_key(cache_key)) {
+        !progress_reported.insert(cache_key.to_string())
+    } else {
+        progress_reported.contains(cache_key)
     }
 }
 pub(super) fn emit_warm_snapshot_progress<Reporter: self::Reporter>(

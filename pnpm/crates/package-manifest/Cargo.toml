@@ -11,7 +11,13 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+pnpm-diagnostics = { workspace = true }
+pnpm-fs = { workspace = true }
+pnpm-tool-protocol = { workspace = true }
+pnpm-yaml-document-sync = { workspace = true }
+
 derive_more = { workspace = true }
+json5 = { workspace = true }
 miette = { workspace = true }
 node-semver = { workspace = true }
 serde = { workspace = true }

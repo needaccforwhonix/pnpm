@@ -40,6 +40,7 @@ fn add_to_multi_pattern_workspace_root_requires_workspace_root_flag() {
 #[test]
 fn add_accepts_multiple_local_package_selectors() {
     let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+    write_json(&workspace.join("package.json"), &serde_json::json!({ "name": "root" }));
     let fixtures_dir = workspace.join("fixtures");
     for package_name in ["local-a", "local-b"] {
         let package_dir = fixtures_dir.join(package_name);
@@ -89,6 +90,7 @@ fn add_accepts_multiple_local_package_selectors() {
 #[test]
 fn add_installs_a_local_package_reached_through_a_symlinked_directory() {
     let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+    write_json(&workspace.join("package.json"), &serde_json::json!({ "name": "root" }));
     let real_dir = workspace.join("fixtures/real-local");
     std::fs::create_dir_all(&real_dir).expect("create local package directory");
     std::fs::write(
@@ -339,12 +341,8 @@ fn save_workspace_protocol_decides_the_saved_workspace_range() {
         (None, "workspace:1.2.3", "1.2.3", true, "workspace:*"),
         (None, "workspace:*", "1.2.3", true, "workspace:*"),
         (Some("true"), "workspace:^1.2.3", "1.2.3", true, "workspace:^1.2.3"),
-        // The typed `~` loses to the default `^`: the pinned form reads
-        // its operator off the previous entry, and there is none here.
-        (Some("true"), "workspace:~1.2.3", "1.2.3", true, "workspace:^1.2.3"),
-        // The local version wins over the typed range.
+        (Some("true"), "workspace:~1.2.3", "1.2.3", true, "workspace:~1.2.3"),
         (Some("true"), "workspace:^1.0.0", "2.5.0", true, "workspace:^2.5.0"),
-        // A range over a prerelease would not match it, so it is exact.
         (Some("true"), "workspace:^1.0.0", "2.0.0-beta.1", true, "workspace:2.0.0-beta.1"),
         (Some("false"), "workspace:^1.2.3", "1.2.3", true, "workspace:^1.2.3"),
     ];
@@ -404,6 +402,19 @@ fn a_bare_workspace_add_uses_the_local_package_and_saved_protocol_setting() {
         assert_eq!(saved_spec(&app_dir, LIB).as_deref(), Some(expected));
         drop(root);
     }
+}
+
+#[test]
+fn a_workspace_add_at_a_dist_tag_keeps_the_local_package_over_a_matching_catalog_entry() {
+    const LIB: &str = "@pnpm.e2e/ws-tagged";
+    let settings =
+        format!("{}catalogMode: prefer\ncatalog:\n  '{LIB}': legacy\n", linking_settings(None));
+    let (root, app_dir) =
+        workspace_with_lib(&settings, &[(LIB, "1.2.3")], "packages/app/package.json");
+    add_in(&app_dir, &format!("{LIB}@legacy"));
+
+    assert_eq!(saved_spec(&app_dir, LIB).as_deref(), Some("workspace:^"));
+    drop(root);
 }
 
 /// `workspace:<target>@<range>` installs `<target>` under the name the
@@ -476,4 +487,66 @@ fn the_env_var_drives_the_saved_workspace_range() {
         assert_eq!(saved_spec(&app_dir, LIB).as_deref(), Some(expected));
         drop(root);
     }
+}
+
+/// The install after `pnpm add` reuses the workspace projects the add walked,
+/// so they must carry the manifest the add rewrote: a sibling that injects the
+/// project gets the added dependency in its copy.
+#[test]
+fn add_reaches_the_injected_copy_of_the_project() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let mut workspace_yaml = std::fs::read_to_string(workspace.join("pnpm-workspace.yaml"))
+        .expect("read pnpm-workspace.yaml");
+    workspace_yaml.push_str("\npackages:\n  - 'packages/*'\ndedupeInjectedDeps: false\n");
+    std::fs::write(workspace.join("pnpm-workspace.yaml"), workspace_yaml)
+        .expect("write pnpm-workspace.yaml");
+    write_json(&workspace.join("package.json"), &serde_json::json!({ "name": "root" }));
+    let lib_dir = workspace.join("packages/lib");
+    for dir in [&workspace.join("packages/app"), &lib_dir] {
+        std::fs::create_dir_all(dir).expect("create the project directory");
+    }
+    write_json(
+        &workspace.join("packages/app/package.json"),
+        &serde_json::json!({
+            "name": "app",
+            "version": "1.0.0",
+            "dependencies": { "lib": "workspace:*" },
+            "dependenciesMeta": { "lib": { "injected": true } },
+        }),
+    );
+    write_json(
+        &lib_dir.join("package.json"),
+        &serde_json::json!({ "name": "lib", "version": "1.0.0" }),
+    );
+
+    Command::cargo_bin("pnpm")
+        .expect("find the pnpm binary")
+        .with_current_dir(&lib_dir)
+        .with_args(["add", "@pnpm.e2e/foo", "--lockfile-only"])
+        .assert()
+        .success();
+
+    let lockfile = Lockfile::load_wanted_from_dir(&workspace)
+        .expect("read pnpm-lock.yaml")
+        .expect("pnpm-lock.yaml exists");
+    let injected_lib = lockfile.snapshots
+        .as_ref()
+        .and_then(|snapshots| {
+            snapshots
+                .iter()
+                .find(|(key, _)| key.to_string() == "lib@file:packages/lib")
+        })
+        .map(|(_, snapshot)| snapshot)
+        .expect("app's injected copy of lib");
+    let dependencies = injected_lib.dependencies
+        .as_ref()
+        .map(|dependencies| {
+            dependencies
+                .keys()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        });
+    assert_eq!(dependencies, Some(vec!["@pnpm.e2e/foo".to_string()]));
+    drop((root, npmrc_info));
 }

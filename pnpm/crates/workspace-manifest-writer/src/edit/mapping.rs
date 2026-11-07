@@ -2,8 +2,8 @@ use crate::model::CatalogEntries;
 
 use super::{
     Component, DEFAULT_CATALOG_NAME, Document, IndexMap, Inline, Manifest, Op, Patch, Route,
-    comment_start, flow, insert_top_level_block, locate, locate_mapping, render, render_bool,
-    splice, structural_colon_index,
+    comment_start, flow, insert_top_level_block, locate, locate_mapping, render, splice,
+    structural_colon_index,
 };
 
 /// Where a catalog's entries live (or should be created) in the manifest.
@@ -109,7 +109,8 @@ fn create_target(
             Some(IndexMap::from([(dep.to_string(), specifier.to_string())]));
     } else if manifest.catalogs.named.is_some() {
         // `catalogs:` exists but lacks this name — add a named sub-block.
-        let new_text = write_named_subblock(manifest, catalog_name, dep, &value);
+        let new_text =
+            write_named_subblock(manifest.document.text(), "catalogs", catalog_name, dep, &value);
         manifest.document.set_text(new_text);
         manifest.catalogs.named
             .as_mut()
@@ -271,15 +272,20 @@ pub(super) fn write_rendered_entry_at(
     splice(text, offset, &line)
 }
 
-/// Write a new named catalog (`<name>:` + its first entry) into an existing
-/// top-level `catalogs:` block, at the position the reorder pass would choose.
-fn write_named_subblock(manifest: &Manifest, name: &str, dep: &str, value: &str) -> String {
-    let text = manifest.document.text();
-    if let Inline::Flow(collection) = locate_mapping(text, &["catalogs"]) {
+/// Write a new named mapping (`<name>:` + its first entry) into an existing
+/// top-level `block`, at the position the reorder pass would choose.
+pub(super) fn write_named_subblock(
+    text: &str,
+    block: &str,
+    name: &str,
+    dep: &str,
+    value: &str,
+) -> String {
+    if let Inline::Flow(collection) = locate_mapping(text, &[block]) {
         let entry = format!("{{ {}: {value} }}", render::render_value(dep));
         return flow::upsert(text, &collection, name, &entry);
     }
-    let catalogs = locate(text, &["catalogs"]).expect("catalogs block exists");
+    let catalogs = locate(text, &[block]).expect("top-level block exists");
     let existing: Vec<String> = catalogs.entries
         .iter()
         .map(|entry| entry.key.clone())
@@ -303,17 +309,25 @@ fn write_named_subblock(manifest: &Manifest, name: &str, dep: &str, value: &str)
         catalogs.entries
             .iter()
             .find(|entry| &entry.key == predecessor)
-            .expect("predecessor named catalog exists")
+            .expect("predecessor entry exists")
             .block_end
     };
     splice(text, offset, &block)
 }
 
-/// Rewrite the scalar value of `key`'s existing entry under `path` in place,
-/// preserving the key's text/quoting and any trailing comment. Used for
+/// Rewrite an entry's value in place under `path`, replacing the whole
+/// value — a scalar line or a sub-block — with `value_text`, preserving the
+/// key's text/quoting and any trailing comment. Used for `permissions` and
 /// `allowBuilds` instead of the `yamlpatch` route, which rejects a key
 /// containing `:` (an artifact pkgId such as `foo@https://example.com/foo.tgz`).
-pub(super) fn replace_bool_value_at(text: &str, path: &[&str], key: &str, value: bool) -> String {
+/// A block-valued entry (`skills:` with nested `- item` lines) is replaced
+/// with the rendered value in one pass, so no nested line survives.
+pub(super) fn replace_value_text_at(
+    text: &str,
+    path: &[&str],
+    key: &str,
+    value_text: &str,
+) -> String {
     let mapping = locate(text, path).expect("mapping exists");
     let entry = mapping.entries
         .iter()
@@ -324,6 +338,22 @@ pub(super) fn replace_bool_value_at(text: &str, path: &[&str], key: &str, value:
     let indent_len = content.len() - content.trim_start().len();
     let colon = indent_len
         + structural_colon_index(&content[indent_len..]).expect("entry line has a delimiter");
+    let new_line = format_replaced_line(content, colon, value_text);
+    // A block-valued entry's sub-block ends past its own line; ending the
+    // span at `line_end` would leave the nested lines behind.
+    let value_span_end =
+        if entry.block_end > entry.line_end { entry.block_end } else { entry.line_end };
+
+    let mut out = String::with_capacity(text.len());
+    out.push_str(&text[..entry.line_start]);
+    out.push_str(&new_line);
+    out.push_str(&text[value_span_end..]);
+    out
+}
+
+/// Key and replacement value formatted into a line, keeping any trailing
+/// comment on the original entry.
+fn format_replaced_line(content: &str, colon: usize, value_text: &str) -> String {
     let key_text = content[..colon].trim_end();
     // Preserve any trailing comment, and replace the whole value.
     // Ending the value at its first whitespace would truncate a
@@ -335,11 +365,5 @@ pub(super) fn replace_bool_value_at(text: &str, path: &[&str], key: &str, value:
         Some(idx) => format!(" {}", &after[idx..]),
         None => String::new(),
     };
-    let new_line = format!("{key_text}: {}{trailing}\n", render_bool(value));
-
-    let mut out = String::with_capacity(text.len());
-    out.push_str(&text[..entry.line_start]);
-    out.push_str(&new_line);
-    out.push_str(&text[entry.line_end..]);
-    out
+    format!("{key_text}: {value_text}{trailing}\n")
 }

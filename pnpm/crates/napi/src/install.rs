@@ -9,7 +9,7 @@
 //! result over a oneshot channel — so the borrows never have to cross the FFI
 //! boundary or become `'static`.
 //!
-//! [`rebuild`] takes the frozen path against the already-materialized
+//! [`rebuild`](fn@rebuild) takes the frozen path against the already-materialized
 //! `node_modules`; [`get_peer_dependency_issues`] runs a sink-driven
 //! `dry_run` resolve that writes nothing and returns the per-importer
 //! peer-dependency issues.
@@ -22,6 +22,7 @@ pub use options::{
 };
 pub(crate) use overlay::install_http_client;
 pub use peer_issues::get_peer_dependency_issues;
+pub use rebuild::rebuild;
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -46,14 +47,15 @@ use tokio::sync::Mutex;
 use crate::{
     config::{ConfigOverlay, resolve_config},
     error::{invalid_manifest_error, to_napi_error, unsupported_option_error},
-    hooks::{BatchHookSink, HookSink, JsBatchedReadPackageHook, JsReadPackageHook},
+    hooks::{
+        BatchHookSink, ChecksummedHooks, HookSink, JsBatchedReadPackageHook, JsReadPackageHook,
+    },
     native_reporter::{NativeRenderer, OutputSink, ReporterOptions},
     reporter_bridge::{EngineCallGuard, LogSink, NodeBridgeReporter, begin_stats, take_stats},
 };
 
-/// Per-project add/remove counts. `linkedToRoot` mirrors pnpm's field; pacquet
-/// does not emit it separately, so it stays 0 and consumers use
-/// `added + removed` for "did anything change".
+/// Per-project add/remove counts. `linkedToRoot` mirrors pnpm's field; it
+/// stays 0, so consumers use `added + removed` for "did anything change".
 #[napi(object)]
 pub struct InstallStatsResult {
     pub added: f64,
@@ -61,7 +63,7 @@ pub struct InstallStatsResult {
     pub linked_to_root: f64,
 }
 
-/// Result of [`install`]. Mirrors [`InstallResult`] in `index.d.ts`.
+/// Result of [`install`].
 #[napi(object)]
 pub struct InstallResult {
     pub stats: InstallStatsResult,
@@ -97,6 +99,7 @@ pub async fn install(
     read_package_batch_hook: Option<BatchHookSink>,
     on_output: Option<OutputSink>,
 ) -> napi::Result<InstallResult> {
+    pnpm_package_manager::configure_rayon_pool();
     let _guard = engine_call_lock().lock().await;
     let renderer = build_renderer(&options, on_output);
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -205,8 +208,13 @@ enum EngineMode {
 }
 
 impl EngineMode {
+    /// A peer-issue query exists to resolve, so it never takes a
+    /// repeat-install short-circuit. An install takes them: the
+    /// workspace-state check compares the caller's in-memory manifests by
+    /// content (see [`InstallShape::configure`]), and the post-verification
+    /// "nothing to materialize" return works from the lockfile alone.
     fn disable_optimistic_repeat_install(&self) -> bool {
-        matches!(self, Self::Install(_) | Self::PeerIssues(_))
+        matches!(self, Self::PeerIssues(_))
     }
 
     fn peer_issues_sink(&self) -> Option<pnpm_package_manager::PeerIssuesSink> {
@@ -250,8 +258,9 @@ impl InstallShape {
             mutation: project_mutation(mode, ignore_package_manifest),
         }
     }
-    /// In-memory manifests require the full freshness check. Peer queries
-    /// resolve without writes and report through their dedicated sink.
+    /// In-memory manifests are checked by content, never by mtime. Peer
+    /// queries resolve without writes and report through their dedicated
+    /// sink.
     fn configure<'a>(
         self,
         install: Install<'a, Vec<DependencyGroup>>,
@@ -265,12 +274,14 @@ impl InstallShape {
                 frozen: self.frozen_lockfile,
                 prefer_frozen: self.prefer_frozen_lockfile,
                 ignore_manifest_check: options.ignore_package_manifest == Some(true),
-                // The optimistic repeat-install fast path uses on-disk
-                // manifest mtimes as its freshness signal. NAPI installs use
-                // caller-supplied manifests that can change without touching
-                // package.json, so they must continue to the lockfile
-                // freshness check. Peer-issue queries must always resolve too.
                 disable_optimistic_repeat: mode.disable_optimistic_repeat_install(),
+                // The repeat-install fast path keys off `package.json` mtimes
+                // by default. NAPI installs use caller-supplied manifests
+                // that can change without touching `package.json` (which may
+                // not exist at all), so every manifest is compared against
+                // the lockfile by content instead; a repeat install with
+                // unchanged manifests still returns "Already up to date"
+                // before any install setup runs.
                 ..install.lockfile_policy
             },
             execution: pnpm_package_manager::InstallExecution {
@@ -294,7 +305,10 @@ impl InstallShape {
             },
             projects: pnpm_package_manager::InstallProjects {
                 supported_architectures: None,
-                pnpmfile_hook_override: pnpmfile_hook,
+                pnpmfile_hook_override: ChecksummedHooks::wrap(
+                    pnpmfile_hook,
+                    options.read_package_hook_checksum.as_deref(),
+                ),
                 workspace_projects_override: build_workspace_projects_override(&options.projects),
                 ..install.projects
             },
@@ -339,16 +353,13 @@ fn updates_everything(
 }
 
 /// `enableModulesDir: false` ("do not create a `node_modules` directory") is
-/// honored via pacquet's lockfile-only path: the graph resolves and the
-/// lockfile is written, but nothing is materialized under `node_modules`.
-/// Confined to the install path — a rebuild runs against an
-/// already-materialized `node_modules`, so it must never take the
-/// lockfile-only short-circuit (which would make it silently do nothing) even
-/// when the caller reuses install options that disable the modules dir.
-/// `ignorePackageManifest` overrides both: it materializes the virtual
-/// store from the lockfile, which the lockfile-only short-circuit would
-/// skip entirely (the TS fetch handler forces `enableModulesDir: true` for
-/// the same reason).
+/// not a lockfile-only install: the engine reads it from the config, skips
+/// `node_modules` yet fetches the registry packages the host can install into
+/// the store, and leaves a
+/// rebuild alone. `ignorePackageManifest` overrides `lockfileOnly`: it
+/// materializes the virtual store from the lockfile, which the lockfile-only
+/// short-circuit would skip entirely (the TS fetch handler forces
+/// `enableModulesDir: true` for the same reason).
 fn is_lockfile_only(
     options: &InstallOptions,
     mode: &EngineMode,
@@ -356,7 +367,7 @@ fn is_lockfile_only(
 ) -> bool {
     matches!(mode, EngineMode::Install(_))
         && !ignore_package_manifest
-        && (options.lockfile_only.unwrap_or(false) || options.enable_modules_dir == Some(false))
+        && options.lockfile_only.unwrap_or(false)
 }
 
 /// A rebuild takes the frozen path against the already-materialized
@@ -486,57 +497,14 @@ fn multi_thread_runtime() -> napi::Result<tokio::runtime::Runtime> {
         })
 }
 
-#[napi]
-pub async fn rebuild(
-    options: InstallOptions,
-    on_log: Option<LogSink>,
-    selected_names: Option<Vec<String>>,
-    on_output: Option<OutputSink>,
-) -> napi::Result<()> {
-    let _guard = engine_call_lock().lock().await;
-    let renderer = build_renderer(&options, on_output);
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    std::thread::Builder::new()
-        .name("pnpm-napi-rebuild".to_string())
-        .stack_size(32 * 1024 * 1024)
-        .spawn(move || {
-            let _ = tx.send(run_rebuild_blocking(&options, on_log, renderer, selected_names));
-        })
-        .map_err(|error| {
-            napi::Error::from_reason(format!("failed to spawn rebuild thread: {error}"))
-        })?;
-    rx.await.map_err(|_| napi::Error::from_reason("rebuild worker thread panicked"))?
-}
-
-fn run_rebuild_blocking(
-    options: &InstallOptions,
-    on_log: Option<LogSink>,
-    renderer: Option<NativeRenderer>,
-    selected_names: Option<Vec<String>>,
-) -> napi::Result<()> {
-    // Restores the previous sink and renderer on drop — including on a
-    // panic in `run_install_inner`, which unwinds this dedicated thread.
-    let _sink_guard = EngineCallGuard::with_renderer(on_log, renderer);
-    // `None` (or an empty list) rebuilds every build-needing package; a
-    // non-empty list restricts the rebuild to the matching names / build keys.
-    let rebuild_options = RebuildOptions {
-        selected_names: selected_names
-            .filter(|names| !names.is_empty())
-            .map(|names| names.into_iter().collect()),
-        // The engine API rebuilds dependencies only; running a workspace
-        // project's own deferred scripts is `pnpm rebuild --pending`.
-        pending_projects: Vec::new(),
-    };
-    let outcome = run_install_inner(options, None, EngineMode::Rebuild(rebuild_options));
-    outcome.map(|_| ())
-}
-
 #[cfg(test)]
 mod tests;
 
 use overlay::{build_overlay, build_workspace_projects_override};
 
 mod peer_issues;
+
+mod rebuild;
 
 mod options;
 

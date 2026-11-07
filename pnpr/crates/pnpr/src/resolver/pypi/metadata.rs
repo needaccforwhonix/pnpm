@@ -1,15 +1,16 @@
-use super::{
-    BTreeMap, Candidate, Cursor, MAX_METADATA_BYTES, Target, WheelMetadata, candidates_from_page,
-};
-use std::io::Read;
+use super::{BTreeMap, Offered, Target, WheelMetadata, candidates_from_page};
+use pnpm_python_resolver::matches_published_digest;
 
-/// The candidates a project page offers, refusing a page that is not one.
+/// What a project page offers, refusing a page that is not one. The
+/// releases it leaves out travel with the candidates: they are what a
+/// resolution failure tells the client about a distribution that offered
+/// it nothing.
 pub(super) fn parse_page(
     page: &str,
     page_url: &url::Url,
     name: &pep508_rs::PackageName,
     target: &Target,
-) -> Result<BTreeMap<pep440_rs::Version, Candidate>, String> {
+) -> Result<Offered, String> {
     candidates_from_page(page, page_url, name, target)
         .map_err(|err| super::super::report_message(&err))
 }
@@ -20,28 +21,15 @@ pub(super) fn text(bytes: Vec<u8>, kind: &str, of: &str) -> Result<String, Strin
 }
 
 /// The metadata a document describes, refusing one that describes another
-/// distribution: what a wheel requires decides what a client installs, so
-/// metadata for something else must not stand in for it.
+/// distribution.
 pub(super) fn parse_metadata(
     document: &str,
     name: &pep508_rs::PackageName,
     version: &pep440_rs::Version,
     filename: &str,
 ) -> Result<WheelMetadata, String> {
-    let metadata =
-        WheelMetadata::parse(document).map_err(|err| super::super::report_message(&err))?;
-    let named = metadata.name
-        .parse::<pep508_rs::PackageName>()
-        .map_err(|err| format!("read the distribution the metadata of {filename} names: {err}"))?;
-    let versioned = metadata.version
-        .parse::<pep440_rs::Version>()
-        .map_err(|err| format!("read the version the metadata of {filename} names: {err}"))?;
-    if named != *name || versioned != *version {
-        return Err(format!(
-            "the metadata of {filename} describes {named} {versioned}, not {name} {version}",
-        ));
-    }
-    Ok(metadata)
+    WheelMetadata::parse_for(document, name, version, filename)
+        .map_err(|err| super::super::report_message(&err))
 }
 
 /// The project page of `canonical_name` under an index, keeping whatever
@@ -51,15 +39,6 @@ pub(super) fn project_page_url(index: &url::Url, canonical_name: &str) -> Result
     let mut url = index.clone();
     url.set_path(&format!("{}{canonical_name}/", index.path()));
     Ok(url)
-}
-
-/// The metadata file published beside a wheel (PEP 658), which is the
-/// wheel's own address with `.metadata` on the end of its path — the query
-/// stays where it is.
-pub(super) fn metadata_url(wheel: &url::Url) -> url::Url {
-    let mut url = wheel.clone();
-    url.set_path(&format!("{}.metadata", wheel.path()));
-    url
 }
 
 /// A document as it was read, beside the URL it came from: a redirected
@@ -96,9 +75,7 @@ pub(super) fn verify_digest(
     kind: &str,
     filename: &str,
 ) -> Result<(), String> {
-    let Some(expected) = digests.get("sha256") else { return Ok(()) };
-    let actual = pnpm_crypto_hash::create_hex_hash_bytes(bytes);
-    if !actual.eq_ignore_ascii_case(expected) {
+    if !matches_published_digest(bytes, digests) {
         return Err(format!(
             "the {kind} of {filename} does not match the SHA-256 the index published",
         ));
@@ -109,40 +86,5 @@ pub(super) fn verify_digest(
 /// The `METADATA` inside a wheel, for an index that publishes no metadata
 /// file of its own.
 pub(super) fn metadata_from_wheel(wheel: &[u8], filename: &str) -> Result<Vec<u8>, String> {
-    let mut archive = zip::ZipArchive::new(Cursor::new(wheel))
-        .map_err(|err| format!("read the wheel {filename}: {err}"))?;
-    let entry = (0..archive.len())
-        .filter_map(|index| {
-            Some(
-                archive
-                    .by_index(index)
-                    .ok()?
-                    .name()
-                    .to_string(),
-            )
-        })
-        .find(|name| {
-            let mut segments = name.split('/');
-            segments
-                .next()
-                .is_some_and(|directory| directory.ends_with(".dist-info"))
-                && segments.next() == Some("METADATA")
-                && segments.next().is_none()
-        })
-        .ok_or_else(|| format!("the wheel {filename} has no dist-info METADATA"))?;
-    let mut document = Vec::new();
-    archive
-        .by_name(&entry)
-        .map_err(|err| format!("read {entry} from {filename}: {err}"))?
-        // One byte past the cap, so a document that reaches it is refused
-        // rather than read as a whole one: a `METADATA` cut short still
-        // names its distribution, and the requirements after the cut would
-        // silently not exist.
-        .take(MAX_METADATA_BYTES as u64 + 1)
-        .read_to_end(&mut document)
-        .map_err(|err| format!("read {entry} from {filename}: {err}"))?;
-    if document.len() > MAX_METADATA_BYTES {
-        return Err(format!("the metadata in {filename} exceeds {MAX_METADATA_BYTES} bytes"));
-    }
-    Ok(document)
+    pnpr_pypi::archive::metadata_from_zip(wheel, filename, pnpr_pypi::DistributionKind::Wheel)
 }

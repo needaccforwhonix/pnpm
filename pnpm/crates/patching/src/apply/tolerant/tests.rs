@@ -1,4 +1,4 @@
-use super::apply;
+use super::{apply, drop_context_no_newline_markers, strip_cr_from_extended_headers};
 use diffy::Patch;
 use pretty_assertions::assert_eq;
 use text_block_macros::text_block_fnl;
@@ -263,4 +263,109 @@ fn applies_zero_context_insertions_after_deletion_and_replacement_shifts() {
     let after = applied(original, patch);
     eprintln!("{after}");
     assert_eq!(after, expected);
+}
+
+/// The markers on a deleted and an inserted line carry the final newline
+/// change. Lines that only look like the marker, such as those of a `.patch`
+/// file shipped inside a package, are file content.
+#[test]
+fn drops_only_the_no_newline_markers_that_follow_context() {
+    let patch = text_block_fnl! {
+        "@@ -1,3 +1 @@"
+        " one"
+        r"\ No newline at end of file"
+        "-two"
+        "-"
+        "@@ -5,3 +3,2 @@"
+        " five"
+        ""
+        r"\ No newline at end of file"
+        "-"
+        "@@ -9,2 +8,2 @@"
+        " nine"
+        "-ten"
+        r"\ No newline at end of file"
+        "+TEN"
+        r"\ No newline at end of file"
+        "@@ -12,2 +12,3 @@"
+        r" \ No newline at end of file"
+        r"+\ No newline at end of file"
+        r" \ No newline at end of file"
+        r"\ No newline at end of file"
+    };
+    let expected = text_block_fnl! {
+        "@@ -1,3 +1 @@"
+        " one"
+        "-two"
+        "-"
+        "@@ -5,3 +3,2 @@"
+        " five"
+        ""
+        "-"
+        "@@ -9,2 +8,2 @@"
+        " nine"
+        "-ten"
+        r"\ No newline at end of file"
+        "+TEN"
+        r"\ No newline at end of file"
+        "@@ -12,2 +12,3 @@"
+        r" \ No newline at end of file"
+        r"+\ No newline at end of file"
+        r" \ No newline at end of file"
+    };
+    assert_eq!(drop_context_no_newline_markers(patch.to_string()), expected);
+    assert_eq!(
+        drop_context_no_newline_markers(patch.to_string().replace('\n', "\r\n")),
+        expected.to_string().replace('\n', "\r\n"),
+    );
+}
+
+/// Only the extended headers whose value `diffy` matches exactly lose
+/// their `\r`: the `index`/`similarity index` line diffy ignores, the
+/// `---`/`+++` paths, and hunk content all keep it.
+#[test]
+fn strips_the_carriage_return_from_value_headers_only() {
+    let patch = text_block_fnl! {
+        "diff --git a/file.txt b/file.txt"
+        "old mode 100644"
+        "new mode 100755"
+        "rename from old.txt"
+        "copy to new.txt"
+        "similarity index 100%"
+        "index 1111111..2222222 100644"
+        "--- a/file.txt"
+        "@@ -1 +1 @@"
+        "-one"
+        "+two"
+    };
+    let normalized = strip_cr_from_extended_headers(patch.to_string().replace('\n', "\r\n"));
+
+    assert_eq!(
+        normalized.split('\n').collect::<Vec<_>>(),
+        [
+            "diff --git a/file.txt b/file.txt",
+            "old mode 100644",
+            "new mode 100755",
+            "rename from old.txt",
+            "copy to new.txt",
+            "similarity index 100%\r",
+            "index 1111111..2222222 100644\r",
+            "--- a/file.txt\r",
+            "@@ -1 +1 @@\r",
+            "-one\r",
+            "+two\r",
+            "",
+        ],
+    );
+}
+
+/// A CRLF patch saved without a final newline ends its last header in a
+/// bare `\r`.
+#[test]
+fn strips_the_carriage_return_from_an_unterminated_final_header() {
+    let normalized = strip_cr_from_extended_headers(
+        "diff --git a/run.sh b/run.sh\r\nnew mode 100755\r".to_string(),
+    );
+
+    assert_eq!(normalized, "diff --git a/run.sh b/run.sh\nnew mode 100755");
 }

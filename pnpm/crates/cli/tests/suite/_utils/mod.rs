@@ -1,3 +1,10 @@
+pub mod console;
+#[cfg(target_os = "linux")]
+pub mod inotify;
+pub mod terminal;
+
+pub use pnpm_testing_utils::bin::read_v11_bundle_path;
+
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
 use pnpm_lockfile::{Lockfile, PkgName, ProjectSnapshot, SnapshotEntry};
@@ -11,14 +18,44 @@ use pnpm_testing_utils::{
 use pnpm_workspace_state::WorkspaceState;
 use serde_json::{Map, Value, json};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     ffi::OsStr,
     fmt::Write as _,
     fs,
+    io::Write as _,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Child, Command, ExitStatus, Output},
+    thread,
+    time::{Duration, Instant},
 };
 use tempfile::TempDir;
+
+/// Fresh `node <bundle>` invocation anchored in `workspace` with ambient pnpm
+/// config cleared.
+#[must_use]
+pub fn v11_in(bundle: &OsStr, workspace: &Path) -> Command {
+    let mut command = Command::new("node");
+    command.arg(bundle);
+    command.with_current_dir(workspace).without_ambient_pnpm_config()
+}
+
+#[cfg(unix)]
+pub fn write_executable(path: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::write(path, body).expect("write executable");
+    let mut perms = fs::metadata(path).expect("stat executable").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).expect("chmod executable");
+}
+
+pub fn write_fake_bin(bin_dir: &Path, name: &str, marker: &str) {
+    fs::create_dir_all(bin_dir).expect("create the bin dir");
+    #[cfg(unix)]
+    write_executable(&bin_dir.join(name), &format!("#!/bin/sh\necho {marker}\n"));
+    #[cfg(windows)]
+    fs::write(bin_dir.join(format!("{name}.cmd")), format!("@echo {marker}\r\n"))
+        .expect("write the command shim");
+}
 
 /// Fresh `pnpm` invocation anchored in `workspace`, for tests that run
 /// the binary more than once (an `assert_cmd` command is consumed by
@@ -29,6 +66,65 @@ pub fn pacquet_in(workspace: &Path) -> Command {
         .expect("find the pnpm binary")
         .with_current_dir(workspace)
         .without_ambient_pnpm_config()
+}
+
+/// How long [`wait_for_child`] and [`wait_for_child_output`] give a child
+/// before they stop it and fail the test. A fixture that holds a process
+/// until something cancels it holds for longer than this, so a missed
+/// cancellation fails on this deadline rather than ending the run itself.
+pub const CHILD_DEADLINE: Duration = Duration::from_secs(30);
+
+pub fn wait_for_child(child: &mut Child) -> ExitStatus {
+    let deadline = Instant::now() + CHILD_DEADLINE;
+    loop {
+        if let Some(status) = child.try_wait().expect("read child status") {
+            return status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().expect("stop stalled child");
+            child.wait().expect("reap stalled child");
+            panic!("child did not finish before the deadline");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+pub fn wait_for_child_output(child: &mut Child, path: &Path, expected: &str) {
+    let deadline = Instant::now() + CHILD_DEADLINE;
+    loop {
+        let output = fs::read_to_string(path).unwrap_or_default();
+        if output.contains(expected) {
+            return;
+        }
+        if let Some(status) = child.try_wait().expect("read child status") {
+            panic!("child exited with {status} before writing {expected:?}:\n{output}");
+        }
+        if Instant::now() >= deadline {
+            child.kill().expect("stop stalled child");
+            child.wait().expect("reap stalled child");
+            panic!("child did not write {expected:?} before the deadline:\n{output}");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+pub fn assert_child_output_stays_absent(child: &mut Child, path: &Path, unexpected: &str) {
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        let output = fs::read_to_string(path).expect("read child output");
+        assert!(!output.contains(unexpected), "unexpected {unexpected:?}:\n{output}");
+        assert!(
+            child
+                .try_wait()
+                .expect("read child status")
+                .is_none(),
+            "child exited while it was expected to remain blocked:\n{output}",
+        );
+        if Instant::now() >= deadline {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// Make the spawned `pnpm` style its output.
@@ -95,12 +191,25 @@ pub fn enable_gvs_in_workspace_yaml(workspace: &Path, extra_yaml: &str) {
 /// — so this cutoff makes 1.1.0 the only immature version.
 #[must_use]
 pub fn bravo_dep_mature_up_to_1_0_1_minimum_release_age() -> u64 {
-    const CUTOFF_UNIX_SECS: u64 = 1_646_092_800; // 2022-03-01T00:00:00Z
+    minutes_since(1_646_092_800) // 2022-03-01T00:00:00Z
+}
+
+/// Minutes elapsed since 2022-04-15T00:00:00Z, for [`set_minimum_release_age`].
+///
+/// The mocked registry publishes `@pnpm.e2e/bravo@1.0.0` on 2022-04-01 and
+/// `@pnpm.e2e/bravo-dep@1.1.0` on 2022-05-01, so this cutoff admits the
+/// former and not the latter.
+#[must_use]
+pub fn bravo_mature_bravo_dep_1_1_0_immature_minimum_release_age() -> u64 {
+    minutes_since(1_649_980_800) // 2022-04-15T00:00:00Z
+}
+
+fn minutes_since(cutoff_unix_secs: u64) -> u64 {
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock after epoch")
         .as_secs();
-    (now_secs - CUTOFF_UNIX_SECS) / 60
+    (now_secs - cutoff_unix_secs) / 60
 }
 
 /// Append a top-level `key: value` line to the `pnpm-workspace.yaml` the
@@ -260,11 +369,27 @@ impl WorkspaceFixture {
         Command::cargo_bin("pnpm")
             .expect("find the pnpm binary")
             .with_current_dir(cwd)
+            .without_ambient_pnpm_config()
             .env("PNPM_CONFIG_REGISTRY", self.registry.mock_instance.url())
             .arg("--reporter=ndjson")
             .args(args)
             .output()
             .expect("run pacquet")
+    }
+
+    pub fn v11_command_at<Args, Arg>(&self, bundle: &OsStr, cwd: &Path, args: Args) -> Output
+    where
+        Args: IntoIterator<Item = Arg>,
+        Arg: AsRef<OsStr>,
+    {
+        v11_in(bundle, cwd)
+            .env("PNPM_CONFIG_REGISTRY", self.registry.mock_instance.url())
+            .env("XDG_CONFIG_HOME", self.workspace.with_file_name("xdg-config"))
+            .arg("--config.confirm-modules-purge=false")
+            .arg("--reporter=ndjson")
+            .args(args)
+            .output()
+            .expect("run the pnpm v11 bundle")
     }
 
     pub fn run<Args, Arg>(&self, args: Args) -> Vec<Value>
@@ -371,6 +496,22 @@ fn insert_dependency_group(manifest: &mut Map<String, Value>, group: &str, deps:
 }
 
 #[must_use]
+/// A gzipped tar holding `entries`, each a `(path, contents)` pair.
+pub fn gzipped_tarball(entries: &[(&str, &str)]) -> Vec<u8> {
+    let mut builder = tar::Builder::new(Vec::new());
+    for (path, contents) in entries {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_data(&mut header, path, contents.as_bytes()).expect("append tar entry");
+    }
+    let tar = builder.into_inner().expect("finish the tar archive");
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&tar).expect("gzip the tarball");
+    encoder.finish().expect("finish the gzip stream")
+}
+
 pub fn read_manifest(project: &Path) -> Value {
     serde_json::from_str(
         &fs::read_to_string(project.join("package.json")).expect("read package.json"),
@@ -460,7 +601,84 @@ pub fn repin_snapshot_dependency(
         .get_mut(&dependency.parse().expect("parse the dependency name"))
         .unwrap_or_else(|| panic!("snapshot {snapshot_key} does not pin {dependency}"));
     *pin = serde_saphyr::from_str(new_ref).expect("parse the new dependency ref");
-    lockfile.save_to_path(lockfile_path).expect("write the rewritten lockfile");
+    lockfile
+        .save_to_path(lockfile_path, pnpm_lockfile::SymlinkedLockfile::Refuse)
+        .expect("write the rewritten lockfile");
+}
+
+/// A package script that creates `relative_path` as an empty file: the
+/// portable stand-in for `touch`, which Windows has no program for.
+///
+/// The path is relative, so the marker lands in whatever directory the
+/// runner gave the script — which is what the recursive suites assert on.
+#[must_use]
+pub fn write_marker_script(relative_path: &str) -> String {
+    format!(r#"node -e "require('fs').writeFileSync('{relative_path}', '')""#)
+}
+
+/// How long [`wait_for_marker_script`] gives another project's script to
+/// reach its marker.
+///
+/// Longer than [`CHILD_DEADLINE`], which waits on a child the test spawned
+/// itself. Reaching a marker here takes a whole `pacquet` run to schedule,
+/// install and spawn the project that writes it, which on a loaded runner
+/// costs tens of seconds. The deadline is a deadlock detector, so a pair
+/// that never overlaps fails instead of hanging, and the `slow-timeout` in
+/// `.config/nextest.toml` stops a test that makes no progress well after
+/// it.
+const MARKER_DEADLINE: Duration = Duration::from_mins(2);
+
+/// A package script that waits for `relative_path` to appear, paired with
+/// the [`write_marker_script`] of whichever project it waits on.
+///
+/// The marker outlives its writer, so one wait shows an ordering. Overlap
+/// takes a reciprocal pair, each waiting for the other.
+#[must_use]
+pub fn wait_for_marker_script(relative_path: &str) -> String {
+    let deadline = MARKER_DEADLINE.as_millis();
+    format!(
+        r#"node -e "const fs = require('fs'); const deadline = Date.now() + {deadline}; (function poll () {{ if (fs.existsSync('{relative_path}')) process.exit(0); if (Date.now() > deadline) process.exit(1); setTimeout(poll, 50) }})()""#,
+    )
+}
+
+/// A package script that appends `line` and a newline to `relative_path`,
+/// the portable stand-in for `echo <line> >> <path>`. `cmd` would carry
+/// the spaces before its redirection operator into the file, and would
+/// end the line with a carriage return the readers do not expect.
+///
+/// The newline comes from `String.fromCharCode` rather than a `\n`
+/// escape: `sh -c` unescapes the backslash before Node sees it while
+/// `cmd /d /s /c` passes it through, so an escape would hand the two
+/// platforms different programs.
+#[must_use]
+pub fn append_line_script(line: &str, relative_path: &str) -> String {
+    format!(
+        r#"node -e "require('fs').appendFileSync('{relative_path}', '{line}' + String.fromCharCode(10))""#,
+    )
+}
+
+/// Assert that `shim` is a bin a caller could actually invoke.
+///
+/// What that takes differs per platform: Unix has the executable bit on
+/// the extensionless shim, while Windows has no such bit and relies on the
+/// `.cmd` / `.ps1` launchers written next to it.
+pub fn assert_bin_linked(shim: &Path) {
+    assert!(shim.exists(), "the bin must be linked at {shim:?}");
+    #[cfg(unix)]
+    assert!(
+        pnpm_testing_utils::fs::is_path_executable(shim),
+        "the bin shim at {shim:?} must be executable",
+    );
+    #[cfg(windows)]
+    for extension in ["cmd", "ps1"] {
+        let launcher = shim.with_file_name(format!(
+            "{}.{extension}",
+            shim.file_name()
+                .expect("bin shim has a file name")
+                .to_string_lossy(),
+        ));
+        assert!(launcher.exists(), "the bin shim at {shim:?} needs its {extension} launcher");
+    }
 }
 
 pub fn assert_success(output: &Output) {
@@ -484,6 +702,18 @@ pub fn ndjson_records(output: &Output) -> Vec<Value> {
         })
         .filter_map(|line| serde_json::from_str(&line).ok())
         .collect()
+}
+
+/// Whether a `name: "pnpm" / level: "error"` log carries `message`.
+#[must_use]
+pub fn has_pnpm_error_log(records: &[Value], message: &str) -> bool {
+    records
+        .iter()
+        .any(|record| {
+            record.get("name").and_then(Value::as_str) == Some("pnpm")
+                && record.get("level").and_then(Value::as_str) == Some("error")
+                && record.get("message").and_then(Value::as_str) == Some(message)
+        })
 }
 
 /// The `name: "pnpm" / level: "info"` log pnpm's headless installer
@@ -616,4 +846,311 @@ pub fn importer_has_group_dependency(
         _ => panic!("unsupported dependency group {group}"),
     }
     .is_some_and(|dependencies| dependencies.contains_key(&name))
+}
+
+/// The dependency the Git-conflict fixtures lock. The mocked registry also
+/// publishes 3.1.0, which satisfies [`CONFLICTED_SPECIFIER`] and is what a
+/// resolution that discarded the conflicted lockfile would pick.
+pub const CONFLICTED_DEPENDENCY: &str = "@pnpm.e2e/multi-version-b";
+pub const CONFLICTED_SPECIFIER: &str = ">=2.0.0 <3.1.1";
+/// The version merging the two conflict sides keeps: the newer of the
+/// two they locked.
+pub const CONFLICTED_MERGED_VERSION: &str = "3.0.0";
+
+/// Leave `workspace` holding a `pnpm-lock.yaml` Git left conflicted
+/// between two valid lockfiles, and a manifest both sides satisfy. The
+/// sides lock different versions of [`CONFLICTED_DEPENDENCY`], so a run
+/// that dropped one of them is visible in what ends up locked.
+///
+/// Returns the conflicted text, which a test that installs more than once
+/// writes back to restore the conflict.
+pub fn write_conflicted_lockfile_fixture(workspace: &Path) -> String {
+    let ours = locked_conflict_side(workspace, "2.0.0");
+    let theirs = locked_conflict_side(workspace, CONFLICTED_MERGED_VERSION);
+    assert_ne!(ours, theirs, "the conflict sides must lock different graphs");
+    write_manifest_value(
+        workspace,
+        &json!({ "dependencies": { CONFLICTED_DEPENDENCY: CONFLICTED_SPECIFIER } }),
+    );
+    let conflicted = format!("<<<<<<< HEAD\n{ours}=======\n{theirs}>>>>>>> branch\n");
+    fs::write(workspace.join("pnpm-lock.yaml"), &conflicted).expect("write conflicted lockfile");
+    conflicted
+}
+
+/// Lock `version` for [`CONFLICTED_DEPENDENCY`] in `workspace`, then
+/// restate the importer's specifier as [`CONFLICTED_SPECIFIER`]. Both
+/// sides have to agree on the specifier the way two branches that only
+/// moved the locked version do.
+fn locked_conflict_side(workspace: &Path, version: &str) -> String {
+    write_manifest_value(workspace, &json!({ "dependencies": { CONFLICTED_DEPENDENCY: version } }));
+    pacquet_in(workspace)
+        .with_args(["install", "--lockfile-only"])
+        .assert()
+        .success();
+    fs::read_to_string(workspace.join("pnpm-lock.yaml"))
+        .expect("read locked side")
+        .replace(&format!("specifier: {version}"), &format!("specifier: '{CONFLICTED_SPECIFIER}'"))
+}
+
+/// The registry also publishes 3.1.0, which satisfies the fixture's
+/// range, so the version assertion below is what separates a merge from
+/// a fresh resolution that discarded a side.
+pub fn assert_merged_conflicted_lockfile(workspace: &Path, stdout: &str) {
+    eprintln!("STDOUT:\n{stdout}");
+    assert!(
+        stdout.contains("Merge conflict detected in pnpm-lock.yaml and successfully merged"),
+        "the merge must be reported",
+    );
+    assert!(!stdout.contains("Ignoring broken lockfile"), "the lockfile must not be discarded");
+    let written = fs::read_to_string(workspace.join("pnpm-lock.yaml")).expect("read lockfile");
+    assert!(!written.contains("<<<<<<<"), "the conflict markers must be gone:\n{written}");
+    assert_eq!(
+        importer_version(
+            &read_lockfile(&workspace.join("pnpm-lock.yaml")),
+            ".",
+            CONFLICTED_DEPENDENCY
+        ),
+        CONFLICTED_MERGED_VERSION,
+    );
+}
+
+/// Every regular file under `root`, without following links.
+pub fn walk_files(root: &Path) -> Vec<PathBuf> {
+    walkdir::WalkDir::new(root)
+        .into_iter()
+        .map(|entry| entry.expect("walk the workspace"))
+        .filter(|entry| entry.file_type().is_file())
+        .map(walkdir::DirEntry::into_path)
+        .collect()
+}
+
+/// Copy everything under `from` except the `node_modules` directories.
+pub fn copy_sources(from: &Path, to: &Path) {
+    for entry in walkdir::WalkDir::new(from)
+        .into_iter()
+        .filter_entry(|entry| entry.file_name() != "node_modules")
+    {
+        let entry = entry.expect("walk the workspace");
+        let target = to.join(
+            entry
+                .path()
+                .strip_prefix(from)
+                .expect("under the workspace"),
+        );
+        if entry.file_type().is_dir() {
+            fs::create_dir_all(&target).expect("create a directory in the copy");
+        } else {
+            fs::copy(entry.path(), &target).expect("copy a source file");
+        }
+    }
+}
+
+/// Every lockfile under `workspace`, the current ones included.
+#[must_use]
+pub fn workspace_lockfiles(workspace: &Path) -> BTreeMap<String, String> {
+    walk_files(workspace)
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name == "pnpm-lock.yaml" || name == "lock.yaml")
+        })
+        .map(|path| {
+            let relative = path.strip_prefix(workspace).expect("under the workspace");
+            let text = fs::read_to_string(&path).expect("read a lockfile");
+            (relative.to_string_lossy().replace('\\', "/"), text)
+        })
+        .collect()
+}
+
+fn normalize_dir_map(map: &mut BTreeMap<String, Vec<String>>) {
+    for dirs in map.values_mut() {
+        for dir in dirs.iter_mut() {
+            *dir = dir.replace('\\', "/");
+        }
+        dirs.sort();
+    }
+}
+
+fn read_normalized_modules_manifest(modules_dir: &Path) -> Modules {
+    let mut manifest = read_modules_manifest::<ModulesHost>(modules_dir)
+        .expect("read .modules.yaml")
+        .expect(".modules.yaml exists");
+    manifest.pruned_at.clear();
+    manifest.package_manager.clear();
+    manifest.store_dir.clear();
+    manifest.virtual_store_dir = pathdiff::diff_paths(&manifest.virtual_store_dir, modules_dir)
+        .unwrap_or_else(|| PathBuf::from(&manifest.virtual_store_dir))
+        .to_string_lossy()
+        .replace('\\', "/");
+    manifest.pending_builds.sort();
+    manifest.skipped.sort();
+    if let Some(injected_deps) = &mut manifest.injected_deps {
+        normalize_dir_map(injected_deps);
+        if injected_deps.is_empty() {
+            manifest.injected_deps = None;
+        }
+    }
+    if manifest.allow_builds.as_ref().is_some_and(BTreeMap::is_empty) {
+        manifest.allow_builds = None;
+    }
+    if manifest.ignored_builds.as_ref().is_some_and(indexmap::IndexSet::is_empty) {
+        manifest.ignored_builds = None;
+    }
+    if let Some(hoisted_locations) = &mut manifest.hoisted_locations {
+        normalize_dir_map(hoisted_locations);
+    }
+    manifest
+}
+
+/// Every `node_modules/.modules.yaml` under `workspace` as raw file text.
+#[must_use]
+pub fn workspace_raw_modules_manifests(workspace: &Path) -> BTreeMap<String, String> {
+    walk_files(workspace)
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name == pnpm_modules_yaml::MODULES_FILENAME)
+        })
+        .map(|path| {
+            let relative = path.strip_prefix(workspace).expect("under the workspace");
+            let text = fs::read_to_string(&path).expect("read .modules.yaml");
+            (relative.to_string_lossy().replace('\\', "/"), text)
+        })
+        .collect()
+}
+
+/// Every `node_modules/.modules.yaml` under `workspace`, normalized so
+/// run-specific timestamps, CLI version strings, and host store paths do not
+/// mask layout differences.
+#[must_use]
+pub fn workspace_modules_manifests(workspace: &Path) -> BTreeMap<String, Modules> {
+    walk_files(workspace)
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name == pnpm_modules_yaml::MODULES_FILENAME)
+        })
+        .map(|path| {
+            let modules_dir = path.parent().expect("modules directory");
+            let relative = path.strip_prefix(workspace).expect("under the workspace");
+            let manifest = read_normalized_modules_manifest(modules_dir);
+            (relative.to_string_lossy().replace('\\', "/"), manifest)
+        })
+        .collect()
+}
+
+/// Resolves dependencies through `node_modules` the way Node.js does, from
+/// each package's real path, and spells the result without absolute paths.
+pub struct TreeView {
+    root: PathBuf,
+    memo: HashMap<PathBuf, String>,
+}
+
+impl TreeView {
+    #[must_use]
+    pub fn new(workspace: &Path) -> Self {
+        let root = fs::canonicalize(workspace).expect("canonicalize workspace");
+        Self { root, memo: HashMap::new() }
+    }
+
+    pub fn project(&mut self, project_dir: &Path, with_dev: bool) -> String {
+        let manifest = read_manifest_or_null(project_dir);
+        let groups: &[&str] = if with_dev {
+            &["dependencies", "optionalDependencies", "devDependencies"]
+        } else {
+            &["dependencies", "optionalDependencies"]
+        };
+        let dependencies = declared_dependencies(&manifest, groups);
+        self.dependencies(project_dir, &dependencies)
+    }
+
+    fn dependencies(&mut self, from: &Path, names: &[String]) -> String {
+        let resolved = names
+            .iter()
+            .map(|name| {
+                let target = resolve_node_modules_package(from, name)
+                    .map(|dir| self.package(&dir))
+                    .unwrap_or_else(|| "<missing>".to_string());
+                format!("{name}={target}")
+            })
+            .collect::<Vec<_>>();
+        format!("{{{}}}", resolved.join(","))
+    }
+
+    fn package(&mut self, dir: &Path) -> String {
+        let real = fs::canonicalize(dir).expect("canonicalize a resolved dependency");
+        if let Some(seen) = self.memo.get(&real) {
+            return seen.clone();
+        }
+        self.memo.insert(real.clone(), "<cycle>".to_string());
+        let manifest = read_manifest_or_null(&real);
+        let label = match real.strip_prefix(&self.root) {
+            Ok(relative)
+                if !relative
+                    .components()
+                    .any(|part| part.as_os_str() == "node_modules") =>
+            {
+                format!("workspace:{}", relative.to_string_lossy().replace('\\', "/"))
+            }
+            _ => format!(
+                "{}@{}",
+                manifest["name"].as_str().unwrap_or_default(),
+                manifest["version"].as_str().unwrap_or_default(),
+            ),
+        };
+        let dependencies =
+            declared_dependencies(&manifest, &["dependencies", "optionalDependencies"]);
+        let described = format!("{label}{}", self.dependencies(&real, &dependencies));
+        self.memo.insert(real, described.clone());
+        described
+    }
+}
+
+/// Where Node.js finds each dependency `project_dir` declares from the
+/// registry, every group included. Workspace dependencies are left out.
+#[must_use]
+pub fn registry_dependency_dirs(project_dir: &Path) -> Vec<(String, Option<PathBuf>)> {
+    let manifest = read_manifest_or_null(project_dir);
+    declared_dependencies(&manifest, &["dependencies", "optionalDependencies", "devDependencies"])
+        .into_iter()
+        .filter(|name| {
+            ["dependencies", "optionalDependencies", "devDependencies"]
+                .iter()
+                .filter_map(|group| manifest[*group][name].as_str())
+                .all(|spec| !spec.starts_with("workspace:"))
+        })
+        .map(|name| {
+            let dir = resolve_node_modules_package(project_dir, &name);
+            (name, dir)
+        })
+        .collect()
+}
+
+fn read_manifest_or_null(dir: &Path) -> Value {
+    fs::read_to_string(dir.join("package.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or(Value::Null)
+}
+
+fn declared_dependencies(manifest: &Value, groups: &[&str]) -> Vec<String> {
+    let mut names = groups
+        .iter()
+        .filter_map(|group| manifest[*group].as_object())
+        .flat_map(|deps| deps.keys().cloned())
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Node.js's lookup of `name` from a package at `from`.
+fn resolve_node_modules_package(from: &Path, name: &str) -> Option<PathBuf> {
+    from.ancestors()
+        .filter(|dir| {
+            dir.file_name()
+                .is_none_or(|base| base != "node_modules")
+        })
+        .map(|dir| dir.join("node_modules").join(name))
+        .find(|candidate| candidate.join("package.json").is_file())
 }

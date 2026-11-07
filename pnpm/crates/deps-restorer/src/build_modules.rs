@@ -1,16 +1,20 @@
 pub(crate) mod allow_build_policy;
 pub(crate) mod build_one_snapshot;
+pub(crate) mod skills_policy;
 pub(crate) mod slots;
 pub use allow_build_policy::{
-    AllowBuildPolicy, allow_build_key_from_ignored_build, normalize_build_dep_path,
-    parse_allow_build_selector,
+    AllowBuildPolicy, allow_build_key_from_ignored_build, is_git_hosted_dep_path,
+    normalize_build_dep_path, parse_allow_build_selector, short_package_label,
 };
 pub(crate) use build_one_snapshot::build_one_snapshot;
 pub(crate) use build_requirements::deferred_builds;
+pub use build_requirements::{ScheduledBuilds, ScheduledBuildsInputs};
+pub use skills_policy::SkillsPolicy;
 pub use slots::parse_name_version_from_key;
 pub(crate) use slots::{
-    PkgRoots, bin_dirs_in_all_parent_dirs, discard_failed_global_virtual_store_slot,
-    materialize_side_effects, slot_carries_overlay,
+    PkgRoots, bin_dirs_in_all_parent_dirs, discard_skipped_optional_dependency,
+    is_started_build_marker, mark_global_virtual_store_build_started, materialize_side_effects,
+    slot_carries_overlay,
 };
 
 mod build_requirements;
@@ -23,17 +27,18 @@ use build_requirements::{
 use crate::{
     ImportIndexedDirError, ImportIndexedDirOpts, NEEDS_BUILD_MARKER, SkippedSnapshots,
     build_graph::build_graph,
-    import_indexed_dir, store_index_key_for_resolution,
-    version_policy::{VersionPolicyError, expand_package_version_specs},
+    find_root_runtime_node_key, import_indexed_dir, store_index_key_for_resolution,
+    version_policy::{
+        PackageVersionPolicy, PolicyMatch, VersionPolicyError, create_package_version_policy,
+        expand_package_version_spec, expand_package_version_specs,
+    },
 };
 
 use derive_more::{Display, Error};
 use miette::Diagnostic;
-use pnpm_config::{Config, PackageImportMethod};
+use pnpm_config::Config;
 use pnpm_deps_path::{get_pkg_id_with_patch_hash, index_of_dep_path_suffix, remove_suffix};
-use pnpm_executor::{
-    LifecycleScriptError, RunPostinstallHooks, ScriptsPrependNodePath, run_postinstall_hooks,
-};
+use pnpm_executor::{LifecycleScriptError, RunPostinstallHooks, run_postinstall_hooks};
 use pnpm_lockfile::{PackageKey, SnapshotEntry};
 use pnpm_patching::{PatchApplyError, apply_patch_to_dir};
 use pnpm_reporter::{
@@ -51,11 +56,23 @@ use std::{
 /// Error from the build-modules step.
 #[derive(Debug, Display, Error, Diagnostic)]
 pub enum BuildModulesError {
+    /// A completed dependency build's executable could not be relinked before its consumer ran.
+    #[diagnostic(transparent)]
+    BinLink(#[error(source)] crate::LinkVirtualStoreBinsError),
     #[diagnostic(transparent)]
     LifecycleScript(#[error(source)] LifecycleScriptError),
 
     #[diagnostic(transparent)]
     PatchApply(#[error(source)] PatchApplyError),
+
+    /// Incompatible engine requirements after applying patches.
+    #[diagnostic(transparent)]
+    PatchedEngines(#[error(source)] Box<pnpm_package_is_installable::InstallabilityError>),
+
+    /// Failure reading patched manifest.
+    #[display("Cannot read the patched package.json of {dep_path}")]
+    #[diagnostic(code(ERR_PNPM_PATCHED_MANIFEST_UNREADABLE))]
+    PatchedManifestUnreadable { dep_path: String },
 
     /// `ERR_PNPM_PATCH_FILE_PATH_MISSING` — fired when a snapshot's
     /// resolved patch carries a hash but
@@ -107,6 +124,34 @@ pub enum BuildModulesError {
     /// stored `added` / `deleted` diff on top of the pristine files.
     #[diagnostic(transparent)]
     MaterializeSideEffects(#[error(source)] ImportIndexedDirError),
+
+    /// Creating a symlink a cached build recorded failed while its
+    /// side-effects overlay was re-materialized into the slot.
+    #[display("Failed to create the symlink {} from the side-effects cache: {source}", path.display())]
+    MaterializeSideEffectsSymlink {
+        path: PathBuf,
+        #[error(source)]
+        source: std::io::Error,
+    },
+
+    /// A global-virtual-store slot's `.pnpm-needs-build` marker exists but
+    /// cannot be read, so whether another install's build left the slot
+    /// half-built is unknown.
+    #[display("Failed to read the build marker at {}: {source}", path.display())]
+    ReadBuildMarker {
+        path: PathBuf,
+        #[error(source)]
+        source: std::io::Error,
+    },
+
+    /// An optional dependency's build failed and the package could not be
+    /// removed, so it would stay installed half-built.
+    #[display("Failed to remove {}, an optional dependency whose build failed: {source}", path.display())]
+    RemoveSkippedOptionalDependency {
+        path: PathBuf,
+        #[error(source)]
+        source: std::io::Error,
+    },
 }
 
 /// Drives a forced rebuild of already-installed packages. Constructed by
@@ -116,9 +161,10 @@ pub enum BuildModulesError {
 /// Effect on [`BuildModules`]: a selected package is built even when the
 /// side-effects cache reports it already built (an explicit rebuild always
 /// re-runs the scripts). The allow-policy gate is unchanged — a rebuild
-/// never builds a disallowed package — and non-selected packages keep
-/// their normal install gating so a partial rebuild does not drop the
-/// ignored-builds record for the packages it did not touch.
+/// never builds a disallowed package. A package outside the selection is
+/// neither inspected nor built, as under pnpm's `rebuild <pkg>`; the
+/// ignored-builds record keeps the entries of the packages a partial
+/// rebuild did not touch.
 #[derive(Debug, Default, Clone)]
 pub struct RebuildOptions {
     /// Allow-build keys (the package name for registry deps, the full
@@ -137,6 +183,24 @@ pub struct RebuildOptions {
     /// by the rebuild itself; a project's is only settled by running its
     /// scripts, which nothing else in the rebuild path does.
     pub pending_projects: Vec<String>,
+
+    /// Of the settings the lockfile records, check only the patches
+    /// against the configuration. The rest (`pnpmfileChecksum`,
+    /// `overrides`, ...) decide what a resolution produces, and a rebuild
+    /// resolves nothing, so they cannot change what it builds; pnpm v11's
+    /// `rebuild` compares the patches alone. The manifest specifiers are
+    /// still checked: a rebuild materializes the lockfile, so it must not
+    /// fetch a dependency the manifests no longer declare. The
+    /// `@pnpm/napi` rebuild sets it: an embedder rebuilds the lockfile it
+    /// just installed or restored, which may have been resolved with other
+    /// `readPackage` hooks or settings.
+    pub check_lockfile_patches_only: bool,
+
+    /// Keep the side-effects `is_built` gate for the selected packages, so
+    /// one the side-effects cache already holds a build of is restored
+    /// from it instead of running its scripts again. pnpm v11's
+    /// `skipIfHasSideEffectsCache`; the `@pnpm/napi` rebuild exposes it.
+    pub skip_if_has_side_effects_cache: bool,
 }
 
 impl RebuildOptions {
@@ -171,6 +235,13 @@ impl RebuildOptions {
         let (name, _) = parse_name_version_from_key(remove_suffix(dep_path));
         self.is_selected(&name) || self.is_selected(&allow_build_key_from_ignored_build(dep_path))
     }
+
+    /// Whether the snapshot installed under `key` is in the rebuild
+    /// selection, by its package name or its allow-build key.
+    #[must_use]
+    pub fn selects_snapshot(&self, key: &PackageKey) -> bool {
+        self.selected_names.is_none() || self.settles_dependency(&key.to_string())
+    }
 }
 
 /// Run lifecycle scripts for all packages that require a build.
@@ -190,15 +261,15 @@ pub struct BuildModules<'a> {
     /// Excluded from both `requires_build` computation and the
     /// build graph. Pacquet does not run scripts (or
     /// even check `binding.gyp`) for slots that don't exist on
-    /// disk. Skipped snapshots never enter the build graph.
+    /// disk.
     pub skipped: &'a SkippedSnapshots,
 
     /// Forced-rebuild selection. `None` for a normal install — every
     /// package follows the standard `requires_build` + allow-policy +
     /// side-effects-cache gates. `Some` (a `pacquet rebuild` /
-    /// `approve-builds`) restricts the build to the selected names and
-    /// forces them past the side-effects `is_built` gate. See
-    /// [`RebuildOptions`].
+    /// `approve-builds`) restricts the inspection and the build to the
+    /// selected names and forces them past the side-effects `is_built`
+    /// gate. See [`RebuildOptions`].
     pub rebuild: Option<&'a RebuildOptions>,
 }
 
@@ -228,23 +299,53 @@ pub struct BuildModulesOutput {
     /// importers whose manifests provably match what the link phase
     /// already shimmed.
     pub mutated_slots: bool,
+    /// Snapshot keys whose contents may have changed, for targeted bin relinking.
+    pub mutated_snapshot_keys: HashSet<PackageKey>,
+}
+
+fn take_mutated_snapshot_keys(
+    bin_state: &crate::build_options::BuildBinState,
+) -> HashSet<PackageKey> {
+    std::mem::take(
+        &mut *bin_state.slot_mutations.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
+fn empty_build_output(bin_state: &crate::build_options::BuildBinState) -> BuildModulesOutput {
+    let mutated_snapshot_keys = take_mutated_snapshot_keys(bin_state);
+    BuildModulesOutput {
+        mutated_slots: !mutated_snapshot_keys.is_empty(),
+        mutated_snapshot_keys,
+        ..BuildModulesOutput::default()
+    }
 }
 
 impl BuildModules<'_> {
     /// Run the build, reporting the packages that needed one but did
     /// not get it — see [`BuildModulesOutput`].
     pub fn run<Reporter: self::Reporter>(self) -> Result<BuildModulesOutput, BuildModulesError> {
+        self.run_with_bin_state::<Reporter>(&crate::build_options::BuildBinState::default())
+    }
+
+    pub(crate) fn run_with_bin_state<Reporter: self::Reporter>(
+        self,
+        bin_state: &crate::build_options::BuildBinState,
+    ) -> Result<BuildModulesOutput, BuildModulesError> {
         let Some(snapshots) = self.graph.snapshots else {
             return Ok(BuildModulesOutput::default());
         };
 
         let requires_build_map = self.requires_build_map(snapshots);
+        if !self.has_work(&requires_build_map) {
+            return Ok(empty_build_output(bin_state));
+        }
         let dep_states = self.dep_states(snapshots, &requires_build_map);
         let build_graph = build_graph(
             &requires_build_map,
             self.graph.patches,
             snapshots,
             self.graph.importers,
+            self.graph.dependency_groups,
             self.skipped,
         );
 
@@ -252,7 +353,7 @@ impl BuildModules<'_> {
         // sorted lexicographically — matches `dedupePackageNamesFromIgnoredBuilds`.
         // `Mutex` for the same parallelism reason as the dep-state cache.
         let ignored_builds: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
-        let slot_mutations = std::sync::atomic::AtomicBool::new(false);
+        let project_bin_dirs = self.project_bin_dirs(snapshots);
         schedule_builds::<Reporter>(
             &build_graph,
             &self.snapshot_context(
@@ -260,7 +361,8 @@ impl BuildModules<'_> {
                 &requires_build_map,
                 &dep_states,
                 &ignored_builds,
-                &slot_mutations,
+                bin_state,
+                &project_bin_dirs,
             ),
             self.child_concurrency,
         )?;
@@ -274,11 +376,30 @@ impl BuildModules<'_> {
         // so the canonical poison-recovery pattern is safe.
         let ignored_builds =
             ignored_builds.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mutated_snapshot_keys = take_mutated_snapshot_keys(bin_state);
         Ok(BuildModulesOutput {
             ignored_builds: ignored_builds.into_iter().collect(),
-            deferred_builds: deferred_builds(requires_build_map.iter(), self.scripts.ignore),
-            mutated_slots: slot_mutations.into_inner(),
+            deferred_builds: self.deferred_builds(&requires_build_map),
+            mutated_slots: !mutated_snapshot_keys.is_empty(),
+            mutated_snapshot_keys,
         })
+    }
+
+    /// See [`BuildModulesOutput::deferred_builds`].
+    fn deferred_builds(&self, requires_build_map: &HashMap<PackageKey, bool>) -> Vec<String> {
+        deferred_builds(
+            requires_build_map
+                .iter()
+                .filter(|(snapshot_key, _)| {
+                    crate::build_scope::in_build_scope(self.graph.build_scope, snapshot_key)
+                }),
+            self.scripts.ignore,
+        )
+    }
+
+    fn has_work(&self, requires_build_map: &HashMap<PackageKey, bool>) -> bool {
+        !self.graph.patches.is_none_or(HashMap::is_empty)
+            || requires_build_map.values().any(|&requires_build| requires_build)
     }
 
     fn requires_build_map(
@@ -294,7 +415,50 @@ impl BuildModules<'_> {
             },
             prefetched: self.graph.requires_build_by_snapshot,
             patches: self.graph.patches,
+            rebuild: self.rebuild,
         })
+    }
+
+    /// The project directories every dependency build script gets on `PATH`
+    /// after the ones walked up from its own package: the root project's
+    /// runtime `node`, the privately hoisted `node_modules/.bin`, and the
+    /// configured extra bin paths (the workspace root's `node_modules/.bin`).
+    /// The runtime comes first so a hoisted package's `node` bin cannot
+    /// replace the Node.js whose version keys the slot.
+    ///
+    /// A global virtual store slot has no `node_modules` ancestor inside the
+    /// project, so without these its scripts would miss them. They are given
+    /// on purpose although the slot hash records only the runtime's version:
+    /// `NODE_PATH` already exposes the root and hoisted `node_modules` to the
+    /// same scripts, and builds that run a tool they do not declare would
+    /// fail without them.
+    fn project_bin_dirs(&self, snapshots: &HashMap<PackageKey, SnapshotEntry>) -> Vec<PathBuf> {
+        let hoisted_bin_dir = self.scripts.path.private_hoisting
+            .then_some(self.scripts.patched_engines.install_state_dir)
+            .flatten()
+            .map(|install_state_dir| install_state_dir.join("node_modules").join(".bin"));
+        self.runtime_node_bin_dir(snapshots)
+            .into_iter()
+            .chain(hoisted_bin_dir)
+            .chain(self.scripts.path.extra_bin_paths.iter().cloned())
+            .collect()
+    }
+
+    /// The directory holding the `node` binary of the root project's
+    /// `node@runtime:` dependency, the one that keys the engine part of every
+    /// built slot's hash. `None` when `--no-runtime` skipped the runtime.
+    fn runtime_node_bin_dir(
+        &self,
+        snapshots: &HashMap<PackageKey, SnapshotEntry>,
+    ) -> Option<PathBuf> {
+        let runtime_key = find_root_runtime_node_key(self.graph.importers, snapshots)?;
+        if self.skipped.contains(runtime_key) {
+            return None;
+        }
+        let pkg_dir =
+            PkgRoots { layout: self.directories.layout, by_key: self.directories.pkg_roots_by_key }
+                .canonical(runtime_key)?;
+        Some(if cfg!(windows) { pkg_dir } else { pkg_dir.join("bin") })
     }
 
     fn snapshot_context<'a>(
@@ -303,24 +467,30 @@ impl BuildModules<'_> {
         requires_build_map: &'a HashMap<PackageKey, bool>,
         dep_states: &'a DepStates,
         ignored_builds: &'a Mutex<BTreeSet<String>>,
-        slot_mutations: &'a std::sync::atomic::AtomicBool,
+        bin_state: &'a crate::build_options::BuildBinState,
+        project_bin_dirs: &'a [PathBuf],
     ) -> build_one_snapshot::BuildOneSnapshot<'a> {
         build_one_snapshot::BuildOneSnapshot {
             cache: self.cache,
             directories: self.directories,
             graph: crate::BuildSnapshotInputs {
+                skipped: self.skipped,
                 snapshots,
                 packages: self.graph.packages,
                 patches: self.graph.patches,
                 requires_build_map,
+                importers: self.graph.importers,
+                build_scope: self.graph.build_scope,
             },
             progress: crate::BuildProgress {
                 dep_graph: dep_states.graph.as_ref(),
                 deps_state_cache: &dep_states.cache,
                 ignored_builds,
-                slot_mutations,
+                slot_mutations: &bin_state.slot_mutations,
+                refreshed_hoisted_bins: &bin_state.refreshed_hoisted_bins,
             },
             scripts: self.scripts,
+            project_bin_dirs,
 
             allow_build_policy: self.allow_build_policy,
 
@@ -357,34 +527,28 @@ impl BuildModules<'_> {
             can_write_store: self.cache.store_index_writer.is_some()
                 && self.cache.store_dir.is_some(),
             has_packages: self.graph.packages.is_some(),
-            has_cache_rows: self.cache.maps_by_snapshot.is_some_and(|map| !map.is_empty()),
+            // A rebuild that skips cached builds also reads the empty rows
+            // the overlays leave out.
+            has_cache_rows: self.cache.side_effects.has_overlays()
+                || (self.rebuild.is_some_and(|rebuild| rebuild.skip_if_has_side_effects_cache)
+                    && self.cache.side_effects.has_rows()),
         });
         let graph = cache_gate_active.then(|| {
+            // Every requires-build snapshot is a root, including the ones
+            // the install's dependency-group filter keeps out of the build
+            // graph.
             let roots = requires_build_map
                 .iter()
                 .filter(|&(_, &requires_build)| requires_build)
                 .map(|(key, _)| key.clone());
+            let host = crate::platform_selection::VariantPlatforms::host();
             crate::build_deps_subgraph(
                 snapshots,
                 self.graph.packages.expect("`cache_gate_active` requires packages: Some"),
-                roots,
+                (roots, self.graph.variant_platforms.unwrap_or(&host)),
             )
         });
         let cache = Mutex::new(pnpm_graph_hasher::DepsStateCache::new());
-        // Prime it in lockfile key order before any build runs. The
-        // ready nodes race for the mutex, and a snapshot inside a
-        // dependency cycle takes the digest of whichever walk reached
-        // it first — so an unprimed cache would hand the same install
-        // a different side-effects-cache key on every run, and every
-        // repeat install would re-run the build it already has cached.
-        if let Some(graph) = &graph {
-            let mut cache_guard = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            pnpm_graph_hasher::warm_deps_state_cache(
-                graph,
-                &mut cache_guard,
-                crate::deps_graph::in_lockfile_order(graph).into_iter().map(|(key, _)| key),
-            );
-        }
         DepStates { graph, cache }
     }
 }
@@ -440,14 +604,3 @@ fn schedule_builds<Reporter: self::Reporter>(
 
 #[cfg(test)]
 mod tests;
-
-/// The executor's canonical `scriptsPrependNodePath`. Config's mirror
-/// enum carries the yaml-deserialize impl; the executor's stays free of
-/// serde wiring.
-pub fn exec_scripts_prepend_node_path(config: &Config) -> ScriptsPrependNodePath {
-    match config.scripts_prepend_node_path {
-        pnpm_config::ScriptsPrependNodePath::Always => ScriptsPrependNodePath::Always,
-        pnpm_config::ScriptsPrependNodePath::Never => ScriptsPrependNodePath::Never,
-        pnpm_config::ScriptsPrependNodePath::WarnOnly => ScriptsPrependNodePath::WarnOnly,
-    }
-}

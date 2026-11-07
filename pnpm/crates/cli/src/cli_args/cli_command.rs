@@ -1,6 +1,7 @@
 pub(super) mod options;
 
 pub use commands::CliCommand;
+pub use selection_settings::SelectionSettingArgs;
 
 use super::{
     access::AccessArgs,
@@ -29,6 +30,7 @@ use super::{
     exec::ExecArgs,
     fetch::FetchArgs,
     find_hash::FindHashArgs,
+    fund::FundArgs,
     ignored_builds::IgnoredBuildsArgs,
     import::ImportArgs,
     init::InitArgs,
@@ -49,10 +51,12 @@ use super::{
     patch_commit::PatchCommitArgs,
     patch_remove::PatchRemoveArgs,
     peers::PeersArgs,
+    permissions::{ApproveArgs, PermissionsArgs},
     ping::PingArgs,
     pipeline::PipelineArgs,
     pkg::PkgArgs,
     prefix::PrefixArgs,
+    profile::ProfileArgs,
     prune::PruneArgs,
     publish::PublishArgs,
     rebuild::RebuildArgs,
@@ -74,7 +78,9 @@ use super::{
     star::StarArgs,
     stars::StarsArgs,
     store::StoreCommand,
+    tasks::TasksArgs,
     team::TeamArgs,
+    token::TokenArgs,
     undeprecate::UndeprecateArgs,
     unlink::UnlinkArgs,
     unpublish::UnpublishArgs,
@@ -82,6 +88,7 @@ use super::{
     update::UpdateArgs,
     version::VersionArgs,
     view::ViewArgs,
+    whoami::WhoamiArgs,
     why::WhyArgs,
     with::WithArgs,
 };
@@ -112,6 +119,21 @@ pub struct CliArgs {
     /// Automatically answer yes to prompts.
     #[clap(short = 'y', long, global = true)]
     pub yes: bool,
+    /// Load environment variables from a dotenv-style file before running.
+    /// Repeat to layer more files: later files override earlier files, and
+    /// variables already in the environment are never overridden. Relative
+    /// paths resolve against the invocation working directory. The loaded
+    /// variables are visible to config resolution (`PNPM_CONFIG_<KEY>`
+    /// overrides and `${VAR}` tokens in user-level `.npmrc` files), to
+    /// lifecycle scripts, and to any pnpm the command dispatches to.
+    //
+    // The load runs on the main thread before startup, since the process
+    // environment must not be mutated once another thread is alive. This
+    // field exists so the flag is still accepted, validated, documented,
+    // and completed — a valueless `--env-file` is reported instead of
+    // silently ignored.
+    #[clap(long = "env-file", value_name = "PATH", global = true)]
+    pub env_file: Vec<PathBuf>,
     #[clap(flatten)]
     pub paths: CliPathArgs,
     #[clap(flatten)]
@@ -136,6 +158,8 @@ pub struct CliWorkspaceArgs {
     /// the project in `--dir`.
     #[clap(short = 'r', long, global = true)]
     pub recursive: bool,
+    #[clap(skip)]
+    pub recursive_from_command_line: bool,
     #[clap(flatten)]
     pub selection: WorkspaceSelectionArgs,
     #[clap(flatten)]
@@ -144,7 +168,7 @@ pub struct CliWorkspaceArgs {
     pub execution: WorkspaceExecutionArgs,
 }
 
-#[derive(Debug, Clone, clap::Args)]
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
 pub struct CliPathArgs {
     /// Set working directory. Accepted anywhere on the command line,
     /// before or after the subcommand, like every other rc-option.
@@ -187,7 +211,7 @@ pub struct CliPathArgs {
     pub workspace_packages: Vec<String>,
 }
 
-#[derive(Debug, Clone, clap::Args)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, clap::Args)]
 pub struct CliNetworkArgs {
     /// Base URL of the npm registry to resolve and fetch packages from.
     /// Universal rc-option: accepted on every command and layered onto
@@ -227,19 +251,19 @@ pub struct PresentationArgs {
     // like nopt does — `--silent` expands to `--reporter=silent` (see
     // `crate::shorthands`), so `--silent --reporter=ndjson` must not be a
     // duplicate-argument error.
-    #[clap(
-        long,
-        value_enum,
-        default_value_t = ReporterType::Default,
-        global = true,
-        overrides_with = "reporter"
-    )]
-    pub reporter: ReporterType,
-    /// What level of logs to print. Mirrors pnpm's universal `--loglevel`
-    /// option: `silent` selects the silent reporter over any `--reporter`
-    /// choice; the other levels cap the default reporter's output.
+    #[clap(long, value_enum, global = true, overrides_with = "reporter")]
+    pub reporter: Option<ReporterType>,
+    /// What level of logs to print. `silent` selects the silent reporter
+    /// over any `--reporter` choice; the other levels cap the default
+    /// reporter's output.
     #[clap(long, value_enum, global = true)]
     pub loglevel: Option<LogLevelSetting>,
+    /// Enable dependency and download progress output.
+    #[clap(long, global = true, overrides_with = "no_progress", hide = true)]
+    pub progress: bool,
+    /// Disable dependency and download progress output.
+    #[clap(long = "no-progress", global = true, overrides_with = "progress")]
+    pub no_progress: bool,
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -257,26 +281,8 @@ pub struct WorkspaceSelectionArgs {
     /// Run the command on the root workspace project.
     #[clap(short = 'w', long = "workspace-root", global = true)]
     pub workspace_root: bool,
-    /// Exit with code 1 when the `--filter` / `--filter-prod` selectors
-    /// match no workspace project.
-    #[clap(long = "fail-if-no-match", global = true)]
-    pub fail_if_no_match: bool,
-    /// Also run a recursive command on the root workspace project, which
-    /// `run` / `exec` / `add` / `test` otherwise leave out.
-    #[clap(
-        long = "include-workspace-root",
-        global = true,
-        overrides_with = "no_include_workspace_root"
-    )]
-    pub include_workspace_root: bool,
-    /// Leave the root workspace project out of a recursive command,
-    /// overriding an `includeWorkspaceRoot: true` setting.
-    #[clap(
-        long = "no-include-workspace-root",
-        global = true,
-        overrides_with = "include_workspace_root"
-    )]
-    pub no_include_workspace_root: bool,
+    #[clap(flatten)]
+    pub settings: SelectionSettingArgs,
     /// Glob patterns naming test files, used by the `[since]` `--filter`
     /// selector to decide which changes count.
     #[clap(long = "test-pattern", global = true)]
@@ -301,8 +307,13 @@ pub struct WorkspaceOrderingArgs {
     /// Process recursive workspace projects in their normal order.
     #[clap(long = "no-reverse", global = true, hide = true, overrides_with = "reverse")]
     pub no_reverse: bool,
-    /// Maximum number of workspace projects to process in parallel.
-    #[clap(long = "workspace-concurrency", global = true)]
+    /// Maximum number of workspace projects to process in parallel, or
+    /// `Infinity` for no limit.
+    #[clap(
+        long = "workspace-concurrency",
+        global = true,
+        value_parser = parse_workspace_concurrency
+    )]
     #[clap(id = "workspace_concurrency")]
     pub concurrency: Option<i32>,
     /// Run scripts in every selected workspace project concurrently,
@@ -328,6 +339,10 @@ pub struct WorkspaceExecutionArgs {
     /// Don't fail when the named script is undefined.
     #[clap(long = "if-present", hide = true)]
     pub if_present: bool,
+    /// Run the specified scripts one by one. Spelled ahead of a script
+    /// name (`pnpm -s lint`), where `run`'s own `-s` cannot reach it.
+    #[clap(long, short = 's', hide = true)]
+    pub sequential: bool,
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -380,6 +395,14 @@ fn parse_color_mode(value: &str) -> Result<pnpm_config::ColorMode, &'static str>
     }
 }
 
+fn parse_workspace_concurrency(value: &str) -> Result<i32, std::num::ParseIntError> {
+    if value == "Infinity" {
+        return Ok(i32::MAX);
+    }
+    value.parse()
+}
+
 impl CliArgs {}
 
 mod commands;
+mod selection_settings;

@@ -13,7 +13,9 @@ use pnpm_config::{
     property_path::{Segment, get_object_value_by_property_path, parse_property_path},
 };
 use pnpm_package_manifest::PackageManifest;
-use serde_json::{Map, Value};
+use pnpm_resolving_git_resolver::HostedGit;
+use report_keys::{ReportIdentity, report_keys};
+use serde_json::{Map, Value, json};
 use std::path::Path;
 
 #[derive(Debug, Display, Error, Diagnostic)]
@@ -109,7 +111,7 @@ impl PkgArgs {
             PkgSubcommand::Get(args) => {
                 let output = pkg_get(manifest_path, &args.keys, self.json)?;
                 if !output.is_empty() {
-                    println!("{output}");
+                    pnpm_diagnostics::println!("{output}");
                 }
             }
             PkgSubcommand::Set(args) => {
@@ -200,40 +202,44 @@ fn get_output(manifest: &Value, keys: &[String], json: bool) -> miette::Result<S
     }
 }
 
-/// Print the selected keys of every project, keyed by project name.
+/// Print the selected keys of every project, keyed as [`report_keys()`]
+/// describes.
 fn print_recursive_get<'a>(
     projects: impl Iterator<Item = &'a pnpm_workspace::Project>,
     keys: &[String],
     workspace_root: &Path,
 ) -> miette::Result<()> {
+    let projects: Vec<_> = projects.collect();
+    let identities: Vec<_> = projects
+        .iter()
+        .map(|project| report_identity(project, workspace_root))
+        .collect();
     let mut entries = Map::new();
-    for project in projects {
-        let name = project_report_name(project, workspace_root);
-        entries.insert(name, select_from_manifest(project.manifest.value(), keys)?);
+    for (project, key) in projects
+        .iter()
+        .zip(report_keys(&identities))
+    {
+        entries.insert(key, select_from_manifest(project.manifest.value(), keys)?);
     }
     let output = serde_json::to_string_pretty(&Value::Object(entries))
         .map_err(|error| miette::miette!("{error}"))?;
-    println!("{output}");
+    pnpm_diagnostics::println!("{output}");
     Ok(())
 }
 
-/// How the recursive report names one project: its manifest name, or
-/// its workspace-relative directory when it declares none.
-fn project_report_name(project: &pnpm_workspace::Project, workspace_root: &Path) -> String {
-    project.manifest
-        .value()
-        .get("name")
-        .and_then(Value::as_str)
-        .map_or_else(
-            || {
-                project.root_dir
-                    .strip_prefix(workspace_root)
-                    .unwrap_or(&project.root_dir)
-                    .display()
-                    .to_string()
-            },
-            String::from,
-        )
+fn report_identity(project: &pnpm_workspace::Project, workspace_root: &Path) -> ReportIdentity {
+    ReportIdentity {
+        name: project.manifest
+            .value()
+            .get("name")
+            .and_then(Value::as_str)
+            .map(String::from),
+        dir_key: project.root_dir
+            .strip_prefix(workspace_root)
+            .unwrap_or(&project.root_dir)
+            .display()
+            .to_string(),
+    }
 }
 
 /// Read one project's manifest, apply `edit`, and write it back.
@@ -241,10 +247,13 @@ fn edit_project_manifest(
     project: &pnpm_workspace::Project,
     edit: impl FnOnce(&mut Value) -> miette::Result<()>,
 ) -> miette::Result<()> {
-    let mut manifest = PackageManifest::from_path(project.root_dir.join("package.json"))
-        .wrap_err("reading package.json")?;
+    let path = pnpm_workspace::project_manifest_path(&project.root_dir);
+    let mut manifest = PackageManifest::from_path(path.clone())
+        .wrap_err_with(|| format!("reading {}", path.display()))?;
     edit(manifest.value_mut())?;
-    manifest.save().wrap_err("saving package.json")
+    manifest
+        .save()
+        .wrap_err_with(|| format!("saving {}", path.display()))
 }
 
 /// Apply the `key=value` pairs of a `pnpm pkg set`.
@@ -282,10 +291,12 @@ fn pkg_set(manifest_path: &Path, pairs: &[String], json: bool) -> miette::Result
     if pairs.is_empty() {
         return Err(PkgError::SetMissingArgs.into());
     }
-    let mut manifest =
-        PackageManifest::from_path(manifest_path.to_path_buf()).wrap_err("reading package.json")?;
+    let mut manifest = PackageManifest::from_path(manifest_path.to_path_buf())
+        .wrap_err_with(|| format!("reading {}", manifest_path.display()))?;
     apply_set_pairs(manifest.value_mut(), pairs, json)?;
-    manifest.save().wrap_err("saving package.json")?;
+    manifest
+        .save()
+        .wrap_err_with(|| format!("saving {}", manifest_path.display()))?;
     Ok(())
 }
 
@@ -296,10 +307,12 @@ fn pkg_delete(manifest_path: &Path, keys: &[String]) -> miette::Result<()> {
     for key in keys {
         check_unsafe_key_in_path(key)?;
     }
-    let mut manifest =
-        PackageManifest::from_path(manifest_path.to_path_buf()).wrap_err("reading package.json")?;
+    let mut manifest = PackageManifest::from_path(manifest_path.to_path_buf())
+        .wrap_err_with(|| format!("reading {}", manifest_path.display()))?;
     apply_delete_keys(manifest.value_mut(), keys)?;
-    manifest.save().wrap_err("saving package.json")?;
+    manifest
+        .save()
+        .wrap_err_with(|| format!("saving {}", manifest_path.display()))?;
     Ok(())
 }
 
@@ -311,11 +324,13 @@ fn apply_delete_keys(value: &mut Value, keys: &[String]) -> miette::Result<()> {
 }
 
 fn pkg_fix(manifest_path: &Path) -> miette::Result<()> {
-    let mut manifest =
-        PackageManifest::from_path(manifest_path.to_path_buf()).wrap_err("reading package.json")?;
+    let mut manifest = PackageManifest::from_path(manifest_path.to_path_buf())
+        .wrap_err_with(|| format!("reading {}", manifest_path.display()))?;
     let value = manifest.value_mut();
     fix_manifest(value);
-    manifest.save().wrap_err("saving package.json")?;
+    manifest
+        .save()
+        .wrap_err_with(|| format!("saving {}", manifest_path.display()))?;
     Ok(())
 }
 
@@ -329,6 +344,26 @@ fn fix_manifest(value: &mut Value) {
         remove_ill_typed_field(obj, field, Value::is_object);
     }
     remove_ill_typed_field(obj, "bin", |bin| bin.is_string() || bin.is_object());
+    normalize_repository(obj);
+}
+
+/// Rewrite `repository` the way the `fixRepositoryField` step of
+/// `npm pkg fix` does: a non-empty string becomes a `{ "type": "git", "url" }`
+/// object, and a `url` on a recognised git host becomes
+/// [`HostedGit::normalized_repository_url`].
+fn normalize_repository(obj: &mut Map<String, Value>) {
+    let Some(repository) = obj.get_mut("repository") else { return };
+    if let Value::String(url) = repository
+        && !url.is_empty()
+    {
+        *repository = json!({ "type": "git", "url": std::mem::take(url) });
+    }
+    let Some(Value::String(url)) = repository.get_mut("url") else { return };
+    if let Some(normalized) =
+        HostedGit::from_url(url).and_then(|hosted| hosted.normalized_repository_url())
+    {
+        *url = normalized;
+    }
 }
 
 /// Drop a manifest field whose value is not of a shape pnpm can read.
@@ -349,3 +384,5 @@ fn remove_ill_typed_field(
 mod tests;
 
 mod editing;
+
+mod report_keys;

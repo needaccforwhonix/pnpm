@@ -6,11 +6,29 @@ import type { LockfileObject } from '@pnpm/lockfile.utils'
 import { fixtures } from '@pnpm/test-fixtures'
 import type { ProjectId } from '@pnpm/types'
 
-const f = fixtures(import.meta.dirname)
+const testFixtures = fixtures(import.meta.dirname)
 
 test('hoist', async () => {
-  const lockfile = await readWantedLockfile(f.find('fixture'), { ignoreIncompatible: true })
+  const lockfile = await readWantedLockfile(testFixtures.find('fixture'), { ignoreIncompatible: true })
   expect(hoist(lockfile!)).toBeTruthy()
+})
+
+test.each([
+  ['Set', (name: string) => new Set([name])],
+  ['Array', (name: string) => [name]],
+  ['Generator', function * (name: string) {
+    yield name
+  }],
+])('hoist strips externalDependencies passed as a %s from the root dependencies', async (_kind, toExternalDependencies) => {
+  const lockfile = await readWantedLockfile(testFixtures.find('fixture'), { ignoreIncompatible: true })
+  const withoutExternals = hoist(lockfile!)
+  const [targetDep] = withoutExternals.dependencies
+  expect(targetDep).toBeDefined()
+
+  const withExternals = hoist(lockfile!, {
+    externalDependencies: toExternalDependencies(targetDep.name),
+  })
+  expect([...withExternals.dependencies].some((dep) => dep.name === targetDep.name)).toBe(false)
 })
 
 test('hoist throws an error if the lockfile is broken', () => {
@@ -63,4 +81,18 @@ test('getHoistingLimits in "dependencies" mode additionally borders each importe
   // Each non-root importer borders its own direct deps so their
   // transitives stay nested under them.
   expect(limits!.get('packages%2Ffoo@workspace:packages/foo')).toStrictEqual(new Set(['b']))
+})
+
+test('getHoistingLimits preserves synthetic root border when root importer is omitted', () => {
+  const filteredLockfile: Pick<LockfileObject, 'importers'> = {
+    importers: {
+      ['packages/foo' as ProjectId]: {
+        dependencies: { b: '1.0.0' },
+        specifiers: { b: '1.0.0' },
+      },
+    },
+  }
+  const limits = getHoistingLimits(filteredLockfile, 'workspaces')
+  expect([...limits!.keys()]).toStrictEqual(['.@'])
+  expect(limits!.get('.@')).toStrictEqual(new Set(['packages%2Ffoo']))
 })

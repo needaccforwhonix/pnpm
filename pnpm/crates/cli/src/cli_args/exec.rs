@@ -1,7 +1,11 @@
 mod recursive;
 
-use super::reporter::{ReporterType, reporter_emit};
-use crate::path_env::{BadPathDir, prepend_dirs_to_path, set_command_path};
+use super::reporter::ReporterType;
+use crate::{
+    path_env::{BadPathDir, prepend_dirs_to_path, set_command_path},
+    process::{Command, ExitStatus, Stdio},
+};
+
 use clap::Args;
 use derive_more::{Display, Error};
 use miette::Diagnostic;
@@ -15,10 +19,7 @@ use pnpm_package_manager::{
     pnp_path_for_execution,
 };
 use pnpm_workspace::read_project_name;
-use std::{
-    path::Path,
-    process::{Command, ExitStatus, Stdio},
-};
+use std::{collections::HashMap, path::Path};
 
 /// Run a shell command in the context of a project.
 ///
@@ -104,7 +105,12 @@ impl ExecArgs {
         reporter: ReporterType,
     ) -> miette::Result<()> {
         let command = prepare_command(self.command)?;
-        super::verify_deps::verify_deps_before_run(dirs.project, config, reporter)?;
+        super::verify_deps::verify_deps_before_run(
+            dirs.project,
+            &[dirs.project],
+            config,
+            reporter,
+        )?;
         let status =
             spawn_in_dir(&command, dirs, config, self.shell_mode, ScriptOutput::Inherit, None)?;
         if !status.success() {
@@ -122,8 +128,7 @@ impl ExecArgs {
         dir: &Path,
         reporter: ReporterType,
     ) -> miette::Result<()> {
-        super::verify_deps::verify_deps_before_run(dir, config, reporter)?;
-        recursive::exec_recursive(self, config, dir, reporter_emit(reporter)).await
+        recursive::exec_recursive(self, config, dir, reporter).await
     }
 }
 
@@ -163,7 +168,7 @@ pub(super) fn spawn_in_dir(
     process_tracker: Option<&ProcessTracker>,
 ) -> Result<ExitStatus, ExecError> {
     let mut cmd = command_in_dir(command, dirs, config, shell_mode)?;
-    let ScriptOutput::Streamed { dep_path, emit } = output else {
+    let ScriptOutput::Streamed { dep_path, emit, color } = output else {
         let mut child = spawn_child(&mut cmd, process_tracker)
             .map_err(|source| ExecError::Spawn { command: command[0].clone(), source })?;
         return child
@@ -172,12 +177,20 @@ pub(super) fn spawn_in_dir(
     };
     let wd = dirs.run.to_string_lossy();
     let streamed = StreamedScript { dep_path, stage: EXEC_STAGE, wd: &wd, emit };
+    if color
+        && std::env::var_os("FORCE_COLOR").is_none()
+        && !cmd
+            .get_envs()
+            .any(|(name, _)| name == "FORCE_COLOR")
+    {
+        cmd.env("FORCE_COLOR", "1");
+    }
     cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = spawn_child(&mut cmd, process_tracker)
         .map_err(|source| ExecError::Spawn { command: command[0].clone(), source })?;
     let status = streamed
-        .pump(child.child_mut())
+        .pump(&mut child)
         .map_err(|source| ExecError::Spawn { command: command[0].clone(), source })?;
     streamed.finished(status.code().unwrap_or(-1));
     Ok(status)
@@ -190,11 +203,8 @@ fn command_in_dir(
     shell_mode: bool,
 ) -> Result<Command, ExecError> {
     let ExecDirs { run: dir, project } = dirs;
-    // Prepend `./node_modules/.bin` (resolved against the project
-    // directory) and then the `extraBinPaths`. pnpm prepends the whole
-    // ancestor chain of `node_modules/.bin` directories, of which the
-    // project's is the one that holds the installed executables.
-    let path = command_search_path(dirs, config)?;
+    let project_name = read_project_name(project);
+    let path = command_search_path(dirs, config, project_name.as_deref())?;
 
     let mut cmd = if shell_mode {
         // execa's `shell: true` joins the command and its arguments
@@ -223,39 +233,66 @@ fn command_in_dir(
 
     cmd.current_dir(dir);
     // `updateConfig`-provided env, applied first so pnpm's own keys
-    // below (PATH, user-agent, NODE_OPTIONS) win on conflict — matching
+    // below (PATH, user-agent, NODE_OPTIONS, PWD) win on conflict — matching
     // TS `makeEnv`, which spreads `...extraEnv` into the base. Empty
     // unless an install-family command populated it.
-    cmd.envs(&config.extra_env);
+    cmd.envs(project_extra_env(config, project, project_name.as_deref()));
     set_command_path(&mut cmd, &path);
+    let init_cwd = std::env::current_dir().unwrap_or_else(|_| dir.to_path_buf());
+    set_logical_pwd(&mut cmd, &init_cwd, dir);
+    set_package_manager_env(&mut cmd, &init_cwd, &config.extra_env);
     cmd.env("npm_config_user_agent", &config.user_agent);
     // Same recursion-guard stamp as the lifecycle env builder.
     cmd.env(pnpm_executor::VERIFY_DEPS_BEFORE_RUN_ENV, "false");
-    if let Some(name) = read_project_name(project) {
+    if let Some(name) = &project_name {
         cmd.env("PNPM_PACKAGE_NAME", name);
     }
-    let mut node_options = configured_node_options(config);
-    if let Some(pnp_path) = pnp_path_for_execution(config, project) {
-        node_options = Some(make_node_require_option(&pnp_path, node_options.as_deref()));
-    }
-    if let Some(package_map_path) = package_map_path_for_execution(config, project) {
-        node_options =
-            Some(make_node_package_map_option(&package_map_path, node_options.as_deref()));
-    }
     // pnpm forwards `nodeOptions` as `NODE_OPTIONS` to the child.
-    // See exec.ts:246.
-    if let Some(node_options) = node_options {
+    if let Some(node_options) = execution_node_options(config, project) {
         cmd.env("NODE_OPTIONS", node_options);
     }
 
     Ok(cmd)
 }
 
+// The child inherits the PWD of pnpm's own cwd. When the command runs
+// in that same directory the inherited value is already right and may
+// hold the logical path through a symlink, so keep it. Otherwise point
+// PWD at the command's cwd: shells trust PWD over getcwd(), so a
+// project reached through a symlink then reports its logical path.
+#[cfg(unix)]
+fn set_logical_pwd(cmd: &mut Command, init_cwd: &Path, dir: &Path) {
+    if init_cwd != dir {
+        cmd.env("PWD", dir);
+    }
+}
+
+// POSIX-only: neither cmd.exe nor PowerShell reads PWD.
+#[cfg(not(unix))]
+fn set_logical_pwd(_cmd: &mut Command, _init_cwd: &Path, _dir: &Path) {}
+
+pub(super) fn set_package_manager_env(
+    cmd: &mut Command,
+    init_cwd: &Path,
+    extra_env: &HashMap<String, String>,
+) {
+    cmd.env_remove("NODE").env_remove("npm_node_execpath");
+    cmd.envs(pnpm_executor::package_manager_env(
+        init_cwd,
+        extra_env
+            .get("NODE")
+            .filter(|value| !value.is_empty())
+            .map(Path::new),
+        None,
+        std::env::var_os("PATH").as_deref(),
+    ));
+}
+
 /// The `stage` pnpm stamps on the lifecycle events of an exec'd command.
 pub(super) const EXEC_STAGE: &str = "(exec)";
 
 fn configured_node_options(config: &Config) -> Option<String> {
-    match config.node_options.as_deref() {
+    match config.exported_node_options() {
         Some(node_options) => {
             Some(pnpm_config::esm_node_path_loader::keep_esm_node_path_loader_option(
                 node_options,
@@ -269,16 +306,49 @@ fn configured_node_options(config: &Config) -> Option<String> {
 #[cfg(test)]
 mod tests;
 
+fn project_extra_env(
+    config: &Config,
+    project: &Path,
+    project_name: Option<&str>,
+) -> HashMap<String, String> {
+    let mut env = config.extra_env.clone();
+    config.prepend_project_node_path::<pnpm_config::Host>(
+        &mut env,
+        project,
+        &config.modules_dir_name_for(project, project_name),
+    );
+    env
+}
+
 fn command_search_path(
     dirs: ExecDirs<'_>,
     config: &Config,
+    project_name: Option<&str>,
 ) -> Result<std::ffi::OsString, ExecError> {
     let ExecDirs { run: dir, project } = dirs;
+    let modules_dir_name = config.modules_dir_name_for(project, project_name);
     let mut prepend = Vec::with_capacity(2 + config.extra_bin_paths.len());
-    prepend.push(dir.join("node_modules").join(".bin"));
+    prepend.push(dir.join(&modules_dir_name).join(".bin"));
     if project != dir {
-        prepend.push(project.join("node_modules").join(".bin"));
+        prepend.push(project.join(&modules_dir_name).join(".bin"));
     }
-    prepend.extend(pnpm_python_installer::execution_paths(config, project).iter().cloned());
+    prepend.extend(crate::ecosystem_install::execution_paths(config, project).iter().cloned());
     prepend_dirs_to_path(&prepend).map_err(ExecError::from)
+}
+
+fn execution_node_options(config: &Config, project: &Path) -> Option<String> {
+    let mut node_options = configured_node_options(config);
+    if let Some(pnp_path) = pnp_path_for_execution(config, project) {
+        node_options = Some(make_node_require_option(&pnp_path, node_options.as_deref()));
+    }
+    if let Some(package_map_path) = package_map_path_for_execution(config, project) {
+        node_options =
+            Some(make_node_package_map_option(&package_map_path, node_options.as_deref()));
+    }
+    let mut loader_env = HashMap::new();
+    if let Some(options) = node_options.take() {
+        loader_env.insert("NODE_OPTIONS".to_string(), options);
+    }
+    config.add_cas_loader_env(project, &mut loader_env);
+    loader_env.remove("NODE_OPTIONS")
 }

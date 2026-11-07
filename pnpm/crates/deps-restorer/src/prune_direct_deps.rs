@@ -16,7 +16,7 @@ use derive_more::{Display, Error};
 use miette::Diagnostic;
 use pnpm_cmd_shim::{Host, get_bins_from_package_manifest, remove_bin};
 use pnpm_config::Config;
-use pnpm_fs::{read_symlink_dir, remove_symlink_dir};
+use pnpm_fs::{read_symlink_dir, remove_dirent, remove_symlink_dir};
 use pnpm_lockfile::Lockfile;
 use pnpm_modules_yaml::IncludedDependencies;
 use pnpm_package_manifest::{DependencyGroup, parse_manifest_bytes};
@@ -57,6 +57,14 @@ pub enum PruneDirectDepsError {
         error: io::Error,
     },
 
+    #[display("Failed to read {path:?} while pruning direct dependencies: {error}")]
+    #[diagnostic(code(ERR_PNPM_PACKAGE_MANAGER_PRUNE_DIRECT_DEPS_READ_MODULES_DIR))]
+    ReadModulesDir {
+        path: PathBuf,
+        #[error(source)]
+        error: io::Error,
+    },
+
     #[display("Failed to remove the excluded direct dependency at {path:?}: {error}")]
     #[diagnostic(code(ERR_PNPM_PACKAGE_MANAGER_PRUNE_DIRECT_DEPS_REMOVE_LINK))]
     RemoveLink {
@@ -68,7 +76,7 @@ pub enum PruneDirectDepsError {
 
 /// Remove the direct-dependency links that `old_included` selected but
 /// `new_included` does not, for every importer recorded in the current
-/// lockfile (`<virtual_store_dir>/lock.yaml` — what the previous install
+/// lockfile (`<install_state_dir>/lock.yaml` — what the previous install
 /// actually materialized). When `prunable_importer_ids` is set, only links
 /// belonging to those importers are eligible for removal; a filtered
 /// install leaves every other importer's links untouched because it never
@@ -122,8 +130,7 @@ pub fn prune_direct_deps_excluded_by_groups(
     // Same per-importer `modulesDir` suffix peeling as
     // [`crate::SymlinkDirectDependencies`], so removal targets exactly
     // where the linker writes.
-    let modules_dir_name: &OsStr =
-        config.modules_dir.file_name().unwrap_or_else(|| OsStr::new("node_modules"));
+    let modules_dir_name: &OsStr = config.modules_dir_name();
 
     for (importer_id, snapshot) in &current_lockfile.importers {
         // A malformed importer key is rejected with a typed error by
@@ -194,7 +201,7 @@ pub fn confined_modules_dir(modules_dir: &Path, workspace_root: &Path) -> Option
 /// directory). Removals must not reach *through* a redirected
 /// intermediate component (`@scope/`, `.bin/`); the containment check
 /// above only vouches for the modules dir itself.
-fn is_real_dir(path: &Path) -> bool {
+pub(crate) fn is_real_dir(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_dir())
         && read_symlink_dir(path).is_err()
 }
@@ -208,13 +215,25 @@ pub fn selected_groups(included: IncludedDependencies) -> Vec<DependencyGroup> {
     if included.dev_dependencies {
         groups.push(DependencyGroup::Dev);
     }
-    if included.optional_dependencies {
+    if included.includes_project_optional_dependencies() {
         groups.push(DependencyGroup::Optional);
     }
     groups
 }
 
-pub fn remove_direct_dep_link(modules_dir: &Path, name: &str) -> Result<(), PruneDirectDepsError> {
+/// A direct-dependency link [`remove_direct_dep_link`] removed.
+#[derive(Debug)]
+pub struct UnlinkedDependency {
+    /// The linked package's manifest version, when it has a readable one.
+    pub version: Option<String>,
+}
+
+/// Removes the `<modules_dir>/<name>` link and the bin shims of its
+/// package. Returns `None` when there was no link to remove.
+pub fn remove_direct_dep_link(
+    modules_dir: &Path,
+    name: &str,
+) -> Result<Option<UnlinkedDependency>, PruneDirectDepsError> {
     let link =
         safe_join_modules_dir(modules_dir, name).map_err(PruneDirectDepsError::InvalidAlias)?;
     // For a scoped alias the join passes through `@scope/`; refuse to
@@ -223,52 +242,99 @@ pub fn remove_direct_dep_link(modules_dir: &Path, name: &str) -> Result<(), Prun
         && parent != modules_dir
         && !is_real_dir(parent)
     {
-        return Ok(());
+        return Ok(None);
     }
     // Only a symlink (junction on Windows) can be a direct-dep entry the
     // isolated linker wrote; anything else stays untouched. The probe
     // also covers "not there at all" — nothing to remove.
     if read_symlink_dir(&link).is_err() {
-        return Ok(());
+        return Ok(None);
     }
-    remove_dep_bins(modules_dir, &link)?;
+    let version = remove_dep_bins_with_version(modules_dir, &link)?;
     match remove_symlink_dir(&link) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Ok(()) => Ok(Some(UnlinkedDependency { version })),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(PruneDirectDepsError::RemoveLink { path: link, error }),
     }
 }
 
-/// Remove the shims the package behind `link` declares from
+/// Remove an extraneous entry (symlink, directory, or file) at
+/// `<modules_dir>/<name>` during `pnpm prune`, returning its manifest
+/// version (if readable) when an entry was removed.
+pub(crate) fn remove_extraneous_direct_dep(
+    modules_dir: &Path,
+    name: &str,
+) -> Result<Option<Option<String>>, PruneDirectDepsError> {
+    let Ok(pkg_dir) = safe_join_modules_dir(modules_dir, name) else {
+        return Ok(None);
+    };
+    if let Some(parent) = pkg_dir.parent()
+        && parent != modules_dir
+        && !is_real_dir(parent)
+    {
+        return Ok(None);
+    }
+    match fs::symlink_metadata(&pkg_dir) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(PruneDirectDepsError::RemoveLink { path: pkg_dir, error }),
+    }
+    let version = remove_dep_bins_with_version(modules_dir, &pkg_dir)?;
+    match remove_dirent(&pkg_dir) {
+        Ok(()) => Ok(Some(version)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(PruneDirectDepsError::RemoveLink { path: pkg_dir, error }),
+    }
+}
+
+/// Remove the shims the package at `pkg_dir` declares from
 /// `<modules_dir>/.bin`. A missing or unparsable `package.json` (a
 /// dangling link, a broken package) yields no bins to remove — the same
 /// best-effort read as pnpm's `removeBins`.
-fn remove_dep_bins(modules_dir: &Path, link: &Path) -> Result<(), PruneDirectDepsError> {
-    let manifest_path = link.join("package.json");
+pub(crate) fn remove_dep_bins(
+    modules_dir: &Path,
+    pkg_dir: &Path,
+) -> Result<(), PruneDirectDepsError> {
+    remove_dep_bins_with_version(modules_dir, pkg_dir).map(|_| ())
+}
+
+fn remove_dep_bins_with_version(
+    modules_dir: &Path,
+    pkg_dir: &Path,
+) -> Result<Option<String>, PruneDirectDepsError> {
+    let manifest_path = pkg_dir.join("package.json");
     let bytes = match fs::read(&manifest_path) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error)
+            if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) =>
+        {
+            return Ok(None);
+        }
         Err(error) => {
             return Err(PruneDirectDepsError::ReadManifest { path: manifest_path, error });
         }
     };
     let Ok(manifest) = parse_manifest_bytes(&bytes) else {
-        return Ok(());
+        return Ok(None);
     };
+    let version = manifest
+        .get("version")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
     // Shims are deleted with plain `remove_file`, so a `.bin` that is
     // itself a symlink or junction would redirect the deletions
     // outside the confined modules dir — skip shim removal unless
     // `.bin` is a real directory. (Absent `.bin` means no shims.)
     let bins_dir = modules_dir.join(".bin");
     if !is_real_dir(&bins_dir) {
-        return Ok(());
+        return Ok(version);
     }
-    for command in get_bins_from_package_manifest::<Host>(&manifest, link) {
+    for command in get_bins_from_package_manifest::<Host>(&manifest, pkg_dir) {
         let shim_path = bins_dir.join(&command.name);
         remove_bin(&shim_path)
             .map_err(|error| PruneDirectDepsError::RemoveBin { path: shim_path, error })?;
     }
-    Ok(())
+    Ok(version)
 }
 
 #[cfg(test)]

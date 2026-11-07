@@ -1,6 +1,6 @@
-pub use arguments::{AddInstallArgs, AddSaveArgs, AddTargetArgs};
+pub use arguments::{AddIncludeArgs, AddInstallArgs, AddRequest, AddSaveArgs, AddTargetArgs};
 
-pub(crate) use execution::{add_package, add_packages};
+pub(crate) use execution::{AddGroups, add_package, add_packages};
 
 mod arguments;
 
@@ -8,9 +8,12 @@ use crate::{
     State,
     cargo_manifest::CargoDependencyKind,
     cli_args::{
-        install::resolve_bool_override, lockfile_dir::LockfileDirArg,
-        pipelines::InstallFamilySelection, recursive,
-        supported_architectures::SupportedArchitecturesArgs, workspace_option::workspace_link_root,
+        install::{included_dependency_groups, resolve_bool_override},
+        lockfile_dir::LockfileDirArg,
+        pipelines::InstallFamilySelection,
+        recursive,
+        supported_architectures::SupportedArchitecturesArgs,
+        workspace_option::workspace_link_root,
     },
     config_deps,
     engine_pm::{
@@ -41,13 +44,13 @@ use std::{
 #[derive(Debug, Clone, Args)]
 pub struct AddDependencyOptions {
     /// Install the specified packages as regular dependencies.
-    #[clap(short = 'P', long)]
+    #[clap(short = 'P', visible_short_alias = 'p', long)]
     save_prod: bool,
     /// Install the specified packages as devDependencies.
-    #[clap(short = 'D', long)]
+    #[clap(short = 'D', visible_short_alias = 'd', long)]
     save_dev: bool,
     /// Install the specified packages as optionalDependencies.
-    #[clap(short = 'O', long)]
+    #[clap(short = 'O', visible_short_alias = 'o', long)]
     save_optional: bool,
     /// Install crate: packages as Cargo build dependencies.
     #[clap(long = "save-build")]
@@ -170,7 +173,7 @@ impl AddDependencyOptions {
     /// flag names it explicitly, `None` when pnpm infers it per package
     /// (an already-declared dependency is updated in the group it
     /// occupies; a new one lands in `dependencies`).
-    fn save_target(&self) -> Option<Vec<DependencyGroup>> {
+    pub(crate) fn save_target(&self) -> Option<Vec<DependencyGroup>> {
         let &AddDependencyOptions {
             save_prod,
             save_dev,
@@ -189,10 +192,13 @@ impl AddDependencyOptions {
 pub struct AddArgs {
     /// Names of the packages to add.
     #[clap(required = true)]
-    pub package_names: Vec<String>,
+    pub package_names: Vec<AddRequest>,
     /// --save-prod, --save-dev, --save-optional, --save-peer
     #[clap(flatten)]
     pub dependency_options: AddDependencyOptions,
+    /// `--prod` / `--dev`: which dependency groups end up in `node_modules`.
+    #[clap(flatten)]
+    pub include: AddIncludeArgs,
     /// `--cpu`, `--os`, and `--libc` filters for which optional dependencies are installed.
     #[clap(flatten)]
     pub supported_architectures: SupportedArchitecturesArgs,
@@ -233,14 +239,37 @@ impl AddArgs {
 
     pub(crate) fn apply_cli_config(&self, config: &mut Config) {
         self.scripts.apply(config);
+        if self.save.types || self.save.no_save_types {
+            config.cli_settings.insert("saveTypes".to_string());
+        }
+        config.save_types =
+            resolve_bool_override(self.save.types, self.save.no_save_types, config.save_types);
+        self.install.dedupe.apply(config);
+        if self.target.ignore_workspace_root_check || self.target.no_ignore_workspace_root_check {
+            config.cli_settings.insert("ignoreWorkspaceRootCheck".to_string());
+        }
         config.ignore_workspace_root_check = resolve_bool_override(
             self.target.ignore_workspace_root_check,
             self.target.no_ignore_workspace_root_check,
             config.ignore_workspace_root_check,
         );
+        if self.install.optional || self.install.no_optional {
+            config.cli_settings.insert("optional".to_string());
+        }
         config.optional =
             resolve_bool_override(self.install.optional, self.install.no_optional, config.optional);
+        if self.install.force {
+            config.cli_settings.insert("force".to_string());
+        }
         config.force = self.install.force || config.force;
+    }
+
+    /// The dependency groups the install that follows the manifest edit
+    /// resolves and materializes. Distinct from
+    /// [`AddDependencyOptions::save_target`], which names the manifest
+    /// group the added packages are written to.
+    fn included_groups(&self, config: &Config) -> Vec<DependencyGroup> {
+        included_dependency_groups(self.include.prod, self.include.dev, config.optional).collect()
     }
 
     /// The `--config` selectors parsed into the `name → specifier` pairs to
@@ -259,10 +288,11 @@ impl AddArgs {
 
         let mut added = BTreeMap::new();
         for package_name in &self.package_names {
-            let parsed = parse_wanted_dependency(package_name);
+            let selector = package_name.selector();
+            let parsed = parse_wanted_dependency(selector);
             let Some(name) = parsed.alias else {
                 return Err(miette::miette!(
-                    "'{package_name}' is not a valid package name for a configuration dependency",
+                    "'{selector}' is not a valid package name for a configuration dependency",
                 ));
             };
             let specifier = parsed.bare_specifier.unwrap_or_else(|| "latest".to_string());
@@ -272,12 +302,15 @@ impl AddArgs {
     }
 
     /// The style that decides the saved range: `--save-exact` /
-    /// `--save-prefix` layered over the `saveExact` and `savePrefix`
+    /// `--tilde` / `--save-prefix` layered over the `saveExact` and `savePrefix`
     /// settings, mirroring pnpm's `getRangeSpecStyle`.
     fn range_spec_style(&self, config: &Config) -> RangeSpecStyle {
+        let cli_save_prefix = (!self.save.exact)
+            .then_some(())
+            .and_then(|()| self.save.tilde.then_some("~").or(self.save.prefix.as_deref()));
         RangeSpecStyle::from_save_options(
-            self.save.exact || config.save_exact,
-            self.save.prefix.as_deref().or(config.save_prefix.as_deref()),
+            self.save.exact || (cli_save_prefix.is_none() && config.save_exact),
+            cli_save_prefix.or(config.save_prefix.as_deref()),
         )
     }
 
@@ -333,8 +366,7 @@ fn workspace_selectors(
 /// disallows (`allowBuilds: false`), persist the allowed names to
 /// `settings_dir`'s `pnpm-workspace.yaml`, and enable them for this
 /// install. `settings_dir` is the workspace root, or the project
-/// directory outside a workspace. Mirrors pnpm's `add` handler; shared by
-/// the workspace and `--global` add paths.
+/// directory outside a workspace. Mirrors pnpm's `add` handler.
 pub(crate) fn apply_allow_build(
     config: &mut Config,
     allow_build: &[String],

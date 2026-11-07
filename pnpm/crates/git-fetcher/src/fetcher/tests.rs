@@ -1,13 +1,11 @@
 use super::{
-    GitFetcher, GitManifestQuery, exec_git_with, extract_host, is_safe_repo_arg,
-    is_valid_commit_hash, read_git_manifest, should_use_shallow, ssh_repo_host,
+    GitFetcher, GitManifestQuery, exec_git_with, is_safe_repo_arg, is_valid_commit_hash,
+    prepare_git_cmd, read_git_manifest, remote::extract_host, should_use_shallow, ssh_repo_host,
 };
 use crate::{
     error::{GitFetcherError, PreparePackageError},
     prepare_package::AllowBuildRef,
 };
-use miette::Diagnostic;
-use pnpm_executor::ScriptsPrependNodePath;
 use pnpm_reporter::SilentReporter;
 use pnpm_store_dir::StoreDir;
 #[cfg(unix)]
@@ -57,7 +55,7 @@ fn make_bare_repo_with_prepare_script(tmp: &Path, prepare_script: &str) -> (Path
 }
 
 fn allow_all_builds<'a>() -> AllowBuildRef<'a> {
-    &|_| true
+    &|_| Some(true)
 }
 
 /// Create a tiny bare git repo whose single commit ships a
@@ -120,7 +118,7 @@ fn make_bare_repo_with_sub_package(tmp: &Path) -> (PathBuf, String) {
 }
 
 fn deny_all_builds<'a>() -> AllowBuildRef<'a> {
-    &|_| false
+    &|_| None
 }
 
 /// Variant of [`make_bare_repo`] for monorepo-style fixtures: commits
@@ -284,10 +282,13 @@ fn write_failing_git_shim(dir: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     fs::create_dir_all(dir).unwrap();
     let shim_path = dir.join("git");
-    let body = r"#!/bin/sh
+    let body = r#"#!/bin/sh
+for arg; do
+    if [ "$arg" = config ]; then exit 1; fi
+done
 printf 'ssh: connect to host port 22: Connection refused\n' >&2
 exit 128
-";
+"#;
     fs::write(&shim_path, body).unwrap();
     fs::set_permissions(&shim_path, fs::Permissions::from_mode(0o755)).unwrap();
     shim_path
@@ -306,11 +307,10 @@ fn failing_fetcher<'a>(
             ignore: false,
             unsafe_perm: true,
             user_agent: None,
-            prepend_node_path: ScriptsPrependNodePath::Never,
             shell: None,
             node_execpath: None,
             npm_execpath: None,
-            pnpm_execpath: None,
+            running_pnpm: crate::RunningPnpm::default(),
         },
         source: crate::GitSource {
             cache: source_cache,
@@ -347,3 +347,10 @@ mod manifests;
 mod security;
 
 mod reporting;
+
+mod submodules;
+
+mod bundles;
+
+#[cfg(unix)]
+mod prompts;

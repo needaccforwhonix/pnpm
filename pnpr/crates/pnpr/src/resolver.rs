@@ -87,7 +87,9 @@ use indexmap::IndexMap;
 use pnpm_config::Config as PacquetConfig;
 use pnpm_lockfile::Lockfile;
 use pnpm_lockfile_verification::{collect_resolution_policy_violations, hash_lockfile};
-use pnpm_network::{AuthHeaders, ThrottledClient, UpstreamRouteHook};
+use pnpm_network::{
+    AuthHeaders, GuardedDnsResolver, ThrottledClient, UpstreamRouteHook, native_dns_resolver,
+};
 use pnpm_package_manager::build_resolution_verifiers;
 use pnpm_resolving_npm_resolver::{
     InMemoryPackageMetaCache, ObservedDistStats, PackageMetaCache, observed_dist_stats_sink,
@@ -99,12 +101,12 @@ use self::{
     cache::{CachedResolution, cached_resolution, resolution_cache_key, store_resolution},
     protocol::{EcosystemProbe, ResolveRequest},
     request_validation::{
-        reject_inline_url_auth, reject_invalid_patch_hashes, reject_invalid_registries,
-        reject_off_allowlist_fetches,
+        reject_incompatible_lockfile_format, reject_inline_url_auth, reject_invalid_patch_hashes,
+        reject_invalid_registries, reject_off_allowlist_fetches, reject_unsafe_publish_directories,
     },
     verdict_cache::VerdictCache,
     wire::{
-        StreamObserver, TarballRouter, done_frame, error_frame, frozen_package_frames,
+        StreamObserver, TarballRouter, done_frame, error_frame_with_code, frozen_package_frames,
         ndjson_frames, ndjson_single_frame, ndjson_stream_response, osv_violations_for_lockfile,
         verify_done_or_osv_violations, violations_frame,
     },
@@ -153,8 +155,6 @@ struct ResolverCache {
     /// every time (uncached) rather than failing the server.
     verdicts: Option<VerdictCache>,
     /// HMAC secret namespacing a private footprint's cache descriptor.
-    /// Part 1 uses it only to label each resolve's cache class in the
-    /// operator debug log; Part 2 keys private cache entries by it.
     secret: Arc<[u8]>,
 }
 
@@ -203,8 +203,8 @@ impl Resolver {
     }
 
     fn build(config: &RegistryConfig, osv_index: Option<Arc<OsvIndex>>) -> Resolver {
-        let store_dir = config.storage.cache_dir.join("pnpr-store");
-        let cache_dir = config.storage.cache_dir.join("pnpr-cache");
+        let store_dir = config.storage.cache_dir.join("resolver-store");
+        let cache_dir = config.storage.cache_dir.join("resolver-cache");
         // Best-effort: a real failure here (e.g. a permission problem)
         // resurfaces with a precise error on the first store/cache write
         // during resolution, so there's nothing actionable to report yet.
@@ -213,11 +213,17 @@ impl Resolver {
         let route_context = Arc::new(RouteContext::from_config(config));
         // Re-validate every redirect hop against the same fetch allowlist the
         // request boundary uses, so an allowlisted registry that redirects to
-        // an off-allowlist host cannot slip a server-side fetch past it (SSRF).
+        // an off-allowlist host cannot slip a server-side fetch past it (SSRF),
+        // and check every address a hostname resolves to before connecting.
         let redirect_context = Arc::clone(&route_context);
-        let client = Arc::new(ThrottledClient::new_for_installs_with_redirect_guard(move |url| {
-            redirect_context.allows_registry(url.as_str())
-        }));
+        let connect_context = Arc::clone(&route_context);
+        let client = Arc::new(ThrottledClient::new_for_installs_with_guards(
+            move |url| redirect_context.allows_fetch(url.as_str()),
+            Arc::new(GuardedDnsResolver::new(
+                native_dns_resolver(),
+                Arc::new(move |host, address| connect_context.allows_address(host, address)),
+            )),
+        ));
         Resolver {
             store_dir: StoreDir::new(store_dir),
             client,
@@ -352,6 +358,9 @@ async fn handle_npm_resolve(runtime: &Resolver, identity: Identity, body: &[u8])
     resolve_npm_request(runtime, identity, request).await
 }
 
+/// Resolve an npm project: verify the client's input lockfile under the
+/// client's policy, resolve against the client's registries, and stream
+/// the result back as NDJSON.
 async fn resolve_npm_request(
     runtime: &Resolver,
     identity: Identity,
@@ -373,15 +382,6 @@ async fn resolve_npm_request(
     let request_auth = runtime.hooked_auth(&request, &identity, &footprint);
     let tarball_router = request_tarball_router(runtime, &identity, config);
 
-    // Verify the *input* lockfile under the client's policy before any
-    // package is streamed ([pnpm/pnpm#12139](https://github.com/pnpm/pnpm/issues/12139)).
-    // The client skips its own `verifyLockfileResolutions` whenever a
-    // pnpr server is configured, so this is the only place the
-    // committed/reused entries get checked. A true first install sends
-    // no lockfile — nothing to verify. `trustLockfile` is the client's
-    // opt-out (mirrors the local path's `--trust-lockfile`). Freshly-
-    // resolved entries are held to the same policy by the resolver's
-    // pick-time gate (the policy is wired into `config`).
     let verified_dist_stats =
         match verify_request_lockfile(runtime, config, &request, &request_auth, &tarball_router)
             .await
@@ -391,12 +391,7 @@ async fn resolve_npm_request(
         };
 
     // Short-circuit paths that produce the whole lockfile without an
-    // incremental tree walk. A verified frozen lockfile still announces
-    // its tarballs as `package` frames when the verification fan-out
-    // just fetched their metadata — the sizes let the client start the
-    // largest downloads first. On a verdict-cache hit no metadata was
-    // fetched, so there's nothing to add and the response is the bare
-    // `done` frame.
+    // incremental tree walk.
     if let Some(response) =
         frozen_lockfile_response(runtime, config, &request, &tarball_router, verified_dist_stats)
     {
@@ -407,7 +402,7 @@ async fn resolve_npm_request(
     // may reuse a stored lockfile.
     let resolution_cache_key = resolution_cache_key(config, &request);
     if let Some(response) =
-        cached_resolution_response(runtime, &identity, resolution_cache_key.as_ref())
+        cached_resolution_response(runtime, &identity, resolution_cache_key.as_ref(), &request)
     {
         return response;
     }
@@ -457,26 +452,14 @@ async fn verify_request_lockfile(
     }
 }
 
-/// Resolve an npm project: verify the client's input lockfile under the
-/// client's policy, resolve against the client's registries, and stream
-/// the result back as NDJSON.
-///
-/// The response is `application/x-ndjson`: one `package` frame per
-/// resolved tarball as the server's tree walk yields it (so the client
-/// fetches tarballs while the server is still resolving —
-/// [pnpm/pnpm#12234](https://github.com/pnpm/pnpm/issues/12234)),
-/// followed by exactly one terminal frame: `done` carrying the full
-/// lockfile + stats, `error` if resolution aborts mid-stream, or
-/// `violations` if the input lockfile failed the client's policy. The
-/// short-circuit paths (frozen reuse, cache hit) emit only the terminal
-/// `done` frame. A private proxied tarball is announced through its
-/// upstream's `/~<name>/` registry endpoint rather than its upstream URL.
 /// The request-level refusals a resolve is held to before any fetch.
 fn reject_unusable_resolve(request: &ResolveRequest, context: &RouteContext) -> Option<Response> {
     reject_invalid_registries(request)
         .or_else(|| reject_invalid_patch_hashes(request))
         .or_else(|| reject_inline_url_auth(request))
+        .or_else(|| reject_unsafe_publish_directories(request))
         .or_else(|| reject_off_allowlist_fetches(request, context))
+        .or_else(|| reject_incompatible_lockfile_format(request))
 }
 
 /// A verified frozen lockfile is the whole answer: no incremental tree walk
@@ -504,7 +487,8 @@ fn frozen_lockfile_response(
     let mut frames = verified_dist_stats
         .map(|sizes| frozen_package_frames(config, tarball_router, &lockfile, &sizes))
         .unwrap_or_default();
-    frames.push(done_frame(&lockfile));
+    let applied = protocol::AppliedPolicies::from_request(request);
+    frames.push(done_frame(&lockfile, Some(&applied)));
     Some(ndjson_frames(&frames))
 }
 
@@ -517,6 +501,7 @@ fn cached_resolution_response(
     runtime: &Resolver,
     identity: &Identity,
     key: Option<&String>,
+    request: &ResolveRequest,
 ) -> Option<Response> {
     let lockfile = cached_resolution(
         &runtime.cache.entries,
@@ -525,7 +510,8 @@ fn cached_resolution_response(
         &runtime.route_context,
         identity,
     )?;
-    Some(ndjson_single_frame(&done_frame(&lockfile)))
+    let applied = protocol::AppliedPolicies::from_request(request);
+    Some(ndjson_single_frame(&done_frame(&lockfile, Some(&applied))))
 }
 
 /// What a finished resolution offers the resolution cache.
@@ -576,11 +562,18 @@ fn report_message(report: &miette::Report) -> String {
 }
 
 fn json_error(status: StatusCode, message: &str) -> Response {
-    let body = serde_json::json!({ "error": message }).to_string();
+    json_error_with_code(status, message, None)
+}
+
+fn json_error_with_code(status: StatusCode, message: &str, code: Option<&str>) -> Response {
+    let mut val = serde_json::json!({ "error": message });
+    if let Some(code) = code {
+        val["code"] = serde_json::Value::String(code.to_string());
+    }
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(body))
+        .body(Body::from(val.to_string()))
         .expect("static json error response is always valid")
 }
 

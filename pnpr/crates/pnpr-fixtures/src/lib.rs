@@ -1,9 +1,27 @@
+pub mod presets;
+pub use metadata::{
+    deprecate_version, read_hosted_document, read_hosted_file, read_packument, remove_version,
+    set_dist_tag, tarball_path, write_hosted_document, write_hosted_file, write_packuments,
+    write_packuments_into,
+};
+pub use presets::{
+    MockConfigPresets, REGISTRY_MOCK_LOCAL_PATTERNS, REGISTRY_MOCK_UPSTREAM_TIMEOUT, TAR_REGISTRY,
+    proxy_config, registry_mock_graph, registry_mock_rules, static_serve_config, with_tar_registry,
+};
+
+mod metadata;
 mod tarball;
 use tarball::{build_tarball, fixture_files};
 
 use base64::{Engine, engine::general_purpose};
 use flate2::{Compression, write::GzEncoder};
 use node_semver::{Range, Version};
+use pnpr_registry::Ecosystem;
+use pnpr_storage::{
+    BlobId,
+    layout::{local_archive_path, write_local_layout_marker},
+    metadata::{ArtifactBlob, BlobRef},
+};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256, Sha512};
 use std::{
@@ -17,6 +35,14 @@ use std::{
     },
 };
 use walkdir::WalkDir;
+
+pub const MOCK_CONFIG_PATH: &str = "pnpr/.fixtures/config.yaml";
+pub const MOCK_CONFIG_YAML: &str = include_str!("../../../.fixtures/config.yaml");
+
+#[must_use]
+pub fn mock_config_path() -> PathBuf {
+    workspace_root().join(MOCK_CONFIG_PATH)
+}
 
 const PACKAGES_DIR: &str = "pnpr/.fixtures/packages";
 const GENERATED_DIR: &str = "pnpr-fixtures";
@@ -37,15 +63,24 @@ pub fn ensure_storage() -> &'static Path {
     STORAGE.as_path()
 }
 
+/// The metadata database of the fixture storage at `storage`, the one pnpr
+/// reads by default.
+#[must_use]
+pub fn metadata_path(storage: &Path) -> PathBuf {
+    pnpr_config::default_metadata_path(storage)
+}
+
 #[must_use]
 pub fn packages_dir() -> PathBuf {
     workspace_root().join(PACKAGES_DIR)
 }
 
-/// Build verdaccio-shaped storage from the raw package fixtures in `packages`
-/// into `out`, replacing any existing contents. Used by the `pnpr-prepare`
-/// binary so the JS test harness can serve the moved fixtures; pacquet's own
-/// tests use [`ensure_storage`] (process-global, cached) instead.
+/// Build registry storage from the raw package fixtures in `packages` into
+/// `out`, replacing any existing contents: the tarballs as hosted blobs and
+/// the packuments in the `SQLite` metadata database pnpr reads by default.
+/// Used by the `pnpr-prepare` binary so the JS test harness can serve the
+/// moved fixtures; pacquet's own tests use [`ensure_storage`]
+/// (process-global, cached) instead.
 pub fn build_storage_at(packages: &Path, out: &Path) {
     build_storage_at_with_substitutions(packages, out, &[]);
 }
@@ -59,53 +94,31 @@ pub fn build_storage_at_with_substitutions(
     out: &Path,
     substitutions: &[(&str, &str)],
 ) {
-    if out.exists() {
-        fs::remove_dir_all(out).expect("clear existing registry fixture storage");
-    }
+    build_storage_at_with_edits(packages, out, substitutions, &[]);
+}
+
+/// A field a fixture version's registry metadata leaves out while its
+/// tarball keeps it, so the registry serves metadata that disagrees with the
+/// published `package.json`.
+#[derive(Debug, Clone, Copy)]
+pub struct RemovedVersionField<'name> {
+    pub package: &'name str,
+    pub version: &'name str,
+    pub field: &'name str,
+}
+
+/// [`build_storage_at_with_substitutions`], with `removed_fields` left out
+/// of the registry metadata. The store never changes a version it accepted,
+/// so a field is removed as the storage is built, not afterwards.
+pub fn build_storage_at_with_edits(
+    packages: &Path,
+    out: &Path,
+    substitutions: &[(&str, &str)],
+    removed_fields: &[RemovedVersionField<'_>],
+) {
+    remove_tree(out, "clear existing registry fixture storage");
     fs::create_dir_all(out).expect("create registry fixture storage dir");
-    build_storage(packages, out, substitutions);
-}
-
-/// Point `tag` at `version` in a built storage tree — the fixture-side
-/// equivalent of the JS harness's `addDistTag`, and the only way to give a
-/// package a `latest` other than its highest published version.
-///
-/// `time.modified` moves with the tag, the same as pnpr's own
-/// `PUT /-/package/:pkg/dist-tags/:tag` — it is what the served
-/// `Last-Modified` is derived from.
-///
-/// Only call this on a tree the test owns, never on the process-global
-/// storage every other test reads — see [`build_storage_at`].
-pub fn set_dist_tag(storage: &Path, package: &str, version: &str, tag: &str) {
-    let path = storage.join(package).join("package.json");
-    let bytes = fs::read(&path)
-        .unwrap_or_else(|err| panic!("read fixture packument at {}: {err}", path.display()));
-    let mut packument: Value = serde_json::from_slice(&bytes).expect("parse fixture packument");
-    let packument_object = packument.as_object_mut().expect("fixture packument is an object");
-    assert!(
-        packument_object
-            .get("versions")
-            .and_then(Value::as_object)
-            .is_some_and(|versions| versions.contains_key(version)),
-        "{package} has no fixture version {version} to tag as {tag}",
-    );
-    insert_object_entry(packument_object, "dist-tags", tag, json!(version));
-    insert_object_entry(packument_object, "time", "modified", json!(now_iso()));
-    fs::write(&path, serde_json::to_vec(&packument).expect("serialize fixture packument"))
-        .expect("write fixture packument");
-}
-
-fn insert_object_entry(parent: &mut Map<String, Value>, field: &str, key: &str, value: Value) {
-    parent
-        .entry(field.to_string())
-        .or_insert_with(|| Value::Object(Map::new()))
-        .as_object_mut()
-        .unwrap_or_else(|| panic!("fixture packument {field} is an object"))
-        .insert(key.to_string(), value);
-}
-
-fn now_iso() -> String {
-    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    build_storage(packages, out, substitutions, removed_fields);
 }
 
 fn workspace_root() -> PathBuf {
@@ -127,10 +140,8 @@ fn ensure_storage_for_fingerprint(packages: &Path, generated: &Path, storage: &P
     fs::create_dir_all(storage.parent().expect("registry fixture storage has parent"))
         .expect("create generated registry fixture storage dir");
     let temp = generated.join(scratch_name("storage.tmp"));
-    if temp.exists() {
-        fs::remove_dir_all(&temp).expect("remove stale temp registry fixture storage");
-    }
-    build_storage(packages, &temp, &[]);
+    remove_tree(&temp, "remove stale temp registry fixture storage");
+    build_storage(packages, &temp, &[], &[]);
     fs::write(temp.join(COMPLETE_FILE), "").expect("write registry fixture completion marker");
     publish_storage(generated, &temp, storage);
 }
@@ -172,7 +183,7 @@ fn discard_unusable_storage(generated: &Path, storage: &Path) {
         restore_claimed_storage(&claimed, storage);
         return;
     }
-    fs::remove_dir_all(&claimed).expect("remove unusable registry fixture storage");
+    remove_tree(&claimed, "remove unusable registry fixture storage");
 }
 
 /// Put a claimed tree back after it turned out to be complete.
@@ -183,7 +194,16 @@ fn discard_unusable_storage(generated: &Path, storage: &Path) {
 /// longer go back is redundant rather than lost, and gets dropped.
 fn restore_claimed_storage(claimed: &Path, storage: &Path) {
     if fs::rename(claimed, storage).is_err() {
-        fs::remove_dir_all(claimed).expect("remove redundant registry fixture storage");
+        remove_tree(claimed, "remove redundant registry fixture storage");
+    }
+}
+
+/// Remove `path` and its subtree, treating an absent path as removed.
+fn remove_tree(path: &Path, what: &str) {
+    match fs::remove_dir_all(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => panic!("{what} at {}: {error}", path.display()),
     }
 }
 
@@ -191,7 +211,7 @@ fn try_publish_storage(temp: &Path, storage: &Path) -> io::Result<()> {
     match fs::rename(temp, storage) {
         Ok(()) => Ok(()),
         Err(_) if storage.join(COMPLETE_FILE).exists() => {
-            fs::remove_dir_all(temp).expect("remove redundant registry fixture storage");
+            remove_tree(temp, "remove redundant registry fixture storage");
             Ok(())
         }
         Err(err) => Err(err),
@@ -206,6 +226,17 @@ fn scratch_name(prefix: &str) -> String {
 
 fn fixture_fingerprint(root: &Path) -> String {
     let mut hasher = Sha256::new();
+    // A storage tree built in another layout, or with metadata in another
+    // schema, must not be reused.
+    hasher.update(pnpr_storage::layout::LAYOUT_VERSION.to_le_bytes());
+    hasher.update(pnpr_storage::metadata::SqlMetadata::SCHEMA_VERSION.as_bytes());
+    hasher.update(pnpr_storage::metadata::SqlMetadata::SCHEMA_TABLES.as_bytes());
+    hasher.update([0]);
+    hasher.update(
+        local_archive_path(Path::new(""), "", Ecosystem::Npm, "sha512-00.1")
+            .to_string_lossy()
+            .as_bytes(),
+    );
     for entry in fixture_files(root) {
         let path = entry.path();
         let relative = path.strip_prefix(root).expect("fixture entry under root");
@@ -217,7 +248,12 @@ fn fixture_fingerprint(root: &Path) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn build_storage(fixtures_root: &Path, storage_root: &Path, substitutions: &[(&str, &str)]) {
+fn build_storage(
+    fixtures_root: &Path,
+    storage_root: &Path,
+    substitutions: &[(&str, &str)],
+    removed_fields: &[RemovedVersionField<'_>],
+) {
     let mut packages: HashMap<String, Package> = HashMap::new();
     for manifest_path in fixture_manifests(fixtures_root) {
         let version = PackageVersion::load(fixtures_root, &manifest_path, substitutions);
@@ -228,11 +264,34 @@ fn build_storage(fixtures_root: &Path, storage_root: &Path, substitutions: &[(&s
             .insert(version.version.clone(), version);
     }
     assert!(!packages.is_empty(), "no registry package fixtures found under {fixtures_root:?}");
+    let mut packuments = Vec::with_capacity(packages.len());
+    let mut archives = Vec::new();
     for package in packages.values_mut() {
         package.latest =
             latest_version(package.versions.keys()).expect("package has at least one version");
-        package.write(storage_root);
+        archives.extend(package.write_blobs(storage_root));
+        packuments.push((package.name.clone(), package.packument()));
     }
+    for removed in removed_fields {
+        remove_version_field(&mut packuments, removed);
+    }
+    write_local_layout_marker(storage_root).expect("write registry fixture layout marker");
+    metadata::write_packuments_with_archives(storage_root, packuments, archives);
+}
+
+fn remove_version_field(packuments: &mut [(String, Value)], removed: &RemovedVersionField<'_>) {
+    let RemovedVersionField { package, version, field } = *removed;
+    let (_, packument) = packuments
+        .iter_mut()
+        .find(|(name, _)| name == package)
+        .unwrap_or_else(|| panic!("no fixture package {package}"));
+    let removed = packument
+        .get_mut("versions")
+        .and_then(|versions| versions.get_mut(version))
+        .and_then(Value::as_object_mut)
+        .unwrap_or_else(|| panic!("{package} has no fixture version {version}"))
+        .remove(field);
+    assert!(removed.is_some(), "{package}@{version} has no {field} to remove");
 }
 
 struct Package {
@@ -246,18 +305,30 @@ impl Package {
         Self { name, latest: String::new(), versions: BTreeMap::new() }
     }
 
-    fn write(&self, storage_root: &Path) {
-        let package_dir = storage_root.join(&self.name);
-        fs::create_dir_all(&package_dir).expect("create test registry package storage dir");
+    /// Store every version's tarball as the first incarnation of its bytes,
+    /// and return the mapping of each to them, which the metadata commits.
+    fn write_blobs(&self, storage_root: &Path) -> Vec<ArtifactBlob> {
+        let mut archives = Vec::with_capacity(self.versions.len());
+        let name = pnpr_package_name::CanonicalPackageName::parse(&self.name, Ecosystem::Npm)
+            .unwrap_or_else(|error| panic!("package name {:?}: {error}", self.name));
         for version in self.versions.values() {
-            fs::write(package_dir.join(&version.tarball_name), &version.tarball)
+            let blob =
+                BlobRef { id: BlobId::of_bytes(Ecosystem::Npm, &version.tarball), incarnation: 1 };
+            let path = local_archive_path(storage_root, "", Ecosystem::Npm, &blob.key());
+            fs::create_dir_all(path.parent().expect("an archive has a directory"))
+                .expect("create test registry archive dir");
+            fs::write(&path, &version.tarball)
                 .expect("write fixture tarball to test registry storage");
+            archives.push(ArtifactBlob {
+                ecosystem: Ecosystem::Npm,
+                name: name.as_str().to_string(),
+                version: version.version.clone(),
+                artifact: version.tarball_name.clone(),
+                blob,
+                size: version.tarball.len() as u64,
+            });
         }
-        fs::write(
-            package_dir.join("package.json"),
-            serde_json::to_vec(&self.packument()).expect("serialize fixture packument"),
-        )
-        .expect("write fixture packument to test registry storage");
+        archives
     }
 
     fn packument(&self) -> Value {

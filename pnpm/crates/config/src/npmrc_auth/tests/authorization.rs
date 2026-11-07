@@ -8,7 +8,7 @@ use super::{
 fn ignores_non_auth_keys() {
     // `Config::new()` reads `PNPM_HOME` / `XDG_DATA_HOME` via the
     // SmartDefault expression on `Config::store_dir` —
-    // `default_store_dir::<Host, _, _, _>(home::home_dir,
+    // `default_store_dir::<Host, _, _, _>(crate::home_dir,
     // env::current_dir)` — to compute `store_dir`. Both values come
     // from the real process environment, but no other test in this
     // crate mutates them anymore — the per-branch tests in
@@ -713,11 +713,64 @@ fn from_project_ini_warns_on_auth_env_placeholder() {
         "expected auth warning but got: {:?}",
         auth.warnings,
     );
+    let warning = auth.warnings
+        .iter()
+        .find(|w| w.contains("Ignored project-level auth setting"))
+        .unwrap();
+    eprintln!("warning={warning}");
+    assert!(warning.contains("https://pnpm.io/npmrc"));
+    assert!(!warning.contains("secret"));
     assert_eq!(
         default_auth_token(&auth, "//registry.npmjs.org/"),
         None,
         "token must not be set when project .npmrc is untrusted",
     );
+}
+
+#[test]
+fn ignored_auth_warning_redacts_protocol_relative_userinfo() {
+    static_env!(Env, &[("MY_TOKEN", "secret")]);
+
+    let auth = NpmrcAuth::from_project_ini::<Env>(
+        "//user:password@registry.npmjs.org/:_authToken=${MY_TOKEN}\n",
+        Path::new(""),
+    );
+    let warning = auth.warnings
+        .iter()
+        .find(|warning| warning.contains("Ignored project-level auth setting"))
+        .expect("ignored auth warning");
+
+    assert!(warning.contains("//registry.npmjs.org/:_authToken"));
+    assert!(!warning.contains("user:password"));
+
+    let malformed = NpmrcAuth::from_project_ini::<Env>(
+        "//user:pa/ss@registry.npmjs.org/:_authToken=${MY_TOKEN}\n",
+        Path::new(""),
+    );
+    let warning = malformed.warnings
+        .iter()
+        .find(|warning| warning.contains("Ignored project-level auth setting"))
+        .expect("ignored malformed auth warning");
+    assert!(warning.contains("[hidden]"));
+    assert!(!warning.contains("user:pa"));
+    assert!(!warning.contains("ss@registry"));
+}
+
+#[test]
+fn ignored_request_destination_warning_redacts_protocol_relative_userinfo() {
+    static_env!(Env, &[("REGISTRY_PATH", "npm")]);
+
+    let auth = NpmrcAuth::from_project_ini::<Env>(
+        "//user:password@registry.example.com/${REGISTRY_PATH}/:_authToken=abc\n",
+        Path::new(""),
+    );
+    let warning = auth.warnings
+        .iter()
+        .find(|warning| warning.contains("Ignored project-level request destination"))
+        .expect("ignored request destination warning");
+
+    assert!(warning.contains("//registry.example.com/${REGISTRY_PATH}/:_authToken"));
+    assert!(!warning.contains("user:password"));
 }
 
 #[test]
@@ -727,16 +780,76 @@ fn from_ini_expands_auth_env_placeholder_without_warning() {
     let auth =
         NpmrcAuth::from_ini::<Env>("//registry.npmjs.org/:_authToken=${MY_TOKEN}\n", Path::new(""));
 
-    assert!(
-        !auth.warnings
-            .iter()
-            .any(|w| w.contains("Ignored project-level auth setting")),
-        "unexpected auth warning: {:?}",
-        auth.warnings,
-    );
+    assert!(auth.warnings.is_empty(), "unexpected auth warning: {:?}", auth.warnings);
     assert_eq!(
         default_auth_token(&auth, "//registry.npmjs.org/"),
         Some(Some("secret")),
         "token must be expanded when the file is trusted via PNPM_CONFIG_NPMRC_AUTH_FILE",
+    );
+}
+
+#[test]
+fn from_ini_warns_on_empty_auth_env_placeholder() {
+    static_env!(Env, &[("MY_TOKEN", "")]);
+
+    let auth =
+        NpmrcAuth::from_ini::<Env>("//registry.npmjs.org/:_authToken=${MY_TOKEN}\n", Path::new(""));
+
+    assert_eq!(
+        auth.warnings,
+        vec![r#"Failed to replace env in config: ${MY_TOKEN} in .npmrc key "_authToken""#],
+    );
+    assert_eq!(default_auth_token(&auth, "//registry.npmjs.org/"), Some(Some("")));
+}
+
+#[test]
+fn from_ini_expands_optional_auth_env_placeholder_without_warning() {
+    static_env!(Env, &[("SET_TOKEN", "secret"), ("EMPTY_TOKEN", "")]);
+
+    for (variable, expected) in
+        [("SET_TOKEN", "secret"), ("EMPTY_TOKEN", ""), ("MISSING_TOKEN", "")]
+    {
+        let auth = NpmrcAuth::from_ini::<Env>(
+            &format!("//registry.npmjs.org/:_authToken=${{{variable}?}}\n"),
+            Path::new(""),
+        );
+
+        assert!(auth.warnings.is_empty(), "unexpected warning for {variable}: {:?}", auth.warnings);
+        assert_eq!(default_auth_token(&auth, "//registry.npmjs.org/"), Some(Some(expected)));
+    }
+}
+
+#[test]
+fn from_ini_warns_with_expanded_auth_key() {
+    static_env!(
+        Env,
+        &[
+            ("AUTH_KEY", "//registry.example/:_authToken"),
+            ("EMPTY_TOKEN", ""),
+            ("SET_TOKEN", "dummy-token"),
+        ]
+    );
+    for variable in ["MISSING_TOKEN", "EMPTY_TOKEN", "SET_TOKEN"] {
+        let auth =
+            NpmrcAuth::from_ini::<Env>(&format!("${{AUTH_KEY}}=${{{variable}}}\n"), Path::new(""));
+        let expected = if variable == "SET_TOKEN" {
+            vec![]
+        } else {
+            vec![format!(
+                r#"Failed to replace env in config: ${{{variable}}} in .npmrc key "_authToken""#,
+            )]
+        };
+        assert_eq!(auth.warnings, expected);
+    }
+}
+
+/// `pnpm login` and the `ini` package write a key holding `=` as a JSON string.
+#[test]
+fn reads_a_json_quoted_credential_key() {
+    let ini = "\"//registry.example/npm=private/:_authToken\"=quoted-key-token\n";
+    let auth = NpmrcAuth::from_ini::<NoEnv>(ini, Path::new(""));
+    assert_eq!(
+        default_auth_token(&auth, "//registry.example/npm=private/"),
+        Some(Some("quoted-key-token")),
     );
 }

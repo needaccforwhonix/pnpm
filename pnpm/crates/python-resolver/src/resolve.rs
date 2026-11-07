@@ -1,4 +1,15 @@
-use crate::{metadata::WheelMetadata, packages::Packages};
+pub use sources::active_locked_sources;
+
+mod explain;
+mod rules;
+mod sources;
+
+use crate::{
+    candidates::{Refusal, read_requirement},
+    metadata::WheelMetadata,
+    packages::Packages,
+    requires_python::declared_range,
+};
 use miette::{Result, bail};
 use pep440_rs::Version;
 use pep508_rs::{ExtraName, MarkerEnvironment, PackageName, Requirement, VersionOrUrl};
@@ -29,9 +40,13 @@ impl fmt::Display for Package {
 #[derive(Debug)]
 pub enum Step {
     Solved(BTreeMap<PackageName, Version>),
+    /// The tentative sources cannot satisfy the selected dependency graph.
+    Backtrack(String),
     /// The versions this index offers of a distribution nothing has read
     /// yet — see [`crate::candidates_from_page`].
     NeedCandidates(PackageName),
+    /// An explicit source that must win over index candidates.
+    NeedUrl(PackageName, String),
     /// The `METADATA` of one wheel — see [`WheelMetadata::parse`].
     NeedMetadata(PackageName, Version),
 }
@@ -39,8 +54,10 @@ pub enum Step {
 #[derive(Debug)]
 enum Needed {
     Candidates(PackageName),
+    Url(PackageName, String),
     Metadata(PackageName, Version),
     Invalid(String),
+    RejectedSource(String),
 }
 
 impl fmt::Display for Needed {
@@ -95,13 +112,13 @@ impl DependencyProvider for Provider<'_> {
         version: &Version,
     ) -> std::result::Result<Dependencies<Package, Self::VS, String>, Needed> {
         let mut constraints = BTreeMap::<Package, Ranges<Version>>::new();
-        match package {
-            Package::Root => self.constraints(self.requirements, &[], &mut constraints)?,
+        let result = match package {
+            Package::Root => self.constraints(self.requirements, &[], &mut constraints),
             Package::Distribution(name, extra) => {
                 let metadata = self.packages.metadata
                     .get(&(name.clone(), version.clone()))
                     .ok_or_else(|| Needed::Metadata(name.clone(), version.clone()))?;
-                if let Some(unusable) = self.incompatible_interpreter(metadata)? {
+                if let Some(unusable) = self.incompatible_interpreter(metadata) {
                     return Ok(Dependencies::Unavailable(unusable));
                 }
                 let extras = extra
@@ -109,16 +126,7 @@ impl DependencyProvider for Provider<'_> {
                     .into_iter()
                     .collect::<Vec<_>>();
                 if let Some(extra) = extra {
-                    if !metadata.provides_extra
-                        .iter()
-                        .any(|provided| {
-                            provided
-                                .parse::<ExtraName>()
-                                .ok()
-                                .as_ref()
-                                == Some(extra)
-                        })
-                    {
+                    if !provides_extra(metadata, extra) {
                         return Ok(Dependencies::Unavailable(format!(
                             "extra {extra} is not provided",
                         )));
@@ -128,40 +136,120 @@ impl DependencyProvider for Provider<'_> {
                         Ranges::singleton(version.clone()),
                     );
                 }
-                let requirements = metadata_requirements(metadata)?;
-                self.constraints(&requirements, &extras, &mut constraints)?;
+                let requirements = match metadata_requirements(metadata) {
+                    Ok(requirements) => requirements,
+                    Err(refusal) => return unusable_release(refusal),
+                };
+                self.constraints(&requirements, &extras, &mut constraints)
             }
-        }
-        Ok(Dependencies::Available(DependencyConstraints::from_iter(constraints)))
+        };
+        source_dependencies(result, constraints)
     }
 }
 
+fn source_dependencies(
+    result: std::result::Result<(), Needed>,
+    constraints: BTreeMap<Package, Ranges<Version>>,
+) -> std::result::Result<Dependencies<Package, Ranges<Version>, String>, Needed> {
+    match result {
+        Err(Needed::RejectedSource(message)) => Ok(Dependencies::Unavailable(message)),
+        Err(error) => Err(error),
+        Ok(()) => Ok(Dependencies::Available(DependencyConstraints::from_iter(constraints))),
+    }
+}
+
+fn provides_extra(metadata: &WheelMetadata, extra: &ExtraName) -> bool {
+    metadata.provides_extra
+        .iter()
+        .any(|provided| {
+            provided
+                .parse::<ExtraName>()
+                .ok()
+                .as_ref()
+                == Some(extra)
+        })
+}
+
+/// What a release whose requirements pnpm cannot use offers the solver: a
+/// version to pass over, when one of its requirements is unreadable, and
+/// nothing at all when it names a requirement pnpm does not implement,
+/// which every release declaring it would name too.
+fn unusable_release(
+    refusal: Refusal,
+) -> std::result::Result<Dependencies<Package, Ranges<Version>, String>, Needed> {
+    match refusal {
+        Refusal::Unreadable(error) => Ok(Dependencies::Unavailable(format!(
+            "because its metadata declares a requirement pnpm cannot read: {error}",
+        ))),
+        Refusal::Unsupported(requirement) => Err(Needed::Invalid(format!(
+            "unsupported scheme in direct URL Python requirement: {requirement}",
+        ))),
+    }
+}
+
+/// The requirements a wheel declares, or the reason pnpm cannot use them.
+/// A requirement pnpm does not implement outranks one it cannot read
+/// wherever the two appear, so what a release costs a project does not
+/// depend on the order its metadata happens to list them in.
 fn metadata_requirements(
     metadata: &WheelMetadata,
-) -> std::result::Result<Vec<Requirement>, Needed> {
-    metadata.requires_dist
-        .iter()
-        .map(|requirement| {
-            crate::candidates::parse_requirement(requirement)
-                .map_err(|error| Needed::Invalid(error.to_string()))
-        })
-        .collect::<std::result::Result<Vec<_>, _>>()
+) -> std::result::Result<Vec<Requirement>, Refusal> {
+    let mut requirements = Vec::with_capacity(metadata.requires_dist.len());
+    let mut unreadable = None;
+    for declared in &metadata.requires_dist {
+        match read_requirement(declared) {
+            Ok(requirement) => requirements.push(requirement),
+            Err(unsupported @ Refusal::Unsupported(_)) => return Err(unsupported),
+            Err(refusal) => unreadable = unreadable.or(Some(refusal)),
+        }
+    }
+    unreadable.map_or(Ok(requirements), Err)
 }
 
 impl Provider<'_> {
+    fn check_source(&self, requirement: &Requirement) -> std::result::Result<(), Needed> {
+        let Some(VersionOrUrl::Url(url)) = &requirement.version_or_url else { return Ok(()) };
+        let source = url.as_str();
+        if self.packages.rejected_sources.contains(&(requirement.name.clone(), source.to_string()))
+        {
+            return Err(Needed::RejectedSource(format!(
+                "unavailable Python source for {}",
+                requirement.name,
+            )));
+        }
+        let parsed =
+            crate::Source::parse(source).map_err(|error| Needed::Invalid(error.to_string()))?;
+        if let Some(chosen) = self.packages.direct_urls.get(&requirement.name) {
+            let chosen_source =
+                crate::Source::parse(chosen).map_err(|error| Needed::Invalid(error.to_string()))?;
+            if !chosen_source.compatible_with(&parsed) {
+                return Err(Needed::RejectedSource(format!(
+                    "conflicting Python sources for {}",
+                    requirement.name,
+                )));
+            }
+        }
+        if self.packages.candidates
+            .get(&requirement.name)
+            .is_some_and(|versions| {
+                !versions.is_empty()
+                    && versions
+                        .values()
+                        .all(|candidate| candidate.matches_source(&parsed))
+            })
+        {
+            return Ok(());
+        }
+        Err(Needed::Url(requirement.name.clone(), source.to_string()))
+    }
+
     /// Why this interpreter cannot use the wheel, when it cannot: a
     /// `Requires-Python` the running interpreter is outside of.
-    fn incompatible_interpreter(
-        &self,
-        metadata: &WheelMetadata,
-    ) -> std::result::Result<Option<String>, Needed> {
-        let Some(specifier) = &metadata.requires_python else { return Ok(None) };
-        let specifier: pep440_rs::VersionSpecifiers = specifier
-            .parse()
-            .map_err(|error| Needed::Invalid(format!("invalid Requires-Python: {error}")))?;
-        Ok((!specifier.contains(self.environment.python_full_version())).then(|| {
+    fn incompatible_interpreter(&self, metadata: &WheelMetadata) -> Option<String> {
+        let specifier = metadata.requires_python.as_deref().and_then(declared_range)?;
+        (!specifier.contains(self.environment.python_full_version())).then(|| {
             "incompatible Python interpreter".to_string()
-        }))
+        })
     }
 
     fn constraints(
@@ -170,32 +258,27 @@ impl Provider<'_> {
         extras: &[ExtraName],
         constraints: &mut BTreeMap<Package, Ranges<Version>>,
     ) -> std::result::Result<(), Needed> {
-        for requirement in requirements {
+        let is_url = |requirement: &&Requirement| {
+            matches!(requirement.version_or_url, Some(VersionOrUrl::Url(_)))
+        };
+        for requirement in requirements
+            .iter()
+            .filter(is_url)
+            .chain(
+                requirements
+                    .iter()
+                    .filter(|requirement| !is_url(requirement)),
+            )
+        {
             if !requirement.marker.evaluate(self.environment, extras) {
                 continue;
             }
-            let candidates = self.packages.candidates
-                .get(&requirement.name)
-                .ok_or_else(|| Needed::Candidates(requirement.name.clone()))?;
-            let specifiers = requirement_specifiers(requirement)?;
-            let matched = candidates
-                .keys()
-                .filter(|version| specifiers.is_none_or(|specifiers| specifiers.contains(version)))
-                .collect::<Vec<_>>();
-            let allow_prerelease = specifiers.is_some_and(|specifiers| {
-                specifiers.iter().any(pep440_rs::VersionSpecifier::any_prerelease)
-            }) || matched.iter().all(|version| version.any_prerelease());
-            let range = matched
-                .into_iter()
-                .filter(|version| allow_prerelease || !version.any_prerelease())
-                .fold(Ranges::empty(), |range, version| {
-                    range.union(&Ranges::singleton(version.clone()))
-                });
+            self.check_source(requirement)?;
+            let range = self.requirement_range(requirement, extras)?;
             for extra in std::iter::once(None)
                 .chain(
-                    requirement.extras
-                        .iter()
-                        .cloned()
+                    self.requirement_extras(requirement, extras)
+                        .into_iter()
                         .map(Some),
                 )
             {
@@ -208,18 +291,6 @@ impl Provider<'_> {
         }
         Ok(())
     }
-}
-
-fn requirement_specifiers(
-    requirement: &Requirement,
-) -> std::result::Result<Option<&pep440_rs::VersionSpecifiers>, Needed> {
-    Ok(match &requirement.version_or_url {
-        Some(VersionOrUrl::VersionSpecifier(specifiers)) => Some(specifiers),
-        None => None,
-        Some(VersionOrUrl::Url(_)) => {
-            return Err(Needed::Invalid("Python URL requirements are not supported".to_string()));
-        }
-    })
 }
 
 /// Run one pubgrub pass over what `packages` holds so far.
@@ -235,18 +306,33 @@ pub fn step(
 ) -> Result<Step> {
     let provider = Provider { packages, requirements, environment };
     match pubgrub::resolve(&provider, Package::Root, Version::new([0])) {
-        Ok(solution) => Ok(Step::Solved(distributions(solution))),
+        Ok(solution) => {
+            if sources::has_inactive_source(&provider, &solution)? {
+                return Ok(Step::Backtrack(
+                    "Python dependency resolution selected an inactive source".to_string(),
+                ));
+            }
+            Ok(Step::Solved(distributions(solution)))
+        }
         Err(
             PubGrubError::ErrorRetrievingDependencies { source, .. }
             | PubGrubError::ErrorChoosingVersion { source, .. }
             | PubGrubError::ErrorInShouldCancel(source),
         ) => match source {
             Needed::Candidates(name) => Ok(Step::NeedCandidates(name)),
+            Needed::Url(name, url) => Ok(Step::NeedUrl(name, url)),
             Needed::Metadata(name, version) => Ok(Step::NeedMetadata(name, version)),
-            Needed::Invalid(message) => bail!("{message}"),
+            Needed::Invalid(message) | Needed::RejectedSource(message) => bail!("{message}"),
         },
         Err(PubGrubError::NoSolution(tree)) => {
-            bail!("Python dependency resolution failed:\n{}", report_no_solution(tree));
+            let message = format!(
+                "Python dependency resolution failed:\n{}",
+                report_no_solution(tree, packages),
+            );
+            if !packages.direct_urls.is_empty() {
+                return Ok(Step::Backtrack(message));
+            }
+            bail!("{message}");
         }
     }
 }
@@ -261,9 +347,17 @@ pub fn locked_solution(
 ) -> Result<BTreeMap<PackageName, Version>> {
     let provider = Provider { packages, requirements, environment };
     match pubgrub::resolve(&provider, Package::Root, Version::new([0])) {
-        Ok(solution) => Ok(distributions(solution)),
+        Ok(solution) => {
+            if sources::has_inactive_source(&provider, &solution)? {
+                bail!("Python lockfile selected an inactive source");
+            }
+            Ok(distributions(solution))
+        }
         Err(PubGrubError::NoSolution(tree)) => {
-            bail!("Python lockfile does not satisfy the project:\n{}", report_no_solution(tree));
+            bail!(
+                "Python lockfile does not satisfy the project:\n{}",
+                report_no_solution(tree, packages),
+            );
         }
         Err(error) => bail!("Python lockfile does not satisfy the project: {error:?}"),
     }
@@ -296,7 +390,16 @@ fn distributions(
         .collect()
 }
 
-fn report_no_solution(mut tree: DerivationTree<Package, Ranges<Version>, String>) -> String {
+/// pubgrub's own explanation, with a line for each distribution it was
+/// left with no version of.
+fn report_no_solution(
+    mut tree: DerivationTree<Package, Ranges<Version>, String>,
+    packages: &Packages,
+) -> String {
     tree.collapse_no_versions();
-    DefaultStringReporter::report(&tree)
+    format!(
+        "{}{}",
+        DefaultStringReporter::report(&tree),
+        explain::unoffered_distributions(&tree, packages),
+    )
 }

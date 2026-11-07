@@ -17,13 +17,16 @@ pnpr-policy = { workspace = true }
 pnpr-registry = { workspace = true }
 pnpm-config-dir = { workspace = true }
 pnpm-env-replace = { workspace = true }
+pnpm-transparency-log = { workspace = true }
 getrandom = { workspace = true }
 home = { workspace = true }
 indexmap = { workspace = true }
 object_store = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 serde-saphyr = { workspace = true }
+sha2 = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
 

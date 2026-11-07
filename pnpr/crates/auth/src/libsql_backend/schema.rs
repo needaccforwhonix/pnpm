@@ -1,6 +1,8 @@
 use super::{
-    Connection, Duration, LibsqlError, RegistryError, Result, TransactionBehavior, params,
+    Connection, Duration, RegistryError, Result, TransactionBehavior, first_row,
+    is_unique_violation, params,
 };
+use pnpr_libsql::is_transaction_conflict;
 
 /// Take one slot of the capped user counter, reporting whether the cap left
 /// one to take.
@@ -18,20 +20,25 @@ pub(super) async fn claim_user_counter_slot(tx: &libsql::Transaction, max: u64) 
     Ok(updated > 0)
 }
 
-pub(super) async fn init_schema(conn: &Connection) -> Result<()> {
-    conn.execute(super::super::USERS_TABLE_SQL, ()).await?;
-    conn.execute(super::super::token_store::TOKENS_TABLE_SQL, ()).await?;
-    conn.execute(super::super::token_store::TOKENS_INDEX_SQL, ()).await?;
-    conn.execute(super::super::AUTH_COUNTERS_TABLE_SQL, ()).await?;
-    ensure_user_counter(conn).await
+/// Create the schema and seed the user counter. `sync` is
+/// [`crate::schema::migrate_libsql`]'s.
+pub(super) async fn init_schema<SyncFuture>(
+    conn: &Connection,
+    sync: impl Fn() -> SyncFuture + Send + Sync,
+) -> Result<()>
+where
+    SyncFuture: Future<Output = Result<()>> + Send,
+{
+    crate::schema::migrate_libsql(conn, &sync).await?;
+    ensure_user_counter(conn).await?;
+    sync().await
 }
 
 pub(super) async fn ensure_user_counter(conn: &Connection) -> Result<()> {
-    let mut rows = conn.query("SELECT COUNT(*) FROM users", ()).await?;
-    let Some(row) = rows.next().await? else {
+    let rows = conn.query("SELECT COUNT(*) FROM users", ()).await?;
+    let Some(count) = first_row(rows, |row| Ok(row.get::<i64>(0)?)).await? else {
         return Err(missing_count_row());
     };
-    let count: i64 = row.get(0)?;
     let tx = conn.transaction().await?;
     let inserted = tx.execute(
         "INSERT INTO auth_counters (name, value) VALUES (?1, ?2)",
@@ -59,21 +66,16 @@ pub(super) async fn ensure_user_counter(conn: &Connection) -> Result<()> {
 
 pub(super) async fn reconcile_user_counter_overcount(conn: &Connection) -> Result<bool> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).await?;
-    let mut counter_rows =
+    let counter_rows =
         tx.query("SELECT value FROM auth_counters WHERE name = ?1", params!["users"]).await?;
-    let Some(counter_row) = counter_rows.next().await? else {
-        drop(counter_rows);
+    let Some(counter) = first_row(counter_rows, |row| Ok(row.get::<i64>(0)?)).await? else {
         tx.commit().await?;
         return Ok(false);
     };
-    let counter: i64 = counter_row.get(0)?;
-    drop(counter_rows);
-    let mut count_rows = tx.query("SELECT COUNT(*) FROM users", ()).await?;
-    let Some(count_row) = count_rows.next().await? else {
+    let count_rows = tx.query("SELECT COUNT(*) FROM users", ()).await?;
+    let Some(count) = first_row(count_rows, |row| Ok(row.get::<i64>(0)?)).await? else {
         return Err(missing_count_row());
     };
-    let count: i64 = count_row.get(0)?;
-    drop(count_rows);
     if counter <= count {
         tx.commit().await?;
         return Ok(false);
@@ -104,40 +106,6 @@ where
             }
             Err(error) => return Err(error),
         }
-    }
-}
-
-pub(super) fn is_transaction_conflict(error: &LibsqlError) -> bool {
-    match error {
-        LibsqlError::SqliteFailure(code, _) | LibsqlError::RemoteSqliteFailure(_, code, _) => {
-            matches!(code & 0xff, 5 | 6)
-        }
-        LibsqlError::Hrana(error) => {
-            // libsql does not expose Hrana's structured error type publicly.
-            let message = error.to_string();
-            let Some((_, code)) = message.rsplit_once(r#"code: ""#) else {
-                return false;
-            };
-            let Some((code, _)) = code.split_once('"') else {
-                return false;
-            };
-            matches!(code, "SQLITE_BUSY" | "SQLITE_LOCKED")
-                || code.starts_with("SQLITE_BUSY_")
-                || code.starts_with("SQLITE_LOCKED_")
-        }
-        _ => false,
-    }
-}
-
-pub(super) fn is_unique_violation(err: &LibsqlError) -> bool {
-    match err {
-        LibsqlError::SqliteFailure(code, message) => {
-            *code == 19 || *code == 2067 || message.contains("UNIQUE constraint failed")
-        }
-        LibsqlError::RemoteSqliteFailure(_, code, message) => {
-            *code == 19 || *code == 2067 || message.contains("UNIQUE constraint failed")
-        }
-        _ => false,
     }
 }
 

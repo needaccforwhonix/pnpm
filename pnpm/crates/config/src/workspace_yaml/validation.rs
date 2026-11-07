@@ -1,8 +1,8 @@
 use super::{
-    IgnoredAny, IndexMap, LoadWorkspaceYamlError, Path, RemoteSideEffectsCacheSettings,
-    SCHEMA_DIRECTIVE_KEY, SideEffectsCacheSetting, TaskSettings, WorkspaceKeyIssues,
-    WorkspaceSettings, is_camel_case, is_known_setting_key, is_refused_by_a_project_manifest,
-    registries,
+    IgnoredAny, IndexMap, LoadWorkspaceYamlError, NAMED_UNRECOGNIZED_SETTINGS, Path,
+    RemoteSideEffectsCacheSettings, SCHEMA_DIRECTIVE_KEY, SideEffectsCacheSetting, TaskSettings,
+    UnrecognizedSettings, WorkspaceKeyIssues, WorkspaceSettings, is_camel_case,
+    is_known_setting_key, is_refused_by_a_project_manifest, registries,
 };
 
 impl WorkspaceSettings {
@@ -13,6 +13,31 @@ impl WorkspaceSettings {
     /// `serde_saphyr` renders the offending source line verbatim under its
     /// errors, so rejecting at parse time would print the very credential
     /// being rejected into the terminal and any CI log.
+    /// Validate the sections the checks below cover. With `skip_invalid`, a
+    /// section that fails is left out instead, so one this pnpm rejects does
+    /// not take the file's other settings with it (see
+    /// [`crate::Config::settings_read`]).
+    pub(super) fn validate_sections(
+        &mut self,
+        skip_invalid: bool,
+    ) -> Result<(), LoadWorkspaceYamlError> {
+        if !skip_invalid {
+            self.validate_registries()?;
+            self.validate_tasks()?;
+            return self.validate_pipelines();
+        }
+        if self.validate_registries().is_err() {
+            self.registries = None;
+        }
+        if self.validate_tasks().is_err() {
+            self.tasks = None;
+        }
+        if self.validate_pipelines().is_err() {
+            self.pipelines = None;
+        }
+        Ok(())
+    }
+
     pub(super) fn validate_registries(&self) -> Result<(), LoadWorkspaceYamlError> {
         let Some(entries) = self.registries.as_ref() else { return Ok(()) };
         registries::validate(entries)
@@ -30,26 +55,30 @@ impl WorkspaceSettings {
         Ok(())
     }
 
-    /// One task's settings: an unrecognized field, a non-positive
-    /// concurrency, or an empty `dependsOn` entry is a hard error.
+    /// One task's settings: a non-positive concurrency, a group name that
+    /// cannot be a slot directory, a non-integer `priority`, or an empty
+    /// `dependsOn` entry is a hard error. A field this version does not
+    /// read is not — see [`Self::take_unknown_task_settings`].
     pub(super) fn validate_task(
         task: &str,
         settings: &TaskSettings,
     ) -> Result<(), LoadWorkspaceYamlError> {
-        if let Some(field) = settings.unknown.keys().next() {
-            return Err(LoadWorkspaceYamlError::UnknownTaskSettingField {
+        if let Some(error) = invalid_task_concurrency(task, settings) {
+            return Err(error);
+        }
+        if let Some(priority) = settings.invalid_priority.as_ref() {
+            return Err(LoadWorkspaceYamlError::InvalidTaskPriority {
                 task: task.to_string(),
-                field: field.clone(),
+                priority: priority.to_string(),
             });
         }
-        let concurrency = settings.concurrency
-            .filter(|concurrency| *concurrency < 1)
-            .map(|concurrency| concurrency.to_string())
-            .or_else(|| settings.invalid_concurrency.as_ref().map(ToString::to_string));
-        if let Some(concurrency) = concurrency {
-            return Err(LoadWorkspaceYamlError::InvalidTaskConcurrency {
+        if let Some(group) = settings.concurrency_group
+            .as_deref()
+            .filter(|group| !is_valid_concurrency_group_name(group))
+        {
+            return Err(LoadWorkspaceYamlError::InvalidTaskConcurrencyGroup {
                 task: task.to_string(),
-                concurrency,
+                group: group.to_string(),
             });
         }
         for entry in settings.depends_on.iter().flatten() {
@@ -61,6 +90,36 @@ impl WorkspaceSettings {
             }
         }
         Ok(())
+    }
+
+    /// Take the fields of the `tasks` entries this version of pnpm does not
+    /// read, as the paths that name them. A project may pin a pnpm that
+    /// reads them, so they are reported rather than refused.
+    ///
+    /// Taking them is what makes the report true: a field left in place
+    /// would reach the configuration record and be printed back by
+    /// `pnpm config`, as a setting pnpm had said it ignored. An entry that
+    /// carried nothing else goes with them, so a setting this pnpm does not
+    /// read cannot quietly reorder its tasks.
+    fn take_unknown_task_settings(&mut self) -> UnrecognizedSettings {
+        let mut report = UnrecognizedSettings::default();
+        let Some(tasks) = self.tasks.as_mut() else { return report };
+        tasks.retain(|task, settings| {
+            if settings.unknown.is_empty() {
+                return true;
+            }
+            report.total += settings.unknown.len();
+            let named = settings.unknown
+                .keys()
+                .take(NAMED_UNRECOGNIZED_SETTINGS.saturating_sub(report.named.len()));
+            report.named.extend(named.map(|field| format!("tasks['{task}'].{field}")));
+            settings.unknown.clear();
+            // An entry left with nothing declares nothing, and a task with no
+            // entry is the one that keeps the default `^<name>` ordering. A
+            // setting the running pnpm cannot read must not reorder tasks.
+            *settings != TaskSettings::default()
+        });
+        report
     }
 
     /// The `pipelines` section feeds `pnpm pipeline`'s task requests, which
@@ -107,7 +166,27 @@ impl WorkspaceSettings {
             let Some(settings) = setting else { continue };
             Self::reject_machine_only_fields(settings, prefix, path)?;
         }
-        Ok(())
+        self.reject_machine_only_remote_cache_fields(path)
+    }
+
+    /// The token and everything that describes signing belong to the
+    /// machine, for the reasons [`Self::reject_repo_controlled_trust_material`]
+    /// gives for `sideEffectsCache.remote`.
+    fn reject_machine_only_remote_cache_fields(
+        &self,
+        path: &Path,
+    ) -> Result<(), LoadWorkspaceYamlError> {
+        let Some(settings) = self.remote_cache.as_ref() else {
+            return Ok(());
+        };
+        let Some((field, _)) = settings
+            .machine_only_fields()
+            .into_iter()
+            .find(|(_, is_set)| *is_set)
+        else {
+            return Ok(());
+        };
+        Err(LoadWorkspaceYamlError::WorkspaceRemoteCacheTrust { path: path.to_path_buf(), field })
     }
 
     pub(super) fn reject_machine_only_fields(
@@ -137,19 +216,31 @@ impl WorkspaceSettings {
 
     /// Bucket the file's keys that set nothing into [`Self::key_issues`],
     /// under the project-file rules: refused values, keys naming no setting
-    /// any supported pnpm reads, and kebab-case spellings of known settings.
+    /// any supported pnpm reads, kebab-case spellings of known settings, and
+    /// the `tasks` entries' own unknown fields.
     /// Reporting is the caller's job — how severe an unrecognized key is
     /// depends on whether the running pnpm is the project's pinned version,
     /// which only the CLI layer knows.
     pub fn collect_key_issues(&mut self, text: &str) {
+        let unrecognized_task_settings = self.take_unknown_task_settings();
+        let unrecognized_permissions = self.take_unknown_permissions();
+        let mut issues = Self::top_level_key_issues(text);
+        issues.unrecognized_task_settings = unrecognized_task_settings;
+        issues.unrecognized_permissions = unrecognized_permissions;
+        self.key_issues = issues;
+    }
+
+    /// The top-level keys of `text` that set nothing, in the buckets
+    /// they are reported under.
+    fn top_level_key_issues(text: &str) -> WorkspaceKeyIssues {
+        let mut issues = WorkspaceKeyIssues::default();
         if !Self::may_have_key_issues(text) {
-            return;
+            return issues;
         }
         let Ok(document) = serde_saphyr::from_str::<IndexMap<String, Option<IgnoredAny>>>(text)
         else {
-            return;
+            return issues;
         };
-        let mut issues = WorkspaceKeyIssues::default();
         for key in document
             .iter()
             .filter(|(_, value)| value.is_some())
@@ -166,7 +257,7 @@ impl WorkspaceSettings {
                 issues.non_camel_case.push(key.clone());
             }
         }
-        self.key_issues = issues;
+        issues
     }
 
     /// Whether `text` may carry a key [`WorkspaceSettings::collect_key_issues`]
@@ -175,7 +266,7 @@ impl WorkspaceSettings {
     /// Serde keeps no record of the keys it dropped, so collecting them means
     /// re-reading the document — which costs as much as the parse that
     /// produced the settings, on every command, to find nothing in the
-    /// overwhelmingly common case of a file that is simply correct.
+    /// overwhelmingly common case of a file that is correct.
     ///
     /// The top-level keys are the least indented lines of the document, since
     /// everything a key nests under it is indented further; the root mapping
@@ -217,4 +308,38 @@ impl WorkspaceSettings {
                         || is_refused_by_a_project_manifest(key))
             })
     }
+}
+
+fn invalid_task_concurrency(task: &str, settings: &TaskSettings) -> Option<LoadWorkspaceYamlError> {
+    let concurrency = settings.concurrency
+        .filter(|concurrency| *concurrency < 1)
+        .map(|concurrency| concurrency.to_string())
+        .or_else(|| settings.invalid_concurrency.as_ref().map(ToString::to_string))?;
+    Some(LoadWorkspaceYamlError::InvalidTaskConcurrency { task: task.to_string(), concurrency })
+}
+
+/// A group name becomes the name of the group's slot directory under the
+/// state directory, so it is held to a portable file name that cannot
+/// leave that directory: the Windows device names are refused whatever
+/// follows their first dot, and a trailing dot would be dropped there.
+fn is_valid_concurrency_group_name(group: &str) -> bool {
+    !group.is_empty()
+        && !group.ends_with('.')
+        && group
+            .chars()
+            .all(|char| char.is_ascii_alphanumeric() || matches!(char, '.' | '_' | '-'))
+        && !is_windows_device_name(
+            group
+                .split('.')
+                .next()
+                .unwrap_or_default(),
+        )
+}
+
+fn is_windows_device_name(stem: &str) -> bool {
+    let stem = stem.to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$")
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.ends_with(|char: char| char.is_ascii_digit() && char != '0'))
 }

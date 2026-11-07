@@ -1,15 +1,6 @@
 //! End-to-end coverage for `nodeLinker: hoisted` on the
 //! **fresh-lockfile** install path (no checked-in lockfile, not
-//! `--frozen-lockfile`). pnpm/pnpm#11871 enabled this path; before
-//! it, `pacquet install` hard-refused the combination.
-//!
-//! Each test writes a `package.json` (and a `pnpm-workspace.yaml`
-//! carrying `nodeLinker: hoisted` plus any feature knob under test),
-//! then runs `pacquet install` so the fresh resolver builds the
-//! lockfile in memory and the hoisted linker materializes a flat
-//! `node_modules/` of **real directories**.
-
-#![cfg(unix)] // hoisted bin shims + real-dir-vs-junction checks are unix-shaped here.
+//! `--frozen-lockfile`). Covers pnpm/pnpm#11871.
 
 pub use _utils::*;
 
@@ -17,17 +8,13 @@ use crate::_utils;
 
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
+use pnpm_fs::symlink_dir;
 use pnpm_modules_yaml::{Host as ModulesHost, read_modules_manifest};
 use pnpm_testing_utils::{
     bin::{AddMockedRegistry, CommandTempCwd},
-    fs::is_symlink_or_junction,
+    fs::{DirWitness, bump_mtime, is_symlink_or_junction, symlink_file},
 };
-use std::{
-    fs,
-    os::unix::fs::{MetadataExt, symlink},
-    path::Path,
-    process::Command,
-};
+use std::{fs, path::Path, process::Command};
 
 /// Replace the `pnpm-workspace.yaml` written by `add_mocked_registry`
 /// with one that keeps the mock's `storeDir` / `cacheDir` and appends
@@ -122,7 +109,7 @@ fn read_pkg_version(workspace: &Path, relative: &str) -> String {
 ///
 /// The upstream test also removes `node_modules/send` and reinstalls
 /// to assert it is re-added; that re-add is the partial-install path
-/// (pnpm/pacquet#433) and is omitted here.
+/// and is omitted here.
 #[test]
 fn installing_with_hoisted_node_linker() {
     let CommandTempCwd {
@@ -561,10 +548,8 @@ fn node_major() -> u32 {
 /// TS: `install only the dependencies of the specified importer, when
 /// node-linker is hoisted` (`multipleImporters.ts:87`). The subset
 /// install lands the selected project's dependency at the workspace
-/// root, and the wanted lockfile keeps the unselected importer's
-/// entries. (Upstream leaves "the unselected dependency is absent" as a
-/// TODO — the hoisted linker materializes the full shared graph — so
-/// only the positive assertions are pinned, matching upstream.)
+/// root, the unselected dependency is absent, and the wanted lockfile keeps
+/// the unselected importer's entries.
 #[test]
 fn install_only_dependencies_of_specified_importer_with_hoisted_linker() {
     let fixture = WorkspaceFixture::new();
@@ -586,8 +571,122 @@ fn install_only_dependencies_of_specified_importer_with_hoisted_linker() {
         is_real_dir(&fixture.workspace, "node_modules/@pnpm.e2e/foo"),
         "the selected project's dependency must be hoisted to the workspace root",
     );
+    assert!(
+        !fixture.workspace.join("node_modules/@foo/no-deps").exists(),
+        "unselected project's dependency must not be installed",
+    );
     let wanted = fixture.wanted();
     assert_eq!(importer_version(&wanted, "packages/project-2", "@foo/no-deps"), "1.0.0");
+}
+
+#[test]
+fn install_filter_prod_with_hoisted_linker_and_shamefully_hoist() {
+    let fixture = WorkspaceFixture::new();
+    fixture.append_workspace_yaml("nodeLinker: hoisted\nshamefullyHoist: true\n");
+    fixture.project(
+        "project-1",
+        "project-1",
+        ManifestDeps {
+            prod: &[("is-positive", "1.0.0")],
+            dev: &[("@pnpm.e2e/foo", "1.0.0")],
+            ..Default::default()
+        },
+    );
+    fixture.project(
+        "project-2",
+        "project-2",
+        ManifestDeps {
+            prod: &[("is-negative", "1.0.0")],
+            dev: &[("@foo/no-deps", "1.0.0")],
+            ..Default::default()
+        },
+    );
+
+    fixture.run(["--filter", "project-1...", "--prod", "install"]);
+
+    assert!(
+        is_real_dir(&fixture.workspace, "node_modules/is-positive"),
+        "the selected project's prod dependency must be hoisted to the workspace root",
+    );
+    assert!(
+        !fixture.workspace.join("node_modules/@pnpm.e2e/foo").exists(),
+        "selected project's dev dependency must not be installed under --prod",
+    );
+    assert!(
+        !fixture.workspace.join("node_modules/is-negative").exists(),
+        "unselected project's prod dependency must not be installed",
+    );
+    assert!(
+        !fixture.workspace.join("node_modules/@foo/no-deps").exists(),
+        "unselected project's dev dependency must not be installed",
+    );
+}
+
+/// The projects share the root `node_modules`, so a filtered install keeps
+/// the packages of the projects an earlier install put there
+/// ([pnpm/pnpm#16483](https://github.com/pnpm/pnpm/issues/16483)).
+#[test]
+fn filtered_install_keeps_the_packages_of_installed_projects_with_hoisted_linker() {
+    let fixture = WorkspaceFixture::new();
+    fixture.append_workspace_yaml("nodeLinker: hoisted\n");
+    fixture.project(
+        "project-1",
+        "project-1",
+        ManifestDeps { prod: &[("is-positive", "1.0.0")], ..Default::default() },
+    );
+    fixture.project(
+        "project-2",
+        "project-2",
+        ManifestDeps { prod: &[("is-negative", "1.0.0")], ..Default::default() },
+    );
+    fixture.run(["install"]);
+
+    fixture.append_workspace_yaml("dedupePeerDependents: false\n");
+    bump_mtime(&fixture.workspace.join("pnpm-workspace.yaml"));
+    fixture.run(["--filter", "project-1", "install"]);
+
+    assert!(is_real_dir(&fixture.workspace, "node_modules/is-positive"));
+    assert!(
+        is_real_dir(&fixture.workspace, "node_modules/is-negative"),
+        "the unselected project's dependency must stay installed",
+    );
+}
+
+/// A filtered install of one project after a filtered install of another
+/// installs its own dependencies and keeps the other's. A project neither
+/// install selected stays out even when it shares a dependency with one.
+#[test]
+fn filtered_installs_of_different_projects_add_up_with_hoisted_linker() {
+    let fixture = WorkspaceFixture::new();
+    fixture.append_workspace_yaml("nodeLinker: hoisted\n");
+    fixture.project(
+        "project-1",
+        "project-1",
+        ManifestDeps { prod: &[("is-positive", "1.0.0")], ..Default::default() },
+    );
+    fixture.project(
+        "project-2",
+        "project-2",
+        ManifestDeps { prod: &[("is-negative", "1.0.0")], ..Default::default() },
+    );
+    fixture.project(
+        "project-3",
+        "project-3",
+        ManifestDeps {
+            prod: &[("is-positive", "1.0.0"), ("@foo/no-deps", "1.0.0")],
+            ..Default::default()
+        },
+    );
+
+    fixture.run(["--filter", "project-1", "install"]);
+    fixture.run(["--filter", "project-2", "install"]);
+
+    assert!(is_real_dir(&fixture.workspace, "node_modules/is-positive"));
+    assert!(is_real_dir(&fixture.workspace, "node_modules/is-negative"));
+    assert!(
+        !fixture.workspace.join("node_modules/@foo/no-deps").exists(),
+        "a project no install selected must stay uninstalled",
+    );
 }
 
 /// A version that lost the root slot and later wins it must leave no
@@ -638,7 +737,7 @@ fn a_nested_copy_is_removed_once_its_version_wins_the_root_slot() {
     // materialize the root-slot winner inside the project.
     let stale = loser.join("node_modules").join(SCRIPTS);
     fs::create_dir_all(stale.parent().expect("scope dir")).expect("create the scope dir");
-    std::os::unix::fs::symlink(fixture.workspace.join("node_modules").join(SCRIPTS), &stale)
+    symlink_dir(&fixture.workspace.join("node_modules").join(SCRIPTS), &stale)
         .expect("plant a stale link");
     // The repeat-install short-circuit would report the unchanged
     // workspace up to date without ever reaching the linker.
@@ -647,6 +746,63 @@ fn a_nested_copy_is_removed_once_its_version_wins_the_root_slot() {
     fixture.run(["install"]);
 
     assert!(!stale.exists(), "a stale project-local link must not survive a reinstall");
+}
+
+/// TS: `bins of a nested package are removed when the package is deduped
+/// into the root node_modules` (`hoistedNodeLinker/install.ts`).
+#[test]
+fn bins_of_a_nested_copy_are_removed_with_it() {
+    const BIN_PKG: &str = "@pnpm.e2e/hello-world-js-bin";
+    const BIN_NAME: &str = "hello-world-js-bin";
+    let fixture = WorkspaceFixture::new();
+    fixture.append_workspace_yaml("nodeLinker: hoisted\n");
+    fixture.project(
+        "project-1",
+        "project-1",
+        ManifestDeps { prod: &[(BIN_PKG, "1.0.0")], ..Default::default() },
+    );
+    let project_2 = fixture.project(
+        "project-2",
+        "project-2",
+        ManifestDeps { prod: &[(BIN_PKG, "0.0.0")], ..Default::default() },
+    );
+    let project_bin_entries = || -> Vec<String> {
+        fs::read_dir(project_2.join("node_modules/.bin"))
+            .expect("read project-2 node_modules/.bin")
+            .map(|entry| {
+                entry
+                    .expect("read .bin entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name.starts_with(BIN_NAME))
+            .collect()
+    };
+    fixture.run(["install"]);
+    assert_eq!(read_pkg_version(&project_2, &format!("node_modules/{BIN_PKG}")), "0.0.0");
+    assert!(!project_bin_entries().is_empty(), "the nested copy links its command");
+
+    fixture.project(
+        "project-2",
+        "project-2",
+        ManifestDeps { prod: &[(BIN_PKG, "1.0.0")], ..Default::default() },
+    );
+    fixture.run(["install"]);
+
+    assert!(
+        !project_2
+            .join("node_modules")
+            .join(BIN_PKG)
+            .exists(),
+        "the nested copy is deduped",
+    );
+    assert_eq!(
+        project_bin_entries(),
+        Vec::<String>::new(),
+        "no command of the removed copy survives",
+    );
+    assert_bin_linked(&fixture.workspace.join("node_modules/.bin").join(BIN_NAME));
 }
 
 /// TS: `overwriting (…@3.0.0 with …@latest)`
@@ -707,7 +863,7 @@ fn overwriting_existing_files_in_node_modules() {
     write_workspace_yaml(&workspace, "nodeLinker: hoisted\n");
 
     fs::create_dir_all(workspace.join("node_modules")).expect("create node_modules");
-    std::os::unix::fs::symlink(&workspace, workspace.join("node_modules/is-positive"))
+    symlink_dir(&workspace, &workspace.join("node_modules/is-positive"))
         .expect("plant a wrong occupant symlink");
 
     pacquet
@@ -1017,6 +1173,41 @@ fn peer_variants_of_one_version_share_the_root_slot() {
     }
 }
 
+#[test]
+fn peer_variants_with_distinct_peers_are_nested_for_node_resolution() {
+    let fixture = WorkspaceFixture::new();
+    fixture.append_workspace_yaml("nodeLinker: hoisted\nautoInstallPeers: false\n");
+    let deps_with_peer_a_1_0_0 =
+        [("@pnpm.e2e/abc-optional-peers-meta-only", "1.0.0"), ("@pnpm.e2e/peer-a", "1.0.0")];
+    let deps_with_peer_a_1_0_1 =
+        [("@pnpm.e2e/abc-optional-peers-meta-only", "1.0.0"), ("@pnpm.e2e/peer-a", "1.0.1")];
+    fixture.project("a", "a", ManifestDeps { prod: &deps_with_peer_a_1_0_0, ..Default::default() });
+    fixture.project("b", "b", ManifestDeps { prod: &deps_with_peer_a_1_0_1, ..Default::default() });
+
+    fixture.run(["install"]);
+
+    let output = Command::new("node")
+        .arg("-e")
+        .arg(
+            r"const path = require('node:path'); const fs = require('node:fs'); for (const project of ['a', 'b']) { const projectDir = path.resolve('packages', project); const abcDir = path.dirname(require.resolve('@pnpm.e2e/abc-optional-peers-meta-only/package.json', { paths: [projectDir] })); const peerManifest = require.resolve('@pnpm.e2e/peer-a/package.json', { paths: [abcDir] }); process.stdout.write(`${project}:${JSON.parse(fs.readFileSync(peerManifest, 'utf8')).version}\n`); }",
+        )
+        .current_dir(&fixture.workspace)
+        .output()
+        .expect("run Node.js module resolution");
+    assert!(output.status.success(), "Node.js resolution failed: {output:?}");
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("Node.js output is UTF-8"),
+        "a:1.0.0\nb:1.0.1\n",
+    );
+}
+
+#[cfg(unix)]
+mod local_symlinks;
+
+mod modules_dir;
+
 mod repeat_install;
 
 mod scripts;
+
+mod summary;

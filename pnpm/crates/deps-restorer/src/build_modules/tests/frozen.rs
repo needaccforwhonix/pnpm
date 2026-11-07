@@ -10,8 +10,6 @@ use crate::VirtualStoreLayout;
 #[cfg(unix)]
 use pnpm_config::PackageImportMethod;
 #[cfg(unix)]
-use pnpm_executor::ScriptsPrependNodePath;
-#[cfg(unix)]
 use pnpm_lockfile::SnapshotEntry;
 #[cfg(unix)]
 use pnpm_reporter::SilentReporter;
@@ -134,7 +132,10 @@ async fn frozen_store_skips_side_effects_upload() {
 
     BuildModules {
         cache: crate::BuildCacheContext {
-            maps_by_snapshot: Some(&side_effects_maps),
+            side_effects: crate::CachedSideEffects {
+                overlays: Some(&side_effects_maps),
+                rows: None,
+            },
             engine_name: Some("darwin;arm64;node20"),
             read: true,
             write: true,
@@ -144,6 +145,7 @@ async fn frozen_store_skips_side_effects_upload() {
             frozen_store: true,
         },
         directories: crate::BuildLayout {
+            link_options: &pnpm_cmd_shim::LinkBinsOptions::default(),
             layout: &VirtualStoreLayout::legacy(
                 virtual_store_dir.path(),
                 pnpm_config::default_virtual_store_dir_max_length() as usize,
@@ -161,15 +163,23 @@ async fn frozen_store_skips_side_effects_upload() {
             patches: None,
             requires_build_by_snapshot: None,
             importers: &importers,
+            dependency_groups: None,
+            build_scope: None,
+            variant_platforms: None,
         },
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),
             user_agent: "pnpm/test",
-            prepend_node_path: ScriptsPrependNodePath::Never,
+            path: crate::ScriptPath { extra_bin_paths: &[], private_hoisting: false },
             shell: None,
             shell_emulator: false,
             unsafe_perm: true,
             ignore: false,
+            patched_engines: crate::PatchedEngineCheck {
+                engine_strict: false,
+                node_version: None,
+                install_state_dir: None,
+            },
         },
 
         allow_build_policy: &policy,

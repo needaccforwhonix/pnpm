@@ -1,11 +1,12 @@
 use super::{
-    DistributionKind, ProjectDocument, ProjectFile, UploadError, Yanked, escape_html,
+    DistributionKind, PROJECT_DOCUMENT_FORMAT_VERSION, ProjectDocument, ProjectFile, UploadError,
+    Yanked, escape_html,
     multipart::{FormPart, tests::encode_form},
     normalize_name, normalize_version, parse_distribution_filename, parse_upload,
     render_project_list_html, render_project_list_json, wants_json, wants_versioned_html,
 };
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[test]
 fn project_names_normalize_the_pep_503_way() {
@@ -55,7 +56,9 @@ fn distribution_filenames_parse_to_project_and_version() {
 
 fn document() -> ProjectDocument {
     ProjectDocument {
+        format_version: PROJECT_DOCUMENT_FORMAT_VERSION,
         name: "demo-pkg".to_string(),
+        deleted_files: BTreeSet::new(),
         files: vec![
             ProjectFile {
                 filename: "demo_pkg-1.0.0.tar.gz".to_string(),

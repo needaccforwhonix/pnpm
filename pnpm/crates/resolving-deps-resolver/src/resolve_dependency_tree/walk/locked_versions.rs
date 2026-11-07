@@ -1,3 +1,5 @@
+use pnpm_lockfile::RegistryContext;
+
 use super::{
     Arc, CurrentPkg, LockfileResolution, PkgNameVerPeer, PreferredVersionsOverlay,
     ResolveDependencyTreeError, ResolvedPackage, TarballRevision, TreeCtx, WantedDependency,
@@ -14,16 +16,16 @@ use super::{
 pub(super) fn overlay_version_view(
     overlay: &Arc<PreferredVersionsOverlay>,
     wanted: &WantedDependency,
-) -> Vec<(String, Vec<String>)> {
-    let mut view: Vec<(String, Vec<String>)> =
+) -> Vec<(String, Vec<(String, u32)>)> {
+    let mut view: Vec<(String, Vec<(String, u32)>)> =
         overlay_lookup_names(wanted.alias.as_deref(), wanted.bare_specifier.as_deref())
             .into_iter()
             .flatten()
             .filter_map(|name| {
-                let mut versions: Vec<String> = overlay
-                    .versions_for(&name)
+                let mut versions: Vec<(String, u32)> = overlay
+                    .weighted_versions_for(&name)
                     .into_iter()
-                    .map(str::to_string)
+                    .map(|(v, w)| (v.to_string(), w))
                     .collect();
                 if versions.is_empty() {
                     return None;
@@ -43,6 +45,7 @@ pub(super) fn pin_patched_revision(
     wanted: &mut WantedDependency,
     current_pkg: Option<&CurrentPkg>,
     prior_key: Option<&PkgNameVerPeer>,
+    registries: &RegistryContext,
 ) {
     let Some(version) = current_pkg.and_then(|current| current.version.as_deref()) else {
         return;
@@ -51,7 +54,8 @@ pub(super) fn pin_patched_revision(
     wanted.bare_specifier = exact_registry_specifier_for_revision_refresh(
         specifier,
         version,
-        prior_key.and_then(|key| key.suffix.registry_qualified().map(|(name, _)| name)),
+        prior_key.and_then(|key| registries.registry_of_key(key)),
+        registries,
     )
     .into();
 }
@@ -81,7 +85,7 @@ pub(super) fn pin_patched_revision(
 ///
 /// `parent_pkg_aliases` is the scope this edge's level resolves in; it
 /// decides which of the resolved package's `dependencies` its own
-/// `peerDependencies` shadow (see [`peer_shadowed_dependencies`](crate::parent_pkg_aliases::peer_shadowed_dependencies)).
+/// `peerDependencies` shadow (see [`peer_shadowed_dependencies`](crate::peer_provider::peer_shadowed_dependencies)).
 /// Locked-version pin, the fresh-resolve counterpart of subtree reuse: a
 /// transitive edge whose recorded version still satisfies its manifest range
 /// (`prior_key` is satisfies-gated) resolves to exactly that version even when
@@ -100,10 +104,10 @@ pub(super) fn pin_locked_version(
     prior_key: Option<&PkgNameVerPeer>,
     depth: i32,
 ) {
-    let locked_version = prior_key.and_then(|key| key.suffix.version_semver());
     if depth > 0
-        && !update_unpins_edge(ctx.update_scope(), wanted, locked_version, depth)
-        && let Some(version) = locked_version
+        && let Some(key) = prior_key
+        && keeps_locked_version(ctx, wanted, key, depth)
+        && let Some(version) = key.suffix.registry_version()
         && wanted.bare_specifier
             .as_deref()
             .is_some_and(|spec| spec.parse::<node_semver::Range>().is_ok())
@@ -112,10 +116,29 @@ pub(super) fn pin_locked_version(
     }
 }
 
+/// Whether an edge stays on the version the lockfile recorded
+/// for it. A deduplication target and an edge a `pacquet update` reaches
+/// re-pick through the preferred versions instead.
+pub(super) fn keeps_locked_version(
+    ctx: &TreeCtx,
+    wanted: &WantedDependency,
+    prior_key: &PkgNameVerPeer,
+    depth: i32,
+) -> bool {
+    let locked_version = prior_key.suffix.registry_version();
+    !ctx.workspace.reuse.dedupe.covers(&prior_key.name.to_string(), locked_version)
+        && !update_unpins_edge(ctx.update_scope(), wanted, locked_version, depth)
+}
+
+/// `locked_registry` is the registry the locked key's package resolved from.
+/// A named specifier pins only when it names that registry, so another
+/// declared alias of it, a key an older configuration wrote with one, or a
+/// plain key the alias's registry keeps pins too.
 pub(super) fn exact_registry_specifier_for_revision_refresh(
     specifier: &str,
     version: &str,
-    named_registry: Option<&str>,
+    locked_registry: Option<&str>,
+    registries: &RegistryContext,
 ) -> String {
     if has_registry_revision_specifier(specifier) {
         return specifier.to_string();
@@ -126,7 +149,11 @@ pub(super) fn exact_registry_specifier_for_revision_refresh(
     let Some((protocol, body)) = specifier.split_once(':') else {
         return specifier.to_string();
     };
-    if protocol != "npm" && protocol != "jsr" && named_registry != Some(protocol) {
+    let names_locked_registry = registries
+        .registry_of_prefix(protocol)
+        .zip(locked_registry)
+        .is_some_and(|(wanted, locked)| pnpm_lockfile::same_registry(wanted, locked));
+    if protocol != "npm" && protocol != "jsr" && !names_locked_registry {
         return specifier.to_string();
     }
     if body.parse::<node_semver::Range>().is_ok() {
@@ -197,7 +224,7 @@ pub(super) fn ensure_same_registry_revision(
     existing: &ResolvedPackage,
     result: &pnpm_resolving_resolver_base::ResolveResult,
 ) -> Result<(), ResolveDependencyTreeError> {
-    if registry_revisions_conflict(&existing.result.resolution, &result.resolution) {
+    if registry_revisions_conflict(&existing.result().resolution, &result.resolution) {
         let name_ver =
             result.package.name_ver.as_ref().expect("registry result has name and version");
         return Err(ResolveDependencyTreeError::RevisionConflict {

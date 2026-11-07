@@ -272,6 +272,69 @@ fn update_compatible_honors_ignore_dependencies() {
     drop((root, anchor));
 }
 
+#[test]
+fn update_compatible_negation_only_selector_honors_ignore_dependencies() {
+    let (root, workspace, anchor) = setup();
+    set_ignore_dependencies(&workspace, &[FOO]);
+
+    write_manifest(&workspace, &format!(r#"{{ "{DEP}": "100.0.0", "{FOO}": "1.0.0" }}"#));
+    pacquet(&workspace, ["install"]).assert().success();
+
+    write_manifest(&workspace, &format!(r#"{{ "{DEP}": "^100.0.0", "{FOO}": "^1.0.0" }}"#));
+    pacquet(&workspace, ["update", "!@pnpm.e2e/bar"]).assert().success();
+
+    eprintln!("virtual store contents: {:?}", list_virtual_store(&workspace));
+    assert!(virtual_store_has(&workspace, "@pnpm.e2e+dep-of-pkg-with-1-dep@100.1.0"));
+    assert!(virtual_store_has(&workspace, "@pnpm.e2e+foo@1.0.0"));
+    assert!(!virtual_store_has(&workspace, "@pnpm.e2e+foo@1.3.0"));
+
+    drop((root, anchor));
+}
+
+#[test]
+fn update_depth_zero_negation_leaving_only_ignored_dependencies_is_a_noop() {
+    let (root, workspace, anchor) = setup();
+    set_ignore_dependencies(&workspace, &[FOO]);
+    write_manifest(&workspace, &format!(r#"{{ "{FOO}": "^1.0.0" }}"#));
+    pacquet(&workspace, ["install"]).assert().success();
+
+    pacquet(&workspace, ["update", "!@pnpm.e2e/bar", "--depth", "0"]).assert().success();
+
+    assert_eq!(dep_spec(&workspace, FOO).as_deref(), Some("^1.0.0"));
+    drop((root, anchor));
+}
+
+#[test]
+fn update_negation_only_selector_honors_ignore_dependencies() {
+    let (root, workspace, anchor) = setup();
+    set_ignore_dependencies(&workspace, &[DEP]);
+    write_manifest(&workspace, &format!(r#"{{ "{DEP}": "^100.0.0", "{FOO}": "^1.0.0" }}"#));
+    pacquet(&workspace, ["install"]).assert().success();
+
+    pacquet(&workspace, ["update", &format!("!{FOO}"), "--latest"]).assert().success();
+
+    assert_eq!(dep_spec(&workspace, DEP).as_deref(), Some("^100.0.0"));
+    assert_eq!(dep_spec(&workspace, FOO).as_deref(), Some("^1.0.0"));
+    drop((root, anchor));
+}
+
+/// A negated `crate:` selector excludes only that crate. The npm
+/// dependencies still update, and `ignoreDependencies` still holds.
+#[test]
+fn update_negated_crate_selector_updates_npm_dependencies() {
+    let (root, workspace, anchor) = setup();
+    set_ignore_dependencies(&workspace, &[DEP]);
+    append_workspace_yaml_key(&workspace, "cargo", "{ enabled: true }");
+    write_manifest(&workspace, &format!(r#"{{ "{DEP}": "^100.0.0", "{FOO}": "^1.0.0" }}"#));
+    pacquet(&workspace, ["install"]).assert().success();
+
+    pacquet(&workspace, ["update", "!crate:sha2", "--latest"]).assert().success();
+
+    assert_eq!(dep_spec(&workspace, DEP).as_deref(), Some("^100.0.0"));
+    assert_eq!(dep_spec(&workspace, FOO).as_deref(), Some("^100.1.0"));
+    drop((root, anchor));
+}
+
 /// `--prod` scopes the update to production dependencies, and
 /// `ignoreDependencies` still excludes names within that scope. A
 /// devDependency is left untouched even though it has a newer version.
@@ -298,6 +361,231 @@ fn update_prod_scopes_and_honors_ignore() {
         .find(|(k, _)| *k == "@pnpm.e2e/peer-c")
         .map(|(_, spec)| spec.to_string());
     assert_eq!(peer_c.as_deref(), Some("^1.0.0"));
+
+    drop((root, anchor));
+}
+
+#[test]
+fn update_prod_does_not_install_dev_dependencies() {
+    let (root, workspace, anchor) = setup();
+
+    let manifest = format!(
+        r#"{{ "name": "test-update", "version": "1.0.0", "dependencies": {{ "{DEP}": "^100.0.0" }}, "devDependencies": {{ "@pnpm.e2e/peer-c": "^1.0.0" }} }}"#,
+    );
+    fs::write(workspace.join("package.json"), manifest).expect("write package.json");
+    pacquet(&workspace, ["install", "--prod"]).assert().success();
+
+    assert!(
+        workspace
+            .join("node_modules")
+            .join(DEP)
+            .exists(),
+    );
+    assert!(
+        !workspace
+            .join("node_modules")
+            .join("@pnpm.e2e/peer-c")
+            .exists(),
+    );
+
+    pacquet(&workspace, ["update", "--prod", "--latest"]).assert().success();
+
+    assert!(
+        workspace
+            .join("node_modules")
+            .join(DEP)
+            .exists(),
+    );
+    assert!(
+        !workspace
+            .join("node_modules")
+            .join("@pnpm.e2e/peer-c")
+            .exists(),
+        "dev dependency must not be installed by update --prod when previously installed with --prod",
+    );
+
+    pacquet(&workspace, ["update", DEP, "--latest"]).assert().success();
+
+    assert!(
+        workspace
+            .join("node_modules")
+            .join(DEP)
+            .exists(),
+    );
+    assert!(
+        !workspace
+            .join("node_modules")
+            .join("@pnpm.e2e/peer-c")
+            .exists(),
+        "dev dependency must not be installed by update <pkg> when previously installed with --prod",
+    );
+
+    drop((root, anchor));
+}
+
+#[test]
+fn update_prod_without_modules_yaml_omits_dev_dependencies() {
+    let (root, workspace, anchor) = setup();
+
+    let manifest = format!(
+        r#"{{ "name": "test-update", "version": "1.0.0", "dependencies": {{ "{DEP}": "^100.0.0" }}, "devDependencies": {{ "@pnpm.e2e/peer-c": "^1.0.0" }} }}"#,
+    );
+    fs::write(workspace.join("package.json"), manifest).expect("write package.json");
+
+    pacquet(&workspace, ["update", "--prod", "--latest"]).assert().success();
+
+    assert!(
+        workspace
+            .join("node_modules")
+            .join(DEP)
+            .exists(),
+    );
+    assert!(
+        !workspace
+            .join("node_modules")
+            .join("@pnpm.e2e/peer-c")
+            .exists(),
+        "dev dependency must not be installed by update --prod in a project without .modules.yaml",
+    );
+
+    drop((root, anchor));
+}
+
+#[test]
+fn update_dev_without_modules_yaml_installs_all_dependencies() {
+    let (root, workspace, anchor) = setup();
+
+    let manifest = format!(
+        r#"{{ "name": "test-update", "version": "1.0.0", "dependencies": {{ "{DEP}": "^100.0.0" }}, "devDependencies": {{ "@pnpm.e2e/peer-c": "^1.0.0" }} }}"#,
+    );
+    fs::write(workspace.join("package.json"), manifest).expect("write package.json");
+
+    pacquet(&workspace, ["update", "--dev", "--latest"]).assert().success();
+
+    assert!(
+        workspace
+            .join("node_modules")
+            .join(DEP)
+            .exists(),
+        "prod dependency must be installed by update --dev in a project without .modules.yaml",
+    );
+    assert!(
+        workspace
+            .join("node_modules")
+            .join("@pnpm.e2e/peer-c")
+            .exists(),
+        "dev dependency must be installed by update --dev in a project without .modules.yaml",
+    );
+
+    drop((root, anchor));
+}
+
+#[test]
+fn update_prod_and_dev_installs_dev_dependencies_in_prod_install() {
+    let (root, workspace, anchor) = setup();
+
+    let manifest = format!(
+        r#"{{ "name": "test-update", "version": "1.0.0", "dependencies": {{ "{DEP}": "^100.0.0" }}, "devDependencies": {{ "@pnpm.e2e/peer-c": "^1.0.0" }} }}"#,
+    );
+    fs::write(workspace.join("package.json"), manifest).expect("write package.json");
+    pacquet(&workspace, ["install", "--prod"]).assert().success();
+
+    assert!(
+        !workspace
+            .join("node_modules")
+            .join("@pnpm.e2e/peer-c")
+            .exists(),
+    );
+
+    pacquet(&workspace, ["update", "--prod", "--dev", "--latest"]).assert().success();
+
+    assert!(
+        workspace
+            .join("node_modules")
+            .join(DEP)
+            .exists(),
+    );
+    assert!(
+        workspace
+            .join("node_modules")
+            .join("@pnpm.e2e/peer-c")
+            .exists(),
+        "dev dependency must be installed when --prod and --dev are both passed",
+    );
+
+    drop((root, anchor));
+}
+
+#[test]
+fn update_preserves_omitted_optional_dependencies() {
+    let (root, workspace, anchor) = setup();
+
+    let manifest = format!(
+        r#"{{ "name": "test-update", "version": "1.0.0", "dependencies": {{ "{DEP}": "^100.0.0" }}, "optionalDependencies": {{ "@pnpm.e2e/peer-c": "^1.0.0" }} }}"#,
+    );
+    fs::write(workspace.join("package.json"), manifest).expect("write package.json");
+    pacquet(&workspace, ["install", "--no-optional"]).assert().success();
+
+    let optional_dep = workspace.join("node_modules").join("@pnpm.e2e/peer-c");
+    assert!(
+        matches!(fs::symlink_metadata(&optional_dep), Err(err) if err.kind() == std::io::ErrorKind::NotFound),
+        "optional dependency must not be present after --no-optional install",
+    );
+
+    pacquet(&workspace, ["update", "--latest"]).assert().success();
+
+    assert!(
+        workspace
+            .join("node_modules")
+            .join(DEP)
+            .exists(),
+    );
+    assert!(
+        matches!(fs::symlink_metadata(&optional_dep), Err(err) if err.kind() == std::io::ErrorKind::NotFound),
+        "optional dependency must remain omitted on plain update after --no-optional install",
+    );
+
+    pacquet(&workspace, ["update", "--optional", "--latest"]).assert().success();
+
+    assert!(
+        workspace
+            .join("node_modules")
+            .join("@pnpm.e2e/peer-c")
+            .exists(),
+        "optional dependency must be installed by update --optional",
+    );
+
+    drop((root, anchor));
+}
+
+#[test]
+fn update_prod_and_peer_preserves_omitted_dev_dependencies() {
+    let (root, workspace, anchor) = setup();
+
+    let manifest = format!(
+        r#"{{ "name": "test-update", "version": "1.0.0", "dependencies": {{ "{DEP}": "^100.0.0" }}, "devDependencies": {{ "@pnpm.e2e/peer-c": "^1.0.0" }}, "peerDependencies": {{ "{FOO}": "^1.0.0" }} }}"#,
+    );
+    fs::write(workspace.join("package.json"), manifest).expect("write package.json");
+    pacquet(&workspace, ["install", "--prod"]).assert().success();
+
+    let dev_dep = workspace.join("node_modules").join("@pnpm.e2e/peer-c");
+    assert!(
+        matches!(fs::symlink_metadata(&dev_dep), Err(err) if err.kind() == std::io::ErrorKind::NotFound),
+        "dev dependency must not be present after --prod install",
+    );
+
+    pacquet(&workspace, ["update", "--prod", "--peer", "--latest"]).assert().success();
+
+    assert!(
+        workspace
+            .join("node_modules")
+            .join(DEP)
+            .exists(),
+    );
+    assert!(
+        matches!(fs::symlink_metadata(&dev_dep), Err(err) if err.kind() == std::io::ErrorKind::NotFound),
+        "dev dependency must remain omitted when updating with --prod --peer",
+    );
 
     drop((root, anchor));
 }
@@ -549,6 +837,23 @@ fn update_tag_selector_resolves_the_named_tag() {
     assert_eq!(dep_spec(&workspace, FOO).as_deref(), Some("^100.0.0"));
     let packages = lockfile_package_keys(&workspace);
     assert!(packages.contains(&format!("{FOO}@100.0.0")), "{packages:?}");
+
+    drop((root, anchor));
+}
+
+/// Regression test for <https://github.com/pnpm/pnpm/issues/6714>.
+#[test]
+fn update_tag_selector_replaces_a_range_whose_shape_no_save_prefix_describes() {
+    let (root, workspace, anchor) = setup_with_own_registry();
+    write_manifest(&workspace, &format!(r#"{{ "{FOO}": "<= 1.2.5" }}"#));
+    pacquet(&workspace, ["install"]).assert().success();
+
+    anchor.set_dist_tag(FOO, "1.1.0", "stable");
+    pacquet(&workspace, ["update", &format!("{FOO}@stable")]).assert().success();
+
+    assert_eq!(dep_spec(&workspace, FOO).as_deref(), Some("^1.1.0"));
+    let packages = lockfile_package_keys(&workspace);
+    assert!(packages.contains(&format!("{FOO}@1.1.0")), "{packages:?}");
 
     drop((root, anchor));
 }

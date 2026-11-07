@@ -1,10 +1,12 @@
 use super::{
-    BTreeMap, CatalogResolutionResult, CatalogWantedDependency, Config, Context, DependencyGroup,
-    DlxError, Duration, IntoDiagnostic, Path, PathBuf, RangeSpecStyle, Reporter, State,
-    SupportedArchitectures, SupportedArchitecturesArgs, SystemTime, UNIX_EPOCH, Value, add_package,
-    configured_catalogs, create_short_hash, force_symlink_dir, fs, json, parse_catalog_protocol,
-    parse_manifest, parse_overrides_iter, parse_wanted_dependency, resolve_from_catalog,
+    BTreeMap, CatalogAnchor, CatalogResolutionResult, CatalogWantedDependency, Config, Context,
+    DependencyGroup, DlxError, Duration, IntoDiagnostic, Path, PathBuf, RangeSpecStyle, Reporter,
+    State, SupportedArchitectures, SupportedArchitecturesArgs, SystemTime, UNIX_EPOCH, Value,
+    add_package, configured_catalogs, create_short_hash, force_symlink_dir, fs, json,
+    parse_catalog_protocol, parse_manifest, parse_overrides_iter, parse_wanted_dependency,
+    resolve_from_catalog,
 };
+use pnpm_graph_hasher::{detect_node_major, engine_name};
 
 /// Install the packages into a fresh prepare directory and point the
 /// cache link at it.
@@ -16,7 +18,8 @@ pub(super) async fn prepare_cache_dir<Reporter: self::Reporter + 'static>(
     supported_architectures: &SupportedArchitecturesArgs,
     config: &'static mut Config,
 ) -> miette::Result<PathBuf> {
-    let prepare_dir = get_prepare_dir(dlx_command_cache_dir, SystemTime::now(), std::process::id());
+    let prepare_dir =
+        get_prepare_dir(dlx_command_cache_dir, SystemTime::now(), pnpm_fs::process_id());
     if let Err(error) = install_into_cache::<Reporter>(
         &prepare_dir,
         pkgs,
@@ -56,51 +59,7 @@ async fn install_into_cache<Reporter: self::Reporter + 'static>(
     fs::write(&manifest_path, json!({ "name": "dlx", "version": "0.0.0" }).to_string())
         .map_err(|source| DlxError::Cache { dir: manifest_path.display().to_string(), source })?;
 
-    // Per-axis CLI overrides (`--cpu` / `--os` / `--libc`) replace the
-    // matching axis of the config-derived value for the dlx install.
-    config.supported_architectures =
-        supported_architectures.apply_to(config.supported_architectures.clone());
-
-    config.modules_dir = prepare_dir.join("node_modules");
-    config.virtual_store_dir = prepare_dir.join("node_modules").join(".pacquet");
-    // Force the project-local virtual store so the whole prepare dir is
-    // self-contained and can be symlinked as the cache entry. This is a
-    // deliberate deviation from pnpm's dlx, which keeps
-    // `enableGlobalVirtualStore ?? true`: pnpm caches only the
-    // `node_modules` tree and lets the global store back it, whereas
-    // pacquet symlinks the entire prepare dir, so its store must live
-    // inside that dir (the installer picks `global_virtual_store_dir`
-    // when this is on — see virtual_store_layout.rs).
-    config.enable_global_virtual_store = false;
-    // The cache install is always fresh, so no lockfile is loaded from
-    // the process working directory.
-    config.lockfile = false;
-    resolve_cache_overrides(config)?;
-    // The throwaway cache project is not part of the caller's
-    // workspace. If a caller has a settings-only pnpm-workspace.yaml,
-    // carrying its workspace root here makes the install enumerate that
-    // workspace and fail on the missing root package.json. Anchored
-    // rather than `None`, which walks up from the cache dir and can
-    // adopt a stray `pnpm-workspace.yaml` above it (pnpm/pnpm#13697).
-    config.workspace_dir = Some(prepare_dir.to_path_buf());
-    // Same reasoning for a pinned `lockfileDir`: it names the caller's
-    // lockfile, which the throwaway install must not touch.
-    config.lockfile_dir = None;
-    // The caller's patches never apply to the throwaway install (pnpm's
-    // dlx installs the package unpatched too). Their paths are relative
-    // to the caller's workspace root, which the anchor above replaced, so
-    // keeping them would also make every dlx invocation from a project
-    // with `patchedDependencies` fail on a patch file missing under the
-    // cache dir.
-    config.patched_dependencies = None;
-    // Build a *fresh* allow-list for the throwaway install — the dlx
-    // packages themselves plus the CLI `--allow-build` entries — rather
-    // than inheriting the caller project's `allow_builds` /
-    // `dangerously_allow_all_builds`. Inheriting the caller's policy would
-    // run build scripts the dlx invocation never opted into, and would
-    // also leave the cache key (which hashes only pkgs + CLI allow_build)
-    // unable to distinguish two callers with different policies.
-    apply_dlx_build_policy(config, pkgs, allow_build);
+    configure_cache_install(config, prepare_dir, pkgs, allow_build, supported_architectures)?;
     let config: &Config = config;
 
     for pkg in pkgs {
@@ -120,6 +79,12 @@ async fn install_into_cache<Reporter: self::Reporter + 'static>(
         )
         .await?;
     }
+    crate::cli_args::approve_builds::prompt_approve_install_builds::<Reporter>(
+        config,
+        prepare_dir,
+        prepare_dir,
+    )
+    .await?;
     Ok(())
 }
 
@@ -144,6 +109,10 @@ pub(super) fn dlx_command_cache_dir(config: &Config, cache_key: &str) -> miette:
 /// untouched, and the catalogs are only read when at least one spec needs
 /// them. A misconfigured entry is reported as the pnpm error the caller
 /// would get from `pnpm add`.
+///
+/// A `file:` / `link:` entry becomes an absolute path: dlx installs into
+/// a cache directory outside the workspace, so nothing there can read a
+/// path measured from `pnpm-workspace.yaml`.
 pub(super) fn resolve_catalog_specs(
     pkgs: &[String],
     config: &Config,
@@ -156,6 +125,10 @@ pub(super) fn resolve_catalog_specs(
         return Ok(pkgs.to_vec());
     }
     let catalogs = configured_catalogs(config)?;
+    let anchor = match config.workspace_dir.as_deref() {
+        Some(workspace_dir) => CatalogAnchor::Reanchor { workspace_dir, consumer_dir: None },
+        None => CatalogAnchor::AsWritten,
+    };
     pkgs.iter()
         .map(|pkg| {
             let parsed = parse_wanted_dependency(pkg);
@@ -163,7 +136,7 @@ pub(super) fn resolve_catalog_specs(
                 return Ok(pkg.clone());
             };
             let wanted = CatalogWantedDependency { alias: alias.clone(), bare_specifier };
-            match resolve_from_catalog(&catalogs, &wanted) {
+            match resolve_from_catalog(&catalogs, &wanted, anchor) {
                 CatalogResolutionResult::Found(found) => {
                     Ok(format!("{alias}@{}", found.resolution.specifier))
                 }
@@ -187,9 +160,9 @@ fn build_registries_map(config: &Config) -> BTreeMap<String, String> {
 }
 
 /// Build the dlx cache key from the sorted package specs, sorted
-/// registries, the optional `allow_build` list, and each non-empty
-/// `supportedArchitectures` axis (deduped + sorted, in `cpu` / `libc` /
-/// `os` order), all hashed together. pacquet keys on the raw specs (not
+/// registries, the optional `allow_build` list, each non-empty
+/// `supportedArchitectures` axis, and the Node.js engine name, all hashed
+/// together. pacquet keys on the raw specs (not
 /// resolved ids) and uses [`create_short_hash`] rather than a full-length
 /// hex digest; the dlx caches are not shared between the two
 /// implementations, so the key format is not a cross-tool contract.
@@ -198,6 +171,7 @@ pub(super) fn create_cache_key(
     registries: &BTreeMap<String, String>,
     allow_build: &[String],
     supported_architectures: Option<&SupportedArchitectures>,
+    engine: Option<&str>,
 ) -> String {
     let mut sorted: Vec<&str> = pkgs
         .iter()
@@ -217,35 +191,70 @@ pub(super) fn create_cache_key(
         sorted_allow.sort_unstable();
         args.push(json!({ "allowBuild": sorted_allow }));
     }
-    if let Some(arch) = supported_architectures {
-        for (key, values) in [("cpu", &arch.cpu), ("libc", &arch.libc), ("os", &arch.os)] {
-            let Some(values) = values
-                .as_ref()
-                .filter(|values| !values.is_empty())
-            else {
-                continue;
-            };
-            let mut deduped: Vec<&str> = values
-                .iter()
-                .map(String::as_str)
-                .collect();
-            deduped.sort_unstable();
-            deduped.dedup();
-            args.push(json!({ "supportedArchitectures": { key: deduped } }));
-        }
-    }
+    args.extend(architecture_key_inputs(supported_architectures));
+    // `null` when no `node` is found, which still differs from a key that
+    // records no engine at all.
+    args.push(json!({ "engine": engine }));
     create_short_hash(&serde_json::to_string(&args).expect("serialize cache key inputs"))
 }
 
-/// Return the cache target behind `cache_link` when it is a symlink whose
+/// What the platforms an install prepares for contribute to its cache
+/// key.
+///
+/// The axes are recorded one axis at a time, each named once and sorted,
+/// since rewriting them in another order asks for the same install.
+///
+/// A platform list is recorded as the platforms it resolves to, in the
+/// order it named them. The order matters because which platform comes
+/// first decides which runtime archive the install takes when this
+/// machine is none of them, and resolving matters because `current` is a
+/// different platform on each machine while the word is the same.
+fn architecture_key_inputs(supported: Option<&SupportedArchitectures>) -> Vec<Value> {
+    match supported {
+        None => Vec::new(),
+        Some(SupportedArchitectures::Axes(axes)) => {
+            [("cpu", &axes.cpu), ("libc", &axes.libc), ("os", &axes.os)]
+                .into_iter()
+                .filter_map(|(key, values)| {
+                    let values = values
+                        .as_ref()
+                        .filter(|values| !values.is_empty())?;
+                    Some(json!({ "supportedArchitectures": { key: sorted_once(values) } }))
+                })
+                .collect()
+        }
+        Some(supported @ SupportedArchitectures::Platforms(_)) => {
+            let named: Vec<String> = supported
+                .host_platforms()
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+            vec![json!({ "supportedArchitectures": named })]
+        }
+    }
+}
+
+/// The values as the cache key records them: named once, in an order
+/// rewriting the configuration cannot change.
+fn sorted_once(values: &[String]) -> Vec<&str> {
+    let mut deduped: Vec<&str> = values
+        .iter()
+        .map(String::as_str)
+        .collect();
+    deduped.sort_unstable();
+    deduped.dedup();
+    deduped
+}
+
+/// Return the cache target behind `cache_link` when it is a symlink or junction whose
 /// own mtime is within `max_age_minutes` of `now`.
 pub(super) fn get_valid_cache_dir(
     cache_link: &Path,
     max_age_minutes: u64,
     now: SystemTime,
 ) -> Option<PathBuf> {
-    let meta = fs::symlink_metadata(cache_link).ok()?;
-    if !meta.file_type().is_symlink() {
+    let meta = pnpm_fs::symlink_metadata_with_retry(cache_link).ok()?;
+    if !pnpm_fs::is_symlink_or_junction(cache_link).ok()? {
         return None;
     }
     // `dunce::canonicalize` (not `fs::canonicalize`) so the cache-hit path
@@ -254,13 +263,14 @@ pub(super) fn get_valid_cache_dir(
     // `node_modules/.bin` string into `PATH`.
     let target = dunce::canonicalize(cache_link).ok()?;
     let mtime = meta.modified().ok()?;
+    (!is_expired(mtime, max_age_minutes, now)).then_some(target)
+}
+
+pub(super) fn is_expired(mtime: SystemTime, max_age_minutes: u64, now: SystemTime) -> bool {
     let max_age = Duration::from_secs(max_age_minutes.saturating_mul(60));
-    // Valid while `mtime + max_age >= now`. A negative elapsed time
-    // (clock skew, `now` before `mtime`) is treated as still valid,
-    // matching pnpm's numeric comparison.
     match now.duration_since(mtime) {
-        Ok(age) => (age <= max_age).then_some(target),
-        Err(_) => Some(target),
+        Ok(age) => age > max_age,
+        Err(_) => false,
     }
 }
 
@@ -334,6 +344,7 @@ pub(super) fn command_cache_dir(
             &build_registries_map(config),
             allow_build,
             supported_architectures.apply_to(config.supported_architectures.clone()).as_ref(),
+            detect_node_major().map(|major| engine_name(major, None, None)).as_deref(),
         ),
     )
 }
@@ -342,6 +353,7 @@ pub(super) fn command_cache_dir(
 fn apply_dlx_build_policy(config: &mut Config, pkgs: &[String], allow_build: &[String]) {
     config.dangerously_allow_all_builds = false;
     config.allow_builds.clear();
+    config.disable_agent_skills();
     for spec in pkgs {
         if let Some(alias) = parse_wanted_dependency(spec).alias {
             config.allow_builds.insert(alias, true);
@@ -349,5 +361,102 @@ fn apply_dlx_build_policy(config: &mut Config, pkgs: &[String], allow_build: &[S
     }
     for name in allow_build {
         config.allow_builds.insert(name.clone(), true);
+    }
+}
+
+pub(super) fn configure_cache_install(
+    config: &mut Config,
+    prepare_dir: &Path,
+    pkgs: &[String],
+    allow_build: &[String],
+    supported_architectures: &SupportedArchitecturesArgs,
+) -> miette::Result<()> {
+    // Per-axis CLI overrides (`--cpu` / `--os` / `--libc`) replace the
+    // matching axis of the config-derived value for the dlx install.
+    config.supported_architectures =
+        supported_architectures.apply_to(config.supported_architectures.clone());
+
+    config.modules_dir = prepare_dir.join("node_modules");
+    config.install_state_dir = prepare_dir.join("node_modules").join(".pnpm");
+    // Force the project-local virtual store so the whole prepare dir is
+    // self-contained and can be symlinked as the cache entry. This is a
+    // deliberate deviation from pnpm's dlx, which keeps
+    // `enableGlobalVirtualStore ?? true`: pnpm caches only the
+    // `node_modules` tree and lets the global store back it, whereas
+    // pacquet symlinks the entire prepare dir, so its store must live
+    // inside that dir (the installer picks `global_virtual_store_dir`
+    // when this is on — see virtual_store_layout.rs).
+    config.enable_global_virtual_store = false;
+    // Keep a cache-local lockfile so approved builds can be rebuilt.
+    config.lockfile = true;
+    resolve_cache_overrides(config)?;
+    // The throwaway cache project is not part of the caller's
+    // workspace. If a caller has a settings-only pnpm-workspace.yaml,
+    // carrying its workspace root here makes the install enumerate that
+    // workspace and fail on the missing root package.json. Anchored
+    // rather than `None`, which walks up from the cache dir and can
+    // adopt a stray `pnpm-workspace.yaml` above it (pnpm/pnpm#13697).
+    config.workspace_dir = Some(prepare_dir.to_path_buf());
+    // Same reasoning for a pinned `lockfileDir`: it names the caller's
+    // lockfile, which the throwaway install must not touch.
+    config.lockfile_dir = None;
+    // The caller's patches never apply to the throwaway install (pnpm's
+    // dlx installs the package unpatched too). Their paths are relative
+    // to the caller's workspace root, which the anchor above replaced, so
+    // keeping them would also make every dlx invocation from a project
+    // with `patchedDependencies` fail on a patch file missing under the
+    // cache dir.
+    config.patched_dependencies = None;
+    // pnpm's dlx resolves a version-less package to `latest` whatever the
+    // caller's `tag` setting says, and the cache key holds no tag.
+    config.tag = None;
+    // Build a *fresh* allow-list for the throwaway install — the dlx
+    // packages themselves plus the CLI `--allow-build` entries — rather
+    // than inheriting the caller project's `allow_builds` /
+    // `dangerously_allow_all_builds`. Inheriting the caller's policy would
+    // run build scripts the dlx invocation never opted into, and would
+    // also leave the cache key (which hashes only pkgs + CLI allow_build)
+    // unable to distinguish two callers with different policies.
+    apply_dlx_build_policy(config, pkgs, allow_build);
+    config.strict_dep_builds = false;
+    Ok(())
+}
+
+pub(super) async fn get_or_prepare_cache<Reporter: self::Reporter + 'static>(
+    config: &'static mut Config,
+    pkgs: &[String],
+    allow_build: &[String],
+    supported_architectures: &SupportedArchitecturesArgs,
+) -> miette::Result<PathBuf> {
+    let command_dir = command_cache_dir(config, pkgs, allow_build, supported_architectures)?;
+    let cache_link = command_dir.join("pkg");
+    match get_valid_cache_dir(&cache_link, config.dlx_cache_max_age, SystemTime::now()) {
+        Some(cached_dir) if cached_dir.join("pnpm-lock.yaml").is_file() => {
+            configure_cache_install(
+                config,
+                &cached_dir,
+                pkgs,
+                allow_build,
+                supported_architectures,
+            )?;
+            crate::cli_args::approve_builds::prompt_approve_install_builds::<Reporter>(
+                config,
+                &cached_dir,
+                &cached_dir,
+            )
+            .await?;
+            Ok(cached_dir)
+        }
+        _ => {
+            prepare_cache_dir::<Reporter>(
+                &command_dir,
+                &cache_link,
+                pkgs,
+                allow_build,
+                supported_architectures,
+                config,
+            )
+            .await
+        }
     }
 }

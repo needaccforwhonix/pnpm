@@ -1,9 +1,9 @@
 use super::{
-    Context, ConvertCtx, DeployError, DirectoryResolution, HashMap, ImporterDepVersion,
-    IntoDiagnostic, LockfileResolution, PackageKey, PackageMetadata, Path, PathBuf, PkgName,
-    PkgNameVerPeer, ProjectInfo, ProjectPathKey, ProjectSnapshot, ResolvedDependencyMap,
-    ResolvedDependencySpec, SnapshotDepRef, SnapshotEntry, TarballResolution, VersionPart,
-    is_child_path, lexical_normalize, relative_path, same_path,
+    Context, ConvertCtx, DirectoryResolution, HashMap, ImporterDepVersion, IntoDiagnostic,
+    LockfileResolution, PackageKey, PackageMetadata, Path, PathBuf, PkgName, PkgNameVerPeer,
+    ProjectInfo, ProjectPathKey, ProjectSnapshot, ResolvedDependencyMap, ResolvedDependencySpec,
+    SnapshotDepRef, SnapshotEntry, TarballResolution, VersionPart, lexical_normalize,
+    relative_path, same_path,
 };
 
 pub(super) struct ResolveBases<'a> {
@@ -23,18 +23,14 @@ pub(super) fn convert_package_metadata(
     let mut metadata = metadata.clone();
     metadata.resolution = match &metadata.resolution {
         LockfileResolution::Directory(resolution) => {
-            let resolved = validate_lockfile_local_path(
-                &ctx.lockfile_dir.join(&resolution.directory),
-                ctx.lockfile_dir,
-            )?;
+            let resolved = lexical_normalize(&ctx.lockfile_dir.join(&resolution.directory));
             LockfileResolution::Directory(DirectoryResolution {
                 directory: relative_path(ctx.deploy_dir, &resolved),
             })
         }
         LockfileResolution::Tarball(resolution) if resolution.tarball.starts_with("file:") => {
             let input_path = resolution.tarball.trim_start_matches("file:");
-            let resolved =
-                validate_lockfile_local_path(&ctx.lockfile_dir.join(input_path), ctx.lockfile_dir)?;
+            let resolved = lexical_normalize(&ctx.lockfile_dir.join(input_path));
             LockfileResolution::Tarball(TarballResolution {
                 tarball: format!("file:{}", relative_path(ctx.deploy_dir, &resolved)),
                 integrity: resolution.integrity.clone(),
@@ -94,8 +90,25 @@ pub(super) fn convert_resolved_dependency_spec(
 ) -> miette::Result<ResolvedDependencySpec> {
     let mut spec = spec.clone();
     spec.version = convert_importer_dep_version(name, &spec.version, ctx, bases)?;
-    spec.specifier = spec.version.to_string();
+    spec.specifier = deploy_dependency_specifier(name, &spec.version);
     Ok(spec)
+}
+
+fn deploy_dependency_specifier(name: &PkgName, reference: &ImporterDepVersion) -> String {
+    let (resolved_name, version) = match reference {
+        ImporterDepVersion::Regular(version) => (name, version),
+        ImporterDepVersion::Alias(key) => (&key.name, &key.suffix),
+        ImporterDepVersion::Link(_) | ImporterDepVersion::File(_) => return reference.to_string(),
+    };
+    if !version.prefix().as_str().is_empty() {
+        return reference.to_string();
+    }
+    let Some(version) = version.version_semver() else { return reference.to_string() };
+    if resolved_name == name {
+        version.to_string()
+    } else {
+        format!("npm:{resolved_name}@{version}")
+    }
 }
 
 fn convert_importer_dep_map_to_snapshot_deps(
@@ -139,7 +152,7 @@ fn convert_importer_dep_version(
     Ok(version.clone())
 }
 
-fn convert_importer_version_to_snapshot_ref(
+pub(super) fn convert_importer_version_to_snapshot_ref(
     alias: &PkgName,
     version: &ImporterDepVersion,
     ctx: &ConvertCtx,
@@ -195,6 +208,13 @@ fn resolve_snapshot_dep_ref(
         }
         SnapshotDepRef::Alias(key) => resolve_pkg_ver_peer(&key.suffix, bases.file_base)
             .map(|local| local.with_alias(&key.name)),
+        // A link into the declaring package is resolved where that package
+        // is placed, so it reads the same in the deploy directory.
+        SnapshotDepRef::Link(target)
+            if pnpm_lockfile::package_root_link_target(target).is_some() =>
+        {
+            None
+        }
         SnapshotDepRef::Link(target) => Some(resolve_link_payload(bases.link_base, target)),
     }
 }
@@ -236,12 +256,11 @@ fn local_to_importer_dep_version(
     local: &LocalResolve,
     ctx: &ConvertCtx,
 ) -> miette::Result<ImporterDepVersion> {
-    let resolved_path = validate_lockfile_local_path(&local.resolved_path, ctx.lockfile_dir)?;
-    if same_path(&resolved_path, ctx.deployed_project_root) {
+    let resolved_path = &local.resolved_path;
+    if same_path(resolved_path, ctx.deployed_project_root) {
         return Ok(ImporterDepVersion::Link(".".to_string()));
     }
-    let key =
-        create_file_url_key(&resolved_path, &local.suffix, ctx.projects_by_path, Some(alias))?;
+    let key = create_file_url_key(resolved_path, &local.suffix, ctx.projects_by_path, Some(alias))?;
     Ok(ImporterDepVersion::Alias(key))
 }
 
@@ -250,12 +269,12 @@ fn local_to_snapshot_dep_ref(
     local: &LocalResolve,
     ctx: &ConvertCtx,
 ) -> miette::Result<SnapshotDepRef> {
-    let resolved_path = validate_lockfile_local_path(&local.resolved_path, ctx.lockfile_dir)?;
-    if same_path(&resolved_path, ctx.deployed_project_root) {
+    let resolved_path = &local.resolved_path;
+    if same_path(resolved_path, ctx.deployed_project_root) {
         return Ok(SnapshotDepRef::Link(".".to_string()));
     }
     Ok(SnapshotDepRef::Alias(create_file_url_key(
-        &resolved_path,
+        resolved_path,
         &local.suffix,
         ctx.projects_by_path,
         Some(alias),
@@ -267,20 +286,8 @@ pub(super) fn convert_package_key(
     ctx: &ConvertCtx,
 ) -> miette::Result<PackageKey> {
     let VersionPart::File(path) = key.suffix.version() else { return Ok(key.clone()) };
-    let resolved = validate_lockfile_local_path(&ctx.lockfile_dir.join(path), ctx.lockfile_dir)?;
+    let resolved = lexical_normalize(&ctx.lockfile_dir.join(path));
     create_file_url_key(&resolved, key.suffix.peer(), ctx.projects_by_path, Some(&key.name))
-}
-
-pub(super) fn validate_lockfile_local_path(
-    path: &Path,
-    lockfile_dir: &Path,
-) -> miette::Result<PathBuf> {
-    let normalized = lexical_normalize(path);
-    let workspace_dir = lexical_normalize(lockfile_dir);
-    if same_path(&normalized, &workspace_dir) || is_child_path(&normalized, &workspace_dir) {
-        return Ok(normalized);
-    }
-    Err(DeployError::UnsafeLockfilePath { path: normalized, workspace_dir }.into())
 }
 
 pub(super) fn create_file_url_key(
@@ -296,6 +303,11 @@ pub(super) fn create_file_url_key(
         .to_string();
     let name = projects_by_path
         .get(&ProjectPathKey::new(&normalized))
+        .or_else(|| {
+            projects_by_path
+                .values()
+                .find(|project| project.linked_publish_dir.as_deref() == Some(&*normalized))
+        })
         .and_then(|project| project.name.as_deref())
         .map(str::to_string)
         .or_else(|| package_name.map(PkgName::to_string))

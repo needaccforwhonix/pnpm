@@ -7,9 +7,8 @@ use crate::cli_args::{
 };
 use bump::{Bump, inc, parse_bump, parse_current_version};
 use clap::Args;
-use derive_more::{Display, Error};
 use git::version_from_git;
-use miette::{Context, Diagnostic};
+use miette::Context;
 use node_semver::{Identifier, Version};
 use pnpm_config::Config;
 use pnpm_executor::{RunPostinstallHooks, run_lifecycle_hook};
@@ -48,6 +47,13 @@ pub struct VersionArgs {
     /// Show information in JSON format.
     #[clap(long)]
     pub json: bool,
+    /// With the bare `pnpm version -r`: a file with a summary of the
+    /// release. It goes above the release notes composed from the change
+    /// intents for a registry declared `serverType: pnpr`: the publication's
+    /// note, or the package's version note when the release has one
+    /// package.
+    #[clap(long = "release-notes", value_name = "FILE")]
+    pub release_notes: Option<String>,
     #[clap(flatten)]
     pub git: VersionGitArgs,
 }
@@ -70,62 +76,11 @@ pub struct VersionGitArgs {
     /// Sign the generated git tag with GPG.
     #[clap(long = "sign-git-tag")]
     pub sign_git_tag: bool,
-    /// Sets the tag prefix. Default is "v". Set to empty string to remove
-    /// the prefix.
-    #[clap(long = "tag-version-prefix", default_value = "v")]
-    pub tag_version_prefix: String,
-}
-
-/// Errors of `pnpm version`. Codes and messages match the TypeScript CLI.
-#[derive(Debug, Display, Error, Diagnostic)]
-enum VersionError {
-    #[display(
-        "A version argument is required. Must be a valid semver version (e.g. 1.2.3) or one of: major, minor, patch, premajor, preminor, prepatch, prerelease, from-git"
-    )]
-    #[diagnostic(code(ERR_PNPM_INVALID_VERSION_BUMP))]
-    MissingBump,
-
-    #[display(
-        "Invalid version argument: {raw}. Must be a valid semver version (e.g. 1.2.3) or one of: major, minor, patch, premajor, preminor, prepatch, prerelease, from-git"
-    )]
-    #[diagnostic(code(ERR_PNPM_INVALID_VERSION_BUMP))]
-    InvalidBump { raw: String },
-
-    #[display(
-        "Could not determine a valid version from Git in {dir:?} using tag prefix {tag_version_prefix:?}: {reason}"
-    )]
-    #[diagnostic(code(ERR_PNPM_INVALID_VERSION_FROM_GIT))]
-    InvalidVersionFromGit { dir: String, tag_version_prefix: String, reason: String },
-
-    #[display("Invalid version in {dir}: {version}")]
-    #[diagnostic(code(ERR_PNPM_INVALID_VERSION))]
-    InvalidVersion { dir: String, version: String },
-
-    #[display("Version was not changed: {version}")]
-    #[diagnostic(code(ERR_PNPM_VERSION_NOT_CHANGED))]
-    VersionNotChanged { version: String },
-
-    #[display("No packages to version")]
-    #[diagnostic(code(ERR_PNPM_NO_PACKAGES_TO_VERSION))]
-    NoPackagesToVersion,
-
-    #[display("Cannot stage manifest outside of git cwd: {path}")]
-    #[diagnostic(code(ERR_PNPM_INVALID_MANIFEST_PATH))]
-    InvalidManifestPath { path: String },
-
-    #[display("git {args} failed: {stderr}")]
-    #[diagnostic(code(ERR_PNPM_GIT_COMMAND_FAILED))]
-    GitCommandFailed { args: String, stderr: String },
-
-    #[display(
-        r#"The bare "pnpm version -r" form consumes change intents and is only supported in a workspace"#
-    )]
-    #[diagnostic(code(ERR_PNPM_WORKSPACE_ONLY))]
-    ReleaseOutsideWorkspace,
-
-    #[display("Working tree is not clean. Commit or stash your changes.")]
-    #[diagnostic(code(ERR_PNPM_UNCLEAN_WORKING_TREE))]
-    UncleanWorkingTree,
+    /// Sets the tag prefix. Defaults to the `tagVersionPrefix` setting,
+    /// or "v" when the setting is unset. Set to empty string to remove the
+    /// prefix.
+    #[clap(long = "tag-version-prefix")]
+    pub tag_version_prefix: Option<String>,
 }
 
 impl VersionArgs {
@@ -136,10 +91,17 @@ impl VersionArgs {
         recursive: bool,
     ) -> miette::Result<()> {
         match self.params.first().map(String::as_str) {
-            None if recursive => self.release_from_intents(config).await,
+            None if recursive => self.release_from_intents(config, dir).await,
+            _ if self.release_notes.is_some() => {
+                Err(VersionError::ReleaseNotesWithoutIntents.into())
+            }
             None => Err(VersionError::MissingBump.into()),
             Some(_) => self.npm_style_bump::<Reporter>(config, dir, recursive),
         }
+    }
+
+    fn effective_tag_version_prefix<'a>(&'a self, config: &'a Config) -> &'a str {
+        self.git.tag_version_prefix.as_deref().unwrap_or(&config.tag_version_prefix)
     }
 
     /// Apply an npm-style bump — `pnpm version <major|minor|…|x.y.z>` — to
@@ -155,8 +117,9 @@ impl VersionArgs {
     ) -> miette::Result<()> {
         let raw = self.params[0].as_str();
         let git_cwd = config.workspace_dir.clone().unwrap_or_else(|| dir.to_path_buf());
+        let tag_version_prefix = self.effective_tag_version_prefix(config);
         let bump = if raw == "from-git" {
-            Bump::Explicit(version_from_git(&git_cwd, &self.git.tag_version_prefix)?)
+            Bump::Explicit(version_from_git(&git_cwd, tag_version_prefix)?)
         } else {
             parse_bump(raw)?
         };
@@ -179,10 +142,11 @@ impl VersionArgs {
         // tag the commit with. Skip the git commit and tag entirely then.
         if !self.dry_run
             && !recursive
+            && config.git_tag_version
             && !self.git.no_git_tag_version
             && is_git_repo::<Host>(&git_cwd)
         {
-            self.commit_and_tag(&changes[0], &git_cwd)?;
+            self.commit_and_tag(&changes[0], &git_cwd, tag_version_prefix)?;
         }
 
         for change in &changes {
@@ -239,7 +203,10 @@ impl VersionArgs {
                     })
                 })
                 .collect();
-            println!("{}", serde_json::to_string_pretty(&entries).expect("serialize changes"));
+            pnpm_diagnostics::println!(
+                "{}",
+                serde_json::to_string_pretty(&entries).expect("serialize changes"),
+            );
             return;
         }
 
@@ -257,7 +224,7 @@ impl VersionArgs {
             )
             .expect("write to string");
         }
-        print!("{output}");
+        pnpm_diagnostics::print!("{output}");
     }
 
     /// Bump one package's manifest, running its `preversion` and `version`
@@ -271,7 +238,7 @@ impl VersionArgs {
         config: &Config,
         init_cwd: &Path,
     ) -> miette::Result<Option<VersionChange>> {
-        let manifest_path = pkg_dir.join("package.json");
+        let manifest_path = pnpm_workspace::project_manifest_path(pkg_dir);
         let mut manifest = PackageManifest::from_path(manifest_path.clone())
             .wrap_err_with(|| format!("reading {}", manifest_path.display()))?;
 
@@ -395,17 +362,16 @@ fn run_version_lifecycle_hook<Reporter: pnpm_reporter::Reporter>(
     };
 
     let root_modules_dir = change.path.join(&config.modules_dir);
+    let (bin_dir, extra_env) = project_scripts_bin_dir_and_env(change, config);
     let script_shell = config.script_shell.as_ref().map(PathBuf::from);
     let run_opts = RunPostinstallHooks {
-        environment: super::run::script_environment(config, init_cwd, &config.extra_env),
+        environment: super::run::script_environment(config, init_cwd, &extra_env),
         execution: pnpm_executor::ScriptExecutionOptions {
             extra_bin_paths: &config.extra_bin_paths,
             node_gyp_bin: pnpm_executor::bundled_node_gyp_bin(),
-            prepend_node_path: super::run::exec_scripts_prepend_node_path(
-                config.scripts_prepend_node_path,
-            ),
             shell: script_shell.as_deref(),
             shell_emulator: config.shell_emulator,
+            wd_bin_dir: Some(&bin_dir),
         },
         dep_path: &change.name,
         pkg_root: &change.path,
@@ -418,6 +384,20 @@ fn run_version_lifecycle_hook<Reporter: pnpm_reporter::Reporter>(
     let parent_env: HashMap<String, String> = std::env::vars().collect();
     run_lifecycle_hook::<Reporter>(stage, &script, &run_opts, manifest.value(), &parent_env)
         .map_err(miette::Report::new)
+}
+
+fn project_scripts_bin_dir_and_env(
+    change: &VersionChange,
+    config: &Config,
+) -> (PathBuf, HashMap<String, String>) {
+    let modules_dir_name = config.modules_dir_name_for(&change.path, Some(&change.name));
+    let mut extra_env = config.extra_env.clone();
+    config.prepend_project_node_path::<pnpm_config::Host>(
+        &mut extra_env,
+        &change.path,
+        &modules_dir_name,
+    );
+    (change.path.join(modules_dir_name).join(".bin"), extra_env)
 }
 
 /// One package's version bump: what it was, what it became, and where its
@@ -454,5 +434,8 @@ mod tests;
 mod bump;
 
 mod release;
+
+mod error;
+use error::VersionError;
 
 mod git;

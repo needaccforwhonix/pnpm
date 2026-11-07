@@ -7,14 +7,16 @@
 //! that replaces the git source. Cargo then resolves the pinned revision
 //! without a fetch of its own.
 
-use super::add_cargo_checksum;
+use super::{add_cargo_checksum, slot_is_complete};
 use cargo_lock::package::GitReference;
 use futures_util::{StreamExt, stream};
 use manifest::{Checkout, CheckoutPackage, entry_file_type, read_directory};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use pnpm_config::PackageImportMethod;
 use pnpm_deps_restorer::{ImportIndexedDirOpts, import_indexed_dir};
-use pnpm_git_fetcher::{CheckoutOptions, checkout_commit};
+use pnpm_git_fetcher::{
+    CheckoutOptions, SUPPORTED_GIT_PROTOCOLS, checkout_commit, checkout_submodules,
+};
 use pnpm_network::redact_and_sanitize;
 use pnpm_reporter::Reporter;
 use pnpm_store_dir::StoreDir;
@@ -36,11 +38,6 @@ pub(crate) const GIT_SOURCE_NAME: &str = "pnpm-git";
 const DEPENDENCY_KINDS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
 /// Directories `cargo` never reads a package's sources from.
 const EXCLUDED_DIRECTORIES: [&str; 2] = [".git", "target"];
-/// The transports a git dependency is fetched over. `git` runs whatever a
-/// scheme outside this set names — `ext::` hands the URL to a shell — and
-/// a lockfile is not a place to take a command from.
-const SUPPORTED_SCHEMES: [&str; 5] = ["file", "git", "http", "https", "ssh"];
-
 /// A git repository at one revision, as `Cargo.lock` spells it.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct GitSource {
@@ -85,13 +82,7 @@ impl GitSource {
             Some(GitReference::Rev(rev)) => Some(("rev", rev.clone())),
             Some(GitReference::DefaultBranch) | None => None,
         };
-        if !SUPPORTED_SCHEMES.contains(&source.url().scheme()) {
-            let repository = redact_and_sanitize(&url);
-            let scheme = source.url().scheme();
-            return Err(miette::miette!(
-                "Cargo source {repository} asks for the {scheme} transport, which pnpm does not fetch a git dependency over",
-            ));
-        }
+        validate_transport(source)?;
         let Some(commit) = source.precise() else {
             let source = redact_and_sanitize(&source.to_string());
             return Err(miette::miette!("Cargo source {source} pins no commit"));
@@ -127,6 +118,17 @@ impl GitSource {
     }
 }
 
+pub(super) fn validate_transport(source: &cargo_lock::SourceId) -> Result<()> {
+    if SUPPORTED_GIT_PROTOCOLS.contains(&source.url().scheme()) {
+        return Ok(());
+    }
+    let repository = redact_and_sanitize(source.url().as_ref());
+    let scheme = source.url().scheme();
+    Err(miette::miette!(
+        "Cargo source {repository} asks for the {scheme} transport, which pnpm does not fetch a git dependency over",
+    ))
+}
+
 impl GitPackage {
     pub(crate) fn link_name(&self) -> String {
         format!("{}-{}", self.name, self.version)
@@ -140,7 +142,7 @@ impl GitPackage {
             .join("crates")
             .join(&self.name)
             .join(&self.version)
-            .join(format!("git-{}", self.source.commit))
+            .join(format!("git-submodules-v1-{}", self.source.commit))
     }
 }
 
@@ -209,9 +211,7 @@ fn vendor_source<Reporter: self::Reporter>(
     let mut missing = Vec::new();
     for package in options.packages {
         let slot = package.store_slot(options.store_dir.root());
-        // The checksum manifest sorts first among a crate's files, which
-        // makes it the completion marker `import_indexed_dir` writes last.
-        if slot.join(".cargo-checksum.json").exists() {
+        if slot_is_complete(&slot, None) {
             linked.push((package.link_name(), slot));
         } else {
             missing.push((package, slot));
@@ -268,7 +268,7 @@ fn import_package(
     root: &Path,
     package: &CheckoutPackage,
     package_dirs: &BTreeSet<&Path>,
-) -> Result<HashMap<String, PathBuf>> {
+) -> Result<pnpm_fs::CasPaths> {
     let context = ImportContext {
         store_dir,
         root,
@@ -289,7 +289,7 @@ fn import_directory(
     context: &ImportContext<'_>,
     dir: &Path,
     prefix: &str,
-    cas_paths: &mut HashMap<String, PathBuf>,
+    cas_paths: &mut pnpm_fs::CasPaths,
 ) -> Result<()> {
     for entry in read_directory(dir)? {
         // A lossy name would key one file's contents under another's, and
@@ -303,6 +303,9 @@ fn import_directory(
                 let path = path.display();
                 miette::miette!("cannot vendor {path}: its name is not valid UTF-8")
             })?;
+        if name == ".git" {
+            continue;
+        }
         let path = entry.path();
         match entry_kind(context.root, &entry)? {
             Some(EntryKind::Directory) => {
@@ -331,12 +334,12 @@ fn import_file(
     path: &Path,
     relative: &str,
     executable: bool,
-) -> Result<PathBuf> {
+) -> Result<pnpm_fs::StoreFile> {
     if relative == "Cargo.toml" {
         return context.store_dir
             .write_cas_file(context.manifest.as_bytes(), executable)
             .into_diagnostic()
-            .map(|(cas_path, _)| cas_path)
+            .map(|written| written.file)
             .wrap_err_with(|| format!("store {}", path.display()));
     }
     // Streamed rather than read whole: a repository is free to carry a
@@ -347,7 +350,7 @@ fn import_file(
     context.store_dir
         .write_cas_file_from_reader(&mut file, executable, None)
         .into_diagnostic()
-        .map(|(cas_path, _, _)| cas_path)
+        .map(|written| written.file)
         .wrap_err_with(|| format!("store {}", path.display()))
 }
 
@@ -435,12 +438,19 @@ fn checkout_source(options: &VendorSourceOptions<'_>) -> Result<tempfile::TempDi
         git_shallow_hosts: options.git_shallow_hosts,
         git_bin: None,
         dest: checkout.path(),
+        git_config: &[],
     })
     .map_err(|error| {
         let error = redact_and_sanitize(&error.to_string());
         miette::miette!("{error}")
     })
     .wrap_err_with(|| format!("check out {repository} at {}", options.source.commit))?;
+    checkout_submodules(checkout.path())
+        .map_err(|error| {
+            let error = redact_and_sanitize(&error.to_string());
+            miette::miette!("{error}")
+        })
+        .wrap_err_with(|| format!("check out submodules of {repository}"))?;
     Ok(checkout)
 }
 

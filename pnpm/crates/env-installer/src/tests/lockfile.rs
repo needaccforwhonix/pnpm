@@ -4,6 +4,8 @@ use super::{
     harness, integrity_of, options, pnpm_engine_packages, resolve_and_install_config_deps,
     resolve_package_manager_integrities,
 };
+use crate::running_version_unpublished;
+use pnpm_config::PNPM_VERSION;
 
 /// The entries a forced resync repairs already record the pinned version,
 /// so `--frozen-lockfile` re-resolves them in memory: the caller gets usable
@@ -67,13 +69,8 @@ async fn force_resync_under_frozen_lockfile_resolves_without_writing() {
     assert_eq!(std::fs::read_to_string(&lockfile_path).unwrap(), before);
 }
 
-/// A pnpm below 11.20.0 pins `@pnpm/exe` beside `pnpm` for a v12 version.
-/// The entry pins the wanted version and cannot change which pnpm runs, so a
-/// frozen lockfile accepts the block a teammate's older pnpm left behind,
-/// and a writable install rewrites it to the packages this pnpm installs
-/// from.
 #[tokio::test]
-async fn frozen_lockfile_accepts_an_engine_package_it_does_not_install_from() {
+async fn an_engine_package_pnpm_does_not_install_from_is_left_alone() {
     let harness = harness();
     let root = TempDir::new().unwrap();
     let fixtures = || {
@@ -133,7 +130,8 @@ async fn frozen_lockfile_accepts_an_engine_package_it_does_not_install_from() {
         .keys()
         .map(String::as_str)
         .collect();
-    assert_eq!(recorded, ["pnpm"], "a writable install records what it installs from");
+    assert_eq!(recorded, ["@pnpm/exe", "pnpm"], "the block is kept as the older pnpm wrote it");
+    assert_eq!(std::fs::read_to_string(&lockfile_path).unwrap(), before);
 }
 
 /// The tolerance is for a package pinned at the wanted version. One pinning
@@ -176,7 +174,7 @@ async fn frozen_lockfile_rejects_an_engine_package_pinned_at_another_version() {
                 version: "11.23.0".to_string(),
             },
         );
-    env_lockfile.write(root.path()).unwrap();
+    env_lockfile.write(root.path(), pnpm_lockfile::SymlinkedLockfile::Refuse).unwrap();
     let lockfile_path = root.path().join("pnpm-lock.yaml");
     let before = std::fs::read_to_string(&lockfile_path).unwrap();
 
@@ -318,5 +316,114 @@ async fn frozen_lockfile_rejects_old_format_migration() {
     assert!(
         matches!(error, ConfigDepError::FrozenLockfileOutdated { .. }),
         "unexpected error: {error:?}",
+    );
+}
+
+#[tokio::test]
+async fn array_engines_are_not_recorded() {
+    let harness = harness();
+    let root = TempDir::new().unwrap();
+    let resolver = FixtureResolver::new()
+        .package(serde_json::json!({
+            "name": "pnpm",
+            "version": "12.0.0",
+            "bin": "bin/pnpm.cjs",
+            "engines": ["node >= 0.8"],
+        }));
+    let env = resolve_package_manager_integrities(
+        pnpm_engine_packages("12.0.0"),
+        "^12.0.0",
+        "12.0.0",
+        &resolver,
+        &options(&harness, root.path(), false),
+        false,
+    )
+    .await
+    .unwrap();
+
+    let key: PackageKey = "pnpm@12.0.0".parse().unwrap();
+    assert_eq!(env.packages[&key].engines, None);
+}
+
+/// A project pinning the running pnpm asks for no download, so a registry
+/// that does not publish that version leaves nothing to record. The
+/// recording paths read this as "no integrity to write" and carry on, which
+/// is what keeps an install working on a mirror that has not synced the
+/// release yet.
+#[tokio::test]
+async fn an_unpublished_running_version_reads_as_nothing_to_record() {
+    let harness = harness();
+    let root = TempDir::new().unwrap();
+    let error = resolve_package_manager_integrities(
+        pnpm_engine_packages(PNPM_VERSION),
+        PNPM_VERSION,
+        PNPM_VERSION,
+        &FixtureResolver::new().unpublished("pnpm"),
+        &options(&harness, root.path(), false),
+        false,
+    )
+    .await
+    .expect_err("the registry publishes no such version");
+
+    assert!(
+        running_version_unpublished(&error, PNPM_VERSION),
+        "the running version missing from the registry is nothing to record, got {error:?}",
+    );
+    assert!(
+        !root
+            .path()
+            .join("pnpm-lock.yaml")
+            .exists(),
+        "a version with no integrity to record writes no lockfile",
+    );
+}
+
+/// The tolerance is keyed on the pin naming the pnpm that is running. A pin
+/// on any other version is a pin that cannot be satisfied, so it stays an
+/// error however the registry answers.
+#[tokio::test]
+async fn an_unpublished_other_version_stays_an_error() {
+    let harness = harness();
+    let root = TempDir::new().unwrap();
+    let wanted = "12.0.0-not-the-running-version";
+    let error = resolve_package_manager_integrities(
+        pnpm_engine_packages(wanted),
+        wanted,
+        wanted,
+        &FixtureResolver::new().unpublished("pnpm"),
+        &options(&harness, root.path(), false),
+        false,
+    )
+    .await
+    .expect_err("the registry publishes no such version");
+
+    assert_ne!(wanted, PNPM_VERSION, "the fixture version must not be the running one");
+    assert!(
+        !running_version_unpublished(&error, wanted),
+        "a pin on another version is a real failure, got {error:?}",
+    );
+}
+
+/// Keyed on the registry's answer too, not on the version alone: a
+/// resolution that fails any other way is a real failure even when the pin
+/// names the running pnpm.
+#[tokio::test]
+async fn another_failure_on_the_running_version_stays_an_error() {
+    let harness = harness();
+    let root = TempDir::new().unwrap();
+    let error = resolve_package_manager_integrities(
+        pnpm_engine_packages(PNPM_VERSION),
+        PNPM_VERSION,
+        PNPM_VERSION,
+        &FixtureResolver::new(),
+        &options(&harness, root.path(), false),
+        false,
+    )
+    .await
+    .expect_err("the fixture resolver resolves nothing");
+
+    assert!(
+        !running_version_unpublished(&error, PNPM_VERSION),
+        "only the registry's no-matching-version answer is tolerated, got {error:?}",
     );
 }

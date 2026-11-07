@@ -1,6 +1,7 @@
 use super::{
     BTreeMap, DepPath, DirectDep, HashMap, HashSet, ImporterPeerInput, NodeId, ResolvePeersOptions,
-    ResolvedTree, linked_package, package, resolve_peers, resolve_peers_workspace, tree_node,
+    ResolvedTree, WorkspacePeerSettings, linked_package, package, resolve_peers,
+    resolve_peers_workspace, tree_node,
 };
 
 /// Same as [`pruned_hoisted_provider_falls_back_to_root_resolution`] but
@@ -16,16 +17,13 @@ fn pruned_hoisted_provider_falls_back_in_workspace_pass() {
             DirectDep {
                 alias: "consumer".to_string(),
                 node_id: consumer.clone(),
-                id: "consumer@1.0.0".to_string(),
+                id: "consumer@1.0.0".into(),
             },
-            DirectDep {
-                alias: "prov".to_string(),
-                node_id: prov.clone(),
-                id: "prov@1.0.0".to_string(),
-            },
+            DirectDep { alias: "prov".to_string(), node_id: prov.clone(), id: "prov@1.0.0".into() },
         ],
         root_dir: std::path::PathBuf::from("/repo"),
         modules_dir: None,
+        rejected_optional_peers: HashSet::default(),
     };
     let mut tree = ResolvedTree {
         direct: Vec::new(),
@@ -47,9 +45,7 @@ fn pruned_hoisted_provider_falls_back_in_workspace_pass() {
         &mut tree,
         &[importer],
         std::path::Path::new("/repo"),
-        false,
-        false,
-        false,
+        WorkspacePeerSettings::default(),
         ResolvePeersOptions {
             scope: crate::PeerResolutionScope {
                 hoisted_peer_provider_node_ids: HashSet::from_iter([prov]),
@@ -80,7 +76,7 @@ fn single_importer_link_is_rendered_relative_to_project_root() {
         direct: vec![DirectDep {
             alias: "shared".to_string(),
             node_id: shared.clone(),
-            id: "link:packages/shared".to_string(),
+            id: "link:packages/shared".into(),
         }],
         packages: HashMap::from_iter([(
             "link:packages/shared".into(),

@@ -109,7 +109,7 @@ async fn walks_dependencies_and_builds_flat_tree() {
 
     assert_eq!(tree.direct.len(), 1);
     assert_eq!(tree.direct[0].alias, "foo");
-    assert_eq!(tree.direct[0].id, "foo@1.2.0");
+    assert_eq!(&*tree.direct[0].id, "foo@1.2.0");
     assert_eq!(tree.packages.len(), 2);
     assert!(tree.packages.contains_key("foo@1.2.0"));
     let foo_node_id = &tree.direct[0].node_id;
@@ -232,7 +232,12 @@ async fn declined_specifier_surfaces_spec_not_supported_error() {
     )
     .await
     .expect_err("declined spec must error");
-    match err {
+    let ResolveDependencyTreeError::DependencyContext(context) = err else {
+        panic!("expected dependency context, got {err:?}");
+    };
+    assert_eq!(context.alias, "foo");
+    assert_eq!(context.specifier, "git+ssh://example.com");
+    match *context.source {
         ResolveDependencyTreeError::SpecNotSupported { specifier } => {
             assert_eq!(specifier, "foo@git+ssh://example.com");
         }

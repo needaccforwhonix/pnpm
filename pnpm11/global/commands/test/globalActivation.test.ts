@@ -4,10 +4,11 @@ import path from 'node:path'
 import util from 'node:util'
 
 import { afterEach, expect, jest, test } from '@jest/globals'
-import { getBinsFromPackageManifest } from '@pnpm/bins.resolver'
+import { getBinsFromPackageManifest, pkgOwnsBin } from '@pnpm/bins.resolver'
 import type { DependencyManifest } from '@pnpm/types'
 
 type LinkBinsOfPackages = typeof import('@pnpm/bins.linker').linkBinsOfPackages
+type GetBinsToLink = typeof import('@pnpm/bins.linker').getBinsToLink
 type RemoveBin = typeof import('@pnpm/bins.remover').removeBin
 type SymlinkDir = typeof import('symlink-dir').symlinkDir
 
@@ -20,6 +21,7 @@ let removeBinFailure: { name: string, error: Error } | undefined
 let backupRemovalFailure: Error | undefined
 let obstructBackupCleanup = false
 let skipMissingBinSources = false
+let binSourceToRemoveAfterLink: string | undefined
 let symlinkCallCount = 0
 const linkedBinNames: string[] = []
 const backupSymlinkTypes: Array<string | null | undefined> = []
@@ -42,7 +44,7 @@ jest.spyOn(fs, 'rm').mockImplementation(async (target, options) => {
   await realRm(target, options)
 })
 
-const linkBinsOfPackages = jest.fn<LinkBinsOfPackages>(async (pkgs, globalBinDir, opts = {}) => {
+const getBinsToLink = jest.fn<GetBinsToLink>(async (pkgs, excludeBins = new Set()) => {
   const commands = (await Promise.all(pkgs.map(async ({ manifest, location }) => {
     return (await getBinsFromPackageManifest(manifest, location)).map((command) => ({
       command,
@@ -50,12 +52,32 @@ const linkBinsOfPackages = jest.fn<LinkBinsOfPackages>(async (pkgs, globalBinDir
     }))
   })))
     .flat()
-    .filter(({ command }) => !opts.excludeBins?.has(command.name))
+    .filter(({ command }) => !excludeBins.has(command.name))
+  const selected = new Map<string, typeof commands[number]>()
+  for (const candidate of commands) {
+    const existing = selected.get(candidate.command.name)
+    if (existing == null || commandWins(candidate, existing)) selected.set(candidate.command.name, candidate)
+  }
+  return [...selected.values()].map(({ command }) => command)
+})
+
+function commandWins (
+  candidate: { command: { name: string }, pkgName: string },
+  existing: { command: { name: string }, pkgName: string }
+): boolean {
+  const candidateOwns = pkgOwnsBin(candidate.command.name, candidate.pkgName)
+  const existingOwns = pkgOwnsBin(existing.command.name, existing.pkgName)
+  if (candidateOwns !== existingOwns) return candidateOwns
+  return candidate.pkgName.localeCompare(existing.pkgName) > 0
+}
+
+const linkBinsOfPackages = jest.fn<LinkBinsOfPackages>(async (pkgs, globalBinDir, opts = {}) => {
+  const commands = await getBinsToLink(pkgs, opts.excludeBins)
 
   await fs.mkdir(globalBinDir, { recursive: true })
   const writtenPkgNames: string[] = []
   /* eslint-disable no-await-in-loop -- sequential writes make the injected partial failure deterministic */
-  for (const { command, pkgName } of commands) {
+  for (const command of commands) {
     if (skipMissingBinSources && !existsSync(command.path)) continue
     const slot = path.join(globalBinDir, command.name)
     await fs.rm(slot, { force: true, recursive: true })
@@ -63,12 +85,13 @@ const linkBinsOfPackages = jest.fn<LinkBinsOfPackages>(async (pkgs, globalBinDir
     const sourceStat = await fs.stat(command.path)
     await fs.chmod(slot, sourceStat.mode & 0o777)
     linkedBinNames.push(command.name)
-    writtenPkgNames.push(pkgName)
+    writtenPkgNames.push(command.name)
     if (linkFailure != null && writtenPkgNames.length === linkFailure.afterWrites) {
       throw linkFailure.error
     }
   }
   /* eslint-enable no-await-in-loop */
+  if (binSourceToRemoveAfterLink != null) await fs.rm(binSourceToRemoveAfterLink)
   return writtenPkgNames
 })
 
@@ -85,14 +108,7 @@ const removeBin = jest.fn<RemoveBin>(async (cmd) => {
 async function onHashLinkSwap (): Promise<void> {
   symlinkCallCount++
   if (symlinkCallCount === 1) {
-    if (testRoot == null) throw new Error('Expected a activation fixture before linking the hash directory')
-    const backupDirs = await findBackupDirs(testRoot)
-    activationBackupFileContents.push(...(await Promise.all(backupDirs.map(readRegularFileContents))).flat())
-    if (obstructBackupCleanup) {
-      const [backupDir] = backupDirs
-      if (backupDir == null) throw new Error('Expected a global bin backup directory')
-      await fs.writeFile(path.join(backupDir, 'cleanup-obstruction'), 'keep backup directory non-empty\n')
-    }
+    await inspectBackupsAtActivationSwap()
   }
   if (symlinkCallCount === 2 && restorationLinkFailure != null) {
     throw restorationLinkFailure
@@ -100,6 +116,16 @@ async function onHashLinkSwap (): Promise<void> {
   if (symlinkCallCount === 1 && activationLinkFailure != null) {
     throw activationLinkFailure
   }
+}
+
+async function inspectBackupsAtActivationSwap (): Promise<void> {
+  if (testRoot == null) throw new Error('Expected a activation fixture before linking the hash directory')
+  const backupDirs = await findBackupDirs(testRoot)
+  activationBackupFileContents.push(...(await Promise.all(backupDirs.map(readRegularFileContents))).flat())
+  if (!obstructBackupCleanup) return
+  const [backupDir] = backupDirs
+  if (backupDir == null) throw new Error('Expected a global bin backup directory')
+  await fs.writeFile(path.join(backupDir, 'cleanup-obstruction'), 'keep backup directory non-empty\n')
 }
 
 // Used only on the Windows path, where the swap cannot be a rename.
@@ -121,7 +147,7 @@ jest.spyOn(fs, 'symlink').mockImplementation(async (target, linkPath, type) => {
   await realSymlink(target, linkPath, type)
 })
 
-jest.unstable_mockModule('@pnpm/bins.linker', () => ({ linkBinsOfPackages }))
+jest.unstable_mockModule('@pnpm/bins.linker', () => ({ getBinsToLink, getExtraNodePaths: () => [], linkBinsOfPackages }))
 jest.unstable_mockModule('@pnpm/bins.remover', () => ({ removeBin }))
 jest.unstable_mockModule('@pnpm/global.packages', () => ({ getHashLink }))
 jest.unstable_mockModule('@pnpm/logger', () => ({ globalWarn }))
@@ -144,6 +170,7 @@ afterEach(async () => {
     obstructBackupCleanup = false
     removeBinFailure = undefined
     skipMissingBinSources = false
+    binSourceToRemoveAfterLink = undefined
     symlinkCallCount = 0
     backupSymlinkTypes.length = 0
     linkedBinNames.length = 0
@@ -151,6 +178,7 @@ afterEach(async () => {
     getHashLink.mockClear()
     globalWarn.mockClear()
     linkBinsOfPackages.mockClear()
+    getBinsToLink.mockClear()
     removeBin.mockClear()
     symlinkDir.mockClear()
   }
@@ -231,6 +259,7 @@ test('restores exact bin slots when linking fails after a partial write', async 
   await expect(activateGlobalInstall({
     installDir: fixture.freshInstallDir,
     hashLink: fixture.hashLink,
+    nodePathOptions: {},
     globalBinDir: fixture.globalBinDir,
     pkgs: [{ manifest, location: fixture.packageDir }],
     binsToSkip: new Set(),
@@ -249,6 +278,101 @@ test('restores exact bin slots when linking fails after a partial write', async 
   expect(existsSync(fixture.oldInstallDir)).toBe(true)
   expect(existsSync(fixture.freshInstallDir)).toBe(false)
   expect(await findBackupDirs(fixture.root)).toStrictEqual([])
+})
+
+test('rolls back when a retained bin target disappears during activation', async () => {
+  const manifest: DependencyManifest = {
+    name: 'replacement',
+    version: '2.0.0',
+    bin: { tool: 'bin/tool.js' },
+  }
+  const fixture = await createFixture(manifest)
+  const toolSlot = path.join(fixture.globalBinDir, 'tool')
+  await fs.writeFile(toolSlot, 'old tool\n')
+  const toolSlotBefore = await readSlotState(toolSlot)
+  binSourceToRemoveAfterLink = path.join(fixture.packageDir, 'bin/tool.js')
+
+  await expect(activateGlobalInstall({
+    installDir: fixture.freshInstallDir,
+    hashLink: fixture.hashLink,
+    nodePathOptions: {},
+    globalBinDir: fixture.globalBinDir,
+    pkgs: [{ manifest, location: fixture.packageDir }],
+    binsToSkip: new Set(),
+    requiredBinNames: new Set(['tool']),
+  })).rejects.toMatchObject({ code: 'ERR_PNPM_GLOBAL_BIN_TARGET_MISSING' })
+
+  expect(await readSlotState(toolSlot)).toStrictEqual(toolSlotBefore)
+  expect(await fs.realpath(fixture.hashLink)).toBe(await fs.realpath(fixture.oldInstallDir))
+  expect(existsSync(fixture.freshInstallDir)).toBe(false)
+})
+
+test('rejects a retained bin with a dangling symlink target before activation', async () => {
+  const manifest: DependencyManifest = {
+    name: 'replacement',
+    version: '2.0.0',
+    bin: { tool: 'bin/tool.js' },
+  }
+  const fixture = await createFixture(manifest)
+  const toolSlot = path.join(fixture.globalBinDir, 'tool')
+  await fs.writeFile(toolSlot, 'old tool\n')
+  const toolSlotBefore = await readSlotState(toolSlot)
+  const binTarget = path.join(fixture.packageDir, 'bin/tool.js')
+  await fs.rm(binTarget)
+  if (!await seedSymlinkOrSkip(path.join(fixture.packageDir, 'bin/missing.js'), binTarget, 'file')) return
+
+  await expect(activateGlobalInstall({
+    installDir: fixture.freshInstallDir,
+    hashLink: fixture.hashLink,
+    nodePathOptions: {},
+    globalBinDir: fixture.globalBinDir,
+    pkgs: [{ manifest, location: fixture.packageDir }],
+    binsToSkip: new Set(),
+    requiredBinNames: new Set(['tool']),
+  })).rejects.toMatchObject({ code: 'ERR_PNPM_GLOBAL_BIN_TARGET_MISSING' })
+
+  expect(await readSlotState(toolSlot)).toStrictEqual(toolSlotBefore)
+  expect(await fs.realpath(fixture.hashLink)).toBe(await fs.realpath(fixture.oldInstallDir))
+  expect(existsSync(fixture.freshInstallDir)).toBe(false)
+  expect(symlinkCallCount).toBe(0)
+})
+
+test('rolls back when the selected duplicate bin target disappears during activation', async () => {
+  const manifest: DependencyManifest = {
+    name: 'tool',
+    version: '2.0.0',
+    bin: { tool: 'bin/tool.js' },
+  }
+  const fixture = await createFixture(manifest)
+  const otherPackageDir = path.join(fixture.freshInstallDir, 'node_modules/other')
+  const otherManifest: DependencyManifest = {
+    name: 'other',
+    version: '2.0.0',
+    bin: { tool: 'bin/tool.js' },
+  }
+  await fs.mkdir(path.join(otherPackageDir, 'bin'), { recursive: true })
+  await fs.writeFile(path.join(otherPackageDir, 'bin/tool.js'), 'other tool\n')
+  const toolSlot = path.join(fixture.globalBinDir, 'tool')
+  await fs.writeFile(toolSlot, 'old tool\n')
+  const toolSlotBefore = await readSlotState(toolSlot)
+  binSourceToRemoveAfterLink = path.join(fixture.packageDir, 'bin/tool.js')
+
+  await expect(activateGlobalInstall({
+    installDir: fixture.freshInstallDir,
+    hashLink: fixture.hashLink,
+    nodePathOptions: {},
+    globalBinDir: fixture.globalBinDir,
+    pkgs: [
+      { manifest, location: fixture.packageDir },
+      { manifest: otherManifest, location: otherPackageDir },
+    ],
+    binsToSkip: new Set(),
+    requiredBinNames: new Set(['tool']),
+  })).rejects.toMatchObject({ code: 'ERR_PNPM_GLOBAL_BIN_TARGET_MISSING' })
+
+  expect(await readSlotState(toolSlot)).toStrictEqual(toolSlotBefore)
+  expect(await fs.realpath(fixture.hashLink)).toBe(await fs.realpath(fixture.oldInstallDir))
+  expect(existsSync(fixture.freshInstallDir)).toBe(false)
 })
 
 test('leaves skipped bins untouched when hash-link activation fails', async () => {
@@ -277,6 +401,7 @@ test('leaves skipped bins untouched when hash-link activation fails', async () =
   await expect(activateGlobalInstall({
     installDir: fixture.freshInstallDir,
     hashLink: fixture.hashLink,
+    nodePathOptions: {},
     globalBinDir: fixture.globalBinDir,
     pkgs: [{ manifest, location: fixture.packageDir }],
     binsToSkip: new Set(['shared']),
@@ -320,6 +445,7 @@ test('keeps recovery artifacts when rollback fails', async () => {
     await activateGlobalInstall({
       installDir: fixture.freshInstallDir,
       hashLink: fixture.hashLink,
+      nodePathOptions: {},
       globalBinDir: fixture.globalBinDir,
       pkgs: [{ manifest, location: fixture.packageDir }],
       binsToSkip: new Set(),
@@ -372,6 +498,7 @@ test('preserves Windows file and directory symlink kinds with relative targets',
     await expect(activateGlobalInstall({
       installDir: fixture.freshInstallDir,
       hashLink: fixture.hashLink,
+      nodePathOptions: {},
       globalBinDir: fixture.globalBinDir,
       pkgs: [{ manifest, location: fixture.packageDir }],
       binsToSkip: new Set(),
@@ -401,6 +528,7 @@ test('links bins through the hash link, and moves it before linking', async () =
   await activateGlobalInstall({
     installDir: fixture.freshInstallDir,
     hashLink: fixture.hashLink,
+    nodePathOptions: {},
     globalBinDir: fixture.globalBinDir,
     pkgs: [{ manifest, location: fixture.packageDir }],
     binsToSkip: new Set(),
@@ -430,6 +558,7 @@ test('activates into a global bin directory that does not exist yet', async () =
   const activatedBins = await activateGlobalInstall({
     installDir: fixture.freshInstallDir,
     hashLink: fixture.hashLink,
+    nodePathOptions: {},
     globalBinDir: fixture.globalBinDir,
     pkgs: [{ manifest, location: fixture.packageDir }],
     binsToSkip: new Set(),
@@ -458,6 +587,7 @@ test('succeeds when removing the backup directory fails after activation', async
   const activatedBins = await activateGlobalInstall({
     installDir: fixture.freshInstallDir,
     hashLink: fixture.hashLink,
+    nodePathOptions: {},
     globalBinDir: fixture.globalBinDir,
     pkgs: [{ manifest, location: fixture.packageDir }],
     binsToSkip: new Set(),
@@ -491,6 +621,7 @@ test('activates when a Windows bin slot is a dangling symlink', async () => {
     const activatedBins = await activateGlobalInstall({
       installDir: fixture.freshInstallDir,
       hashLink: fixture.hashLink,
+      nodePathOptions: {},
       globalBinDir: fixture.globalBinDir,
       pkgs: [{ manifest, location: fixture.packageDir }],
       binsToSkip: new Set(),
@@ -519,6 +650,7 @@ test('rejects an unsupported bin slot type and cleans up preparation artifacts',
   await expect(activateGlobalInstall({
     installDir: fixture.freshInstallDir,
     hashLink: fixture.hashLink,
+    nodePathOptions: {},
     globalBinDir: fixture.globalBinDir,
     pkgs: [{ manifest, location: fixture.packageDir }],
     binsToSkip: new Set(),
@@ -555,6 +687,7 @@ test('reports fresh-install cleanup failure without claiming a core rollback fai
     await activateGlobalInstall({
       installDir: fixture.freshInstallDir,
       hashLink: fixture.hashLink,
+      nodePathOptions: {},
       globalBinDir: fixture.globalBinDir,
       pkgs: [{ manifest, location: fixture.packageDir }],
       binsToSkip: new Set(),
@@ -599,6 +732,7 @@ test('reports backup cleanup failure after restoring bins and removes the fresh 
     await activateGlobalInstall({
       installDir: fixture.freshInstallDir,
       hashLink: fixture.hashLink,
+      nodePathOptions: {},
       globalBinDir: fixture.globalBinDir,
       pkgs: [{ manifest, location: fixture.packageDir }],
       binsToSkip: new Set(),
@@ -646,6 +780,7 @@ test('preserves both cleanup errors when backup and fresh-install cleanup fail',
     await activateGlobalInstall({
       installDir: fixture.freshInstallDir,
       hashLink: fixture.hashLink,
+      nodePathOptions: {},
       globalBinDir: fixture.globalBinDir,
       pkgs: [{ manifest, location: fixture.packageDir }],
       binsToSkip: new Set(),
@@ -674,7 +809,7 @@ test('preserves both cleanup errors when backup and fresh-install cleanup fail',
   expect(existsSync(fixture.freshInstallDir)).toBe(true)
 })
 
-test('removes an old bin slot when the linker skips a missing source', async () => {
+test('does not report a bin whose source is missing as activated', async () => {
   const manifest: DependencyManifest = {
     name: 'replacement',
     version: '2.0.0',
@@ -691,6 +826,7 @@ test('removes an old bin slot when the linker skips a missing source', async () 
   const activatedBins = await activateGlobalInstall({
     installDir: fixture.freshInstallDir,
     hashLink: fixture.hashLink,
+    nodePathOptions: {},
     globalBinDir: fixture.globalBinDir,
     pkgs: [{ manifest, location: fixture.packageDir }],
     binsToSkip: new Set(),
@@ -711,7 +847,7 @@ test('removes an old bin slot when the linker skips a missing source', async () 
     protectedBins: new Set(),
   })
 
-  expect(activatedBins).toStrictEqual(new Set(['tool']))
+  expect(activatedBins).toStrictEqual(new Set())
   await expect(fs.lstat(toolSlot)).rejects.toMatchObject({ code: 'ENOENT' })
   expect(existsSync(fixture.oldInstallDir)).toBe(false)
   expect(await fs.realpath(fixture.hashLink)).toBe(await fs.realpath(fixture.freshInstallDir))

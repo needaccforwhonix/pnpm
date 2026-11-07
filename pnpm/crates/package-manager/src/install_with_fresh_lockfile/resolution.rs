@@ -2,8 +2,10 @@ pub(super) use early_materializer::{
     FastOverrideFit, fast_override_eligible, interactive_policy, start_early_materialization,
 };
 
+mod automatic_dedupe;
 mod completion;
 mod early_materializer;
+mod preferred_seeds;
 use completion::collect_resolution;
 
 use super::{
@@ -20,8 +22,9 @@ use pnpm_config::Config;
 use pnpm_lockfile::Lockfile;
 use pnpm_package_manifest::PackageManifest;
 use pnpm_reporter::{LogEvent, LogLevel, Reporter, Stage, StageLog};
+use pnpm_resolving_deps_resolver::UpdateTargets;
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashSet},
     path::Path,
     sync::Arc,
 };
@@ -39,7 +42,7 @@ pub(super) struct Resolved<'a, Reporter> {
     pub(super) overrides: ResolvedOverrides,
     pub(super) patches: super::setup::Patches,
     pub(super) hooks: ResolvedHooks,
-    pub(super) reuse: ResolutionReuseGuard<'a>,
+    pub(super) reuse: ResolutionReuse,
     pub(super) graph: ResolvedGraph,
 }
 
@@ -54,12 +57,7 @@ pub(super) struct ResolvedHooks {
     pub(super) after_all_resolved_log: Option<pnpm_hooks::LogFn>,
 }
 
-pub(super) struct ResolutionReuseGuard<'a> {
-    pub(super) guard_previous_importers:
-        Option<&'a HashMap<String, pnpm_lockfile::ProjectSnapshot>>,
-    pub(super) guard_update_reuse_scope: pnpm_resolving_deps_resolver::UpdateReuseScope,
-    pub(super) guard_update_reuse_scopes_by_importer:
-        BTreeMap<String, pnpm_resolving_deps_resolver::UpdateReuseScope>,
+pub(super) struct ResolutionReuse {
     pub(super) full_resolution: bool,
 }
 
@@ -153,6 +151,7 @@ impl<'a, Reporter: self::Reporter + 'static> ResolutionContext<'a, Reporter> {
 
     fn shared_options(&self) -> resolve::SharedResolveOptions<'a> {
         resolve::SharedResolveOptions {
+            locked_package_policy: self.install.execution.locked_package_policy,
             policy: pnpm_resolving_resolver_base::ResolutionPolicyOptions {
                 published_by: self.setup.policy.published_by,
                 published_by_exclude: self.setup.policy.published_by_exclude.clone(),
@@ -167,26 +166,59 @@ impl<'a, Reporter: self::Reporter + 'static> ResolutionContext<'a, Reporter> {
             workspace_packages: self.setup.workspace_packages.clone(),
             update_checksums: self.install.update_checksums,
             update_behavior: resolver_update_behavior(&self.owned.resolution.update_seed_policy),
+            refresh_metadata: matches!(
+                self.owned.resolution.update_seed_policy,
+                super::UpdateSeedPolicy::KeepAllResolveAll,
+            ),
         }
+    }
+
+    /// The `pnpmfileChecksum` this install would record, for the reuse
+    /// gate's comparison against the one the reuse candidate holds. A run
+    /// with no candidate never reaches the comparison, and answers `None`
+    /// rather than evaluating the pnpmfile to find out whether it exports
+    /// any hooks.
+    async fn current_pnpmfile_checksum(&self) -> Option<String> {
+        let lockfile = self.wanted_lockfile()?;
+        pnpm_hooks::current_pnpmfile_checksum(
+            self.prep.hooks.pnpmfile_hook.as_ref(),
+            lockfile.pnpmfile_checksum.as_deref(),
+        )
+        .await
+    }
+
+    /// Whether a checksum-excluded pnpmfile exports `readPackage`, for
+    /// the reuse gate. Like [`Self::current_pnpmfile_checksum`], a run
+    /// with no candidate answers `false` rather than spawning the
+    /// pnpmfile's Node worker for nothing.
+    async fn untracked_read_package_hook(
+        &self,
+    ) -> Result<Option<bool>, InstallWithFreshLockfileError> {
+        if self.wanted_lockfile().is_none() {
+            return Ok(None);
+        }
+        pnpm_hooks::untracked_read_package_hook(self.prep.hooks.pnpmfile_hook.as_ref())
+            .await
+            .map_err(InstallWithFreshLockfileError::PnpmfileHook)
     }
 
     async fn reuse_seed(
         &self,
         shared_resolve_options: &resolve::SharedResolveOptions<'_>,
         preferred_versions_seed: &Arc<pnpm_resolving_resolver_base::PreferredVersions>,
-    ) -> Option<Arc<Lockfile>> {
-        resolve::lockfile_reuse_seed(resolve::ReuseSeedInputs {
-            hooks: pnpm_resolving_deps_resolver::ManifestTransformHooks {
-                manifest_hook: self.prep.transforms.hooks.manifest_hook.clone(),
-                overrides_hook: self.prep.transforms.hooks.overrides_hook.clone(),
-                pnpmfile_hook: None,
-            },
+    ) -> Result<Option<Arc<Lockfile>>, InstallWithFreshLockfileError> {
+        let pnpmfile_checksum = self.current_pnpmfile_checksum().await;
+        let untracked_pnpmfile_read_package_hook = self.untracked_read_package_hook().await?;
+        Ok(resolve::lockfile_reuse_seed(resolve::ReuseSeedInputs {
+            hooks: self.prep.transforms.hooks.with_pnpmfile(None),
             lockfile: crate::install_with_fresh_lockfile::resolution_inputs::ReuseLockfileInputs {
                 wanted: self.wanted_lockfile(),
                 shared: self.prep.wanted_lockfile_shared.as_ref(),
                 extensions_checksum: self.prep.transforms
                     .package_extensions_checksum
                     .as_deref(),
+                pnpmfile_checksum: pnpmfile_checksum.as_deref(),
+                untracked_pnpmfile_read_package_hook,
                 parsed_overrides: self.prep.transforms.parsed_overrides.as_deref(),
                 resolved_overrides: self.prep.transforms.resolved_overrides.as_ref(),
             },
@@ -206,12 +238,25 @@ impl<'a, Reporter: self::Reporter + 'static> ResolutionContext<'a, Reporter> {
             ),
             registries: &self.registries.by_scope,
         })
-        .await
+        .await)
+    }
+
+    /// The override targets the resolution reopens. A reuse seed means the
+    /// lockfile rewrite already absorbed the overrides drift, leaving none.
+    fn stale_override_targets(&self, has_reuse_seed: bool) -> UpdateTargets {
+        if has_reuse_seed {
+            return UpdateTargets::default();
+        }
+        resolve::stale_override_targets(
+            self.wanted_lockfile(),
+            self.prep.transforms.resolved_overrides.as_ref(),
+        )
     }
 
     fn workspace_walk(
-        &mut self,
+        &self,
         lockfile_reuse_seed: Option<&Arc<Lockfile>>,
+        dedupe: UpdateTargets,
     ) -> resolve::WorkspaceWalk {
         resolve::WorkspaceWalk {
             hooks: crate::install_with_fresh_lockfile::resolution_inputs::WorkspaceLifecycleHooks {
@@ -230,17 +275,22 @@ impl<'a, Reporter: self::Reporter + 'static> ResolutionContext<'a, Reporter> {
                             .cloned()
                             .map(Arc::new)
                     }),
-                subtrees: lockfile_reuse_seed.is_some(),
+                // A reused subtree keeps its recorded integrities, which
+                // `--update-checksums` is there to refresh.
+                subtrees: lockfile_reuse_seed.is_some() && !self.install.update_checksums,
                 scope: self.prep.reuse.scope.clone(),
                 scopes_by_importer: self.prep.reuse.by_importer.clone(),
                 depth: self.owned.resolution.update_seed_policy.max_depth(),
+                dedupe,
             },
             share_workspace_resolutions: self.setup.chain.custom_resolvers.is_empty(),
 
             time_based: self.setup.policy.time_based,
 
             registries_by_prefix: self.registries.named.clone(),
-            registries: std::mem::take(&mut self.registries.by_scope),
+            registries: self.registries.by_scope.clone(),
+            declared_prefixes: self.registries.declared.clone(),
+            locked_registries: self.registries.locked.clone(),
         }
     }
 
@@ -276,16 +326,16 @@ impl<'a, Reporter: self::Reporter + 'static> ResolutionContext<'a, Reporter> {
             String,
             Arc<pnpm_resolving_resolver_base::PreferredVersions>,
         >,
+        own_manifest_specifiers: Option<
+            &'b crate::install_with_fresh_lockfile::resolution_inputs::OwnManifestSpecifiers,
+        >,
     ) -> resolve::ImporterInputs<'b> {
         resolve::ImporterInputs {
-            hooks: pnpm_resolving_deps_resolver::ManifestTransformHooks {
-                manifest_hook: self.prep.transforms.hooks.manifest_hook.clone(),
-                overrides_hook: self.prep.transforms.hooks.overrides_hook.clone(),
-                pnpmfile_hook: None,
-            },
+            hooks: self.prep.transforms.hooks.with_pnpmfile(None),
             versions: crate::install_with_fresh_lockfile::resolution_inputs::ImporterVersionSeeds {
                 shared: preferred_versions_seed,
                 by_importer: preferred_versions_seeds_by_importer,
+                own_manifest_specifiers,
                 pick_lowest: self.setup.policy.pick_lowest_direct,
                 published_by: self.setup.policy.published_by,
             },
@@ -302,38 +352,32 @@ impl<'a, Reporter: self::Reporter + 'static> ResolutionContext<'a, Reporter> {
     }
 }
 pub(super) async fn run_prepared_resolve<'m, Reporter: self::Reporter + 'static>(
-    mut context: ResolutionContext<'_, Reporter>,
+    context: ResolutionContext<'_, Reporter>,
     importer_manifests: ManifestsView<'m>,
 ) -> Result<ResolvePass<'m>, InstallWithFreshLockfileError> {
-    let wanted_lockfile = context.wanted_lockfile();
-    let (preferred_versions_seed, preferred_versions_seeds_by_importer) =
-        resolve::preferred_versions_seeds(
-            &context.owned.resolution.update_seed_policy,
-            wanted_lockfile,
-            &importer_manifests,
-            context.owned.resolution.preferred_versions_override.as_ref(),
-        );
+    let (mut preferred_versions_seed, mut preferred_versions_seeds_by_importer) =
+        context.preferred_versions_seeds(&importer_manifests, &UpdateTargets::default());
     let shared_resolve_options = context.shared_options();
     let lockfile_reuse_seed =
-        context.reuse_seed(&shared_resolve_options, &preferred_versions_seed).await;
+        context.reuse_seed(&shared_resolve_options, &preferred_versions_seed).await?;
+    let stale_override_targets = context.stale_override_targets(lockfile_reuse_seed.is_some());
+    if !stale_override_targets.is_empty() {
+        (preferred_versions_seed, preferred_versions_seeds_by_importer) =
+            context.preferred_versions_seeds(&importer_manifests, &stale_override_targets);
+    }
     let phase_start = std::time::Instant::now();
     Reporter::emit(&LogEvent::Stage(StageLog {
         level: LogLevel::Debug,
         prefix: context.install.projects.lockfile_dir.display().to_string(),
         stage: Stage::ResolutionStarted,
     }));
-    let walk = context.workspace_walk(lockfile_reuse_seed.as_ref());
-    let workspace_result = resolve::run_resolve_pass::<Reporter>(resolve::ResolvePassInputs {
-        resolver: &*context.setup.chain.resolver,
-        importer_manifests: &importer_manifests,
-        dependency_groups: context.install.projects.dependency_groups,
-        walk,
-        per_importer: context.importer_inputs(
-            &shared_resolve_options,
-            &preferred_versions_seed,
-            &preferred_versions_seeds_by_importer,
-        ),
-    })
+    let workspace_result = context.resolve_rounds(
+        &importer_manifests,
+        lockfile_reuse_seed.clone(),
+        preferred_versions_seed,
+        preferred_versions_seeds_by_importer,
+        stale_override_targets,
+    )
     .await?;
     Ok(context.completed_pass(
         workspace_result,

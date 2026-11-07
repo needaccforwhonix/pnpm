@@ -1,13 +1,11 @@
 use super::{
     AllowBuildValue, HashSet, IndexMap, Inline, Manifest, flow, insert_top_level_block, locate,
-    locate_mapping, mapping_keys, remove_top_level_block, render, replace_bool_value_at,
+    locate_mapping, mapping_keys, remove_top_level_block, render, replace_value_text_at,
     write_rendered_entry_at,
 };
 
 /// Upsert one `name → bool` entry into the top-level `allowBuilds:` block,
-/// creating the block if absent. Returns whether anything changed. `pnpm
-/// approve-builds` calls this with each approved package set to `true` and
-/// each denied/unselected package set to `false`.
+/// creating the block if absent. Returns whether anything changed.
 pub(crate) fn add_allow_build(manifest: &mut Manifest, name: &str, value: bool) -> bool {
     const BLOCK: &str = "allowBuilds";
     let changed = if locate(manifest.document.text(), &[BLOCK]).is_some() {
@@ -59,7 +57,7 @@ fn write_allow_build(
     let new_text = if let Inline::Flow(collection) = locate_mapping(text, &[block]) {
         flow::upsert(text, &collection, name, render_bool(value))
     } else {
-        replace_bool_value_at(text, &[block], name, value)
+        replace_value_text_at(text, &[block], name, render_bool(value))
     };
     manifest.document.set_text(new_text);
     Some(true)

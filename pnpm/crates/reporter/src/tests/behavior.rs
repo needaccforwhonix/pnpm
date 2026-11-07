@@ -1,10 +1,11 @@
 use super::{
     AddedRoot, BrokenModulesLog, ContextLog, DedupeCheckLog, DependencyType, DeprecationLog,
-    Envelope, GetHostName, GlobalLog, HookLog, Host, LogEvent, LogLevel, PackageImportMethod,
-    PackageImportMethodLog, Pipe, PnpmErrorLog, PnpmLog, PromptAction, PromptLog, RemovedRoot,
-    RequestRetryError, RequestRetryLog, RootLog, RootMessage, Stage, StageLog, StatsLog,
-    StatsMessage, Value, assert_eq,
+    Envelope, GetHostName, GlobalLog, HookLog, Host, LockfileLog, LogEvent, LogLevel,
+    PackageImportMethod, PackageImportMethodLog, Pipe, PnpmErrorLog, PnpmLog, PromptAction,
+    PromptLog, RemovedRoot, RequestRetryError, RequestRetryLog, RootLog, RootMessage, Stage,
+    StageLog, StatsLog, StatsMessage, Value, assert_eq,
 };
+use crate::NonDeprecatedAlternative;
 
 #[test]
 fn prompt_event_matches_pnpm_wire_shape() {
@@ -99,6 +100,29 @@ fn pnpm_event_matches_pnpm_wire_shape() {
     assert_eq!(json["name"], "pnpm");
     assert_eq!(json["level"], "info");
     assert_eq!(json["message"], "Lockfile is up to date, resolution step is skipped");
+    assert_eq!(json["prefix"], "/some/project");
+}
+
+#[test]
+fn lockfile_event_matches_pnpm_wire_shape() {
+    let event = LogEvent::Lockfile(LockfileLog {
+        level: LogLevel::Info,
+        message: "Merge conflict detected in pnpm-lock.yaml and successfully merged".to_string(),
+        prefix: "/some/project".to_string(),
+    });
+    let envelope = Envelope { time: 1_700_000_000_000, hostname: "host", pid: 4242, event: &event };
+    let json: Value = envelope
+        .pipe_ref(serde_json::to_string)
+        .expect("serialize envelope")
+        .pipe_as_ref(serde_json::from_str)
+        .expect("parse JSON");
+
+    assert_eq!(json["name"], "pnpm:lockfile");
+    assert_eq!(json["level"], "info");
+    assert_eq!(
+        json["message"],
+        "Merge conflict detected in pnpm-lock.yaml and successfully merged",
+    );
     assert_eq!(json["prefix"], "/some/project");
 }
 
@@ -301,9 +325,7 @@ fn root_event_matches_pnpm_wire_shape() {
 
 /// `pnpm:stats` is presence-tagged on `added` / `removed`. pnpm
 /// emits each from a separate site, so an event carries one or the
-/// other — never both. Pacquet currently emits both back-to-back
-/// (added from `CreateVirtualStore`, removed from a placeholder)
-/// to keep the wire shape consumable until pruning lands.
+/// other — never both.
 #[test]
 fn stats_event_matches_pnpm_wire_shape() {
     let event = LogEvent::Stats(StatsLog {
@@ -447,8 +469,11 @@ fn deprecation_event_matches_pnpm_wire_shape() {
         pkg_version: "0.14.1".to_string(),
         pkg_id: "express@0.14.1".to_string(),
         prefix: "/projects/x".to_string(),
-        deprecated: "express 0.x series is deprecated".to_string(),
         depth: 0,
+        non_deprecated_alternative: Some(NonDeprecatedAlternative {
+            version: "1.0.0".to_string(),
+            outside_declared_range: true,
+        }),
     });
     let envelope = Envelope { time: 1_700_000_000_000, hostname: "host", pid: 4242, event: &event };
     let json: Value = envelope
@@ -463,8 +488,13 @@ fn deprecation_event_matches_pnpm_wire_shape() {
     assert_eq!(json["pkgVersion"], "0.14.1");
     assert_eq!(json["pkgId"], "express@0.14.1");
     assert_eq!(json["prefix"], "/projects/x");
-    assert_eq!(json["deprecated"], "express 0.x series is deprecated");
     assert_eq!(json["depth"], 0);
+    assert!(
+        json.get("deprecated").is_none(),
+        "the registry's deprecation notice must not reach an NDJSON consumer",
+    );
+    assert_eq!(json["nonDeprecatedAlternative"]["version"], "1.0.0");
+    assert_eq!(json["nonDeprecatedAlternative"]["outsideDeclaredRange"], true);
 }
 
 /// Transitive deprecation events (`depth > 0`) also match the wire shape.
@@ -476,8 +506,8 @@ fn deprecation_event_transitive_matches_pnpm_wire_shape() {
         pkg_version: "2.88.2".to_string(),
         pkg_id: "request@2.88.2".to_string(),
         prefix: "/projects/x".to_string(),
-        deprecated: "request has been deprecated".to_string(),
         depth: 3,
+        non_deprecated_alternative: None,
     });
     let envelope = Envelope { time: 1_700_000_000_000, hostname: "host", pid: 4242, event: &event };
     let json: Value = envelope

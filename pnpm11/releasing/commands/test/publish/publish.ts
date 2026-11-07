@@ -209,7 +209,7 @@ test('publish packages with workspace LICENSE if no own LICENSE is present', asy
   fs.writeFileSync(path.join(externalTarget, 'package.json'), JSON.stringify({ name: 'target', version: '1.0.0' }))
 
   process.chdir(externalTarget)
-  crossSpawn.sync(pnpmBin, ['add', 'project-100', 'project-200', `--registry=http://localhost:${REGISTRY_MOCK_PORT}`], { env: SPAWN_ENV })
+  crossSpawn.sync(pnpmBin, ['add', 'project-100', 'project-200', `--registry=http://localhost:${REGISTRY_MOCK_PORT}/npm/`], { env: SPAWN_ENV })
 
   expect(fs.readFileSync('node_modules/project-100/LICENSE', 'utf8')).toBe('workspace license')
   expect(fs.readFileSync('node_modules/project-200/LICENSE', 'utf8')).toBe('project-200 license')
@@ -287,7 +287,7 @@ test('publish: package with all possible fields in publishConfig', async () => {
   })
 
   process.chdir('../test-publish-config-installation')
-  crossSpawn.sync(pnpmBin, ['add', 'test-publish-config', `--registry=http://localhost:${REGISTRY_MOCK_PORT}`], { env: SPAWN_ENV })
+  crossSpawn.sync(pnpmBin, ['add', 'test-publish-config', `--registry=http://localhost:${REGISTRY_MOCK_PORT}/npm/`], { env: SPAWN_ENV })
 
   const { default: publishedManifest } = await import(path.resolve('node_modules/test-publish-config/package.json'))
   expect(publishedManifest).toEqual({
@@ -318,7 +318,7 @@ test('publish: package with publishConfig.registry overrides the default registr
     version: '1.0.0',
 
     publishConfig: {
-      registry: `http://localhost:${REGISTRY_MOCK_PORT}`,
+      registry: `http://localhost:${REGISTRY_MOCK_PORT}/npm/`,
     },
   })
 
@@ -378,7 +378,7 @@ test('publish: package with publishConfig.directory', async () => {
     []
   )
 
-  crossSpawn.sync(pnpmBin, ['add', 'publish_config_directory_dist_package', '--no-link-workspace-packages', `--registry=http://localhost:${REGISTRY_MOCK_PORT}`], { env: SPAWN_ENV })
+  crossSpawn.sync(pnpmBin, ['add', 'publish_config_directory_dist_package', '--no-link-workspace-packages', `--registry=http://localhost:${REGISTRY_MOCK_PORT}/npm/`], { env: SPAWN_ENV })
 
   expect(JSON.parse(fs.readFileSync('node_modules/publish_config_directory_dist_package/package.json', { encoding: 'utf-8' })))
     .toEqual({
@@ -418,7 +418,7 @@ test('publish: preserves packageManager and publish lifecycle scripts when skipM
   }, [])
 
   process.chdir('../test-publish-skip-manifest-obfuscation-installation')
-  crossSpawn.sync(pnpmBin, ['add', 'test-publish-skip-manifest-obfuscation', `--registry=http://localhost:${REGISTRY_MOCK_PORT}`], { env: SPAWN_ENV })
+  crossSpawn.sync(pnpmBin, ['add', 'test-publish-skip-manifest-obfuscation', `--registry=http://localhost:${REGISTRY_MOCK_PORT}/npm/`], { env: SPAWN_ENV })
 
   const { default: publishedManifest } = await import(path.resolve('node_modules/test-publish-skip-manifest-obfuscation/package.json'))
   expect(publishedManifest).toEqual({
@@ -591,7 +591,7 @@ test.skip('convert specs with workspace protocols to regular version ranges', as
 
   process.chdir('..')
 
-  crossSpawn.sync(pnpmBin, ['multi', 'install', '--store-dir=store', `--registry=http://localhost:${REGISTRY_MOCK_PORT}`], { env: SPAWN_ENV })
+  crossSpawn.sync(pnpmBin, ['multi', 'install', '--store-dir=store', `--registry=http://localhost:${REGISTRY_MOCK_PORT}/npm/`], { env: SPAWN_ENV })
 
   process.chdir('workspace-protocol-package')
 
@@ -604,7 +604,7 @@ test.skip('convert specs with workspace protocols to regular version ranges', as
 
   process.chdir('../target')
 
-  crossSpawn.sync(pnpmBin, ['add', '--store-dir=store', 'workspace-protocol-package', '--no-link-workspace-packages', `--registry=http://localhost:${REGISTRY_MOCK_PORT}`], { env: SPAWN_ENV })
+  crossSpawn.sync(pnpmBin, ['add', '--store-dir=store', 'workspace-protocol-package', '--no-link-workspace-packages', `--registry=http://localhost:${REGISTRY_MOCK_PORT}/npm/`], { env: SPAWN_ENV })
 
   const { default: publishedManifest } = await import(path.resolve('node_modules/workspace-protocol-package/package.json'))
   expect(publishedManifest.dependencies).toEqual({
@@ -697,7 +697,7 @@ test.skip('convert specs with relative workspace protocols to regular version ra
     '--store-dir=../store',
     'relative-workspace-protocol-package',
     '--no-link-workspace-packages',
-    `--registry=http://localhost:${REGISTRY_MOCK_PORT}`,
+    `--registry=http://localhost:${REGISTRY_MOCK_PORT}/npm/`,
   ], { env: SPAWN_ENV })
 
   const { default: publishedManifest } = await import(path.resolve('node_modules/relative-workspace-protocol-package/package.json'))
@@ -767,7 +767,7 @@ describe('catalog protocol converted when publishing', () => {
       '--store-dir=../store',
       testPackageName,
       '--no-link-workspace-packages',
-      `--registry=http://localhost:${REGISTRY_MOCK_PORT}`,
+      `--registry=http://localhost:${REGISTRY_MOCK_PORT}/npm/`,
     ], { env: SPAWN_ENV })
 
     const { default: publishedManifest } = await import(path.resolve(`node_modules/${testPackageName}/package.json`))
@@ -830,7 +830,7 @@ describe('catalog protocol converted when publishing', () => {
       '--store-dir=../store',
       testPackageName,
       '--no-link-workspace-packages',
-      `--registry=http://localhost:${REGISTRY_MOCK_PORT}`,
+      `--registry=http://localhost:${REGISTRY_MOCK_PORT}/npm/`,
     ], { env: SPAWN_ENV })
 
     const { default: publishedManifest } = await import(path.resolve(`node_modules/${testPackageName}/package.json`))
@@ -849,18 +849,16 @@ test('publish: runs all the lifecycle scripts', async () => {
     version: '0.0.0',
 
     scripts: {
-      // eslint-disable:object-literal-sort-keys
       prepublish: server.sendLineScript('prepublish'),
       prepare: server.sendLineScript('prepare'),
       prepublishOnly: server.sendLineScript('prepublishOnly'),
       prepack: server.sendLineScript('prepack'),
       publish: server.sendLineScript('publish'),
       postpublish: server.sendLineScript('postpublish'),
-      // eslint-enable:object-literal-sort-keys
     },
   })
 
-  crossSpawn.sync(pnpmBin, ['install', '--ignore-scripts', '--store-dir=../store', `--registry=http://localhost:${REGISTRY_MOCK_PORT}`], { env: SPAWN_ENV })
+  crossSpawn.sync(pnpmBin, ['install', '--ignore-scripts', '--store-dir=../store', `--registry=http://localhost:${REGISTRY_MOCK_PORT}/npm/`], { env: SPAWN_ENV })
 
   await publish.handler({
     ...DEFAULT_OPTS,
@@ -887,18 +885,16 @@ test('publish: ignores all the lifecycle scripts when --ignore-scripts is used',
     version: '0.0.0',
 
     scripts: {
-      // eslint-disable:object-literal-sort-keys
       prepublish: server.sendLineScript('prepublish'),
       prepare: server.sendLineScript('prepare'),
       prepublishOnly: server.sendLineScript('prepublishOnly'),
       prepack: server.sendLineScript('prepack'),
       publish: server.sendLineScript('publish'),
       postpublish: server.sendLineScript('postpublish'),
-      // eslint-enable:object-literal-sort-keys
     },
   })
 
-  crossSpawn.sync(pnpmBin, ['install', '--ignore-scripts', '--store-dir=../store', `--registry=http://localhost:${REGISTRY_MOCK_PORT}`], { env: SPAWN_ENV })
+  crossSpawn.sync(pnpmBin, ['install', '--ignore-scripts', '--store-dir=../store', `--registry=http://localhost:${REGISTRY_MOCK_PORT}/npm/`], { env: SPAWN_ENV })
 
   await publish.handler({
     ...DEFAULT_OPTS,
@@ -1084,3 +1080,29 @@ test('publish --json: writes per-package summary to stdout', async () => {
 
   await checkPkgExists(pkgName, '0.0.0')
 })
+
+test('publish inherits registry from workspace root .npmrc (pnpm/pnpm#7182)', async () => {
+  const pkgName = `@pnpmtest/test-workspace-npmrc-publish-${Date.now()}`
+  preparePackages([
+    {
+      name: pkgName,
+      version: '1.0.0',
+    },
+  ])
+
+  fs.writeFileSync('.npmrc', `registry=http://localhost:${REGISTRY_MOCK_PORT}/npm/\n//localhost:${REGISTRY_MOCK_PORT}/:_authToken=${getRegistryMockToken()}\n`)
+  writeYamlFileSync('pnpm-workspace.yaml', { packages: ['**'] })
+
+  process.chdir(pkgName)
+
+  fs.writeFileSync('.npmrc', 'engine-strict=true\nsave-exact=true\n')
+
+  const result = crossSpawn.sync(pnpmBin, ['publish', '--no-git-checks'], { env: SPAWN_ENV })
+  if (result.status !== 0) {
+    throw new Error(`pnpm publish failed with status ${result.status}: ${result.stderr?.toString()}`)
+  }
+  expect(result.status).toBe(0)
+
+  await checkPkgExists(pkgName, '1.0.0')
+})
+

@@ -9,8 +9,6 @@ use crate::{SkippedSnapshots, VirtualStoreLayout};
 #[cfg(unix)]
 use pnpm_config::PackageImportMethod;
 #[cfg(unix)]
-use pnpm_executor::ScriptsPrependNodePath;
-#[cfg(unix)]
 use pnpm_lockfile::{PackageKey, SnapshotEntry};
 #[cfg(unix)]
 use pnpm_reporter::SilentReporter;
@@ -135,6 +133,7 @@ async fn write_path_cache_key_includes_patch_hash() {
         files: base_files,
         side_effects: None,
         remote_side_effects_quarantine: None,
+        tar_integrity: None,
     };
     {
         let mut index = StoreIndex::open_in(&store_dir).expect("open index for seed");
@@ -196,7 +195,7 @@ new file mode 100644
 
     BuildModules {
         cache: crate::BuildCacheContext {
-            maps_by_snapshot: None,
+            side_effects: crate::CachedSideEffects { overlays: None, rows: None },
             engine_name: Some(engine),
             read: true,
             write: true,
@@ -206,6 +205,7 @@ new file mode 100644
             frozen_store: false,
         },
         directories: crate::BuildLayout {
+            link_options: &pnpm_cmd_shim::LinkBinsOptions::default(),
             layout: &VirtualStoreLayout::legacy(
                 virtual_store_dir.path(),
                 pnpm_config::default_virtual_store_dir_max_length() as usize,
@@ -223,15 +223,23 @@ new file mode 100644
             patches: Some(&patches),
             requires_build_by_snapshot: None,
             importers: &importers,
+            dependency_groups: None,
+            build_scope: None,
+            variant_platforms: None,
         },
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),
             user_agent: "pnpm/test",
-            prepend_node_path: ScriptsPrependNodePath::Never,
+            path: crate::ScriptPath { extra_bin_paths: &[], private_hoisting: false },
             shell: None,
             shell_emulator: false,
             unsafe_perm: true,
             ignore: false,
+            patched_engines: crate::PatchedEngineCheck {
+                engine_strict: false,
+                node_version: None,
+                install_state_dir: None,
+            },
         },
 
         allow_build_policy: &policy,
@@ -325,7 +333,7 @@ new file mode 100644
 
     BuildModules {
         cache: crate::BuildCacheContext {
-            maps_by_snapshot: None,
+            side_effects: crate::CachedSideEffects { overlays: None, rows: None },
             engine_name: None,
             read: false,
             write: false,
@@ -335,6 +343,7 @@ new file mode 100644
             frozen_store: false,
         },
         directories: crate::BuildLayout {
+            link_options: &pnpm_cmd_shim::LinkBinsOptions::default(),
             layout: &VirtualStoreLayout::legacy(
                 virtual_store_dir.path(),
                 pnpm_config::default_virtual_store_dir_max_length() as usize,
@@ -352,15 +361,23 @@ new file mode 100644
             patches: Some(&patches),
             requires_build_by_snapshot: None,
             importers: &importers,
+            dependency_groups: None,
+            build_scope: None,
+            variant_platforms: None,
         },
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),
             user_agent: "pnpm/test",
-            prepend_node_path: ScriptsPrependNodePath::Never,
+            path: crate::ScriptPath { extra_bin_paths: &[], private_hoisting: false },
             shell: None,
             shell_emulator: false,
             unsafe_perm: true,
             ignore: false,
+            patched_engines: crate::PatchedEngineCheck {
+                engine_strict: false,
+                node_version: None,
+                install_state_dir: None,
+            },
         },
 
         allow_build_policy: &policy,
@@ -423,7 +440,7 @@ async fn missing_patch_file_path_errors_with_diagnostic() {
 
     let err = BuildModules {
         cache: crate::BuildCacheContext {
-            maps_by_snapshot: None,
+            side_effects: crate::CachedSideEffects { overlays: None, rows: None },
             engine_name: None,
             read: false,
             write: false,
@@ -433,6 +450,7 @@ async fn missing_patch_file_path_errors_with_diagnostic() {
             frozen_store: false,
         },
         directories: crate::BuildLayout {
+            link_options: &pnpm_cmd_shim::LinkBinsOptions::default(),
             layout: &VirtualStoreLayout::legacy(
                 virtual_store_dir.path(),
                 pnpm_config::default_virtual_store_dir_max_length() as usize,
@@ -450,15 +468,23 @@ async fn missing_patch_file_path_errors_with_diagnostic() {
             patches: Some(&patches),
             requires_build_by_snapshot: None,
             importers: &importers,
+            dependency_groups: None,
+            build_scope: None,
+            variant_platforms: None,
         },
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),
             user_agent: "pnpm/test",
-            prepend_node_path: ScriptsPrependNodePath::Never,
+            path: crate::ScriptPath { extra_bin_paths: &[], private_hoisting: false },
             shell: None,
             shell_emulator: false,
             unsafe_perm: true,
             ignore: false,
+            patched_engines: crate::PatchedEngineCheck {
+                engine_strict: false,
+                node_version: None,
+                install_state_dir: None,
+            },
         },
 
         allow_build_policy: &policy,

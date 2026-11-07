@@ -1,17 +1,30 @@
 use super::{
     Config, ExecDirs, HashMap, IndexMap, IntoDiagnostic, Mutex, PackageManifest, Path,
     ProcessTracker, ReporterType, RunError, RunScript, ScheduleGraphOptions, ScriptExit,
-    ScriptOutput, ScriptSelector, ScriptsPrependNodePath, SyncInjectedDeps, TaskCompletion, Value,
-    env, exec_fallback, exit_like, make_node_package_map_option, make_node_require_option,
-    package_map_path_for_execution, pnp_path_for_execution, run_script, schedule_graph,
-    sync_injected_deps, throw_or_filter_hidden_scripts,
+    ScriptOutput, ScriptSelector, TaskCompletion, Value, env, exec_fallback, exit_like,
+    injected_sync::{start_injected_edit_watch, sync_injected_deps_after},
+    interrupt_count,
+    lifecycle_failure::report_lifecycle_failure,
+    make_node_package_map_option, make_node_require_option, package_map_path_for_execution,
+    pnp_path_for_execution, run_script, schedule_graph, throw_or_filter_hidden_scripts,
 };
+use crate::cli_args::concurrency_group::{
+    SlotOutcome, acquire_concurrency_group_slot, with_held_group,
+};
+use pnpm_reporter::LogEvent;
 
 /// Shared inputs for running a script, threaded through
 /// [`run_stages`] and [`run_stage`] so neither grows an unwieldy
 /// argument list. The submodule `recursive` builds a per-project
 /// [`RunContext`] and reuses [`run_stages`], so the type and its
 /// fields are visible up to the parent module.
+#[cfg_attr(
+    dylint_lib = "perfectionist",
+    expect(
+        perfectionist::too_many_struct_fields,
+        reason = "The fields are every input of a script spawn, bundled so the stage runners keep a short argument list."
+    )
+)]
 pub(in super::super) struct RunContext<'a> {
     pub(in super::super) manifest: &'a PackageManifest,
     pub(in super::super) dir: &'a Path,
@@ -21,6 +34,9 @@ pub(in super::super) struct RunContext<'a> {
     pub(in super::super) silent: bool,
     pub(in super::super) output: ScriptOutput<'a>,
     pub(in super::super) process_tracker: Option<&'a ProcessTracker>,
+    /// Where pnpm's own notices about the run go. Distinct from the
+    /// streamed script output, which a pipeline may be capturing.
+    pub(in super::super) emit: fn(&LogEvent),
 }
 
 /// Resolve `name` to a runnable main script body, or `Ok(None)` when
@@ -57,13 +73,8 @@ fn resolve_main_script(ctx: &RunContext<'_>, name: &str) -> Result<Option<String
 /// - `main_body` is not `"npx only-allow pnpm"` when `args` is empty
 ///   (otherwise the main stage's [`run_stage`] would no-op).
 ///
-/// Both callers — single-project [`RunArgs::run`](super::RunArgs::run) and the recursive
-/// runner — validate these conditions before calling: single-project
-/// via [`resolve_main_script`] plus an inline npx-only-allow skip,
-/// recursive via its outer per-project filter. Given that, the main
-/// stage is guaranteed to actually run, so this function returns a
-/// plain [`ScriptExit`] instead of `Option<ScriptExit>` and the callers
-/// don't need to defensively handle a "nothing ran" case.
+/// Given that, the main stage is guaranteed to actually run, so this
+/// function returns a plain [`ScriptExit`] instead of `Option<ScriptExit>`.
 ///
 /// On the first non-success stage (pre / main / post) the function
 /// short-circuits and returns that stage's status; the caller decides
@@ -124,8 +135,8 @@ fn run_one_script(
         return TaskCompletion::Passed;
     }
     match run_stages(ctx, name, &main, args) {
-        Ok(status) if status.success() => TaskCompletion::Passed,
-        Ok(status) => outcome.fail(name, status),
+        Ok(exit) if exit.status.success() => TaskCompletion::Passed,
+        Ok(exit) => outcome.fail(name, exit.status),
         Err(error) => outcome.abort(error),
     }
 }
@@ -148,11 +159,7 @@ pub(super) fn no_matching_script(
     if fallback_to_exec {
         return exec_fallback(script_name, args, dirs, config, reporter);
     }
-    Err(RunError::NoScript {
-        script: script_name.to_owned(),
-        hint: format!(r#"Command "{script_name}" not found."#),
-    }
-    .into())
+    Err(RunError::no_script(script_name, args).into())
 }
 
 /// The scripts the selector matches. Hidden scripts (names starting
@@ -173,6 +180,7 @@ pub(super) fn selected_scripts(
 /// non-default linker needs prepended to `NODE_OPTIONS`.
 pub(super) fn script_extra_env(config: &Config, dir: &Path) -> HashMap<String, String> {
     let mut extra_env = config.extra_env_with_node_options();
+    config.add_cas_loader_env(dir, &mut extra_env);
     if let Some(pnp_path) = pnp_path_for_execution(config, dir) {
         let node_options = extra_env.get("NODE_OPTIONS").map(String::as_str);
         extra_env.insert(
@@ -281,49 +289,88 @@ impl ScriptOutcome<'_> {
     }
 }
 
+/// How a script's stages ended: the status of the stage that ended them,
+/// and whether the user's interrupt ended that stage.
+#[derive(Debug, Clone, Copy)]
+pub(in super::super) struct StageExit {
+    pub(in super::super) status: ScriptExit,
+    pub(in super::super) interrupted: bool,
+}
+
 pub(in super::super) fn run_stages(
     ctx: &RunContext<'_>,
     name: &str,
     main_body: &str,
     args: &[String],
-) -> miette::Result<ScriptExit> {
+) -> miette::Result<StageExit> {
+    let project_env = project_extra_env(ctx);
+    let ctx = &RunContext { extra_env: &project_env, ..*ctx };
+    // Held across every stage, so a `pre` script cannot hand the slot
+    // to another process between it and the main script.
+    let cancelled = || ctx.process_tracker.is_some_and(ProcessTracker::is_cancelled);
+    let slot = match acquire_concurrency_group_slot(ctx.config, name, ctx.emit, &cancelled)? {
+        SlotOutcome::Ungated => return run_script_stages(ctx, name, main_body, args),
+        SlotOutcome::Held(slot) => slot,
+        // The callers read the tracker after a script ends, as they do for
+        // a child the cancellation killed.
+        SlotOutcome::Cancelled => {
+            return Ok(StageExit { status: ScriptExit::Emulated(1), interrupted: false });
+        }
+    };
+    let held_env = with_held_group(ctx.extra_env, slot.group());
+    run_script_stages(&RunContext { extra_env: &held_env, ..*ctx }, name, main_body, args)
+}
+
+fn project_extra_env(ctx: &RunContext<'_>) -> HashMap<String, String> {
+    let mut env = ctx.extra_env.clone();
+    ctx.config.prepend_project_node_path::<pnpm_config::Host>(
+        &mut env,
+        ctx.dir,
+        &project_modules_dir_name(ctx),
+    );
+    env
+}
+
+fn project_modules_dir_name<'a>(ctx: &RunContext<'a>) -> std::borrow::Cow<'a, std::ffi::OsStr> {
+    let project_name = ctx.manifest
+        .value()
+        .get("name")
+        .and_then(Value::as_str);
+    ctx.config.modules_dir_name_for(ctx.dir, project_name)
+}
+
+fn run_script_stages(
+    ctx: &RunContext<'_>,
+    name: &str,
+    main_body: &str,
+    args: &[String],
+) -> miette::Result<StageExit> {
+    // Joined before the hardlink sync below, including when a stage fails.
+    let watch = start_injected_edit_watch(ctx, name);
     let mut main_status = None;
     for (stage, script) in
         get_run_script_stages(ctx.manifest, name, main_body, ctx.config.enable_pre_post_scripts)
     {
         let is_main = stage == name;
-        let Some(status) = run_stage(ctx, &stage, &script, if is_main { args } else { &[] })?
-        else {
+        let Some(exit) = run_stage(ctx, &stage, &script, if is_main { args } else { &[] })? else {
             continue;
         };
         // A failing stage stops the script, and its status is the
         // script's.
-        if !status.success() {
-            return Ok(status);
+        if !exit.status.success() {
+            drop(watch);
+            return Ok(exit);
         }
         if is_main {
-            main_status = Some(status);
+            main_status = Some(exit);
         }
     }
     let main_status = main_status.expect(
         "caller validated main_body is neither empty nor the args-less `npx only-allow pnpm` no-op",
     );
 
-    if ctx.config.sync_injected_deps_after_scripts
-        .iter()
-        .any(|script| script == name)
-    {
-        sync_injected_deps(&SyncInjectedDeps {
-            pkg_name: ctx.manifest
-                .value()
-                .get("name")
-                .and_then(Value::as_str),
-            pkg_root_dir: ctx.dir,
-            workspace_dir: ctx.config.workspace_dir.as_deref(),
-            // Read before the script ran, so a bin it drops can still be named.
-            manifest_before_scripts: Some(ctx.manifest.value()),
-        })?;
-    }
+    drop(watch);
+    sync_injected_deps_after(ctx, name)?;
 
     Ok(main_status)
 }
@@ -376,7 +423,7 @@ fn get_run_script_stages(
 /// Run one lifecycle stage. Returns `Ok(None)` when pnpm's per-stage
 /// no-op guards apply (empty body, or `npx only-allow pnpm` with no
 /// args), so the caller can record "didn't actually run" without
-/// inventing a synthetic exit. A non-success [`ScriptExit`] is
+/// inventing a synthetic exit. A non-success status is
 /// returned to the caller — single-project `RunArgs::run` exits with
 /// the code; recursive `run_recursive` records `Failure` and decides
 /// whether to bail.
@@ -385,30 +432,31 @@ pub(in super::super) fn run_stage(
     stage: &str,
     script: &str,
     args: &[String],
-) -> miette::Result<Option<ScriptExit>> {
+) -> miette::Result<Option<StageExit>> {
     // The `npx only-allow pnpm` guard script is a no-op, so a lifecycle
     // stage whose final command is exactly that string is skipped. Args
     // are appended *before* this check, so a stage invoked with args
     // (which lengthen the command past the literal) is never skipped;
     // pre/post stages always pass `args = &[]`.
-    if args.is_empty() && script == "npx only-allow pnpm" {
-        return Ok(None);
-    }
     // An empty script body is a no-op: any stage whose (post-arg) command
     // is falsy is skipped, and pre/post are gated on the body being
     // truthy, so an empty `pre<name>`/`post<name>` never runs.
-    if script.is_empty() {
+    if (args.is_empty() && script == "npx only-allow pnpm") || script.is_empty() {
         return Ok(None);
     }
 
+    let modules_bin_dir = ctx.dir
+        .join(project_modules_dir_name(ctx))
+        .join(".bin");
+    let interrupts_before = interrupt_count();
     let status = run_script(&RunScript {
         environment: super::script_environment(ctx.config, ctx.init_cwd, ctx.extra_env),
         execution: pnpm_executor::ScriptExecutionOptions {
-            extra_bin_paths: &pnpm_python_installer::execution_paths(ctx.config, ctx.dir),
+            extra_bin_paths: &crate::ecosystem_install::execution_paths(ctx.config, ctx.dir),
             node_gyp_bin: None,
-            prepend_node_path: exec_scripts_prepend_node_path(ctx.config.scripts_prepend_node_path),
             shell: ctx.config.script_shell.as_deref().map(Path::new),
             shell_emulator: ctx.config.shell_emulator,
+            wd_bin_dir: Some(&modules_bin_dir),
         },
         invocation: pnpm_executor::ScriptInvocation { stage, script, args },
         manifest: ctx.manifest.value(),
@@ -421,27 +469,18 @@ pub(in super::super) fn run_stage(
     })
     .map_err(miette::Report::new)?;
 
-    if !status.success() {
-        // The `test` stage gets a fixed message; a numeric exit code is
-        // reported verbatim; a signal-terminated child (no code) is
-        // "Command failed." with no number.
-        if stage == "test" {
-            eprintln!("[ELIFECYCLE] Test failed. See above for more details.");
-        } else if let Some(code) = status.code() {
-            eprintln!("[ELIFECYCLE] Command failed with exit code {code}.");
-        } else {
-            eprintln!("[ELIFECYCLE] Command failed.");
-        }
+    // A script the user interrupted while it ran is not a lifecycle
+    // failure. The interrupt ended it, and the status it leaves is the
+    // shell's rather than the script's: on Windows, `cmd` ends with
+    // `STATUS_CONTROL_C_EXIT` and PowerShell with 1 once the console's
+    // `Ctrl+C` has reached them, and a Bourne shell re-raises `SIGINT`.
+    // pnpm still ends the way the script did, so the terminal shows an
+    // interrupted command and nothing else (pnpm/pnpm#16579). A script
+    // that fails on its own after an earlier stage handled an interrupt
+    // is still reported.
+    let interrupted = !status.success() && interrupt_count() != interrupts_before;
+    if !status.success() && !interrupted {
+        report_lifecycle_failure(ctx, status, stage);
     }
-    Ok(Some(status))
-}
-
-pub(crate) fn exec_scripts_prepend_node_path(
-    value: pnpm_config::ScriptsPrependNodePath,
-) -> ScriptsPrependNodePath {
-    match value {
-        pnpm_config::ScriptsPrependNodePath::Always => ScriptsPrependNodePath::Always,
-        pnpm_config::ScriptsPrependNodePath::Never => ScriptsPrependNodePath::Never,
-        pnpm_config::ScriptsPrependNodePath::WarnOnly => ScriptsPrependNodePath::WarnOnly,
-    }
+    Ok(Some(StageExit { status, interrupted }))
 }

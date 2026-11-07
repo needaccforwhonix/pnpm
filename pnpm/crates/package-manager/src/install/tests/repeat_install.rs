@@ -1,18 +1,19 @@
 use super::{
-    super::{
-        Install, InstallError, ProjectMutation, UpToDateFastPathCheck, install_already_up_to_date,
-    },
+    super::{Install, InstallError, ProjectMutation},
     InstallDirs, assert_purge_diagnostic, fresh_lockfile_only_with_compatibility_db,
     install_then_go_offline, recorded_verified_file_integrity_report, touch_manifest,
 };
-use crate::PolicyExcludes;
+use crate::{PolicyExcludes, UpToDateFastPathCheck, install_already_up_to_date};
 use pnpm_config::Config;
 use pnpm_lockfile::{Lockfile, MaybeLazyLockfile};
 use pnpm_modules_yaml::{Host, LayoutVersion, Modules, NodeLinker, write_modules_manifest};
 use pnpm_package_manifest::{DependencyGroup, PackageManifest};
 use pnpm_reporter::{LogEvent, Reporter, SilentReporter};
 use pnpm_store_dir::VerifiedFileIntegrity;
-use pnpm_testing_utils::registry::TestRegistry;
+use pnpm_testing_utils::{
+    fs::{MTIME_STEP_MS, set_mtime_ms},
+    registry::TestRegistry,
+};
 use pnpm_workspace_state as workspace_state;
 use std::{sync::Mutex, time::Duration};
 use tempfile::tempdir;
@@ -45,6 +46,10 @@ async fn optimistic_repeat_install_skips_entire_pipeline_when_state_is_fresh() {
     std::fs::create_dir_all(&dirs.project_root).expect("create project root");
     std::fs::create_dir_all(&dirs.modules_dir)
         .expect("create modules dirs.dir so the deps gate passes");
+    // A fresh install links a `link:` dependency, so the fixture's modules
+    // directory has to hold the entry the state was recorded for.
+    std::fs::create_dir_all(dirs.modules_dir.join("sibling"))
+        .expect("create the link entry the fresh install would have made");
     let manifest_path = dirs.project_root.join("package.json");
     let mut manifest = PackageManifest::create_if_needed(manifest_path.clone()).unwrap();
     manifest.add_dependency("sibling", "link:../sibling", DependencyGroup::Prod).unwrap();
@@ -61,7 +66,7 @@ async fn optimistic_repeat_install_skips_entire_pipeline_when_state_is_fresh() {
     config.lockfile = false;
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
     let config = config.leak();
 
     let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
@@ -93,7 +98,7 @@ async fn optimistic_repeat_install_skips_entire_pipeline_when_state_is_fresh() {
         public_hoist_pattern: config.public_hoist_pattern.clone(),
         store_dir: config.store_dir.display().to_string(),
         virtual_store_dir: config
-            .effective_virtual_store_dir()
+            .virtual_store_dir()
             .to_string_lossy()
             .into_owned(),
         virtual_store_dir_max_length: config.virtual_store_dir_max_length,
@@ -101,34 +106,33 @@ async fn optimistic_repeat_install_skips_entire_pipeline_when_state_is_fresh() {
     };
     write_modules_manifest::<Host>(&dirs.modules_dir, seed_modules).expect("seed .modules.yaml");
 
-    let mut projects = std::collections::BTreeMap::new();
-    projects.insert(
-        dirs.project_root.to_string_lossy().into_owned(),
-        workspace_state::ProjectEntry {
-            name: Some("project".to_string()),
-            version: Some("1.0.0".to_string()),
-        },
-    );
-    let settings = crate::optimistic_repeat_install::settings::current_settings(
+    let seed_state = crate::install::recorded_workspace_state(&crate::install::StateWrite {
+        workspace_root: &dirs.project_root,
         config,
-        pnpm_config::NodeLinker::Isolated,
-        included,
-        None,
-    );
-    workspace_state::update_workspace_state(
-        &dirs.project_root,
-        &pnpm_workspace_state::WorkspaceState {
-            last_validated_timestamp: pnpm_testing_utils::fs::backdate_existing_files(
-                &dirs.project_root,
-            ),
-            projects,
-            pnpmfiles: Vec::new(),
-            filtered_install: false,
-            config_dependencies: None,
-            settings,
+        layout: crate::RepeatInstallLayout {
+            node_linker: pnpm_config::NodeLinker::Isolated,
+            included,
+            supported_architectures: None,
         },
-    )
-    .expect("seed workspace state");
+        catalogs: &std::collections::BTreeMap::default(),
+        projects: crate::install::StateProjects {
+            manifests: crate::DeclaredManifests::new(&[(dirs.project_root.clone(), &manifest)]),
+            workspace_projects: None,
+            lockfile: None,
+        },
+        filesystem_now_ms: Some(pnpm_testing_utils::fs::backdate_existing_files(
+            &dirs.project_root,
+        )),
+        carried: crate::install::CarriedSettings {
+            established_auto_dedupe: None,
+            registry_keys_verified: true,
+            registry_routes: Some(crate::install_state::settings::recorded_registry_routes(config)),
+            kept_settings: None,
+        },
+        vouched: &crate::install_state::validation::Vouched::All,
+    });
+    workspace_state::update_workspace_state(&dirs.project_root, &seed_state)
+        .expect("seed workspace state");
 
     Install {
         lockfile_policy: crate::InstallLockfilePolicy {
@@ -177,6 +181,8 @@ async fn optimistic_repeat_install_skips_entire_pipeline_when_state_is_fresh() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<RecordingReporter>()
@@ -222,6 +228,10 @@ fn sync_fast_path_matches_optimistic_short_circuit() {
     let modules_dir = project_root.join("node_modules");
 
     std::fs::create_dir_all(&modules_dir).expect("create modules dir so the deps gate passes");
+    // A fresh install links a `link:` dependency, so the recorded state has to
+    // see the entry the install made.
+    std::fs::create_dir_all(modules_dir.join("sibling"))
+        .expect("create the link entry the fresh install would have made");
     let manifest_path = project_root.join("package.json");
     let mut manifest = PackageManifest::create_if_needed(manifest_path.clone()).unwrap();
     manifest.add_dependency("sibling", "link:../sibling", DependencyGroup::Prod).unwrap();
@@ -233,7 +243,7 @@ fn sync_fast_path_matches_optimistic_short_circuit() {
     config.lockfile = false;
     config.store_dir = dir.path().join("pacquet-store").into();
     config.modules_dir = modules_dir.clone();
-    config.virtual_store_dir = modules_dir.join(".pacquet");
+    config.install_state_dir = modules_dir.join(".pacquet");
     let config = config.leak();
 
     let included = pnpm_modules_yaml::IncludedDependencies {
@@ -241,34 +251,34 @@ fn sync_fast_path_matches_optimistic_short_circuit() {
         dev_dependencies: false,
         optional_dependencies: false,
     };
-    let mut projects = std::collections::BTreeMap::new();
-    projects.insert(
-        project_root.to_string_lossy().into_owned(),
-        workspace_state::ProjectEntry {
-            name: Some("project".to_string()),
-            version: Some("1.0.0".to_string()),
-        },
-    );
-    let settings = crate::optimistic_repeat_install::settings::current_settings(
+    let last_validated_timestamp = 1_700_000_000_000;
+    set_mtime_ms(&manifest_path, last_validated_timestamp - 2 * MTIME_STEP_MS);
+    set_mtime_ms(&project_root.join("pnpm-lock.yaml"), last_validated_timestamp - MTIME_STEP_MS);
+    let seed_state = crate::install::recorded_workspace_state(&crate::install::StateWrite {
+        workspace_root: &project_root,
         config,
-        pnpm_config::NodeLinker::Isolated,
-        included,
-        None,
-    );
-    workspace_state::update_workspace_state(
-        &project_root,
-        &pnpm_workspace_state::WorkspaceState {
-            last_validated_timestamp: pnpm_testing_utils::fs::backdate_existing_files(
-                &project_root,
-            ),
-            projects,
-            pnpmfiles: Vec::new(),
-            filtered_install: false,
-            config_dependencies: None,
-            settings,
+        layout: crate::RepeatInstallLayout {
+            node_linker: pnpm_config::NodeLinker::Isolated,
+            included,
+            supported_architectures: None,
         },
-    )
-    .expect("seed workspace state");
+        catalogs: &std::collections::BTreeMap::default(),
+        projects: crate::install::StateProjects {
+            manifests: crate::DeclaredManifests::new(&[(project_root.clone(), &manifest)]),
+            workspace_projects: None,
+            lockfile: None,
+        },
+        filesystem_now_ms: Some(last_validated_timestamp),
+        carried: crate::install::CarriedSettings {
+            established_auto_dedupe: None,
+            registry_keys_verified: true,
+            registry_routes: Some(crate::install_state::settings::recorded_registry_routes(config)),
+            kept_settings: None,
+        },
+        vouched: &crate::install_state::validation::Vouched::All,
+    });
+    workspace_state::update_workspace_state(&project_root, &seed_state)
+        .expect("seed workspace state");
 
     let check = UpToDateFastPathCheck {
         config,
@@ -280,18 +290,41 @@ fn sync_fast_path_matches_optimistic_short_circuit() {
     let root = install_already_up_to_date(&check);
     assert_eq!(
         root.map(|up_to_date| up_to_date.root).as_deref(),
-        Some(&*project_root),
+        Ok(&*project_root),
         "fresh state must short-circuit",
     );
 
-    // Outdate the manifest relative to the recorded timestamp: the
-    // fast path must decline and leave the decision to the full
-    // install.
-    pnpm_testing_utils::fs::bump_mtime(&manifest_path);
-    // The manifest content still matches no lockfile (config.lockfile
-    // is off and no current lockfile exists), so the content re-check
-    // cannot vouch for it either.
-    assert!(install_already_up_to_date(&check).is_none(), "modified manifest must fall through");
+    // Edit the manifest: the fast path must decline and leave the decision
+    // to the full install. The new content matches no lockfile
+    // (config.lockfile is off and no current lockfile exists), so the
+    // content re-check cannot vouch for it either.
+    manifest.add_dependency("other", "link:../other", DependencyGroup::Prod).unwrap();
+    manifest.save().unwrap();
+    let check = UpToDateFastPathCheck {
+        config,
+        manifest: &manifest,
+        dependency_groups: vec![DependencyGroup::Prod],
+        node_linker: pnpm_config::NodeLinker::Isolated,
+        supported_architectures: None,
+    };
+    assert!(install_already_up_to_date(&check).is_err(), "modified manifest must fall through");
+}
+
+#[test]
+fn gvs_build_markers_complete_refuses_missing_wanted_lockfile() {
+    let dir = tempdir().unwrap();
+    let mut config = Config::new();
+    config.enable_global_virtual_store = true;
+    config.dangerously_allow_all_builds = true;
+    assert_eq!(
+        crate::install::run::gvs_build_markers_complete(
+            &config,
+            MaybeLazyLockfile::Loaded(None),
+            dir.path(),
+            None,
+        ),
+        Err("the wanted lockfile cannot be read to look for global virtual store build markers"),
+    );
 }
 /// `add` / `remove` mutate the manifest in memory and persist it only
 /// after `Install::run` returns, so the on-disk mtimes the optimistic
@@ -328,7 +361,7 @@ async fn partial_install_disables_optimistic_short_circuit() {
     config.lockfile = false;
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
     let config = config.leak();
 
     let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
@@ -360,7 +393,7 @@ async fn partial_install_disables_optimistic_short_circuit() {
         public_hoist_pattern: config.public_hoist_pattern.clone(),
         store_dir: config.store_dir.display().to_string(),
         virtual_store_dir: config
-            .effective_virtual_store_dir()
+            .virtual_store_dir()
             .to_string_lossy()
             .into_owned(),
         virtual_store_dir_max_length: config.virtual_store_dir_max_length,
@@ -368,37 +401,36 @@ async fn partial_install_disables_optimistic_short_circuit() {
     };
     write_modules_manifest::<Host>(&dirs.modules_dir, seed_modules).expect("seed .modules.yaml");
     lockfile
-        .save_current_to_virtual_store_dir(&dirs.virtual_store_dir)
+        .save_current_to_install_state_dir(&dirs.virtual_store_dir)
         .expect("seed current lockfile");
 
-    let mut projects = std::collections::BTreeMap::new();
-    projects.insert(
-        dirs.project_root.to_string_lossy().into_owned(),
-        workspace_state::ProjectEntry {
-            name: Some("project".to_string()),
-            version: Some("1.0.0".to_string()),
-        },
-    );
-    let settings = crate::optimistic_repeat_install::settings::current_settings(
+    let seed_state = crate::install::recorded_workspace_state(&crate::install::StateWrite {
+        workspace_root: &dirs.project_root,
         config,
-        pnpm_config::NodeLinker::Isolated,
-        included,
-        None,
-    );
-    workspace_state::update_workspace_state(
-        &dirs.project_root,
-        &pnpm_workspace_state::WorkspaceState {
-            last_validated_timestamp: pnpm_testing_utils::fs::backdate_existing_files(
-                &dirs.project_root,
-            ),
-            projects,
-            pnpmfiles: Vec::new(),
-            filtered_install: false,
-            config_dependencies: None,
-            settings,
+        layout: crate::RepeatInstallLayout {
+            node_linker: pnpm_config::NodeLinker::Isolated,
+            included,
+            supported_architectures: None,
         },
-    )
-    .expect("seed workspace state");
+        catalogs: &std::collections::BTreeMap::default(),
+        projects: crate::install::StateProjects {
+            manifests: crate::DeclaredManifests::new(&[(dirs.project_root.clone(), &manifest)]),
+            workspace_projects: None,
+            lockfile: None,
+        },
+        filesystem_now_ms: Some(pnpm_testing_utils::fs::backdate_existing_files(
+            &dirs.project_root,
+        )),
+        carried: crate::install::CarriedSettings {
+            established_auto_dedupe: None,
+            registry_keys_verified: true,
+            registry_routes: Some(crate::install_state::settings::recorded_registry_routes(config)),
+            kept_settings: None,
+        },
+        vouched: &crate::install_state::validation::Vouched::All,
+    });
+    workspace_state::update_workspace_state(&dirs.project_root, &seed_state)
+        .expect("seed workspace state");
 
     Install {
         lockfile_policy: crate::InstallLockfilePolicy {
@@ -446,6 +478,8 @@ async fn partial_install_disables_optimistic_short_circuit() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<RecordingReporter>()
@@ -541,6 +575,8 @@ async fn optimistic_repeat_install_short_circuits_offline_when_touched_manifest_
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<RecordingReporter>()
@@ -626,8 +662,8 @@ async fn fresh_install_applies_package_extensions_to_dependency_manifest() {
     let mut config = Config::new();
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
-    config.registry = mock_instance.url();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
+    config.registry = mock_instance.url().to_string();
     // Add a `peerDependencies` entry to the resolved manifest of
     // `@pnpm.e2e/hello-world-js-bin`, marked optional so the missing
     // peer never escalates to a fetch error during this minimal test.
@@ -695,6 +731,8 @@ async fn fresh_install_applies_package_extensions_to_dependency_manifest() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()

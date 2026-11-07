@@ -1,11 +1,14 @@
 pub use report::render_release_plan;
 
-use crate::cli_args::{
-    changelog::{published_names, unpublished_release_dirs},
-    recursive::discover_workspace_projects,
+#[cfg(target_family = "wasm")]
+use crate::dialoguer_wasm::{Input, MultiSelect};
+use crate::{
+    cli_args::{changelog::published_names, recursive::discover_workspace_projects},
+    process::Command,
 };
 use clap::Args;
 use derive_more::{Display, Error};
+#[cfg(not(target_family = "wasm"))]
 use dialoguer::{Input, MultiSelect};
 use indexmap::IndexMap;
 use miette::{Diagnostic, IntoDiagnostic};
@@ -24,7 +27,6 @@ use report::{render_status, run_check};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    process::Command,
 };
 
 /// `pnpm change` — record a change intent: which packages a change affects,
@@ -33,9 +35,9 @@ use std::{
 #[derive(Debug, Args)]
 pub struct ChangeArgs {
     /// `status` to print the pending intents and the release plan they
-    /// produce, `check` to validate the committed versions against the
-    /// configured epic bands and fixed-group lockstep; otherwise the packages
-    /// the change affects.
+    /// produce, `check` to validate the pending intents and the committed
+    /// versions against the configured epic bands and fixed-group lockstep;
+    /// otherwise the packages the change affects.
     pub params: Vec<String>,
 
     /// Bump type for the named packages: none, patch, minor, major. "none"
@@ -100,9 +102,6 @@ impl ChangeArgs {
             })
             .transpose()?;
 
-        // For a name shared by several projects the interactive picker offers
-        // each project under its directory reference, so the written intent
-        // stays unambiguous without the contributor knowing the rule exists.
         let pkg_refs = if self.params.is_empty() {
             let changed_dirs =
                 detect_changed_dirs(&releasable, &engine_projects, &workspace_dir, config);
@@ -122,7 +121,7 @@ impl ChangeArgs {
         let summary = self.change_summary()?;
 
         let id = write_change_intent(&workspace_dir, &releases, &summary)?;
-        println!("Recorded change intent .changeset/{id}.md");
+        pnpm_diagnostics::println!("Recorded change intent .changeset/{id}.md");
         Ok(())
     }
     fn change_summary(&self) -> miette::Result<String> {
@@ -169,8 +168,17 @@ impl ChangeArgs {
         match self.params[0].as_str() {
             "status" => {
                 let names = published_names(projects);
-                let output = render_status(workspace_dir, engine_projects, &names, config).await?;
-                println!("{output}");
+                let private_dirs =
+                    pnpm_versioning::private_project_dirs(engine_projects, workspace_dir);
+                let output = render_status(report::RenderStatusOptions {
+                    workspace_dir,
+                    projects: engine_projects,
+                    published_names: &names,
+                    private_dirs: &private_dirs,
+                    config,
+                })
+                .await?;
+                pnpm_diagnostics::println!("{output}");
             }
             "check" => run_check(workspace_dir, engine_projects, config)?,
             _ => return Ok(false),
@@ -262,7 +270,7 @@ fn prompt_for_packages(
                 .map(|index| ordered[index].reference.clone())
                 .collect());
         }
-        println!("Select at least one package.");
+        pnpm_diagnostics::println!("Select at least one package.");
     }
 }
 
@@ -284,8 +292,11 @@ fn detect_changed_dirs(
         .collect();
     let opts = GetChangedProjectsOptions {
         workspace_dir,
+        working_dir: None,
         test_pattern: &config.test_pattern,
         changed_files_ignore_pattern: &config.changed_files_ignore_pattern,
+        project_dependencies: None,
+        use_glob_dir_filtering: false,
     };
     let Ok(changed) = get_changed_projects(project_dirs, &base_commit, &opts) else {
         return HashSet::new();
@@ -430,6 +441,7 @@ pub fn to_engine_projects(projects: &[Project]) -> Vec<WorkspaceProject> {
             }
             WorkspaceProject {
                 root_dir: project.root_dir.clone(),
+                private: manifest.get("private").and_then(serde_json::Value::as_bool) == Some(true),
                 name: manifest
                     .get("name")
                     .and_then(|name| name.as_str())

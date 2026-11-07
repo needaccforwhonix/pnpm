@@ -1,11 +1,18 @@
 use crate::{
     model::{DependencyKind, FeatureSelection, PackageKey, RegistryDependency, RegistryVersion},
-    registry::{Registry, compatibility_line, matching_versions},
+    packages::{newest_line_package, selected_package},
+    registry::Registry,
 };
 use miette::Result;
 use pubgrub::SelectedDependencies;
 use semver::Version;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+#[derive(Default, Clone, Copy)]
+pub(crate) struct DependencyOptions {
+    pub(crate) include_dev: bool,
+    pub(crate) lockfile: bool,
+}
 
 #[derive(Debug, Default)]
 struct FeatureActivations {
@@ -41,9 +48,10 @@ impl FeatureActivations {
         }
     }
 
-    fn activate_weak_dependency_features(&mut self) {
+    fn activate_weak_dependency_features(&mut self, lockfile: bool) {
         for (alias, feature) in std::mem::take(&mut self.weak_dependency_features) {
-            if self.active_aliases.contains(&alias) {
+            if lockfile || self.active_aliases.contains(&alias) {
+                self.active_aliases.insert(alias.clone());
                 self.dependency_features
                     .entry(alias)
                     .or_default()
@@ -53,11 +61,19 @@ impl FeatureActivations {
     }
 }
 
-pub(crate) fn active_dependencies(
+/// Dependencies Cargo records in its target-independent lockfile graph.
+/// Weak dependency features also require a lock entry, even when the build
+/// feature graph leaves that optional dependency inactive.
+pub(crate) fn locked_dependencies(
     package: &RegistryVersion,
     selection: &FeatureSelection,
 ) -> Result<Vec<RegistryDependency>> {
-    active_dependencies_from_parts(&package.dependencies, &package.features, selection, false)
+    dependencies_from_parts(
+        &package.dependencies,
+        &package.features,
+        selection,
+        DependencyOptions { lockfile: true, ..DependencyOptions::default() },
+    )
 }
 
 pub(crate) fn supports_features(package: &RegistryVersion, selection: &FeatureSelection) -> bool {
@@ -65,22 +81,54 @@ pub(crate) fn supports_features(package: &RegistryVersion, selection: &FeatureSe
         implicit_optional_aliases(&package.dependencies, &package.features);
     selection.features
         .iter()
-        .all(|feature| {
-            package.features.contains_key(feature)
-                || implicit_optional_aliases.contains(feature.as_str())
-        })
+        .all(|feature| defines_feature(package, &implicit_optional_aliases, feature))
 }
 
-pub(crate) fn active_dependencies_from_parts(
+/// The entries of `features` that `package` does not define. An entry
+/// naming a feature of one of its dependencies (`dep/feature`) counts as
+/// defined while `package` still has that dependency; the dependency's own
+/// feature is left for Cargo to check.
+pub(crate) fn missing_features<'a>(
+    package: &RegistryVersion,
+    features: &'a [String],
+) -> Vec<&'a str> {
+    let implicit_optional_aliases =
+        implicit_optional_aliases(&package.dependencies, &package.features);
+    features
+        .iter()
+        .map(String::as_str)
+        .filter(|feature| match feature.split_once('/') {
+            Some((alias, _)) => !has_dependency(package, alias.trim_end_matches('?')),
+            None => !defines_feature(package, &implicit_optional_aliases, feature),
+        })
+        .collect()
+}
+
+fn has_dependency(package: &RegistryVersion, alias: &str) -> bool {
+    package.dependencies
+        .iter()
+        .any(|dependency| dependency.alias == alias)
+}
+
+fn defines_feature(
+    package: &RegistryVersion,
+    implicit_optional_aliases: &BTreeSet<&str>,
+    feature: &str,
+) -> bool {
+    package.features.contains_key(feature) || implicit_optional_aliases.contains(feature)
+}
+
+pub(crate) fn dependencies_from_parts(
     dependencies: &[RegistryDependency],
     features: &BTreeMap<String, Vec<String>>,
     selection: &FeatureSelection,
-    include_dev: bool,
+    options: DependencyOptions,
 ) -> Result<Vec<RegistryDependency>> {
-    let activations = collect_feature_activations(dependencies, features, selection);
+    let activations =
+        collect_feature_activations(dependencies, features, selection, options.lockfile);
     Ok(dependencies
         .iter()
-        .filter(|dependency| include_dev || dependency.kind != DependencyKind::Dev)
+        .filter(|dependency| options.include_dev || dependency.kind != DependencyKind::Dev)
         .filter(|dependency| {
             !dependency.optional || activations.active_aliases.contains(&dependency.alias)
         })
@@ -98,6 +146,7 @@ fn collect_feature_activations(
     dependencies: &[RegistryDependency],
     features: &BTreeMap<String, Vec<String>>,
     selection: &FeatureSelection,
+    lockfile: bool,
 ) -> FeatureActivations {
     let implicit_optional_aliases = implicit_optional_aliases(dependencies, features);
     let mut pending = selection.features
@@ -129,7 +178,7 @@ fn collect_feature_activations(
             );
         }
     }
-    activations.activate_weak_dependency_features();
+    activations.activate_weak_dependency_features(lockfile);
     activations
 }
 
@@ -177,43 +226,42 @@ fn collect_feature_selections(
     while let Some(dependency) = pending.pop_front() {
         registry.validate_dependency_source(dependency.registry.as_deref())?;
         let versions = registry.package(&dependency.name)?;
-        let package = PackageKey::Registry {
-            name: dependency.name.clone(),
-            compatibility: newest_compatibility(versions, &dependency)?,
+        // Before there is a solution the line is a prediction, and the
+        // solver reaches for the newest first. Once there is one, the line
+        // it settled on is the only one this dependency asked anything of.
+        let package = match solution {
+            Some(solution) => selected_package(registry, &dependency, solution)?,
+            None => newest_line_package(registry, &dependency)?,
         };
-        let requested = dependency.feature_selection();
-        let previous = selections.get(&package).cloned();
-        let selection = selections.entry(package.clone()).or_default();
-        selection.default_features |= requested.default_features;
-        selection.features.extend(requested.features);
-        if previous.as_ref() == Some(selection) {
+        let Some(package) = package else { continue };
+        if !widen_line_selection(&mut selections, &dependency, &package) {
             continue;
         }
         let Some(selected_version) = solution.and_then(|solution| solution.get(&package)) else {
             continue;
         };
         let selected = indexed_version(versions, &dependency.name, selected_version)?;
-        pending.extend(active_dependencies(selected, selection)?);
+        let selection = selections
+            .get(&package)
+            .cloned()
+            .unwrap_or_default();
+        pending.extend(locked_dependencies(selected, &selection)?);
     }
     Ok(selections)
 }
 
-/// The compatibility line of the newest non-yanked version satisfying the
-/// dependency's requirement.
-fn newest_compatibility(
-    versions: &[RegistryVersion],
+/// Fold what `dependency` asks for into `package`'s selection, reporting
+/// whether that added anything, which is what makes it worth walking again.
+fn widen_line_selection(
+    selections: &mut BTreeMap<PackageKey, FeatureSelection>,
     dependency: &RegistryDependency,
-) -> Result<String> {
-    matching_versions(versions, &dependency.requirement)
-        .next_back()
-        .map(|version| compatibility_line(&version.version))
-        .ok_or_else(|| {
-            miette::miette!(
-                "no non-yanked version of {} satisfies {}",
-                dependency.name,
-                dependency.requirement,
-            )
-        })
+    package: &PackageKey,
+) -> bool {
+    let previous = selections.get(package).cloned();
+    let selection = selections.entry(package.clone()).or_default();
+    selection.default_features |= dependency.default_features;
+    selection.features.extend(dependency.features.iter().cloned());
+    previous.as_ref() != Some(selection)
 }
 
 pub(crate) fn indexed_version<'v>(

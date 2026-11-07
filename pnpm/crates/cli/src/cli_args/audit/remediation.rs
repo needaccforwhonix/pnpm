@@ -1,10 +1,11 @@
 use super::{
     Arc, AuditAdvisory, AuditArgs, AuditError, AuditFixObserver, AuditOutcome, AuditReport,
     BTreeMap, Config, FixContext, FixMethod, GuardExhaustionPolicy, PackageVersionGuard,
-    PackageVersionGuardDecision, PackageVersionGuardFuture, Reporter, ResolutionObserver,
-    ResolvedPackageHint, State, Version, VulnerabilityGuard, filter_advisories_for_fix,
-    fix_override, fix_with_update, format_fix_with_update_output, interactive_select,
-    print_command_output, prune_ignored_ghsas, sanitize_inline, satisfies_including_prerelease,
+    PackageVersionGuardDecision, PackageVersionGuardFuture, RangeSpecStyle, Reporter,
+    ResolutionObserver, ResolvedPackageHint, State, Version, VulnerabilityGuard,
+    filter_advisories_for_fix, fix_override, fix_with_update, format_fix_with_update_output,
+    interactive_select, print_command_output, prune_ignored_ghsas, sanitize_inline,
+    satisfies_including_prerelease,
 };
 
 /// Drop ignored GHSAs that no longer appear in the report, mirroring
@@ -42,7 +43,7 @@ fn report_pruned_ghsas(pruned: &[String]) {
     if pruned.is_empty() {
         return;
     }
-    println!(
+    pnpm_diagnostics::println!(
         "Removed {} unused ignored GHSA{}: {}",
         pruned.len(),
         if pruned.len() == 1 { "" } else { "s" },
@@ -122,11 +123,12 @@ impl AuditArgs {
         context: &FixContext<'_>,
     ) -> miette::Result<AuditOutcome> {
         prune_ignored_advisories(state.config, report, context.settings_dir)?;
-        // Pre-filter by audit-level and ignored GHSAs so the interactive
-        // prompt and both fix methods see the same advisory set the
-        // override path's fixable filter would.
         let filtered = filter_advisories_for_fix(report, context.audit_level, state.config);
-        let Some(filtered) = self.select_advisories(filtered)? else {
+        let range_spec_style = RangeSpecStyle::from_save_options(
+            state.config.save_exact,
+            state.config.save_prefix.as_deref(),
+        );
+        let Some(filtered) = self.select_advisories(filtered, range_spec_style)? else {
             return Ok(AuditOutcome::Clean);
         };
         match fix_method {
@@ -167,17 +169,16 @@ impl AuditArgs {
     fn select_advisories(
         &self,
         filtered: BTreeMap<String, AuditAdvisory>,
+        range_spec_style: RangeSpecStyle,
     ) -> miette::Result<Option<BTreeMap<String, AuditAdvisory>>> {
         if !self.interactive {
             return Ok(Some(filtered));
         }
-        interactive_select(filtered)
+        interactive_select(filtered, range_spec_style)
     }
 
     /// Resolve the `--fix` flag (and the `--interactive` implies-override
-    /// rule) into a [`FixMethod`]. Mirrors pnpm's fix-method dispatch:
-    /// `--fix`/`--fix override` → override, `--fix update` → update,
-    /// `--interactive` without `--fix` → override, anything else → error.
+    /// rule) into a [`FixMethod`]. Mirrors pnpm's fix-method dispatch.
     pub(super) fn resolve_fix_method(&self) -> miette::Result<Option<FixMethod>> {
         match self.fix.as_deref() {
             Some("override") => Ok(Some(FixMethod::Override)),
@@ -186,5 +187,18 @@ impl AuditArgs {
             None if self.interactive => Ok(Some(FixMethod::Override)),
             None => Ok(None),
         }
+    }
+
+    /// Reject `--ignore` and `--ignore-unfixable` next to a fix flow.
+    pub(super) fn reject_ignore_flags(&self) -> Result<(), AuditError> {
+        let ignore_flag = if !self.advisories.ignore.is_empty() {
+            "--ignore"
+        } else if self.advisories.ignore_unfixable {
+            "--ignore-unfixable"
+        } else {
+            return Ok(());
+        };
+        let fix_flag = if self.fix.is_some() { "--fix" } else { "--interactive" };
+        Err(AuditError::FixWithIgnore { fix_flag, ignore_flag })
     }
 }

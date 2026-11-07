@@ -1,6 +1,6 @@
 //! Ports of the TypeScript `optionalDependencies` install suite
 //! (`installing/deps-installer/test/install/optionalDependencies.ts`) —
-//! see `plans/TEST_PORTING.md` § "Proper Support Of `optionalDependencies`".
+//! see `plans/TEST_PORTING.md`.
 
 pub use _utils::*;
 
@@ -98,6 +98,92 @@ fn skip_failing_optional_dependencies() {
     drop((root, npmrc_info)); // cleanup
 }
 
+/// TS: `remove an optional dependency whose build failed`
+/// (`optionalDependencies.ts`). Under the isolated linker the direct
+/// dependency's link may remain, so `is_dir` rather than [`is_absent`].
+#[test]
+fn remove_optional_dependency_whose_build_failed() {
+    for node_linker in ["isolated", "hoisted"] {
+        let CommandTempCwd {
+            pacquet,
+            root,
+            workspace,
+            npmrc_info,
+            ..
+        } = CommandTempCwd::init().add_mocked_registry();
+        append_workspace_yaml_key(&workspace, "nodeLinker", node_linker);
+        append_workspace_yaml_key(
+            &workspace,
+            "allowBuilds",
+            "{ '@pnpm.e2e/failing-postinstall': true }",
+        );
+
+        pacquet
+            .with_args(["add", "--save-optional", "@pnpm.e2e/failing-postinstall@1.0.0"])
+            .assert()
+            .success();
+
+        assert!(
+            !workspace.join("node_modules/@pnpm.e2e/failing-postinstall").is_dir(),
+            "the optional dependency whose build failed must be removed (nodeLinker={node_linker})",
+        );
+        let lockfile_text =
+            fs::read_to_string(workspace.join(Lockfile::FILE_NAME)).expect("read pnpm-lock.yaml");
+        assert!(
+            lockfile_text.contains("'@pnpm.e2e/failing-postinstall'"),
+            "the lockfile must still record the optional dependency:\n{lockfile_text}",
+        );
+
+        drop((root, npmrc_info)); // cleanup
+    }
+}
+
+/// TS: `rebuild removes an optional dependency whose build failed`
+/// (`building/commands/test/build/index.ts`).
+#[test]
+fn rebuild_removes_optional_dependency_whose_build_failed() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    write_manifest(
+        &workspace,
+        &serde_json::json!({
+            "optionalDependencies": { "@pnpm.e2e/failing-postinstall": "1.0.0" },
+        }),
+    );
+    let installed = workspace.join("node_modules/@pnpm.e2e/failing-postinstall");
+
+    pacquet
+        .with_args(["install", "--ignore-scripts"])
+        .assert()
+        .success();
+    assert!(installed.is_dir(), "--ignore-scripts must install the package unbuilt");
+    append_workspace_yaml_key(
+        &workspace,
+        "allowBuilds",
+        "{ '@pnpm.e2e/failing-postinstall': true }",
+    );
+
+    let CommandTempCwd {
+        pacquet: rebuild,
+        root: rebuild_root,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    rebuild
+        .with_current_dir(&workspace)
+        .arg("rebuild")
+        .assert()
+        .success();
+
+    assert!(!installed.is_dir(), "the optional dependency whose build failed must be removed");
+
+    drop((root, npmrc_info, rebuild_root)); // cleanup
+}
+
 /// TS: `skip failing optional peer dependencies` (`optionalDependencies.ts:34`).
 /// The auto-installed optional peer's postinstall fails; the install must
 /// succeed, and the lockfile must record the peer as an optional dependency
@@ -182,6 +268,198 @@ fn skip_non_existing_optional_dependency() {
         .get(&is_positive_name)
         .expect("is-positive is recorded");
     assert_eq!(is_positive.specifier, "1.0.0");
+
+    drop((root, npmrc_info)); // cleanup
+}
+
+/// Regression test for [pnpm/pnpm#16511](https://github.com/pnpm/pnpm/issues/16511).
+/// An optional dependency whose own dependency is not in the registry is left
+/// out with its subtree, whether or not it fits the current platform.
+#[test]
+fn skip_optional_dependency_whose_dependency_does_not_exist() {
+    for optional in [
+        "@pnpm.e2e/has-unpublished-dep",
+        "@pnpm.e2e/not-compatible-with-any-os-and-has-unpublished-dep",
+    ] {
+        let CommandTempCwd {
+            pacquet,
+            root,
+            workspace,
+            npmrc_info,
+            ..
+        } = CommandTempCwd::init().add_mocked_registry();
+        write_manifest(
+            &workspace,
+            &serde_json::json!({
+                "dependencies": { "is-positive": "1.0.0" },
+                "optionalDependencies": { optional: "1.0.0" },
+            }),
+        );
+
+        pacquet
+            .with_arg("install")
+            .assert()
+            .success();
+
+        assert!(is_absent(&workspace.join("node_modules").join(optional)));
+        let lockfile = read_wanted_lockfile(&workspace);
+        let snapshots: Vec<String> = lockfile.snapshots
+            .iter()
+            .flatten()
+            .map(|(key, _)| key.to_string())
+            .collect();
+        assert_eq!(snapshots, ["is-positive@1.0.0"]);
+
+        drop((root, npmrc_info)); // cleanup
+    }
+}
+
+/// Regression test for [pnpm/pnpm#16514](https://github.com/pnpm/pnpm/issues/16514).
+/// An optional dependency whose locked integrity no longer matches its
+/// tarball is skipped with a warning naming the error, and is not counted as
+/// added.
+#[test]
+fn frozen_install_warns_about_an_optional_dependency_that_cannot_be_fetched() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    write_manifest(
+        &workspace,
+        &serde_json::json!({
+            "dependencies": { "is-negative": "1.0.0" },
+            "optionalDependencies": { "is-positive": "1.0.0" },
+        }),
+    );
+    pacquet
+        .with_args(["install", "--lockfile-only"])
+        .assert()
+        .success();
+    let lockfile_path = workspace.join(Lockfile::FILE_NAME);
+    let lockfile = fs::read_to_string(&lockfile_path).expect("read pnpm-lock.yaml");
+    let (before, after) = lockfile.split_once("  is-positive@1.0.0:\n").expect("is-positive entry");
+    let integrity_start = after.find("sha512-").expect("is-positive integrity");
+    let integrity_end =
+        integrity_start + after[integrity_start..].find('}').expect("integrity end");
+    let corrupted = format!(
+        "{before}  is-positive@1.0.0:\n{}sha512-{}=={}",
+        &after[..integrity_start],
+        "A".repeat(86),
+        &after[integrity_end..],
+    );
+    fs::write(&lockfile_path, corrupted).expect("write the corrupted lockfile");
+
+    let assert = pacquet_in(&workspace)
+        .args(["install", "--frozen-lockfile", "--config.fetch-retries=0"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+
+    assert!(
+        stdout.contains(
+            "is-positive@1.0.0 is an optional dependency that could not be fetched. Excluding it from installation."
+        ),
+        "the install must warn about the skipped package; got:\n{stdout}",
+    );
+    assert!(
+        stdout.contains("ERR_PNPM_TARBALL_INTEGRITY"),
+        "the warning must name the error; got:\n{stdout}",
+    );
+    assert!(stdout.contains("Packages: +1"), "only is-negative is added; got:\n{stdout}");
+    assert!(workspace.join("node_modules/is-negative/package.json").exists());
+    assert!(is_absent(&workspace.join("node_modules/is-positive")));
+
+    drop((root, npmrc_info)); // cleanup
+}
+
+/// Regression test for [pnpm/pnpm#3960](https://github.com/pnpm/pnpm/issues/3960).
+#[test]
+fn frozen_install_skips_the_optional_dependency_the_lockfile_left_out() {
+    frozen_install_with_unresolved_optional_dependency(true);
+}
+
+#[test]
+fn frozen_install_skips_the_only_dependency_when_it_is_unresolved_and_optional() {
+    frozen_install_with_unresolved_optional_dependency(false);
+}
+
+fn frozen_install_with_unresolved_optional_dependency(has_required_dependency: bool) {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    write_manifest(
+        &workspace,
+        &serde_json::json!({
+            "dependencies": if has_required_dependency {
+                serde_json::json!({ "is-positive": "1.0.0" })
+            } else {
+                serde_json::json!({})
+            },
+            "optionalDependencies": { "@pnpm.e2e/i-do-not-exist": "1000" },
+        }),
+    );
+    const SKIP_NOTICE: &str = "info: @pnpm.e2e/i-do-not-exist@1000 is an optional dependency that could not be resolved. Excluding it from installation.";
+
+    let assert = pacquet
+        .with_arg("install")
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    assert!(
+        stdout.contains(SKIP_NOTICE),
+        "the resolving install must report the skip; got:\n{stdout}",
+    );
+    let lockfile_before =
+        fs::read_to_string(workspace.join(Lockfile::FILE_NAME)).expect("read pnpm-lock.yaml");
+
+    for frozen in [["install", "--frozen-lockfile"].as_slice(), ["install"].as_slice()] {
+        if workspace.join("node_modules").exists() {
+            fs::remove_dir_all(workspace.join("node_modules")).expect("remove node_modules");
+        }
+        // The test environment pins `PNPM_CONFIG_CI=false`; the bare
+        // `install` relies on `CI=true` turning the frozen default on.
+        let mut command = pacquet_in(&workspace);
+        command
+            .env_remove("PNPM_CONFIG_CI")
+            .env("CI", "true")
+            .args(frozen);
+        let assert = command.assert().success();
+        let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+        if has_required_dependency {
+            assert!(
+                stdout.contains("Lockfile is up to date, resolution step is skipped"),
+                "{frozen:?} must install from the lockfile; got:\n{stdout}",
+            );
+        } else {
+            assert!(
+                stdout.contains("Already up to date"),
+                "{frozen:?} must report up to date; got:\n{stdout}",
+            );
+        }
+        assert!(stdout.contains(SKIP_NOTICE), "{frozen:?} must report the skip; got:\n{stdout}");
+        if has_required_dependency {
+            assert!(
+                workspace.join("node_modules/is-positive/package.json").exists(),
+                "the resolvable dependency must be installed",
+            );
+        }
+        assert!(
+            is_absent(&workspace.join("node_modules/@pnpm.e2e/i-do-not-exist")),
+            "the unresolvable optional dependency must be skipped",
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join(Lockfile::FILE_NAME)).expect("read pnpm-lock.yaml"),
+            lockfile_before,
+            "a frozen install must not rewrite the lockfile",
+        );
+    }
 
     drop((root, npmrc_info)); // cleanup
 }

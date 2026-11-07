@@ -1,17 +1,25 @@
 use super::{
-    Add, AddArgs, AddError, BTreeMap, Config, Context, DependencyGroup, EngineError,
+    Add, AddArgs, AddError, AddRequest, BTreeMap, Config, Context, DependencyGroup, EngineError,
     InstallFamilySelection, LogEvent, LogLevel, Path, PathBuf, PnpmLog, RangeSpecStyle, Reporter,
     State, WorkspacePackages, build_workspace_packages_map, config_deps, declared_package_manager,
     describe_pin, record_package_manager_pin, resolve_project_pin, tool_install_selector,
     workspace_link_root, workspace_selectors,
 };
+use crate::state::command_lockfile;
+
+/// The dependency groups one add works with, which are two different
+/// sets: `save_target` names the manifest group the added packages are
+/// written to, `included` the groups the install that follows resolves
+/// and materializes (`--prod` / `--dev`). `None` defaults each, as
+/// documented on the [`pnpm_package_manager::AddResources`] fields they
+/// reach.
+pub(crate) struct AddGroups<DependencyGroupList> {
+    pub(crate) save_target: Option<DependencyGroupList>,
+    pub(crate) included: Option<Vec<DependencyGroup>>,
+    pub(crate) save_types: bool,
+}
 
 /// Add a single package to `state`'s manifest and install it.
-///
-/// Shared by `pacquet dlx`, `pacquet runtime`, and the self-updater. dlx
-/// points `state` at a cache directory (via a [`Config`] whose `modules_dir`
-/// is anchored there) and saves to `dependencies` so the package's bin lands
-/// in `<cacheDir>/node_modules/.bin`.
 pub(crate) async fn add_package<Reporter, DependencyGroupList>(
     state: State,
     package_name: &str,
@@ -33,7 +41,7 @@ where
         save_catalog_name,
         lockfile_only,
         supported_architectures,
-        Some(dependency_groups),
+        AddGroups { save_target: Some(dependency_groups), included: None, save_types: false },
     ))
     .await
 }
@@ -64,12 +72,17 @@ struct RecordedPins {
 /// to do deliberately rather than an `add`'s to do as a side effect.
 async fn record_package_manager_pins(
     state: &mut State,
-    package_names: &[String],
+    requests: &[AddRequest],
 ) -> miette::Result<RecordedPins> {
     let mut remaining = Vec::new();
     let mut recorded = Vec::new();
-    for request in package_names {
-        if let Some((pm, version_spec)) = declared_package_manager(request) {
+    for request in requests {
+        let selector = request.selector();
+        if !request.may_name_a_tool() {
+            remaining.push(selector.to_string());
+            continue;
+        }
+        if let Some((pm, version_spec)) = declared_package_manager(selector) {
             let reference = resolve_project_pin(state.config, pm, version_spec.as_deref()).await?;
             let reference = reference.as_deref();
             let manifest = state.manifest
@@ -79,8 +92,8 @@ async fn record_package_manager_pins(
             record_package_manager_pin(manifest, pm, reference);
             recorded.push(describe_pin(pm, reference));
         } else {
-            let selector = tool_install_selector(request);
-            remaining.push(selector.unwrap_or_else(|| request.clone()));
+            let tool = tool_install_selector(selector);
+            remaining.push(tool.unwrap_or_else(|| selector.to_string()));
         }
     }
     Ok(RecordedPins { remaining, recorded })
@@ -118,7 +131,7 @@ pub(crate) async fn add_packages<Reporter, DependencyGroupList>(
     save_catalog_name: Option<String>,
     lockfile_only: bool,
     supported_architectures: Option<pnpm_package_is_installable::SupportedArchitectures>,
-    dependency_groups: Option<DependencyGroupList>,
+    groups: AddGroups<DependencyGroupList>,
 ) -> miette::Result<()>
 where
     Reporter: self::Reporter + 'static,
@@ -132,10 +145,10 @@ where
         manifest,
         lockfile,
         resolved_packages,
+        dedicated: _,
+        discovered_workspace: _,
     } = &mut state;
-    let lockfile = lockfile
-        .get()
-        .map_err(|err| miette::Report::new(err).wrap_err("load the lockfile"))?;
+    let lockfile = command_lockfile(lockfile, &lockfile_path)?;
 
     Add {
         manifest,
@@ -143,16 +156,17 @@ where
             http_client,
             config,
             lockfile,
-            lockfile_path: Some(&lockfile_path),
             package_names,
             range_spec_style,
             resolved_packages,
             lockfile_only,
+            save_types: groups.save_types,
         },
         resources: pnpm_package_manager::AddResources {
             tarball_mem_cache: std::sync::Arc::clone(tarball_mem_cache),
             http_client_arc: std::sync::Arc::clone(http_client),
-            dependency_groups,
+            dependency_groups: groups.save_target,
+            included_groups: groups.included,
             save_catalog_name,
             supported_architectures,
         },
@@ -166,6 +180,7 @@ where
 async fn add_workspace_config_dependencies<Reporter: self::Reporter>(
     state: &State,
     added: &BTreeMap<String, String>,
+    range_spec_style: RangeSpecStyle,
 ) -> miette::Result<()> {
     let root_dir = state.config.workspace_dir
         .clone()
@@ -175,7 +190,13 @@ async fn add_workspace_config_dependencies<Reporter: self::Reporter>(
                 .parent()
                 .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
         });
-    config_deps::add_config_dependencies::<Reporter>(state.config, &root_dir, added).await
+    config_deps::add_config_dependencies::<Reporter>(
+        state.config,
+        &root_dir,
+        added,
+        range_spec_style,
+    )
+    .await
 }
 
 impl AddArgs {
@@ -207,24 +228,18 @@ impl AddArgs {
     ) -> miette::Result<()> {
         // `--config` routes to the configurational-dependency path
         // instead of the regular `package.json` add: resolve + install
-        // into `.pnpm-config`, then record the clean specifiers in
+        // into `.pnpm-config`, then record the saved specifiers in
         // `pnpm-workspace.yaml`.
         if let Some(added) = config_dependencies {
-            return add_workspace_config_dependencies::<Reporter>(&state, &added).await;
+            let range_spec_style = self.range_spec_style(state.config);
+            return add_workspace_config_dependencies::<Reporter>(&state, &added, range_spec_style)
+                .await;
         }
 
-        // Merge CLI overrides with the yaml-derived value before
-        // handing off to the install pipeline. See
-        // `cli_args::install.rs` for the parallel comment — the
-        // pattern is identical (clone from `&'static Config`, merge,
-        // pass merged value through).
         let supported_architectures =
             self.supported_architectures.apply_to(state.config.supported_architectures.clone());
 
-        // `--save-catalog-name=<name>` wins; `--save-catalog` is the
-        // shorthand for the default catalog; otherwise fall back to the
-        // `saveCatalogName` config default (`None`). Mirrors pnpm's
-        // `save-catalog` → `--save-catalog-name=default` shorthand.
+        // Mirrors pnpm's `save-catalog` → `--save-catalog-name=default` shorthand.
         let save_catalog_name = self.effective_save_catalog_name(state.config);
 
         let mut state = state;
@@ -242,6 +257,8 @@ impl AddArgs {
         let range_spec_style = self.range_spec_style(state.config);
         let dependency_options =
             self.dependency_options.clone().with_save_peer_setting(state.config.save_peer);
+        let included_groups = self.included_groups(state.config);
+        let save_types = state.config.save_types;
 
         // The install saves the manifest, so the declarations recorded
         // above reach disk with the dependencies or not at all.
@@ -252,7 +269,11 @@ impl AddArgs {
             save_catalog_name,
             self.install.lockfile_only,
             supported_architectures,
-            dependency_options.save_target(),
+            AddGroups {
+                save_target: dependency_options.save_target(),
+                included: Some(included_groups),
+                save_types,
+            },
         )
         .await?;
         pins.report::<Reporter>();
@@ -272,10 +293,9 @@ impl AddArgs {
             .clone()
             .with_save_peer_setting(state.config.save_peer)
             .save_target();
+        let included_groups = self.included_groups(state.config);
         let lockfile_path = state.lockfile_path();
-        let lockfile = state.lockfile
-            .get()
-            .map_err(|err| miette::Report::new(err).wrap_err("load the lockfile"))?;
+        let lockfile = command_lockfile(&state.lockfile, &lockfile_path)?;
 
         Add {
             manifest: &mut state.manifest,
@@ -283,16 +303,17 @@ impl AddArgs {
                 http_client: &state.http_client,
                 config: state.config,
                 lockfile,
-                lockfile_path: Some(&lockfile_path),
                 package_names: &package_names,
                 range_spec_style: self.range_spec_style(state.config),
                 resolved_packages: &state.resolved_packages,
                 lockfile_only: self.install.lockfile_only,
+                save_types: state.config.save_types,
             },
             resources: pnpm_package_manager::AddResources {
                 tarball_mem_cache: std::sync::Arc::clone(&state.tarball_mem_cache),
                 http_client_arc: std::sync::Arc::clone(&state.http_client),
                 dependency_groups,
+                included_groups: Some(included_groups),
                 save_catalog_name,
                 supported_architectures,
             },
@@ -310,17 +331,24 @@ impl AddArgs {
     ) -> miette::Result<Vec<String>> {
         if let Some(request) = self.package_names
             .iter()
-            .find(|request| declared_package_manager(request).is_some())
+            .find(|request| {
+                request.may_name_a_tool() && declared_package_manager(request.selector()).is_some()
+            })
         {
-            return Err(AddError::PackageManagerInSelection { request: request.clone() }.into());
+            let request = request.selector().to_string();
+            return Err(AddError::PackageManagerInSelection { request }.into());
         }
+        let selectors: Vec<String> = self.package_names
+            .iter()
+            .map(|request| request.selector().to_string())
+            .collect();
         let package_names =
             match workspace_link_root(self.target.workspace, config.workspace_dir.as_deref())? {
                 Some(_) => workspace_selectors(
-                    &self.package_names,
+                    &selectors,
                     &build_workspace_packages_map(Some(&selection.projects)).unwrap_or_default(),
                 )?,
-                None => self.package_names.clone(),
+                None => selectors,
             };
         Ok(package_names)
     }
@@ -333,8 +361,7 @@ impl AddArgs {
     }
 
     /// `pnpm add -g`: install the package into the global packages
-    /// directory and link its bins. Delegates to
-    /// [`crate::cli_args::global::handle_global_add`].
+    /// directory and link its bins.
     pub async fn run_global<Reporter: self::Reporter + 'static>(
         self,
         config: &'static Config,

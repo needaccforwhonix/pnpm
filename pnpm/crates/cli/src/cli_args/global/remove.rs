@@ -2,10 +2,10 @@ use super::{
     ArtifactCleanupError, CmdShimHost, Config, Context, Diagnostic, Display, Error, FsRename,
     GlobalError, GlobalPackageInfo, HashSet, IntoDiagnostic, Path, Reporter,
     acquire_global_bin_lock, bin_names_of_other_groups, check_bin_dir, find_global_package, fs,
-    get_hash_link, get_installed_bin_names, global_dirs, io, is_subdir, remove_cmd_shim,
-    remove_native_shim, remove_symlink_dir, replace_global_bin_slots, restore_virtual_shims,
-    should_replace_existing_package, symlink_dir, unprotected_bin_names, virtual_shims_to_restore,
-    warn_global,
+    get_hash_link, get_installed_bin_names, global_dirs, io, is_global_install_subdir,
+    remove_cmd_shim, remove_native_shim, remove_symlink_dir, replace_global_bin_slots,
+    restore_virtual_shims, should_replace_existing_package, symlink_dir, unprotected_bin_names,
+    virtual_shims_to_restore, warn_global,
 };
 
 /// `pnpm remove -g`. Removes the bins, hash symlinks, and install dirs of
@@ -16,13 +16,35 @@ pub fn handle_global_remove<Reporter: self::Reporter>(
 ) -> miette::Result<()> {
     let (global_pkg_dir, global_bin_dir) = global_dirs(base_config)?;
     check_bin_dir(&global_bin_dir)?;
-    let _global_bin_lock = acquire_global_bin_lock(&global_bin_dir)?;
+    let (rust_named, params) = super::split_rust_param(params);
+    // Every package named is found before anything is removed, so a typo
+    // in one leaves the others installed.
+    if rust_named && !params.is_empty() {
+        requested_global_groups(&global_pkg_dir, &params)?;
+    }
+    if rust_named && !super::rust::remove_global_rust::<Reporter>(base_config, &global_bin_dir)? {
+        return Err(GlobalError::PkgNotFound { param: super::rust::RUST_PARAM.to_string() }.into());
+    }
+    if params.is_empty() {
+        return Ok(());
+    }
+    remove_global_groups::<Reporter>(&global_pkg_dir, &global_bin_dir, &params)
+}
 
-    let groups = requested_global_groups(&global_pkg_dir, params)?;
-    let protected = protected_bins_for_removal(&global_pkg_dir, &groups)?;
+/// The removal behind [`handle_global_remove`], without its check that the
+/// global bin directory is on `PATH`. `global_bin_dir` must already exist.
+pub fn remove_global_groups<Reporter: self::Reporter>(
+    global_pkg_dir: &Path,
+    global_bin_dir: &Path,
+    params: &[String],
+) -> miette::Result<()> {
+    let _global_bin_lock = acquire_global_bin_lock(global_bin_dir)?;
+
+    let groups = requested_global_groups(global_pkg_dir, params)?;
+    let protected = protected_bins_for_removal(global_pkg_dir, &groups)?;
     let shims_to_restore = virtual_shims_to_restore(
         &groups,
-        &global_bin_dir,
+        global_bin_dir,
         &protected,
         &crate::shim_dispatch::global_shims_setting(),
     )?;
@@ -35,8 +57,8 @@ pub fn handle_global_remove<Reporter: self::Reporter>(
             .cloned(),
     );
     let cleanup = GlobalInstallCleanup {
-        global_pkg_dir: &global_pkg_dir,
-        global_bin_dir: &global_bin_dir,
+        global_pkg_dir,
+        global_bin_dir,
         bins_to_keep: &bins_to_keep,
         hash_to_keep: None,
         context: "global",
@@ -47,7 +69,7 @@ pub fn handle_global_remove<Reporter: self::Reporter>(
         affected_bin_names: &affected_bin_names,
     };
     if let Some(leftover) = commit_global_removal::<CmdShimHost>(&transaction, || {
-        restore_virtual_shims(&shims_to_restore, &global_bin_dir)
+        restore_virtual_shims(&shims_to_restore, global_bin_dir)
     })? {
         warn_global::<Reporter>(&leftover.to_string());
     }
@@ -58,12 +80,17 @@ fn protected_bins_for_removal(
     global_pkg_dir: &Path,
     groups: &[GlobalPackageBinSnapshot],
 ) -> miette::Result<HashSet<String>> {
+    let bin_names_to_protect = groups
+        .iter()
+        .flat_map(|pkg| pkg.bin_names.iter().cloned())
+        .collect();
     bin_names_of_other_groups(
         global_pkg_dir,
         &groups
             .iter()
             .map(|pkg| pkg.info.hash.clone())
             .collect::<HashSet<_>>(),
+        &bin_names_to_protect,
     )
     .wrap_err("scan global package bin ownership")
 }
@@ -121,6 +148,7 @@ pub(super) fn collect_existing_global_installs(
     global_pkg_dir: &Path,
     aliases: &[String],
     aliases_to_replace: &[String],
+    retained_bin_names: &HashSet<String>,
 ) -> miette::Result<ExistingGlobalInstalls> {
     let mut groups_to_replace = Vec::new();
     let mut seen = HashSet::new();
@@ -140,7 +168,13 @@ pub(super) fn collect_existing_global_installs(
         .iter()
         .map(|pkg| pkg.info.hash.clone())
         .collect();
-    let protected_bins = bin_names_of_other_groups(global_pkg_dir, &exclude)?;
+    let bin_names_to_protect = groups_to_replace
+        .iter()
+        .flat_map(|pkg| pkg.bin_names.iter().cloned())
+        .filter(|bin| !retained_bin_names.contains(bin))
+        .collect();
+    let protected_bins =
+        bin_names_of_other_groups(global_pkg_dir, &exclude, &bin_names_to_protect)?;
     Ok(ExistingGlobalInstalls { groups_to_replace, protected_bins })
 }
 
@@ -365,7 +399,7 @@ fn cleanup_global_install_dir(
     group: &GlobalPackageInfo,
     cleanup: &GlobalInstallCleanup<'_>,
 ) -> Option<ArtifactCleanupError> {
-    if is_subdir(cleanup.global_pkg_dir, &group.install_dir) {
+    if is_global_install_subdir(cleanup.global_pkg_dir, &group.install_dir) {
         match fs::remove_dir_all(&group.install_dir) {
             Ok(()) => return None,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return None,

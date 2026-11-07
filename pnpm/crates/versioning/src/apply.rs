@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
     path::Path,
 };
@@ -10,9 +10,19 @@ use crate::{
     changelog::{compose_changelog_section, prepend_changelog_section},
     error::VersioningError,
     intents::{ChangeIntent, IntentBumpType},
-    ledger::{Ledger, PackageConsumption, append_to_ledger, build_consumption_index},
-    pending::{remove_pending_changelog, write_pending_changelog},
-    plan::{PlannedRelease, ProjectRefIndex, ReleasePlan, WorkspaceProject, index_project_refs},
+    ledger::{
+        Ledger, PackageConsumption, append_to_ledger, build_consumption_index,
+        normalize_project_dir,
+    },
+    notes::{ComposedNotes, compose_release_notes},
+    parked_publication::{
+        read_parked_publications, remove_parked_publication, write_parked_publication,
+    },
+    pending::{pending_changelog_path, remove_pending_changelog, write_pending_changelog},
+    plan::{
+        PlannedRelease, ProjectRefIndex, ReleasePlan, WorkspaceProject, index_project_refs,
+        private_project_dirs,
+    },
     settings::{ChangelogStorage, VersioningSettings, changelog_storage},
 };
 
@@ -38,6 +48,16 @@ pub struct AppliedRelease {
 /// section files are removed here, their prose now living in the published
 /// tarball. It is ignored in `repository` storage, where the committed
 /// changelog makes the ledger alone sufficient.
+///
+/// A private project is never published, so no tarball can ever carry its
+/// prose: its releases use `repository` storage whatever is configured.
+///
+/// `notes.registries` are the releases bound for a registry that stores
+/// release notes. In `registry` storage they form one publication: their
+/// parked sections are their version notes, and the publication's name and
+/// note are parked beside them. A publication reaches one registry, so a
+/// composed one whose members are bound for several is refused before
+/// anything is written.
 pub fn apply_release_plan(
     plan: &ReleasePlan,
     workspace_dir: &Path,
@@ -45,42 +65,139 @@ pub fn apply_release_plan(
     all_intents: &[ChangeIntent],
     versioning: Option<&VersioningSettings>,
     confirmed_published: &HashSet<String>,
+    notes: &ReleaseNotesOptions,
 ) -> Result<Vec<AppliedRelease>, VersioningError> {
-    let storage = changelog_storage(versioning);
+    let storage = ReleaseStorage {
+        configured: changelog_storage(versioning),
+        private_dirs: private_project_dirs(projects, workspace_dir),
+    };
+    let refs = index_project_refs(projects, workspace_dir);
 
+    let notes = storage.compose_notes(plan, notes, &refs, versioning)?;
     let applied = write_new_versions(plan)?;
     for release in &plan.releases {
-        write_changelog_section(release, workspace_dir, storage)?;
+        let section = notes.version_notes
+            .get(&release.dir)
+            .cloned()
+            .unwrap_or_else(|| compose_changelog_section(release));
+        write_changelog_section(release, workspace_dir, storage.of(&release.dir), &section)?;
+    }
+    if let Some(publication) = &notes.publication {
+        write_parked_publication(workspace_dir, publication)?;
     }
 
     let ledger = append_to_ledger(workspace_dir, &ledger_entries(plan))?;
-    let refs = index_project_refs(projects, workspace_dir);
     remove_consumed_intents(
         all_intents,
         &refs,
         versioning,
-        &consumed_ledger(ledger, storage, confirmed_published),
+        &consumed_ledger(ledger, &storage, confirmed_published),
     )?;
 
     // A confirmed release's parked section has served its purpose — its prose
     // is now in the published tarball — so collect it regardless of whether
     // the intents behind it were also collected.
-    if storage == ChangelogStorage::Registry {
+    if storage.configured == ChangelogStorage::Registry {
         for key in confirmed_published {
             if let Some((name, version)) = split_ledger_key(key) {
                 remove_pending_changelog(workspace_dir, name, version)?;
             }
         }
+        collect_parked_publications(workspace_dir, confirmed_published)?;
     }
 
     Ok(applied)
+}
+
+/// The changelog storage each release uses: the configured one, except for
+/// private projects, which always use `repository` storage.
+struct ReleaseStorage {
+    configured: ChangelogStorage,
+    private_dirs: HashSet<String>,
+}
+
+impl ReleaseStorage {
+    fn of(&self, dir: &str) -> ChangelogStorage {
+        if self.private_dirs.contains(dir) { ChangelogStorage::Repository } else { self.configured }
+    }
+
+    /// The notes of the releases in `notes.registries` that use `registry`
+    /// storage.
+    fn compose_notes(
+        &self,
+        plan: &ReleasePlan,
+        notes: &ReleaseNotesOptions,
+        refs: &ProjectRefIndex,
+        versioning: Option<&VersioningSettings>,
+    ) -> Result<ComposedNotes, VersioningError> {
+        let members: HashSet<String> = notes.registries
+            .keys()
+            .filter(|dir| self.of(dir) == ChangelogStorage::Registry)
+            .cloned()
+            .collect();
+        let composed =
+            compose_release_notes(plan, &members, refs, versioning, notes.summary.as_deref());
+        if let Some(publication) = &composed.publication {
+            let registries: BTreeSet<&String> = members
+                .iter()
+                .filter_map(|dir| notes.registries.get(dir))
+                .collect();
+            if registries.len() > 1 {
+                return Err(VersioningError::PublicationSeveralRegistries {
+                    members: publication.members.clone(),
+                    registries: registries
+                        .into_iter()
+                        .cloned()
+                        .collect(),
+                });
+            }
+        }
+        Ok(composed)
+    }
+}
+
+/// The release notes `pnpm version -r` composes for a registry that stores
+/// them.
+#[derive(Debug, Default)]
+pub struct ReleaseNotesOptions {
+    /// The registry each release bound for such a registry publishes to,
+    /// by workspace-relative dir.
+    pub registries: HashMap<String, String>,
+    /// A summary written by hand. It goes above the composed text of the
+    /// publication note, or of the version note when the publication has
+    /// one member.
+    pub summary: Option<String>,
+}
+
+/// A parked publication has served its purpose once every member is
+/// settled: confirmed now, since the confirmation covers the publication
+/// note, or by an earlier run that already collected its parked section
+/// and so cannot confirm it again.
+fn collect_parked_publications(
+    workspace_dir: &Path,
+    confirmed_published: &HashSet<String>,
+) -> Result<(), VersioningError> {
+    let settled = |member: &String| {
+        confirmed_published.contains(member)
+            || member
+                .rsplit_once('@')
+                .is_some_and(|(name, version)| {
+                    !pending_changelog_path(workspace_dir, name, version).exists()
+                })
+    };
+    for publication in read_parked_publications(workspace_dir)? {
+        if publication.members.iter().all(settled) {
+            remove_parked_publication(workspace_dir, &publication)?;
+        }
+    }
+    Ok(())
 }
 
 /// Stamp every released manifest with its new version.
 fn write_new_versions(plan: &ReleasePlan) -> Result<Vec<AppliedRelease>, VersioningError> {
     let mut applied = Vec::with_capacity(plan.releases.len());
     for release in &plan.releases {
-        let manifest_path = release.root_dir.join("package.json");
+        let manifest_path = pnpm_package_manifest::project_manifest_path(&release.root_dir);
         let mut manifest = pnpm_package_manifest::PackageManifest::from_path(manifest_path)
             .map_err(VersioningError::Manifest)?;
         manifest.value_mut()["version"] = serde_json::Value::String(release.version.next.clone());
@@ -101,14 +218,14 @@ fn write_changelog_section(
     release: &PlannedRelease,
     workspace_dir: &Path,
     storage: ChangelogStorage,
+    section: &str,
 ) -> Result<(), VersioningError> {
-    let section = compose_changelog_section(release);
     match storage {
         ChangelogStorage::Repository => {
-            prepend_changelog_section(&release.root_dir, &release.name, &section)
+            prepend_changelog_section(&release.root_dir, &release.name, section)
         }
         ChangelogStorage::Registry => {
-            write_pending_changelog(workspace_dir, &release.name, &release.version.next, &section)
+            write_pending_changelog(workspace_dir, &release.name, &release.version.next, section)
         }
     }
 }
@@ -138,16 +255,18 @@ fn ledger_entries(plan: &ReleasePlan) -> BTreeMap<String, (String, Vec<String>)>
 /// (see the function contract), so the ledger is filtered down to those.
 fn consumed_ledger(
     ledger: Ledger,
-    storage: ChangelogStorage,
+    storage: &ReleaseStorage,
     confirmed_published: &HashSet<String>,
 ) -> Ledger {
-    match storage {
-        ChangelogStorage::Repository => ledger,
-        ChangelogStorage::Registry => ledger
-            .into_iter()
-            .filter(|(key, _)| confirmed_published.contains(key))
-            .collect(),
-    }
+    ledger
+        .into_iter()
+        .filter(|(key, entry)| {
+            let entry_storage = entry
+                .dir()
+                .map_or(storage.configured, |dir| storage.of(&normalize_project_dir(dir)));
+            entry_storage == ChangelogStorage::Repository || confirmed_published.contains(key)
+        })
+        .collect()
 }
 
 /// Delete every intent file whose work is fully released.

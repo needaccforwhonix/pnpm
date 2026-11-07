@@ -17,6 +17,24 @@ pub(super) fn external_placeholder(dep: &str) -> Rc<HoisterTree> {
     })
 }
 
+/// A `link:<root>/...` dependency points inside the package that declares it,
+/// so it must stay next to that package. The hoister never moves a
+/// `Workspace` node, and keeping the node reserves its name there.
+fn package_root_link_node(
+    alias: &PkgName,
+    dep_ref: &pnpm_lockfile::SnapshotDepRef,
+) -> Rc<HoisterTree> {
+    Rc::new(HoisterTree {
+        name: alias.to_string(),
+        ident_name: alias.to_string(),
+        reference: dep_ref.to_string(),
+        peer_names: BTreeSet::new(),
+        dependency_kind: HoisterDependencyKind::Workspace,
+        hoist_priority: 0,
+        dependencies: RefCell::new(IndexSet::new()),
+    })
+}
+
 /// `HashMap` iteration order is non-deterministic; sort so the
 /// output tree is stable across runs (matters for snapshot
 /// tests).
@@ -46,14 +64,17 @@ pub(super) fn importer_node(
 
 /// Conversion-phase caches. `nodes` interns one [`HoisterTree`] per
 /// `(alias, snapshot key)` edge target. `dep_key_by_pkg_id` maps a
-/// package id (see [`pkg_id`]) to the first snapshot key seen for
-/// it: every peer-suffix variant of one package version
-/// gets that first key as its `reference`, so the hoister sees one
-/// locator per version and dedups the variants instead of
-/// conflict-nesting a copy of each. Ports `depPathByPkgId` from pnpm
-/// v11's `@pnpm/real-hoist` wrapper — without the collapse, a
-/// peer-variant-heavy lockfile turns the per-path hoist walk into a
-/// combinatorial explosion of nested conflict copies.
+/// package id (see [`pkg_id`]) to the first snapshot key seen for it.
+///
+/// A node without peer names gets that first key as its `reference`,
+/// so the hoister sees one locator per package version and dedups the
+/// peer variants instead of nesting a copy of each. Its children still
+/// come from its own snapshot. Ports `depPathByPkgId` from pnpm v11's
+/// `@pnpm/real-hoist` wrapper.
+///
+/// A node with peer names keeps its own snapshot key. The hoister then
+/// nests the variant wherever its peers resolve differently, and the
+/// walker knows which snapshot each copy holds.
 #[derive(Default)]
 pub(super) struct TreeCache {
     pub(super) nodes: HashMap<String, Rc<HoisterTree>>,
@@ -143,22 +164,21 @@ fn build_dep_node(
     // outer call returns the cell holds the populated set, and the
     // shared-by-identity invariant the hoister algorithm relies on
     // survives.
-    // The reference is the *canonical* snapshot key for this package
-    // version — the first-seen peer-suffix variant — not necessarily
-    // `dep_key` itself (see [`TreeCache::dep_key_by_pkg_id`]). The
-    // node's own children still come from `dep_key`'s snapshot,
-    // matching the TS wrapper, which reads `pkgSnapshot` from the
-    // original depPath while stamping `depPathByPkgId.get(id)` as the
-    // reference.
-    let reference = cache.dep_key_by_pkg_id
-        .entry(pkg_id(dep_key))
-        .or_insert_with(|| dep_key.clone())
-        .to_string();
+    let peer_names = peer_names_of(dep_key, snapshot, lockfile, opts);
+    // See [`TreeCache`] for when a variant keeps its own key.
+    let reference = if peer_names.is_empty() {
+        cache.dep_key_by_pkg_id
+            .entry(pkg_id(dep_key))
+            .or_insert_with(|| dep_key.clone())
+            .to_string()
+    } else {
+        dep_key.to_string()
+    };
     let node = Rc::new(HoisterTree {
         name: alias.to_string(),
         ident_name: dep_key.name.to_string(),
         reference,
-        peer_names: peer_names_of(dep_key, snapshot, lockfile, opts),
+        peer_names,
         dependency_kind: HoisterDependencyKind::Regular,
         hoist_priority: 0,
         dependencies: RefCell::new(IndexSet::new()),
@@ -172,7 +192,7 @@ fn build_dep_node(
 }
 
 /// `dep_key`'s entry in the `snapshots:` map. A missing entry is an error
-/// unless the dependency is optional, in which case there is simply nothing
+/// unless the dependency is optional, in which case there is nothing
 /// to hoist.
 fn lookup_snapshot<'a>(
     dep_key: &PkgNameVerPeer,
@@ -254,6 +274,9 @@ fn collect_snapshot_deps(
         // hoist (the install layer materialises them as direct
         // directory symlinks), so we skip them here.
         let Some(dep_key) = dep_ref.resolve(alias) else {
+            if dep_ref.package_root_link_target().is_some() {
+                out.insert(RcByPtr(package_root_link_node(alias, dep_ref)));
+            }
             continue;
         };
         let Some(node) = build_dep_node(alias, &dep_key, optional, lockfile, opts, cache)? else {
@@ -293,12 +316,12 @@ fn collect_snapshot_deps(
 /// one per injected workspace package and cannot explode that way. A
 /// local tarball (`file:foo.tgz`) unpacks the same archive for every
 /// variant like a registry package, so it collapses like one — the
-/// boundary is [`pnpm_lockfile::is_local_tarball_path`], the same one
+/// boundary is [`pnpm_local_spec::is_tarball_filename`], the same one
 /// the lockfile itself draws for `file:` resolutions.
 #[must_use]
 pub fn pkg_id(dep_key: &PkgNameVerPeer) -> String {
     if let VersionPart::File(path) = dep_key.suffix.version()
-        && !pnpm_lockfile::is_local_tarball_path(path)
+        && !pnpm_local_spec::is_tarball_filename(path)
     {
         return dep_key.to_string();
     }

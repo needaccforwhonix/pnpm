@@ -1,4 +1,6 @@
-use super::{CheckboxChoice, CheckboxItem, CheckboxPrompt, CheckboxTheme, KeyOutcome};
+use super::{
+    CheckboxChoice, CheckboxItem, CheckboxPrompt, CheckboxTheme, KeyOutcome, in_active_cyan,
+};
 use console::{Key, strip_ansi_codes};
 
 fn separator(text: &str) -> CheckboxItem<&'static str> {
@@ -10,6 +12,7 @@ fn choice(value: &'static str) -> CheckboxItem<&'static str> {
         name: format!("{value} 1.0.0 ❯ 2.0.0"),
         short: value.to_string(),
         value,
+        description: None,
     })
 }
 
@@ -171,17 +174,23 @@ fn the_answer_names_the_selection_by_its_short_form() {
 #[test]
 fn the_theme_picks_the_icons() {
     let mut prompt = grouped_prompt()
-        .theme(CheckboxTheme {
-            checked: "●".to_string(),
-            unchecked: "○".to_string(),
-            highlight_active: false,
-        });
+        .theme(CheckboxTheme { checked: "●".to_string(), unchecked: "○".to_string() });
 
     press(&mut prompt, &[Key::Char(' ')]);
 
     let lines = frame_lines(&prompt);
     assert_eq!(lines[3], "❯● foo 1.0.0 ❯ 2.0.0");
     assert_eq!(lines[4], " ○ bar 1.0.0 ❯ 2.0.0");
+}
+
+#[test]
+fn the_active_row_cyan_survives_the_rows_own_resets() {
+    let line = "❯○ foo 1.0.0 ❯ 2.\u{1b}[32m1.0\u{1b}[39m \u{1b}[1mweb\u{1b}[0m https://example.com";
+
+    assert_eq!(
+        in_active_cyan(line),
+        "\u{1b}[36m❯○ foo 1.0.0 ❯ 2.\u{1b}[32m1.0\u{1b}[39m\u{1b}[36m \u{1b}[1mweb\u{1b}[0m\u{1b}[36m https://example.com\u{1b}[39m",
+    );
 }
 
 /// The page scrolls to keep the cursor on it. When the rows directly
@@ -220,4 +229,37 @@ fn a_prompt_without_choices_cannot_run() {
 
     let error = prompt.interact().expect_err("no choice to make");
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+#[test]
+fn shows_the_active_choice_description_cut_to_a_page() {
+    let description = (1..=14)
+        .map(|line| format!("line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let described = CheckboxItem::Choice(CheckboxChoice {
+        name: "b".to_string(),
+        short: "b".to_string(),
+        value: "b",
+        description: Some(description),
+    });
+    let mut prompt = CheckboxPrompt::new("Pick", vec![choice("a"), described]);
+    assert!(!prompt.render_frame().contains("line 1"));
+
+    prompt.handle_key(&Key::ArrowDown);
+    let frame = prompt.render_frame();
+
+    assert!(frame.contains(" line 12"), "{frame}");
+    assert!(!frame.contains("line 13"), "{frame}");
+    assert!(frame.contains("2 more lines"), "{frame}");
+}
+
+#[test]
+fn descriptions_take_rows_from_the_list_so_the_frame_fits() {
+    use super::layout_for;
+    assert_eq!(layout_for(Some(24), false), (18, 0));
+    assert_eq!(layout_for(Some(24), true), (9, 7));
+    assert_eq!(layout_for(Some(60), true), (40, 12));
+    let (page, description) = layout_for(Some(10), true);
+    assert!(page + description + 2 <= 10 - 6, "{page} + {description}");
 }

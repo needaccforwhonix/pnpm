@@ -16,18 +16,6 @@
 //! dependency is re-resolved, and its integrity must survive so the next
 //! `--frozen-lockfile` install doesn't fail closed.
 //!
-//! Both upstream bugs stem from pnpm's URL/tarball resolver returning no
-//! integrity (it's learned only on download) and a later fetch step being
-//! skipped on a warm store — so pnpm has to carry the previous lockfile
-//! entry's integrity forward. pacquet has no such gap: because it builds
-//! the lockfile before the install pass, the [`TarballResolver`] learns the
-//! integrity from the tarball's bytes (a download, or — on a re-resolve
-//! where the prior lockfile already recorded the URL + integrity — a reuse
-//! of the warm store extraction, see the no-refetch test below). Either way
-//! a re-resolved entry can never lose its integrity, so pacquet needs no
-//! carry-forward equivalent of pnpm's `packageRequester` / `updateLockfile`
-//! fixes.
-//!
 //! Reaching the [`TarballResolver`] requires a bare specifier whose URL
 //! does *not* start with the configured registry — a registry-host
 //! tarball URL is parsed by the npm resolver instead (see
@@ -184,7 +172,7 @@ fn remote_tarball_integrity_survives_unrelated_install() {
 /// re-resolve against a warm store skips the fetch entirely. pacquet
 /// downloads during resolution to learn the integrity + manifest, so
 /// without reuse it would re-fetch the tarball on every re-resolution
-/// ([PR #12096](https://github.com/pnpm/pnpm/pull/12096)). The resolver now consults the prior lockfile + store
+/// ([PR #12096](https://github.com/pnpm/pnpm/pull/12096)). The resolver consults the prior lockfile + store
 /// index and, on a hit, reuses the cached integrity + bundled manifest
 /// without touching the network.
 ///
@@ -351,7 +339,8 @@ fn frozen_install_refuses_a_remote_tarball_without_integrity() {
             && unwrapped.contains(
                 r#"has no "integrity" field, so its downloaded tarball cannot be verified"#
             )
-            && unwrapped.contains(r#"run "pnpm clean --lockfile""#),
+            && unwrapped.contains(r#"run "pnpm clean --lockfile""#)
+            && !unwrapped.contains("relax the policy"),
         "the verification gate must name the error code, the entry, and the way out; got:\n{stderr}",
     );
     head_mock.assert();
@@ -487,4 +476,464 @@ fn remote_tarball_behind_an_immutable_redirect_reuses_the_warm_store() {
     assert_eq!(after, lockfile, "a warm re-resolve must not rewrite the entry");
 
     drop((root, mock_instance));
+}
+
+/// A remote tarball URL ends in `.tgz` like a local tarball does, but has no
+/// file to compare with its recorded integrity, so it must not send a repeat
+/// install down the fresh-resolve path.
+#[test]
+fn repeat_install_of_a_remote_tarball_reuses_the_lockfile() {
+    let CommandTempCwd { workspace, root, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+
+    let tarball = format!(
+        "{}is-positive/-/is-positive-1.0.0.tgz",
+        mock_instance.url().replace("127.0.0.1", "localhost"),
+    );
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({ "dependencies": { "is-positive": tarball } }).to_string(),
+    )
+    .expect("write package.json");
+    pacquet_at(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+    fs::remove_dir_all(workspace.join("node_modules")).expect("remove node_modules");
+
+    let assert = pacquet_at(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    assert!(
+        stdout.contains("Lockfile is up to date, resolution step is skipped"),
+        "the repeat install must reuse the lockfile:\n{stdout}",
+    );
+
+    drop((root, mock_instance));
+}
+
+/// A lockfile-less repeat install of an `https:` tarball must not GET the
+/// archive again while `Cache-Control` still says the response is fresh.
+/// The store already has the bytes; the URL → integrity record is what
+/// lets resolution find them without a request.
+#[test]
+fn fresh_remote_tarball_skips_the_network_without_a_lockfile() {
+    let CommandTempCwd { workspace, root, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+
+    let workspace_yaml = workspace.join("pnpm-workspace.yaml");
+    let yaml = fs::read_to_string(&workspace_yaml).expect("read pnpm-workspace.yaml");
+    fs::write(&workspace_yaml, format!("{yaml}lockfile: false\n")).expect("disable the lockfile");
+
+    let tarball_path = "/pkg-from-tarball-1.0.0.tgz";
+    let mut tarball_server = mockito::Server::new();
+    let head_mock = tarball_server
+        .mock("HEAD", tarball_path)
+        .with_status(200)
+        .with_header("etag", r#""pkg-from-tarball""#)
+        .with_header("cache-control", "public, max-age=31536000, immutable")
+        .expect(1)
+        .create();
+    let get_mock = tarball_server
+        .mock("GET", tarball_path)
+        .with_status(200)
+        .with_header("etag", r#""pkg-from-tarball""#)
+        .with_header("cache-control", "public, max-age=31536000, immutable")
+        .with_body(minimal_tarball("pkg-from-tarball", "1.0.0"))
+        .expect(1)
+        .create();
+    let tarball_url = format!("{}{tarball_path}", tarball_server.url());
+
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({ "dependencies": { "pkg-from-tarball": &tarball_url } }).to_string(),
+    )
+    .expect("write package.json");
+    pacquet_at(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+    head_mock.assert();
+    get_mock.assert();
+    fs::remove_dir_all(workspace.join("node_modules")).expect("remove node_modules");
+
+    let head_again = tarball_server
+        .mock("HEAD", tarball_path)
+        .expect(0)
+        .create();
+    let get_again = tarball_server
+        .mock("GET", tarball_path)
+        .expect(0)
+        .create();
+    pacquet_at(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+    head_again.assert();
+    get_again.assert();
+
+    drop((root, mock_instance, tarball_server));
+}
+
+/// Once `max-age` has passed, a lockfile-less reinstall revalidates with
+/// `If-None-Match` and keeps the stored archive when the origin answers 304.
+#[test]
+fn stale_remote_tarball_revalidates_with_if_none_match() {
+    let CommandTempCwd { workspace, root, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, cache_dir, .. } = npmrc_info;
+
+    let workspace_yaml = workspace.join("pnpm-workspace.yaml");
+    let yaml = fs::read_to_string(&workspace_yaml).expect("read pnpm-workspace.yaml");
+    fs::write(&workspace_yaml, format!("{yaml}lockfile: false\n")).expect("disable the lockfile");
+
+    let tarball_path = "/pkg-from-tarball-1.0.0.tgz";
+    let mut tarball_server = mockito::Server::new();
+    let head_mock = tarball_server
+        .mock("HEAD", tarball_path)
+        .with_status(200)
+        .with_header("etag", r#""pkg-from-tarball""#)
+        .with_header("cache-control", "public, max-age=31536000, immutable")
+        .expect(1)
+        .create();
+    let get_mock = tarball_server
+        .mock("GET", tarball_path)
+        .with_status(200)
+        .with_header("etag", r#""pkg-from-tarball""#)
+        .with_header("cache-control", "public, max-age=31536000, immutable")
+        .with_body(minimal_tarball("pkg-from-tarball", "1.0.0"))
+        .expect(1)
+        .create();
+    let tarball_url = format!("{}{tarball_path}", tarball_server.url());
+
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({ "dependencies": { "pkg-from-tarball": &tarball_url } }).to_string(),
+    )
+    .expect("write package.json");
+    pacquet_at(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+    head_mock.assert();
+    get_mock.assert();
+    expire_tarball_resolution_cache(&cache_dir);
+    fs::remove_dir_all(workspace.join("node_modules")).expect("remove node_modules");
+
+    let head_again = tarball_server
+        .mock("HEAD", tarball_path)
+        .expect(0)
+        .create();
+    let get_again = tarball_server
+        .mock("GET", tarball_path)
+        .match_header("if-none-match", r#""pkg-from-tarball""#)
+        .with_status(304)
+        .with_header("etag", r#""pkg-from-tarball""#)
+        .with_header("cache-control", "public, max-age=31536000, immutable")
+        .expect(1)
+        .create();
+    pacquet_at(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+    head_again.assert();
+    get_again.assert();
+
+    drop((root, mock_instance, cache_dir, tarball_server));
+}
+
+fn expire_tarball_resolution_cache(cache_dir: &Path) {
+    let dir = cache_dir.join("v11/tarball-resolutions");
+    let entry = fs::read_dir(&dir)
+        .unwrap_or_else(|err| panic!("read {dir:?}: {err}"))
+        .next()
+        .unwrap_or_else(|| panic!("no tarball resolution record in {dir:?}"))
+        .unwrap_or_else(|err| panic!("read cache entry: {err}"));
+    let text = fs::read_to_string(entry.path()).expect("read tarball resolution record");
+    let mut record: serde_json::Value = serde_json::from_str(&text).expect("parse record");
+    record["fetchedAt"] = serde_json::json!(0);
+    fs::write(entry.path(), record.to_string()).expect("expire tarball resolution record");
+}
+
+/// A `304` only vouches for the archive of the URL that answered. When a
+/// mutable redirect now points somewhere else, the stale record is not
+/// renewed from that `304`, and the new target is downloaded in full.
+#[test]
+fn not_modified_from_a_different_redirect_target_downloads_again() {
+    let CommandTempCwd { workspace, root, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+
+    let workspace_yaml = workspace.join("pnpm-workspace.yaml");
+    let yaml = fs::read_to_string(&workspace_yaml).expect("read pnpm-workspace.yaml");
+    fs::write(&workspace_yaml, format!("{yaml}lockfile: false\n")).expect("disable the lockfile");
+
+    let etag = r#""same-etag""#;
+    let mut tarball_server = mockito::Server::new();
+    let first_redirect = redirect_pkg_to(&mut tarball_server, "/v1.tgz");
+    let v1 = tarball_server
+        .mock("GET", "/v1.tgz")
+        .with_status(200)
+        .with_header("etag", etag)
+        .with_header("cache-control", "max-age=0")
+        .with_body(minimal_tarball("pkg-from-tarball", "1.0.0"))
+        .create();
+    let v1_head = tarball_server
+        .mock("HEAD", "/v1.tgz")
+        .with_status(200)
+        .create();
+    let tarball_url = format!("{}/pkg.tgz", tarball_server.url());
+
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({ "dependencies": { "pkg-from-tarball": &tarball_url } }).to_string(),
+    )
+    .expect("write package.json");
+    pacquet_at(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+    fs::remove_dir_all(workspace.join("node_modules")).expect("remove node_modules");
+    for mock in first_redirect
+        .into_iter()
+        .chain([v1, v1_head])
+    {
+        mock.remove();
+    }
+
+    let second_redirect = redirect_pkg_to(&mut tarball_server, "/v2.tgz");
+    let v2_not_modified = tarball_server
+        .mock("GET", "/v2.tgz")
+        .match_header("if-none-match", etag)
+        .with_status(304)
+        .with_header("etag", etag)
+        .expect(1)
+        .create();
+    let v2 = tarball_server
+        .mock("GET", "/v2.tgz")
+        .match_header("if-none-match", mockito::Matcher::Missing)
+        .with_status(200)
+        .with_header("etag", etag)
+        .with_header("cache-control", "max-age=0")
+        .with_body(minimal_tarball("pkg-from-tarball", "2.0.0"))
+        .expect(1)
+        .create();
+    let v2_head = tarball_server
+        .mock("HEAD", "/v2.tgz")
+        .with_status(200)
+        .create();
+    pacquet_at(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+    v2_not_modified.assert();
+    v2.assert();
+
+    let manifest = fs::read_to_string(workspace.join("node_modules/pkg-from-tarball/package.json"))
+        .expect("read installed manifest");
+    let manifest: serde_json::Value = serde_json::from_str(&manifest).expect("parse manifest");
+    assert_eq!(manifest["version"], "2.0.0");
+
+    drop((root, mock_instance, second_redirect, v2_head, tarball_server));
+}
+
+fn redirect_pkg_to(server: &mut mockito::Server, target: &str) -> Vec<mockito::Mock> {
+    ["HEAD", "GET"]
+        .into_iter()
+        .map(|method| {
+            server
+                .mock(method, "/pkg.tgz")
+                .with_status(302)
+                .with_header("location", target)
+                .create()
+        })
+        .collect()
+}
+
+/// A response that varies on `User-Agent` may differ for another install,
+/// so a lockfile-less reinstall asks the origin again.
+#[test]
+fn response_varying_on_user_agent_is_not_reused() {
+    let CommandTempCwd { workspace, root, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    let workspace_yaml = workspace.join("pnpm-workspace.yaml");
+    let yaml = fs::read_to_string(&workspace_yaml).expect("read pnpm-workspace.yaml");
+    fs::write(&workspace_yaml, format!("{yaml}lockfile: false\n")).expect("disable the lockfile");
+
+    let mut tarball_server = mockito::Server::new();
+    let head = tarball_server
+        .mock("HEAD", "/pkg.tgz")
+        .with_status(200)
+        .expect(2)
+        .create();
+    let get = tarball_server
+        .mock("GET", "/pkg.tgz")
+        .with_status(200)
+        .with_header("etag", r#""pkg""#)
+        .with_header("cache-control", "max-age=31536000")
+        .with_header("vary", "User-Agent")
+        .with_body(minimal_tarball("pkg-from-tarball", "1.0.0"))
+        .expect(2)
+        .create();
+    let tarball_url = format!("{}/pkg.tgz", tarball_server.url());
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({ "dependencies": { "pkg-from-tarball": &tarball_url } }).to_string(),
+    )
+    .expect("write package.json");
+    for _ in 0..2 {
+        pacquet_at(&workspace)
+            .with_arg("install")
+            .assert()
+            .success();
+        fs::remove_dir_all(workspace.join("node_modules")).expect("remove node_modules");
+    }
+    head.assert();
+    get.assert();
+
+    drop((root, mock_instance, tarball_server));
+}
+
+/// A `304` that introduces `Vary: User-Agent` does not renew the stale
+/// record. The reinstall downloads the tarball unconditionally instead.
+#[test]
+fn not_modified_varying_on_user_agent_downloads_again() {
+    let CommandTempCwd { workspace, root, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, cache_dir, .. } = npmrc_info;
+    let workspace_yaml = workspace.join("pnpm-workspace.yaml");
+    let yaml = fs::read_to_string(&workspace_yaml).expect("read pnpm-workspace.yaml");
+    fs::write(&workspace_yaml, format!("{yaml}lockfile: false\n")).expect("disable the lockfile");
+
+    let mut tarball_server = mockito::Server::new();
+    let head = tarball_server
+        .mock("HEAD", "/pkg.tgz")
+        .with_status(200)
+        .expect(2)
+        .create();
+    let get = tarball_server
+        .mock("GET", "/pkg.tgz")
+        .match_header("if-none-match", mockito::Matcher::Missing)
+        .with_status(200)
+        .with_header("etag", r#""pkg""#)
+        .with_header("cache-control", "max-age=31536000")
+        .with_body(minimal_tarball("pkg-from-tarball", "1.0.0"))
+        .expect(2)
+        .create();
+    let not_modified = tarball_server
+        .mock("GET", "/pkg.tgz")
+        .match_header("if-none-match", r#""pkg""#)
+        .with_status(304)
+        .with_header("vary", "User-Agent")
+        .expect(1)
+        .create();
+    let tarball_url = format!("{}/pkg.tgz", tarball_server.url());
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({ "dependencies": { "pkg-from-tarball": &tarball_url } }).to_string(),
+    )
+    .expect("write package.json");
+    pacquet_at(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+    expire_tarball_resolution_cache(&cache_dir);
+    fs::remove_dir_all(workspace.join("node_modules")).expect("remove node_modules");
+    pacquet_at(&workspace)
+        .with_arg("install")
+        .assert()
+        .success();
+    head.assert();
+    get.assert();
+    not_modified.assert();
+
+    drop((root, mock_instance, cache_dir, tarball_server));
+}
+
+/// A linked workspace package's peer is checked against the version in the
+/// remote tarball's manifest, not against its URL.
+#[test]
+fn remote_tarball_peer_of_a_linked_package_uses_the_manifest_version() {
+    for version in ["1.0.0", "2.0.0"] {
+        let CommandTempCwd { workspace, root, npmrc_info, .. } =
+            CommandTempCwd::init().add_mocked_registry();
+        let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+
+        let tarball_path = "/provider.tgz";
+        let mut tarball_server = mockito::Server::new();
+        let _tarball_mocks: Vec<_> = ["HEAD", "GET"]
+            .into_iter()
+            .map(|method| {
+                tarball_server
+                    .mock(method, tarball_path)
+                    .with_body(minimal_tarball("provider", version))
+                    .expect_at_least(0)
+                    .create()
+            })
+            .collect();
+        let tarball_url = format!("{}{tarball_path}", tarball_server.url());
+
+        let workspace_yaml = workspace.join("pnpm-workspace.yaml");
+        let yaml = fs::read_to_string(&workspace_yaml).expect("read pnpm-workspace.yaml");
+        fs::write(
+            &workspace_yaml,
+            format!("{yaml}packages:\n  - packages/*\nstrictPeerDependencies: true\n"),
+        )
+        .expect("write pnpm-workspace.yaml");
+        fs::write(workspace.join("package.json"), r#"{ "name": "root", "private": true }"#)
+            .expect("write root package.json");
+        for (name, manifest) in [
+            (
+                "lib",
+                serde_json::json!({
+                    "name": "lib", "version": "1.0.0",
+                    "peerDependencies": { "provider": "^1.0.0" },
+                    "devDependencies": { "provider": &tarball_url },
+                }),
+            ),
+            (
+                "app",
+                serde_json::json!({
+                    "name": "app", "version": "1.0.0",
+                    "dependencies": { "lib": "workspace:*", "provider": &tarball_url },
+                }),
+            ),
+        ] {
+            let project_dir = workspace.join("packages").join(name);
+            fs::create_dir_all(&project_dir).expect("create project directory");
+            fs::write(project_dir.join("package.json"), manifest.to_string())
+                .expect("write project package.json");
+        }
+
+        let install = pacquet_at(&workspace)
+            .with_arg("install")
+            .output()
+            .expect("run install");
+        let check = pacquet_at(&workspace)
+            .with_args(["peers", "check"])
+            .output()
+            .expect("run peers check");
+        for output in [install, check] {
+            let combined = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert_eq!(
+                output.status.success(),
+                version == "1.0.0",
+                "provider {version}:\n{combined}",
+            );
+            if version == "2.0.0" {
+                assert!(combined.contains("Installed: 2.0.0"), "{combined}");
+            }
+        }
+
+        drop((root, mock_instance, tarball_server));
+    }
 }

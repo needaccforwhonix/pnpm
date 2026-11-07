@@ -1,4 +1,4 @@
-use super::{BTreeMap, RegistryEntry, WorkspaceSettings};
+use super::{IndexMap, RegistryEntry, WorkspaceSettings};
 
 impl WorkspaceSettings {
     /// Zero out the release-age and trust policies for `self-update`.
@@ -22,15 +22,14 @@ impl WorkspaceSettings {
         self.trust_policy = None;
         self.trust_policy_exclude = None;
         self.trust_policy_ignore_after = None;
+        self.boot_config = None;
     }
 
     /// Zero out fields not permitted in the global `config.yaml`.
     ///
     /// Every field listed here is a key excluded from the global
     /// config, plus the programmatic-only and workspace-only knobs
-    /// (`patchedDependencies`, `allowBuilds`,
-    /// `supportedArchitectures`, `ignoredOptionalDependencies`,
-    /// `hoistingLimits`, `externalDependencies`) that pnpm only reads
+    /// that pnpm only reads
     /// from `pnpm-workspace.yaml` or the legacy `package.json#pnpm`
     /// field. Without this filter a user could put `nodeLinker:
     /// hoisted` in `~/.config/pnpm/config.yaml` and pacquet would
@@ -41,7 +40,7 @@ impl WorkspaceSettings {
         // machine-local setting would make one developer write a lockfile
         // their collaborators read back with a different layout. The routes to
         // the registry are a legitimate global preference.
-        for entry in self.registries.iter_mut().flat_map(BTreeMap::values_mut) {
+        for entry in self.registries.iter_mut().flat_map(IndexMap::values_mut) {
             if let RegistryEntry::Declaration(declaration) = entry {
                 declaration.server_type = None;
             }
@@ -52,17 +51,25 @@ impl WorkspaceSettings {
         self.clear_workspace_hooks_fields();
     }
 
+    /// `tools` is deliberately absent: a mirror answers "what can this
+    /// machine reach", which is the user's to say and belongs in their
+    /// global config, the same way `nodeDownloadMirrors` does. Clearing
+    /// it here would leave a repository as the only party able to say
+    /// where pnpm downloads a runtime from.
     pub(super) fn clear_workspace_project_fields(&mut self) {
         self.versioning = None;
+        self.publish_branch = None;
         self.cargo = None;
         self.python = None;
         self.packages = None;
         self.catalog = None;
+        self.boot_config = None;
         // Task declarations describe the workspace's own scripts; pnpm's
         // config-file key filter drops them from the global file too. The
         // same holds for the pipelines built from them.
         self.tasks = None;
         self.pipelines = None;
+        self.required_scripts = None;
         self.pipeline_base = None;
         // A pnpmfile belongs to the project that ships it, and pnpm reads
         // `ignorePnpmfile` from `pnpm-workspace.yaml` and the environment but
@@ -101,6 +108,7 @@ impl WorkspaceSettings {
         self.merge_git_branch_lockfiles_branch_pattern = None;
         self.offline = None;
         self.lockfile_include_tarball_url = None;
+        self.runtime = None;
     }
 
     pub(super) fn clear_workspace_resolution_fields(&mut self) {
@@ -113,12 +121,15 @@ impl WorkspaceSettings {
         self.inject_workspace_packages = None;
         self.dedupe_peer_dependents = None;
         self.dedupe_peers = None;
+        self.auto_dedupe = None;
         self.dedupe_direct_deps = None;
         self.prefer_workspace_packages = None;
         self.dedupe_injected_deps = None;
         self.strict_peer_dependencies = None;
         self.ignore_compatibility_db = None;
+        self.add_missing_peer_types = None;
         self.resolve_peers_from_workspace_root = None;
+        self.project_scoped_optional_peers = None;
         self.block_exotic_subdeps = None;
         self.hoisting_limits = None;
         self.external_dependencies = None;
@@ -129,6 +140,7 @@ impl WorkspaceSettings {
         self.pnpmfile = None;
         self.config_dependencies = None;
         self.allow_builds = None;
+        self.permissions = None;
         self.supported_architectures = None;
         self.ignored_optional_dependencies = None;
         self.overrides = None;

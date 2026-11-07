@@ -18,24 +18,45 @@ pub(crate) async fn latest_version(
     name: &str,
     http_client: &ThrottledClient,
 ) -> Result<String> {
-    let cache_dir = cargo_index_cache_dir(config);
-    let index_file = fetch_sparse_index_file(
+    let index_file = fetch_crate_index_file(config, auth_headers, name, http_client).await?;
+    pnpm_cargo_resolver::latest_version(name, &index_file)
+        .wrap_err_with(|| format!("select the latest version of crate {name}"))
+}
+
+pub(crate) async fn resolve_target_version(
+    config: &Config,
+    auth_headers: &AuthHeaders,
+    name: &str,
+    requirement: Option<&semver::VersionReq>,
+    http_client: &ThrottledClient,
+) -> Result<Option<semver::Version>> {
+    let index_file = fetch_crate_index_file(config, auth_headers, name, http_client).await?;
+    pnpm_cargo_resolver::latest_matching_version(name, &index_file, requirement)
+        .wrap_err_with(|| format!("select a matching version of crate {name}"))
+}
+
+/// The sparse-index entry of crate `name` in the configured Cargo index.
+pub(crate) async fn fetch_crate_index_file(
+    config: &Config,
+    auth_headers: &AuthHeaders,
+    name: &str,
+    http_client: &ThrottledClient,
+) -> Result<String> {
+    fetch_sparse_index_file(
         name,
-        &config.cargo.index_url,
-        &cache_dir,
+        config.cargo_index_url(),
+        &cargo_index_cache_dir(config),
         http_client,
         auth_headers,
         config.offline,
         config.retry_opts(),
     )
-    .await?;
-    pnpm_cargo_resolver::latest_version(name, &index_file)
-        .wrap_err_with(|| format!("select the latest version of crate {name}"))
+    .await
 }
 
 /// The credentials a crate archive download may carry.
 ///
-/// `cargo.indexUrl` is repository-selected and its `config.json` names the
+/// The Cargo index is repository-selected and its `config.json` names the
 /// download host, so the only credential that may travel is the one
 /// configured for the registry itself, never one looked up by the host the
 /// registry names. Off the registry's own origin it travels only when the
@@ -51,11 +72,11 @@ pub(super) fn download_auth_headers(
 ) -> Arc<AuthHeaders> {
     // The registry serves its own downloads: every credential configured
     // for it applies to them as it does to its index.
-    if same_origin(&registry_config.dl, &config.cargo.index_url) {
+    if same_origin(&registry_config.dl, config.cargo_index_url()) {
         return Arc::new((*config.auth_headers).clone().with_secure_transport());
     }
     let credential = registry_config.auth_required
-        .then(|| config.auth_headers.for_secure_url(&config.cargo.index_url))
+        .then(|| config.auth_headers.for_secure_url(config.cargo_index_url()))
         .flatten();
     let Some((credential, origin)) = credential.zip(origin_of(&registry_config.dl)) else {
         return Arc::new(AuthHeaders::default());
@@ -82,7 +103,7 @@ fn origin_of(url: &str) -> Option<String> {
 }
 
 pub(crate) fn cargo_auth_headers(config: &Config) -> Result<Arc<AuthHeaders>> {
-    if is_crates_io(&config.cargo.index_url) {
+    if is_crates_io(config.cargo_index_url()) {
         registry_auth::crates_io::<pnpm_config::Host>(&config.auth_headers, config.offline)
     } else {
         Ok(Arc::clone(&config.auth_headers))
@@ -96,7 +117,7 @@ pub(super) async fn fetch_sparse_index(
 ) -> Result<BTreeMap<String, String>> {
     let auth_headers = cargo_auth_headers(config)?;
     let cache_dir = cargo_index_cache_dir(config);
-    let source = pnpm_cargo_resolver::registry_source(&config.cargo.index_url);
+    let source = pnpm_cargo_resolver::registry_source(config.cargo_index_url());
     let mut index_files = BTreeMap::new();
 
     loop {
@@ -113,7 +134,7 @@ pub(super) async fn fetch_sparse_index(
                 async move {
                     let contents = fetch_sparse_index_file(
                         &name,
-                        &config.cargo.index_url,
+                        config.cargo_index_url(),
                         &cache_dir,
                         &http_client,
                         &auth_headers,
@@ -132,10 +153,10 @@ pub(super) async fn fetch_sparse_index(
 }
 
 fn cargo_index_cache_dir(config: &Config) -> PathBuf {
-    let registry = if is_crates_io(&config.cargo.index_url) {
+    let registry = if is_crates_io(config.cargo_index_url()) {
         "crates-io".to_string()
     } else {
-        pnpm_crypto_hash::create_hex_hash(config.cargo.index_url.trim_end_matches('/'))
+        pnpm_crypto_hash::create_hex_hash(config.cargo_index_url().trim_end_matches('/'))
     };
     config.cache_dir
         .join("v11")
@@ -148,7 +169,7 @@ async fn fetch_registry_config(
     http_client: &ThrottledClient,
     auth_headers: &AuthHeaders,
 ) -> Result<RegistryConfig> {
-    if is_crates_io(&config.cargo.index_url) {
+    if is_crates_io(config.cargo_index_url()) {
         return Ok(RegistryConfig {
             dl: CRATES_IO_DOWNLOAD_BASE.to_string(),
             api: Some("https://crates.io".to_string()),
@@ -207,7 +228,8 @@ pub(super) async fn fetch_sparse_index_file(
             .into_diagnostic()
             .wrap_err_with(|| format!("create Cargo sparse-index cache at {}", parent.display()))?;
     }
-    pnpm_fs::write_atomic(&cache_path, contents.as_bytes())
+    // The cached URLs can carry credentials in their userinfo.
+    pnpm_fs::write_atomic_private_if_new(&cache_path, contents.as_bytes())
         .into_diagnostic()
         .wrap_err_with(|| format!("cache sparse index entry for {name}"))?;
     Ok(contents)
@@ -232,7 +254,8 @@ async fn download_registry_config(
     auth_headers: &AuthHeaders,
     cache_path: &Path,
 ) -> Result<Vec<u8>> {
-    let url = format!("{}/{}", config.cargo.index_url.trim_end_matches('/'), RegistryConfig::NAME);
+    let url =
+        format!("{}/{}", config.cargo_index_url().trim_end_matches('/'), RegistryConfig::NAME);
     let response = http_client
         .get_limited_bytes_with_secure_auth_and_retry(
             &url,
@@ -260,7 +283,8 @@ async fn download_registry_config(
             .into_diagnostic()
             .wrap_err_with(|| format!("create Cargo registry cache at {}", parent.display()))?;
     }
-    pnpm_fs::write_atomic(cache_path, &response.body)
+    // The cached URLs can carry credentials in their userinfo.
+    pnpm_fs::write_atomic_private_if_new(cache_path, &response.body)
         .into_diagnostic()
         .wrap_err_with(|| format!("cache Cargo registry config at {}", cache_path.display()))?;
     Ok(response.body)

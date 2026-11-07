@@ -1,6 +1,7 @@
 use super::{
     AsyncWriteExt, AtomicU64, ErrorKind, Ordering, Path, PathBuf, Result, fs, read_dir_if_present,
 };
+use crate::tmp_suffix::{RANDOM_HEX_DIGITS, TMP_MARKER, tmp_suffix};
 
 /// Per-process counter feeding [`unique_tmp_path`] so two concurrent
 /// writes to the same path don't collide on the same temp filename.
@@ -10,19 +11,28 @@ pub(super) static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub(super) const MAX_TEMP_CREATE_ATTEMPTS: usize = 16;
 
+/// What a write does with an existing destination. `Keep` commits with a
+/// hard link, which fails when the path is taken, and then removes the
+/// temp file the rename would have consumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ExistingDestination {
+    Replace,
+    Keep,
+}
+
 pub async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    write_atomic_with_replace(path, bytes, true).await
+    write_atomic_with_destination(path, bytes, ExistingDestination::Replace).await
 }
 
 /// Publishes a complete file without replacing an existing destination.
 pub async fn write_atomic_new(path: &Path, bytes: &[u8]) -> Result<()> {
-    write_atomic_with_replace(path, bytes, false).await
+    write_atomic_with_destination(path, bytes, ExistingDestination::Keep).await
 }
 
-pub(super) async fn write_atomic_with_replace(
+pub(super) async fn write_atomic_with_destination(
     path: &Path,
     bytes: &[u8],
-    replace: bool,
+    destination: ExistingDestination,
 ) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).await?;
@@ -39,14 +49,22 @@ pub(super) async fn write_atomic_with_replace(
         return Err(err.into());
     }
     drop(file);
-    let committed =
-        if replace { fs::rename(&tmp, path).await } else { fs::hard_link(&tmp, path).await };
+    let committed = match destination {
+        ExistingDestination::Replace => fs::rename(&tmp, path).await,
+        ExistingDestination::Keep => fs::hard_link(&tmp, path).await,
+    };
     if let Err(err) = committed {
         let _ = fs::remove_file(&tmp).await;
         return Err(err.into());
     }
-    if !replace && let Err(err) = fs::remove_file(&tmp).await {
-        tracing::warn!(?err, path = %tmp.display(), "atomic publication temp cleanup failed");
+    let leftover = match destination {
+        ExistingDestination::Replace => None,
+        ExistingDestination::Keep => Some(&tmp),
+    };
+    if let Some(leftover) = leftover
+        && let Err(err) = fs::remove_file(leftover).await
+    {
+        tracing::warn!(?err, path = %leftover.display(), "atomic publication temp cleanup failed");
     }
     Ok(())
 }
@@ -59,7 +77,7 @@ pub async fn remove_atomic_write_temps(path: &Path) -> Result<()> {
         return Ok(());
     };
     let mut prefix = file_name.to_os_string();
-    prefix.push(".tmp.");
+    prefix.push(TMP_MARKER);
     let Some(mut entries) = read_dir_if_present(parent).await? else {
         return Ok(());
     };
@@ -80,6 +98,47 @@ pub async fn remove_atomic_write_temps(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Remove the temporary siblings of `base` (see [`unique_tmp_path`]) last
+/// modified more than `max_age` ago: files a process wrote and never moved
+/// into place because it stopped. Returns how many went.
+pub async fn remove_stale_temps(base: &Path, max_age: std::time::Duration) -> Result<usize> {
+    let (Some(parent), Some(file_name)) = (base.parent(), base.file_name()) else {
+        return Ok(0);
+    };
+    let mut prefix = file_name.to_os_string();
+    prefix.push(TMP_MARKER);
+    let Some(mut entries) = read_dir_if_present(parent).await? else {
+        return Ok(0);
+    };
+    let mut removed = 0;
+    while let Some(entry) = entries.next_entry().await? {
+        let name = entry.file_name();
+        let is_temp = name
+            .as_encoded_bytes()
+            .strip_prefix(prefix.as_encoded_bytes())
+            .is_some_and(is_atomic_write_temp_suffix);
+        let stale = entry
+            .metadata()
+            .await
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= max_age);
+        if is_temp && stale && remove_if_present(&entry.path()).await? {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+async fn remove_if_present(path: &Path) -> Result<bool> {
+    match fs::remove_file(path).await {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err.into()),
+    }
+}
+
 pub(super) fn is_atomic_write_temp_suffix(suffix: &[u8]) -> bool {
     let mut parts = suffix.split(|byte| *byte == b'.');
     let (Some(pid), Some(counter), Some(random), None) =
@@ -91,7 +150,7 @@ pub(super) fn is_atomic_write_temp_suffix(suffix: &[u8]) -> bool {
         && pid.iter().all(u8::is_ascii_digit)
         && !counter.is_empty()
         && counter.iter().all(u8::is_ascii_digit)
-        && random.len() == 16
+        && random.len() == RANDOM_HEX_DIGITS
         && random.iter().all(u8::is_ascii_hexdigit)
 }
 
@@ -143,7 +202,7 @@ pub fn unique_tmp_path(base: &Path) -> PathBuf {
         .file_name()
         .map(std::ffi::OsStr::to_os_string)
         .unwrap_or_default();
-    name.push(format!(".tmp.{pid}.{counter}.{random:016x}"));
+    name.push(tmp_suffix(pid, counter, random));
     match base.parent() {
         Some(parent) => parent.join(name),
         None => PathBuf::from(name),

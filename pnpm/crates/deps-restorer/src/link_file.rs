@@ -1,7 +1,9 @@
+pub use pnpm_fs::FsHardLink;
+
 use derive_more::{Display, Error};
 use miette::Diagnostic;
 use pnpm_config::PackageImportMethod;
-use pnpm_fs::{Host, is_cross_device};
+use pnpm_fs::{FsReflink, Host, StoreFile, is_cross_device};
 use pnpm_reporter::{
     LogEvent, LogLevel, PackageImportMethod as WireImportMethod, PackageImportMethodLog, Reporter,
 };
@@ -9,6 +11,9 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU8, Ordering},
+};
+use target_mode::{
+    align_reflinked_target_mode, align_target_mode, desired_permissions, source_has_desired_mode,
 };
 
 /// Error type for [`link_file`].
@@ -28,25 +33,9 @@ pub enum LinkFileError {
     },
 }
 
-// Downgrade state machine used by both `Auto` and `CloneOrCopy`.
-// These are the state *values*, not the cache itself: each mode keeps
-// its own process-global `AtomicU8` (`AUTO_STATE` inside `link_file`,
-// `CLONE_OR_COPY_STATE` likewise), so an `Auto` downgrade doesn't
-// affect `CloneOrCopy` and vice versa.
-//
-// Neither cache is keyed by `(source fs, target fs)`. Once we observe
-// a tier failing anywhere for a given mode, we stop trying it for the
-// rest of the process. That's a coarse optimization to avoid paying
-// the "try reflink, fail" cost for every file in installs where a
-// higher tier is not usable on the store / workspace pair.
-//
-// A failure on one path can therefore downgrade later calls that
-// would have succeeded on a different pair — in practice pacquet runs
-// one install per process with one store and one target root, so this
-// is fine. Pnpm's per-importer `let auto` closure (see
-// `render-peer/fs/indexed-pkg-importer/src/index.ts`,
-// `createAutoImporter` / `createCloneOrCopyImporter`) has the same
-// coarseness once `pnpm install` has picked an import direction.
+// npm keeps process-global fallback tiers in `try_import`. Python keeps an
+// ImportState per source filesystem inside each environment, so temporary
+// build environments cannot downgrade project or npm imports.
 //
 // The state only ever moves forward along the platform's ladder (see
 // [`next_auto_tier`]), each step taken with a compare-exchange from
@@ -62,9 +51,9 @@ const LINK_STATE_COPY: u8 = 2;
 
 /// The tier `Auto` starts at, per platform — the head of
 /// [`next_auto_tier`]'s ladder.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 const AUTO_FIRST_TIER: u8 = LINK_STATE_HARDLINK;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 const AUTO_FIRST_TIER: u8 = LINK_STATE_CLONE;
 
 /// The wire method `Auto` optimistically resolves to on this platform —
@@ -94,21 +83,26 @@ pub fn auto_optimistic_wire_method() -> WireImportMethod {
 /// every ext4 and Windows install runs with, guarded by
 /// `verify-store-integrity`, not by the import tier.
 ///
+/// Windows runs the same ladder. A block clone on a Dev Drive creates
+/// the file and then sets it sparse, copies its integrity settings, sets
+/// its length and duplicates its extents, where a hardlink is one call.
+/// On Windows this also matches pnpm 11, whose `Auto` never clones there.
+///
 /// macOS keeps clone-first: APFS `clonefile` is the platform's cheap
 /// primitive.
 ///
-/// The hardlink-first order is a pnpm 12 change, shipped behind the
-/// major: the TypeScript CLI (pnpm 11) deliberately keeps clone-first,
-/// because changing what the default materializes on disk is not a
+/// The hardlink-first order on Linux is a pnpm 12 change, shipped behind
+/// the major: the TypeScript CLI (pnpm 11) deliberately keeps clone-first
+/// there, because changing what the default materializes on disk is not a
 /// point-release change. The two `Auto` implementations intentionally
 /// diverge on this until pnpm 11 is retired.
 fn next_auto_tier(tier: u8) -> u8 {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     match tier {
         LINK_STATE_HARDLINK => LINK_STATE_CLONE,
         _ => LINK_STATE_COPY,
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", windows)))]
     match tier {
         LINK_STATE_CLONE => LINK_STATE_HARDLINK,
         _ => LINK_STATE_COPY,
@@ -147,11 +141,15 @@ const LOG_FLAG_CLONE: u8 = 1 << 0;
 const LOG_FLAG_HARDLINK: u8 = 1 << 1;
 const LOG_FLAG_COPY: u8 = 1 << 2;
 
-fn log_method_once<Reporter: self::Reporter>(
+pub(crate) fn log_method_once<Reporter: self::Reporter>(
     logged: &AtomicU8,
-    flag: u8,
     method: WireImportMethod,
 ) {
+    let flag = match method {
+        WireImportMethod::Clone => LOG_FLAG_CLONE,
+        WireImportMethod::Hardlink => LOG_FLAG_HARDLINK,
+        WireImportMethod::Copy => LOG_FLAG_COPY,
+    };
     if logged.fetch_or(flag, Ordering::Relaxed) & flag == 0 {
         let method_name = match method {
             WireImportMethod::Clone => "clone",
@@ -179,7 +177,7 @@ fn log_method_once<Reporter: self::Reporter>(
 pub fn link_file<Reporter: self::Reporter>(
     logged: &AtomicU8,
     method: PackageImportMethod,
-    source_file: &Path,
+    source_file: &StoreFile,
     target_link: &Path,
 ) -> Result<(), LinkFileError> {
     // Single `stat` short-circuit. If the target resolves to a live
@@ -225,7 +223,7 @@ pub fn link_file<Reporter: self::Reporter>(
 pub fn import_into_fresh_target<Reporter: self::Reporter>(
     logged: &AtomicU8,
     method: PackageImportMethod,
-    source_file: &Path,
+    source_file: &StoreFile,
     target_link: &Path,
 ) -> Result<(), LinkFileError> {
     // Hardlinking a file from the store into `node_modules` means any
@@ -235,6 +233,7 @@ pub fn import_into_fresh_target<Reporter: self::Reporter>(
     // either — postinstall handling lives in the script runner, not the
     // import layer — so there's nothing to gate on here.
     try_import::<Reporter, Host>(method, logged, source_file, target_link)
+        .map(|_| ())
         .or_else(|error| recover_from_concurrent_import(error, source_file, target_link))
 }
 
@@ -243,12 +242,12 @@ pub fn import_into_fresh_target<Reporter: self::Reporter>(
 ///
 /// `AlreadyExists` means a concurrent writer beat us to the target; its
 /// content is content-addressed and equivalent. pnpm's `linkOrCopy`
-/// returns here without touching disk, but pnpm's clone preserves the
-/// mode and pacquet's reflink does not — so re-assert the exec bit from
-/// the `-exec` suffix (idempotent, a no-op for non-exec entries) before
-/// adopting the dirent. That re-assertion also heals a target that an
-/// earlier failed restore left non-executable; the clone tier relies on
-/// it and keeps such a target in place.
+/// returns here without touching disk, but a reflinked or copied target
+/// carries whichever mode its writer's umask gave it, so the adopted
+/// dirent is aligned with the current umask's store-entry mode first.
+/// That alignment also heals a target an earlier failure left with the
+/// wrong mode; the clone tier relies on it and keeps such a target in
+/// place.
 ///
 /// `NotFound` is the same race when a regular file now sits at the
 /// target: APFS `clonefile` intermittently reports a destination that
@@ -258,29 +257,51 @@ pub fn import_into_fresh_target<Reporter: self::Reporter>(
 /// a store blob that really is gone stays an error, and so does a target
 /// the copy tier could not open through.
 ///
+/// A symlink squatting at the target is left exactly as pnpm leaves it:
+/// no writer materialized it, and the alignment would only fail on it.
 /// Every other error is the caller's to surface.
+fn is_placed_concurrently(error: &io::Error, source_file: &Path, target_link: &Path) -> bool {
+    error.kind() == io::ErrorKind::AlreadyExists
+        || (error.kind() == io::ErrorKind::NotFound
+            && fs::metadata(target_link).is_ok_and(|m| m.is_file())
+            && fs::metadata(source_file).is_ok())
+}
+
+/// Materialize an independent copy of `source_file` over `target_link`
+/// carrying its [`desired_permissions`], leaving `source_file`
+/// untouched.
+fn replace_shared_inode_with_copy(source_file: &Path, target_link: &Path) -> io::Result<()> {
+    pnpm_fs::copy_file_atomic_with_permissions(
+        source_file,
+        target_link,
+        &desired_permissions(source_file)?,
+    )
+}
+
 fn recover_from_concurrent_import(
     error: io::Error,
-    source_file: &Path,
+    source: &StoreFile,
     target_link: &Path,
 ) -> Result<(), LinkFileError> {
+    let source_file = source.path.as_path();
     let import_error = |error| LinkFileError::Import {
         from: source_file.to_path_buf(),
         to: target_link.to_path_buf(),
         error,
     };
-    let placed_concurrently = match error.kind() {
-        io::ErrorKind::AlreadyExists => true,
-        io::ErrorKind::NotFound => {
-            fs::metadata(target_link).is_ok_and(|meta| meta.is_file())
-                && fs::metadata(source_file).is_ok()
-        }
-        _ => false,
-    };
-    if !placed_concurrently {
+    if !is_placed_concurrently(&error, source_file, target_link) {
         return Err(import_error(error));
     }
-    match pnpm_fs::file_mode::restore_exec_bit_from_cas_suffix(source_file, target_link) {
+    if fs::symlink_metadata(target_link).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Ok(());
+    }
+    if same_inode(source_file, target_link) {
+        if source_has_desired_mode(source).map_err(import_error)? {
+            return Ok(());
+        }
+        return replace_shared_inode_with_copy(source_file, target_link).map_err(import_error);
+    }
+    match align_target_mode(source_file, target_link) {
         Ok(()) => Ok(()),
         // Nothing serializes shared-slot imports across
         // processes: the writer that owns the target may
@@ -291,11 +312,7 @@ fn recover_from_concurrent_import(
         // means another writer finished the job — the same
         // tolerance the bin-shim chmod applies
         // (`chmod_tolerating_removal` in `pnpm-cmd-shim`,
-        // pnpm/pnpm#14353). The dirent check keeps the
-        // dangling-symlink detection this recovery is
-        // responsible for: a symlink squatting at the path
-        // also opens as `NotFound`, but its dirent is still
-        // there and no concurrent writer will heal it.
+        // pnpm/pnpm#14353).
         Err(error)
             if error.kind() == io::ErrorKind::NotFound
                 && matches!(
@@ -309,216 +326,172 @@ fn recover_from_concurrent_import(
     }
 }
 
-/// Run the import syscall for the configured `method`. Surfaces
-/// the raw `io::Error` so the caller can dispatch on
-/// `ErrorKind::AlreadyExists` for the EEXIST recovery path.
-fn try_import<Reporter: self::Reporter, Sys: FsHardLink + FsReflink>(
-    method: PackageImportMethod,
-    logged: &AtomicU8,
-    source_file: &Path,
-    target_link: &Path,
-) -> io::Result<()> {
-    match method {
-        PackageImportMethod::Auto => {
-            static AUTO_STATE: AtomicU8 = AtomicU8::new(AUTO_FIRST_TIER);
-            auto_link::<Reporter, Sys>(logged, &AUTO_STATE, source_file, target_link)
+/// Cached fallback tiers for one source/target filesystem pair.
+pub struct ImportState {
+    auto: AtomicU8,
+    clone_or_copy: AtomicU8,
+}
+
+impl ImportState {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            auto: AtomicU8::new(AUTO_FIRST_TIER),
+            clone_or_copy: AtomicU8::new(LINK_STATE_CLONE),
         }
-        // pnpm's explicit `hardlink` method uses `hardlinkPkg(linkOrCopy)`,
-        // which copies on any link failure other than `EEXIST`. Only
-        // `EXDEV` copies here: a store on a different device from
-        // `node_modules` is a placement the user can change, and one
-        // package's copy is cheap. A source that has run out of names
-        // ([`is_too_many_links`]) copies for the same reason: it costs
-        // one file, not the install. Everything else surfaces, `EPERM`
-        // included — a filesystem that refuses links would copy every
-        // package, which is the disk cost `hardlink` was chosen to
-        // avoid, so the user gets an error naming the method instead of
-        // a silent whole-install copy. No caching — the `fs::hard_link`
-        // syscall itself is already cheap; pnpm doesn't cache this path
-        // either.
-        PackageImportMethod::Hardlink => match Sys::hard_link(source_file, target_link) {
+    }
+
+    /// Import a file using the configured method and return the method actually used.
+    /// Existing destinations and missing sources are errors; no existing file is adopted.
+    pub fn import<Reporter: self::Reporter, Sys: FsHardLink + FsReflink>(
+        &self,
+        method: PackageImportMethod,
+        logged: &AtomicU8,
+        source: &StoreFile,
+        target_link: &Path,
+    ) -> io::Result<WireImportMethod> {
+        let source_file = source.path.as_path();
+        match method {
+            PackageImportMethod::Auto => {
+                auto_link::<Reporter, Sys>(logged, &self.auto, source, target_link)
+            }
+            PackageImportMethod::Hardlink => {
+                hardlink_file::<Reporter, Sys>(logged, source, target_link)
+            }
+            PackageImportMethod::Clone => clone_file::<Sys>(source, target_link)
+                .inspect(|()| {
+                    log_method_once::<Reporter>(logged, WireImportMethod::Clone);
+                })
+                .map(|()| WireImportMethod::Clone),
+            PackageImportMethod::CloneOrCopy => clone_or_copy_link::<Reporter, Sys>(
+                logged,
+                &self.clone_or_copy,
+                source,
+                target_link,
+            ),
+            PackageImportMethod::Copy => copy_file(source_file, target_link)
+                .inspect(|()| {
+                    log_method_once::<Reporter>(logged, WireImportMethod::Copy);
+                })
+                .map(|()| WireImportMethod::Copy),
+        }
+    }
+}
+
+impl Default for ImportState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn hardlink_file<Reporter: self::Reporter, Sys: FsHardLink>(
+    logged: &AtomicU8,
+    source: &StoreFile,
+    target_link: &Path,
+) -> io::Result<WireImportMethod> {
+    let source_file = source.path.as_path();
+    // pnpm's explicit `hardlink` method uses `hardlinkPkg(linkOrCopy)`,
+    // which copies on any link failure other than `EEXIST`. Only
+    // `EXDEV` copies here: a store on a different device from
+    // `node_modules` is a placement the user can change, and one
+    // package's copy is cheap. A source that has run out of names
+    // ([`is_too_many_links`]) copies for the same reason: it costs
+    // one file, not the install. Everything else surfaces, `EPERM`
+    // included — a filesystem that refuses links would copy every
+    // package, which is the disk cost `hardlink` was chosen to
+    // avoid, so the user gets an error naming the method instead of
+    // a silent whole-install copy. No caching — the `fs::hard_link`
+    // syscall itself is already cheap; pnpm doesn't cache this path
+    // either.
+    //
+    // A mode that does not match the current umask cannot be fixed on the
+    // store inode every name shares, so the file is copied at the
+    // [`desired_mode`] instead (pnpm/pnpm#3807).
+    if source_has_desired_mode(source)? {
+        match Sys::hard_link(source_file, target_link) {
             Ok(()) => {
-                log_method_once::<Reporter>(logged, LOG_FLAG_HARDLINK, WireImportMethod::Hardlink);
-                Ok(())
+                log_method_once::<Reporter>(logged, WireImportMethod::Hardlink);
+                Ok(WireImportMethod::Hardlink)
             }
             Err(error) if is_cross_device(&error) || is_too_many_links(&error) => {
                 copy_file(source_file, target_link)
                     .inspect(|()| {
-                        log_method_once::<Reporter>(logged, LOG_FLAG_COPY, WireImportMethod::Copy);
+                        log_method_once::<Reporter>(logged, WireImportMethod::Copy);
                     })
+                    .map(|()| WireImportMethod::Copy)
             }
             Err(error) => Err(error),
-        },
-        PackageImportMethod::Clone => clone_file::<Sys>(source_file, target_link)
-            .inspect(|()| {
-                log_method_once::<Reporter>(logged, LOG_FLAG_CLONE, WireImportMethod::Clone);
-            }),
-        PackageImportMethod::CloneOrCopy => {
-            static CLONE_OR_COPY_STATE: AtomicU8 = AtomicU8::new(LINK_STATE_CLONE);
-            clone_or_copy_link::<Reporter, Sys>(
-                logged,
-                &CLONE_OR_COPY_STATE,
-                source_file,
-                target_link,
-            )
         }
-        PackageImportMethod::Copy => copy_file(source_file, target_link)
+    } else {
+        copy_file(source_file, target_link)
             .inspect(|()| {
-                log_method_once::<Reporter>(logged, LOG_FLAG_COPY, WireImportMethod::Copy);
-            }),
+                log_method_once::<Reporter>(logged, WireImportMethod::Copy);
+            })
+            .map(|()| WireImportMethod::Copy)
     }
+}
+
+fn try_import<Reporter: self::Reporter, Sys: FsHardLink + FsReflink>(
+    method: PackageImportMethod,
+    logged: &AtomicU8,
+    source_file: &StoreFile,
+    target_link: &Path,
+) -> io::Result<WireImportMethod> {
+    static STATE: ImportState = ImportState::new();
+    STATE.import::<Reporter, Sys>(method, logged, source_file, target_link)
 }
 
 /// Materialize `source_file` at `target_link` for the copy tier.
 ///
-/// The target is created exclusively, so a symlink squatting at the
-/// path is never opened through: `O_EXCL` does not follow one, and the
-/// `AlreadyExists` it raises instead reaches
-/// [`recover_from_concurrent_import`], where every tier sends an
-/// occupied target. Whatever such a link names keeps its contents, and
-/// a link naming a path that does not exist does not bring it into
-/// being.
-///
-/// Everything after the creation goes through that one handle rather
-/// than the path — the bytes, the mode, and the exec bit the CAS
-/// suffix asks for. A writer that swaps the dirent mid-copy therefore
-/// cannot redirect any of it onto a file outside the package tree, the
-/// way re-opening `target_link` by name for the `chmod` could. The mode
-/// is also supplied at creation, so a `0o600` store entry is never
-/// briefly world-readable, and asserted again at the end, because the
-/// umask can narrow the creation mode.
-///
-/// A failure past the creation leaves a partial file, which a later
-/// import would adopt as a concurrent writer's finished work. It is
-/// removed, but only while the path still names the file this call
-/// created: a concurrent `import_atomic` may have renamed a complete
-/// file over it, and that one must survive.
+/// [`pnpm_fs::copy_file_exclusive`] creates the target exclusively, so
+/// an occupied target raises `AlreadyExists` and reaches
+/// [`recover_from_concurrent_import`], where every tier sends one. A
+/// partial file it removes on failure would otherwise be adopted by a
+/// later import as a concurrent writer's finished work.
 fn copy_file(source_file: &Path, target_link: &Path) -> io::Result<()> {
-    let mut source = fs::File::open(source_file)?;
-    let permissions = source.metadata()?.permissions();
-    let mut target = create_new_with_permissions(target_link, &permissions)?;
-    finish_copy(&mut source, &mut target, permissions, source_file)
-        .inspect_err(|_| {
-            if path_still_names(&target, target_link) {
-                let _ = fs::remove_file(target_link);
-            }
-        })
+    pnpm_fs::copy_file_exclusive(
+        source_file,
+        target_link,
+        &desired_permissions(source_file)?,
+        |_| Ok(()),
+    )
 }
 
-/// The part of [`copy_file`] that runs against the created handle, so
-/// its failures share one cleanup.
-fn finish_copy(
-    source: &mut fs::File,
-    target: &mut fs::File,
-    permissions: fs::Permissions,
-    source_file: &Path,
-) -> io::Result<()> {
-    io::copy(source, target)?;
-    target.set_permissions(permissions)?;
-    if pnpm_fs::file_mode::cas_path_is_executable(source_file) {
-        pnpm_fs::file_mode::make_file_executable(target)?;
-    }
-    Ok(())
+/// [`FsReflink::reflink`] for the explicit `Clone` method, then
+/// alignment with the store-entry mode.
+fn clone_file<Sys: FsReflink>(source: &StoreFile, target_link: &Path) -> io::Result<()> {
+    Sys::reflink(&source.path, target_link)?;
+    align_reflinked_target_mode(source, target_link)
 }
 
-/// Whether `path` still names the file `created` refers to.
-///
-/// Unix reads the identity straight out of the two stat results;
-/// Windows keeps it behind an open handle, which `same-file` compares.
-/// A path that has since been replaced, removed, or turned into a
-/// symlink answers `false`.
-fn path_still_names(created: &fs::File, path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let (Ok(created_meta), Ok(path_meta)) = (created.metadata(), fs::symlink_metadata(path))
-        else {
-            return false;
-        };
-        created_meta.ino() == path_meta.ino() && created_meta.dev() == path_meta.dev()
-    }
-    #[cfg(windows)]
-    {
-        let (Ok(clone), Ok(by_path)) = (created.try_clone(), same_file::Handle::from_path(path))
-        else {
-            return false;
-        };
-        same_file::Handle::from_file(clone).is_ok_and(|by_handle| by_handle == by_path)
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = (created, path);
-        false
-    }
-}
-
-/// Create `path`, failing if anything already occupies it, with the
-/// mode the finished file will carry. The umask may still narrow it;
-/// [`copy_file`] asserts the exact mode once the bytes are written.
 #[cfg(unix)]
-fn create_new_with_permissions(path: &Path, permissions: &fs::Permissions) -> io::Result<fs::File> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(permissions.mode())
-        .open(path)
+fn same_inode(source: &Path, target: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    matches!(
+        (fs::metadata(source), fs::metadata(target)),
+        (Ok(source_meta), Ok(target_meta))
+            if source_meta.ino() == target_meta.ino() && source_meta.dev() == target_meta.dev(),
+    )
 }
 
-/// Windows carries no creation mode: the read-only attribute is the
-/// whole of [`fs::Permissions`] there, and [`copy_file`] asserts it
-/// after the copy.
 #[cfg(not(unix))]
-fn create_new_with_permissions(
-    path: &Path,
-    _permissions: &fs::Permissions,
-) -> io::Result<fs::File> {
-    fs::File::create_new(path)
+fn same_inode(_source: &Path, _target: &Path) -> bool {
+    false
 }
 
-/// [`FsReflink::reflink`] for the explicit `Clone` method, then exec-bit
-/// restoration via [`pnpm_fs::file_mode::restore_exec_bit_from_cas_suffix`].
-fn clone_file<Sys: FsReflink>(source_file: &Path, target_link: &Path) -> io::Result<()> {
-    Sys::reflink(source_file, target_link)?;
-    pnpm_fs::file_mode::restore_exec_bit_from_cas_suffix(source_file, target_link)
-}
-
-/// The hardlink syscall the import methods issue. A capability seam so
-/// tests can hand them the errors only some filesystems return
-/// (`EPERM` from a FUSE mount that has no hardlinks), which a temp dir
-/// on the CI runner's disk cannot reproduce.
-trait FsHardLink {
-    fn hard_link(source: &Path, target: &Path) -> io::Result<()>;
-}
-
-/// The reflink syscall the import methods issue. Same purpose as
-/// [`FsHardLink`]: `FICLONE` is answered with `EPERM` inside the
-/// user-namespace containers of pnpm/pnpm#14722, and the CI runners do
-/// not provide one.
-trait FsReflink {
-    fn reflink(source: &Path, target: &Path) -> io::Result<()>;
-}
-
-impl FsHardLink for Host {
-    fn hard_link(source: &Path, target: &Path) -> io::Result<()> {
-        fs::hard_link(source, target)
-    }
-}
-
-impl FsReflink for Host {
-    fn reflink(source: &Path, target: &Path) -> io::Result<()> {
-        reflink_copy::reflink(source, target)
-    }
-}
-
-/// Unix permission errors that may deny linking while still allowing copying.
+/// Permission errors that may deny linking while still allowing copying.
 /// Android's `SELinux` policy can reject hardlinks with `EACCES`; filesystems
 /// without link support and restricted containers can return `EPERM`.
+/// On Windows, a store file's ACL can refuse a hardlink with
+/// `ERROR_ACCESS_DENIED`.
 /// The copy tier reports any remaining access error on the paths.
 fn is_link_permission_error(err: &io::Error) -> bool {
     #[cfg(unix)]
     return matches!(err.raw_os_error(), Some(libc::EPERM | libc::EACCES));
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    return err.raw_os_error()
+        == Some(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED.cast_signed());
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = err;
         false
@@ -554,7 +527,17 @@ fn is_call_error(err: &io::Error) -> bool {
     }
 }
 
-/// `Auto`'s downgrade chain — hardlink → clone → copy on Linux,
+fn copy_and_log<Reporter: self::Reporter>(
+    logged: &AtomicU8,
+    source: &Path,
+    target: &Path,
+) -> io::Result<WireImportMethod> {
+    copy_file(source, target)?;
+    log_method_once::<Reporter>(logged, WireImportMethod::Copy);
+    Ok(WireImportMethod::Copy)
+}
+
+/// `Auto`'s downgrade chain — hardlink → clone → copy on Linux and Windows,
 /// clone → hardlink → copy elsewhere (see [`next_auto_tier`] for the
 /// why) — using `state` to skip tiers that have already failed in this
 /// process. Factored out so tests can
@@ -567,29 +550,25 @@ fn is_call_error(err: &io::Error) -> bool {
 fn auto_link<Reporter: self::Reporter, Sys: FsHardLink + FsReflink>(
     logged: &AtomicU8,
     state: &AtomicU8,
-    source: &Path,
+    source_file: &StoreFile,
     target: &Path,
-) -> io::Result<()> {
+) -> io::Result<WireImportMethod> {
+    let source = source_file.path.as_path();
     loop {
         match state.load(Ordering::Relaxed) {
             LINK_STATE_CLONE => {
-                if clone_tier::<Reporter, Sys>(logged, source, target)? {
-                    return Ok(());
+                if clone_tier::<Reporter, Sys>(logged, source_file, target)? {
+                    return Ok(WireImportMethod::Clone);
                 }
                 downgrade_auto_tier(state, LINK_STATE_CLONE);
             }
             LINK_STATE_HARDLINK => {
-                if hardlink_tier::<Reporter, Sys>(logged, source, target)? {
-                    return Ok(());
+                if let Some(method) = hardlink_tier::<Reporter, Sys>(logged, source_file, target)? {
+                    return Ok(method);
                 }
                 downgrade_auto_tier(state, LINK_STATE_HARDLINK);
             }
-            _ => {
-                return copy_file(source, target)
-                    .inspect(|()| {
-                        log_method_once::<Reporter>(logged, LOG_FLAG_COPY, WireImportMethod::Copy);
-                    });
-            }
+            _ => return copy_and_log::<Reporter>(logged, source, target),
         }
     }
 }
@@ -598,19 +577,19 @@ fn auto_link<Reporter: self::Reporter, Sys: FsHardLink + FsReflink>(
 /// on this filesystem pair and the caller should downgrade to the next
 /// one.
 ///
-/// Only the reflink itself may downgrade. Restoration runs after
+/// Only the reflink itself may downgrade. Alignment runs after
 /// reflink created the target, so its error is terminal — downgrading
 /// on it would re-attempt the next tier against that just-created file
 /// and mask the real error behind `AlreadyExists`.
 fn clone_tier<Reporter: self::Reporter, Sys: FsReflink>(
     logged: &AtomicU8,
-    source: &Path,
+    source: &StoreFile,
     target: &Path,
 ) -> io::Result<bool> {
-    match Sys::reflink(source, target) {
+    match Sys::reflink(&source.path, target) {
         Ok(()) => {
-            pnpm_fs::file_mode::restore_exec_bit_from_cas_suffix(source, target)?;
-            log_method_once::<Reporter>(logged, LOG_FLAG_CLONE, WireImportMethod::Clone);
+            align_reflinked_target_mode(source, target)?;
+            log_method_once::<Reporter>(logged, WireImportMethod::Clone);
             Ok(true)
         }
         Err(err) if is_call_error(&err) => Err(err),
@@ -623,23 +602,29 @@ fn clone_tier<Reporter: self::Reporter, Sys: FsReflink>(
 /// for: a source out of names copies here and reports the tier still
 /// usable, because [`is_too_many_links`] says nothing about the next
 /// file.
+/// A source whose on-disk mode does not match the current umask's
+/// store-entry mode copies at the right mode, keeping the tier for the
+/// files whose mode does match (pnpm/pnpm#3807).
 fn hardlink_tier<Reporter: self::Reporter, Sys: FsHardLink>(
     logged: &AtomicU8,
-    source: &Path,
+    source_file: &StoreFile,
     target: &Path,
-) -> io::Result<bool> {
-    match Sys::hard_link(source, target) {
-        Ok(()) => {
-            log_method_once::<Reporter>(logged, LOG_FLAG_HARDLINK, WireImportMethod::Hardlink);
-            Ok(true)
+) -> io::Result<Option<WireImportMethod>> {
+    let source = source_file.path.as_path();
+    if source_has_desired_mode(source_file)? {
+        match Sys::hard_link(source, target) {
+            Ok(()) => {
+                log_method_once::<Reporter>(logged, WireImportMethod::Hardlink);
+                Ok(Some(WireImportMethod::Hardlink))
+            }
+            Err(err) if is_too_many_links(&err) => {
+                copy_and_log::<Reporter>(logged, source, target).map(Some)
+            }
+            Err(err) if is_call_error(&err) => Err(err),
+            Err(_) => Ok(None),
         }
-        Err(err) if is_too_many_links(&err) => copy_file(source, target)
-            .inspect(|()| {
-                log_method_once::<Reporter>(logged, LOG_FLAG_COPY, WireImportMethod::Copy);
-            })
-            .map(|()| true),
-        Err(err) if is_call_error(&err) => Err(err),
-        Err(_) => Ok(false),
+    } else {
+        copy_and_log::<Reporter>(logged, source, target).map(Some)
     }
 }
 
@@ -652,26 +637,23 @@ fn hardlink_tier<Reporter: self::Reporter, Sys: FsHardLink>(
 fn clone_or_copy_link<Reporter: self::Reporter, Sys: FsReflink>(
     logged: &AtomicU8,
     state: &AtomicU8,
-    source: &Path,
+    source: &StoreFile,
     target: &Path,
-) -> io::Result<()> {
+) -> io::Result<WireImportMethod> {
     loop {
         match state.load(Ordering::Relaxed) {
             LINK_STATE_CLONE => {
                 if clone_tier::<Reporter, Sys>(logged, source, target)? {
-                    return Ok(());
+                    return Ok(WireImportMethod::Clone);
                 }
                 state.fetch_max(LINK_STATE_COPY, Ordering::Relaxed);
             }
-            _ => {
-                return copy_file(source, target)
-                    .inspect(|()| {
-                        log_method_once::<Reporter>(logged, LOG_FLAG_COPY, WireImportMethod::Copy);
-                    });
-            }
+            _ => return copy_and_log::<Reporter>(logged, &source.path, target),
         }
     }
 }
+
+mod target_mode;
 
 #[cfg(test)]
 mod tests;

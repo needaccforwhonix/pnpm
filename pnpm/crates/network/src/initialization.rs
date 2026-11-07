@@ -1,9 +1,10 @@
 use super::{
-    Arc, Client, ClientBuildInputs, ClientPair, DEFAULT_FETCH_MIN_SPEED_KI_BPS,
-    DEFAULT_FETCH_WARN_TIMEOUT_MS, Duration, ForInstallsError, NetworkSettings, NoProxyMatcher,
-    PerRegistryTls, PrioritySemaphore, ProxyConfig, RedirectGuard, ThrottledClient, TlsConfig,
-    build_client_with_root_fallback, configured_proxy, default_network_concurrency, ignore_warning,
-    load_node_extra_ca_certs, merge_tls, tls,
+    Arc, Client, ClientPair, ClientSet, DEFAULT_FETCH_MIN_SPEED_KI_BPS,
+    DEFAULT_FETCH_WARN_TIMEOUT_MS, Duration, ForInstallsError, HostSocketLimit, NetworkSettings,
+    NoProxyMatcher, OriginLimits, OwnedClientInputs, PerRegistryTls, PrioritySemaphore,
+    ProxyConfig, ProxyRouting, RedirectGuard, RegistryLimits, Resolve, ThrottledClient, TlsConfig,
+    configured_proxy, default_network_concurrency, ignore_warning, load_node_extra_ca_certs,
+    merge_tls, native_dns_resolver, tls,
 };
 
 impl ThrottledClient {
@@ -25,10 +26,7 @@ impl ThrottledClient {
     ///   request-level cap bounds how many fetches actually run at once;
     ///   pacquet's semaphore plays the second role.
     /// * **A `User-Agent` header** ([`NetworkSettings::user_agent`],
-    ///   defaulting to [`DEFAULT_USER_AGENT`](crate::DEFAULT_USER_AGENT)). A default
-    ///   `reqwest::Client` sends no UA, which can trip CDN / WAF rules
-    ///   that reject or RST bot-shaped traffic before any HTTP response
-    ///   is produced.
+    ///   defaulting to [`DEFAULT_USER_AGENT`](crate::DEFAULT_USER_AGENT)).
     ///
     /// `pool_idle_timeout(4s)` matches
     /// [`agentkeepalive`'s](https://github.com/node-modules/agentkeepalive/blob/1e5e312f36/lib/agent.js#L39-L41)
@@ -55,8 +53,8 @@ impl ThrottledClient {
     ///
     /// Hostnames resolve through the platform's `getaddrinfo` behind a
     /// process-wide four-lookup cap shared by every client, matching
-    /// Node's libuv DNS pool. `configure_dns` documents why no pure-Rust
-    /// resolver is used on any platform.
+    /// Node's libuv DNS pool. [`native_dns_resolver`]
+    /// documents why no pure-Rust resolver is used on any platform.
     #[must_use]
     pub fn new_for_installs() -> Self {
         Self::for_installs(
@@ -73,25 +71,9 @@ impl ThrottledClient {
     /// * **Proxy routing.** HTTPS targets route through `https_proxy`,
     ///   HTTP targets through `http_proxy`, and [`ProxyConfig::no_proxy`]
     ///   short-circuits both via a per-URL custom-proxy closure.
-    ///   Basic-auth user/password halves embedded in the proxy URL
-    ///   are percent-decoded before being forwarded as the
-    ///   `Proxy-Authorization` header.
     /// * **TLS.** Every certificate read out of [`TlsConfig::ca`] is
     ///   added as a trusted root; material the TLS backend cannot read
-    ///   is skipped. When both [`TlsConfig::cert`] and
-    ///   [`TlsConfig::key`] are set and neither is blank, they are
-    ///   concatenated and passed to `Identity::from_pem` (rustls
-    ///   single-buffer form). rustls accepts PKCS#1, PKCS#8, and EC
-    ///   private keys — the same surface Node's `tls` exposes.
-    ///   `strict_ssl` defaults to `true` and disables both
-    ///   chain-of-trust and hostname verification when `false` — same
-    ///   as Node's `rejectUnauthorized=false` short-circuit.
-    /// * **`local_address`.** Pinned via
-    ///   `reqwest::ClientBuilder::local_address`.
-    /// * **Trust store.** The platform's, falling back to the Mozilla
-    ///   roots bundled into the binary when the platform verifier
-    ///   cannot be constructed (a system with no trust store at all).
-    ///   Android always uses the bundled roots because the CLI has no JVM.
+    ///   is skipped.
     ///
     /// Returns [`ProxyError::InvalidProxy`](crate::proxy::ProxyError::InvalidProxy) when either configured
     /// proxy URL fails to parse even after the auto-`http://` prefix
@@ -104,7 +86,14 @@ impl ThrottledClient {
         per_registry: &PerRegistryTls,
         settings: &NetworkSettings,
     ) -> Result<Self, ForInstallsError> {
-        Self::for_installs_with_redirect(proxy, tls, per_registry, settings, None)
+        Self::for_installs_with_redirect(
+            proxy,
+            tls,
+            per_registry,
+            settings,
+            None,
+            native_dns_resolver(),
+        )
     }
 
     /// Like [`Self::for_installs`] with an optional redirect guard.
@@ -117,7 +106,14 @@ impl ThrottledClient {
         settings: &NetworkSettings,
         redirect_guard: Option<&RedirectGuard>,
     ) -> Result<Self, ForInstallsError> {
-        Self::for_installs_with_redirect(proxy, tls, per_registry, settings, redirect_guard)
+        Self::for_installs_with_redirect(
+            proxy,
+            tls,
+            per_registry,
+            settings,
+            redirect_guard,
+            native_dns_resolver(),
+        )
     }
 
     /// Like [`Self::new_for_installs`] but installs `redirect_guard` as the
@@ -133,6 +129,17 @@ impl ThrottledClient {
     pub fn new_for_installs_with_redirect_guard(
         is_allowed: impl Fn(&reqwest::Url) -> bool + Send + Sync + 'static,
     ) -> Self {
+        Self::new_for_installs_with_guards(is_allowed, native_dns_resolver())
+    }
+
+    /// Like [`Self::new_for_installs_with_redirect_guard`], resolving
+    /// hostnames through `dns_resolver`. A [`GuardedDnsResolver`](crate::GuardedDnsResolver)
+    /// there checks the address every connection is opened to.
+    #[must_use]
+    pub fn new_for_installs_with_guards(
+        is_allowed: impl Fn(&reqwest::Url) -> bool + Send + Sync + 'static,
+        dns_resolver: Arc<dyn Resolve>,
+    ) -> Self {
         let redirect_guard: RedirectGuard = Arc::new(is_allowed);
         Self::for_installs_with_redirect(
             &ProxyConfig::default(),
@@ -140,6 +147,7 @@ impl ThrottledClient {
             &PerRegistryTls::default(),
             &NetworkSettings::default(),
             Some(&redirect_guard),
+            dns_resolver,
         )
         .expect("default proxy + TLS configs carry no URLs/PEMs and cannot fail")
     }
@@ -150,57 +158,52 @@ impl ThrottledClient {
         per_registry: &PerRegistryTls,
         settings: &NetworkSettings,
         redirect_guard: Option<&RedirectGuard>,
+        dns_resolver: Arc<dyn Resolve>,
     ) -> Result<Self, ForInstallsError> {
         if settings.network_concurrency == 0 {
             return Err(ForInstallsError::ZeroNetworkConcurrency);
         }
-        // See the empty-value contract on `ProxyConfig`.
-        let https = configured_proxy(proxy.https_proxy.as_deref())?;
-        let http = configured_proxy(proxy.http_proxy.as_deref())?;
-        let no_proxy = Arc::new(NoProxyMatcher::from(proxy.no_proxy.as_ref()));
-        // Read once here, not inside `build_client`: `for_installs`
-        // builds one client per per-registry override, so loading the
-        // bundle per call would re-read and re-parse it N times.
+        let proxy_routing = resolve_proxy_routing(proxy)?;
         let extra_ca_certs = load_node_extra_ca_certs();
 
-        let inputs =
-            ClientBuildInputs { settings, https, http, no_proxy, extra_ca_certs, redirect_guard };
-        let build_client = |effective_tls: &TlsConfig, forbid_redirects: bool| {
-            build_client_with_root_fallback(&inputs, effective_tls, forbid_redirects)
-        };
-
-        let default_clients = ClientPair {
-            follow_redirects: build_client(tls, false)?,
-            no_redirects: build_client(tls, true)?,
-        };
-        // Build one client per per-registry override. Each gets a
-        // merged `TlsConfig` where the per-registry fields shadow
-        // their top-level counterparts field-by-field. `strict_ssl` and
-        // `local_address` are top-level-only, so the per-registry client
-        // still honors the top-level values.
-        let per_registry = per_registry.try_map(|override_| -> Result<_, ForInstallsError> {
-            let merged = merge_tls(tls, override_);
-            Ok(ClientPair {
-                follow_redirects: build_client(&merged, false)?,
-                no_redirects: build_client(&merged, true)?,
-            })
+        let inputs = Arc::new(OwnedClientInputs {
+            settings: settings.clone(),
+            https: proxy_routing.https.clone(),
+            http: proxy_routing.http.clone(),
+            no_proxy: Arc::clone(&proxy_routing.no_proxy),
+            extra_ca_certs,
+            redirect_guard: redirect_guard.cloned(),
+            dns_resolver,
+        });
+        let default_clients = ClientSet::build(&inputs, tls)?;
+        // Build one client set per per-registry override.
+        let per_registry = per_registry.try_map(|override_| {
+            ClientSet::build(&inputs, &merge_tls(tls, override_))
         })?;
 
-        Ok(Self::from_client_pairs(default_clients, per_registry, settings))
+        Ok(Self::from_client_pairs(default_clients, per_registry, proxy_routing, settings))
     }
 
     /// Assemble the client around its built pairs and the settings every
     /// request is throttled by.
     pub(super) fn from_client_pairs(
-        default_clients: ClientPair,
-        per_registry: tls::PerRegistryMap<ClientPair>,
+        default_clients: ClientSet,
+        per_registry: tls::PerRegistryMap<ClientSet>,
+        proxy_routing: ProxyRouting,
         settings: &NetworkSettings,
     ) -> Self {
         ThrottledClient {
             semaphore: PrioritySemaphore::new(settings.network_concurrency),
             default_clients,
             per_registry,
-            host_socket_limit: None,
+            origin_limits: OriginLimits::new(
+                RegistryLimits::new(
+                    &settings.network_concurrency_by_registry,
+                    settings.network_concurrency,
+                ),
+                HostSocketLimit::new(None),
+            ),
+            proxy_routing,
             fetch_warn_timeout: settings.fetch_warn_timeout,
             fetch_min_speed_ki_bps: settings.fetch_min_speed_ki_bps,
             warning_handler: std::sync::RwLock::new(ignore_warning),
@@ -210,21 +213,34 @@ impl ThrottledClient {
     /// Construct a throttled client wrapping aligned pre-built clients.
     /// `client_without_redirects` must carry the same TLS, proxy, timeout,
     /// headers, and protocol settings as `client`, differing only in its
-    /// redirect policy.
+    /// redirect policy. Archive downloads use the same two clients, so they
+    /// see whatever content decoding the clients apply.
     #[must_use]
     pub fn from_clients(client: Client, client_without_redirects: Client) -> Self {
         let semaphore = PrioritySemaphore::new(default_network_concurrency());
         ThrottledClient {
             semaphore,
-            default_clients: ClientPair {
-                follow_redirects: client,
-                no_redirects: client_without_redirects,
-            },
+            default_clients: ClientSet::with_archive(
+                ClientPair {
+                    follow_redirects: client.clone(),
+                    no_redirects: client_without_redirects.clone(),
+                },
+                ClientPair { follow_redirects: client, no_redirects: client_without_redirects },
+            ),
             per_registry: tls::PerRegistryMap::default(),
-            host_socket_limit: None,
+            origin_limits: OriginLimits::new(RegistryLimits::default(), HostSocketLimit::new(None)),
+            proxy_routing: ProxyRouting::default(),
             fetch_warn_timeout: Duration::from_millis(DEFAULT_FETCH_WARN_TIMEOUT_MS),
             fetch_min_speed_ki_bps: DEFAULT_FETCH_MIN_SPEED_KI_BPS,
             warning_handler: std::sync::RwLock::new(ignore_warning),
         }
     }
+}
+
+fn resolve_proxy_routing(proxy: &ProxyConfig) -> Result<ProxyRouting, ForInstallsError> {
+    Ok(ProxyRouting {
+        https: configured_proxy(proxy.https_proxy.as_deref())?,
+        http: configured_proxy(proxy.http_proxy.as_deref())?,
+        no_proxy: Arc::new(NoProxyMatcher::from(proxy.no_proxy.as_ref())),
+    })
 }

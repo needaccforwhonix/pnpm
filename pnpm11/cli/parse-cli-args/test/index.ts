@@ -70,6 +70,32 @@ test('when running a global command inside a workspace, the workspace should be 
   expect(workspaceDir).toBeFalsy()
 })
 
+test('when reading the global config inside a workspace, the workspace should be ignored', async () => {
+  const { workspaceDir } = await parseCliArgs({
+    ...DEFAULT_OPTS,
+    getTypesByCommandName: (commandName: string) => commandName === 'config' ? { location: ['global', 'project'] } : {},
+  }, ['config', 'get', 'minimumReleaseAge', '--location=global'])
+  expect(workspaceDir).toBeFalsy()
+})
+
+test('--location=project takes precedence over --global when looking for the workspace', async () => {
+  const { workspaceDir } = await parseCliArgs({
+    ...DEFAULT_OPTS,
+    universalOptionsTypes: { global: Boolean },
+    getTypesByCommandName: (commandName: string) => commandName === 'config' ? { location: ['global', 'project'] } : {},
+  }, ['config', 'get', 'nodeLinker', '--global', '--location=project'])
+  expect(workspaceDir).toBeTruthy()
+})
+
+test('--workspace-root is allowed with --global when --location=project overrides it', async () => {
+  const { workspaceDir, options } = await parseCliArgs({
+    ...DEFAULT_OPTS,
+    universalOptionsTypes: { global: Boolean, 'workspace-root': Boolean },
+    getTypesByCommandName: (commandName: string) => commandName === 'config' ? { location: ['global', 'project'] } : {},
+  }, ['config', 'set', 'nodeLinker', 'hoisted', '--global', '--location=project', '--workspace-root'])
+  expect(options.dir).toBe(workspaceDir)
+})
+
 test('when running with --ignore-workspace option inside a workspace, the workspace should be ignored', async () => {
   const { workspaceDir } = await parseCliArgs({
     ...DEFAULT_OPTS,
@@ -142,6 +168,29 @@ test('allow any option that starts with "config."', async () => {
   expect(options['save-dev']).toBe(true)
 })
 
+test('a "config." option takes the type the command declares for it', async () => {
+  const { options, rawCliConfig } = await parseCliArgs({
+    ...DEFAULT_OPTS,
+    getTypesByCommandName: (commandName: string) => {
+      if (commandName === 'install') {
+        return {
+          'fetch-retries': Number,
+          'hoist-pattern': [String, Array],
+          offline: Boolean,
+        }
+      }
+      return {}
+    },
+    universalOptionsTypes: { 'test-pattern': [String, Array] },
+  }, ['install', '--config.hoist-pattern=*eslint*', '--config.test-pattern=test/**', '--config.fetch-retries=3', '--config.offline=false', '--config.qar=1'])
+  expect(options['hoist-pattern']).toStrictEqual(['*eslint*'])
+  expect(options['test-pattern']).toStrictEqual(['test/**'])
+  expect(options['fetch-retries']).toBe(3)
+  expect(options.offline).toBe(false)
+  expect(options.qar).toBe('1')
+  expect(rawCliConfig).toStrictEqual({ 'hoist-pattern': ['*eslint*'], 'test-pattern': ['test/**'], 'fetch-retries': 3, offline: false, qar: '1' })
+})
+
 test('do not incorrectly change "install" command to "add"', async () => {
   const { cmd, fallbackCommandUsed } = await parseCliArgs({
     ...DEFAULT_OPTS,
@@ -187,7 +236,7 @@ test('no command', async () => {
   expect(cmd).toBeNull()
 })
 
-// Regression for #11487 — --pm-on-fail must reach the consumer even when
+// Regression for pnpm/pnpm#11487 — --pm-on-fail must reach the consumer even when
 // short-circuited by --help, otherwise users can't bypass the
 // packageManager check just to read help text for a stale-pinned project.
 test('universal options typed in the exploratory parse survive the --help short-circuit', async () => {
@@ -377,7 +426,7 @@ test.each([
     // shouldn't affect its arg parsing. Test both scenarios for good measure.
     const input = [...(testWithCommandFallback ? [] : ['run']), ...testInput.split(' ')]
 
-    // eslint-disable-next-line no-await-in-loop
+    // eslint-disable-next-line no-await-in-loop -- two variants, asserted one after the other
     const { options, cmd, params, fallbackCommandUsed } = await parseCliArgs({
       ...DEFAULT_OPTS,
       fallbackCommand: 'run',
@@ -434,7 +483,7 @@ test('--workspace-root fails if used outside of a workspace', async () => {
   expect(err.code).toBe('ERR_PNPM_NOT_IN_WORKSPACE')
 })
 
-// Regression for #11535. The renamed option (`--prefix` → `dir`) must be
+// Regression for pnpm/pnpm#11535. The renamed option (`--prefix` → `dir`) must be
 // considered when locating the workspace root; otherwise running pnpm from
 // a directory outside the project (e.g. `pnpm --prefix=child install` from
 // the parent dir) misses the workspace manifest in the prefix dir, and
@@ -475,6 +524,16 @@ test('workspaceDir resolves from --prefix on the --version short-circuit', async
   }, ['--prefix=child', '--version'])
   expect(cmd).toBeNull()
   expect(workspaceDir && fs.realpathSync.native(workspaceDir)).toBe(fs.realpathSync.native(child))
+})
+
+test('version bootstrap options parse space-separated string values on the --version short-circuit', async () => {
+  const { cmd, options } = await parseCliArgs({
+    ...DEFAULT_OPTS,
+    universalOptionsTypes: { version: Boolean },
+  }, ['--npmrc-auth-file', '/tmp/auth.npmrc', '--state-dir', '/tmp/state', '--version'])
+  expect(cmd).toBeNull()
+  expect(options['npmrc-auth-file']).toBe('/tmp/auth.npmrc')
+  expect(options['state-dir']).toBe('/tmp/state')
 })
 
 // When both the alias and the canonical option are supplied, the canonical
@@ -524,7 +583,7 @@ test('`pnpm install ""` is going to be just `pnpm install`', async () => {
     ...DEFAULT_OPTS,
   }, ['install', ''])
   expect(cmd).toBe('add')
-  // empty string in params will be filtered at: https://github.com/pnpm/pnpm/blob/main/pkg-manager/plugin-commands-installation/src/installDeps.ts#L196
+  // empty string in params will be filtered at: https://github.com/pnpm/pnpm/blob/32679f0ad4/pkg-manager/plugin-commands-installation/src/installDeps.ts#L196
   expect(params).toStrictEqual([''])
 })
 

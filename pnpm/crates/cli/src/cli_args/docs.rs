@@ -1,11 +1,16 @@
 use clap::Args;
 use pnpm_config::Config;
+use pnpm_network::redact_url_for_display;
 use pnpm_network_web_auth::OpenUrl;
 use pnpm_registry::PackageVersion;
 
 /// Open the documentation page of a package in a browser.
 #[derive(Debug, Args)]
 pub struct DocsArgs {
+    /// The base URL of the npm registry.
+    #[clap(long)]
+    pub registry: Option<String>,
+
     /// Package name (optionally with @version).
     pub package: String,
 }
@@ -17,8 +22,13 @@ impl DocsArgs {
     }
 
     async fn documentation_url(&self, config: &Config) -> miette::Result<String> {
-        let (_, manifest) =
-            super::view::fetch_package_metadata(config, None, &self.package, "docs").await?;
+        let (_, manifest) = super::view::fetch_package_metadata(
+            config,
+            self.registry.as_deref(),
+            &self.package,
+            "docs",
+        )
+        .await?;
         Ok(documentation_url_from_manifest(&manifest))
     }
 }
@@ -43,17 +53,9 @@ fn open_url<Sys: OpenUrl>(url: &str) -> miette::Result<()> {
     match Sys::open_url(url) {
         Ok(()) => Ok(()),
         Err(e) => {
-            let redacted = url::Url::parse(url)
-                .map_or_else(
-                    |_| url.to_string(),
-                    |mut parsed_url| {
-                        let _ = parsed_url.set_username("");
-                        let _ = parsed_url.set_password(None);
-                        parsed_url.to_string()
-                    },
-                );
-            eprintln!("Could not open browser: {e}");
-            println!("{redacted}");
+            let redacted = redact_url_for_display(url);
+            pnpm_diagnostics::eprintln!("Could not open browser: {e}");
+            pnpm_diagnostics::println!("{redacted}");
             Ok(())
         }
     }

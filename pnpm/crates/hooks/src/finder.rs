@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -37,23 +38,50 @@ pub fn load_pnpmfile(root: &Path) -> Option<Arc<dyn PnpmfileHooks>> {
 /// own and stays out of `pnpmfileChecksum`, so nothing that trusts the checksum
 /// may treat it as accounted for — the same split pnpm's `requireHooks` makes
 /// with `includeInChecksum: false`.
+///
+/// The plugins among `config_dependencies` load between the two, and count
+/// toward the checksum like the project's own pnpmfile.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PnpmfileSelection<'a> {
     pub configured: Option<&'a [PathBuf]>,
     pub global: Option<&'a Path>,
+    pub config_dependencies: Option<&'a dyn ConfigDependencyNames>,
 }
 
+/// The names a project declares under `configDependencies`, whatever each
+/// entry records beside its name.
+pub trait ConfigDependencyNames: std::fmt::Debug + Sync {
+    fn config_dependency_names(&self) -> Box<dyn Iterator<Item = &str> + '_>;
+}
+
+impl<Value: std::fmt::Debug + Sync> ConfigDependencyNames for BTreeMap<String, Value> {
+    fn config_dependency_names(&self) -> Box<dyn Iterator<Item = &str> + '_> {
+        Box::new(self.keys().map(String::as_str))
+    }
+}
+
+/// The pnpmfiles `selection` names under `root`, in the order their hooks
+/// run: the global pnpmfile, the pnpmfiles of config-dependency plugins
+/// installed under `root`, then the project's own.
 #[must_use]
 pub fn find_pnpmfiles(root: &Path, selection: PnpmfileSelection<'_>) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = selection.global
         .map(Path::to_path_buf)
         .into_iter()
         .collect();
+    let plugins = selection.config_dependencies
+        .map(|dependencies| {
+            calc_pnpmfile_paths_of_plugin_deps(
+                &root.join("node_modules").join(".pnpm-config"),
+                dependencies.config_dependency_names(),
+            )
+        })
+        .unwrap_or_default();
     let project = match selection.configured {
         Some(configured) => configured.to_vec(),
         None => find_pnpmfile(root).into_iter().collect(),
     };
-    for path in project {
+    for path in plugins.into_iter().chain(project) {
         if !paths.contains(&path) {
             paths.push(path);
         }
@@ -63,7 +91,7 @@ pub fn find_pnpmfiles(root: &Path, selection: PnpmfileSelection<'_>) -> Vec<Path
 
 /// A pnpmfile named by the `pnpmfile` setting that is not on disk. Discovery of
 /// the default `.pnpmfile.mjs` / `.pnpmfile.cjs` cannot produce this: an absent
-/// default simply means the project has no pnpmfile, while a configured path
+/// default means the project has no pnpmfile, while a configured path
 /// that resolves to nothing is a misconfiguration the install has to report.
 #[derive(Debug, Display, Error)]
 #[display("pnpmfile at \"{}\" is not found", path.display())]
@@ -99,12 +127,12 @@ pub fn validate_configured_pnpmfiles(
 /// pnpmfile itself requires a missing module, say — is an execution failure and
 /// must keep reporting as one. Hence a bare existence test rather than
 /// [`Path::is_file`], and the `.cjs` suffix pnpm appends to a path that names
-/// neither module extension itself.
+/// none of the supported module extensions itself.
 fn pnpmfile_exists(path: &Path) -> bool {
     let names_a_module = path
         .extension()
         .and_then(std::ffi::OsStr::to_str)
-        .is_some_and(|extension| matches!(extension, "cjs" | "mjs"));
+        .is_some_and(|extension| matches!(extension, "cjs" | "js" | "mjs"));
     if names_a_module {
         return path.exists();
     }
@@ -132,14 +160,66 @@ pub fn load_pnpmfiles(
         // has to go through the wrapper, including a lone global one: its hash
         // must not become the project's.
         (1, 0) => hooks.into_iter().next(),
-        _ => Some(Arc::new(CombinedPnpmfileHooks { hooks, checksum_skips })),
+        _ => Some(Arc::new(CombinedPnpmfileHooks {
+            workspace_hooks_from: hooks.len(),
+            hooks,
+            checksum_skips,
+        })),
     })
+}
+
+/// The pnpmfiles an install of a workspace project with its own lockfile
+/// runs: the project's own (see [`load_pnpmfiles`]), then the workspace
+/// root's that are not among them, the global pnpmfile once. The
+/// `pnpmfileChecksum` covers the project's pnpmfiles when they define any
+/// hooks, else the workspace root's.
+pub fn load_workspace_project_pnpmfiles(
+    project_dir: &Path,
+    workspace_root: &Path,
+    selection: PnpmfileSelection<'_>,
+) -> Result<Option<Arc<dyn PnpmfileHooks>>, MissingPnpmfileError> {
+    validate_configured_pnpmfiles(selection)?;
+    let project_paths = find_pnpmfiles(project_dir, selection);
+    let workspace_paths: Vec<PathBuf> =
+        find_pnpmfiles(workspace_root, PnpmfileSelection { global: None, ..selection })
+            .into_iter()
+            .filter(|path| !project_paths.contains(path))
+            .collect();
+    if workspace_paths.is_empty() {
+        return load_pnpmfiles(project_dir, selection);
+    }
+    let workspace_hooks_from = project_paths.len();
+    let hooks: Vec<_> = project_paths
+        .into_iter()
+        .chain(workspace_paths)
+        .map(load_pnpmfile_at)
+        .collect();
+    Ok(Some(Arc::new(CombinedPnpmfileHooks {
+        hooks,
+        checksum_skips: usize::from(selection.global.is_some()),
+        workspace_hooks_from,
+    })))
+}
+
+/// Whether any of `hooks` exports a `hooks` object, which is what makes a
+/// pnpmfile count toward `pnpmfileChecksum`.
+async fn defines_hooks(hooks: &[Arc<dyn PnpmfileHooks>]) -> bool {
+    for hook in hooks {
+        if hook.calculate_pnpmfile_checksum().await.is_some() {
+            return true;
+        }
+    }
+    false
 }
 
 struct CombinedPnpmfileHooks {
     hooks: Vec<Arc<dyn PnpmfileHooks>>,
     /// How many leading entries of [`Self::hooks`] the checksum leaves out.
     checksum_skips: usize,
+    /// Where the workspace root's hooks start (see
+    /// [`load_workspace_project_pnpmfiles`]), or `hooks.len()` when there are
+    /// none.
+    workspace_hooks_from: usize,
 }
 
 #[async_trait]
@@ -171,10 +251,17 @@ impl PnpmfileHooks for CombinedPnpmfileHooks {
         Ok(if changed { lockfile } else { Value::Null })
     }
 
-    async fn pre_resolution(&self, ctx: PreResolutionHookContext, logger: PreResolutionHookLogger) {
+    async fn pre_resolution(
+        &self,
+        mut ctx: PreResolutionHookContext,
+        logger: PreResolutionHookLogger,
+    ) -> Result<PreResolutionHookContext, HookError> {
         for hook in &self.hooks {
-            hook.pre_resolution(ctx.clone(), logger.clone()).await;
+            if hook.has_pre_resolution().await? {
+                ctx = hook.pre_resolution(ctx, logger.clone()).await?;
+            }
         }
+        Ok(ctx)
     }
 
     async fn filter_log(&self, log: Value, ctx: HookContext) -> bool {
@@ -186,16 +273,60 @@ impl PnpmfileHooks for CombinedPnpmfileHooks {
         true
     }
 
-    async fn calculate_pnpmfile_checksum(&self) -> Option<String> {
-        let mut includes_hooks = false;
+    async fn has_read_package(&self) -> Result<bool, HookError> {
         for hook in &self.hooks {
-            includes_hooks |= hook.calculate_pnpmfile_checksum().await.is_some();
+            if hook.has_read_package().await? {
+                return Ok(true);
+            }
         }
-        if !includes_hooks {
-            return None;
-        }
+        Ok(false)
+    }
 
-        let mut paths: Vec<&Path> = self.hooks[self.checksum_skips..]
+    async fn has_after_all_resolved(&self) -> Result<bool, HookError> {
+        for hook in &self.hooks {
+            if hook.has_after_all_resolved().await? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn has_pre_resolution(&self) -> Result<bool, HookError> {
+        for hook in &self.hooks {
+            if hook.has_pre_resolution().await? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn untracked_read_package_hook(&self) -> Result<Option<bool>, HookError> {
+        if self.checksum_skips == 0 {
+            return Ok(None);
+        }
+        for hook in self.hooks.iter().take(self.checksum_skips) {
+            if hook.has_read_package().await? {
+                return Ok(Some(true));
+            }
+        }
+        Ok(Some(false))
+    }
+
+    async fn calculate_pnpmfile_checksum(&self) -> Option<String> {
+        let (project_hooks, workspace_hooks) = self.hooks.split_at(self.workspace_hooks_from);
+        let (global_hooks, project_hooks) = project_hooks.split_at(self.checksum_skips);
+        let checksummed = if defines_hooks(project_hooks).await {
+            project_hooks
+        } else if defines_hooks(workspace_hooks).await {
+            workspace_hooks
+        } else if defines_hooks(global_hooks).await {
+            // A lone global pnpmfile still records a checksum, over no file.
+            project_hooks
+        } else {
+            return None;
+        };
+
+        let mut paths: Vec<&Path> = checksummed
             .iter()
             .filter_map(|hook| hook.source_path())
             .collect();

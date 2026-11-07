@@ -4,7 +4,11 @@ use miette::{IntoDiagnostic, Result, WrapErr};
 use semver::{Version, VersionReq};
 use std::collections::BTreeMap;
 
-pub(crate) const CRATES_IO_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
+/// The source identifier `cargo` writes for a crates.io package. A crate is
+/// locked against it when its dependency named crates.io or named no
+/// registry from a dependent that came from crates.io, whichever registry
+/// the replacement in `.cargo/config.toml` served it from.
+pub const CRATES_IO_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 const CRATES_IO_INDEX: &str = "https://github.com/rust-lang/crates.io-index";
 const CRATES_IO_SPARSE_SOURCE: &str = "sparse+https://index.crates.io/";
 
@@ -18,6 +22,16 @@ pub fn is_crates_io(index_url: &str) -> bool {
     index_url.trim_end_matches('/') == CRATES_IO_SPARSE_INDEX
 }
 
+/// Whether a `[patch.<key>]` table of a Cargo manifest replaces crates.io
+/// crates: `crates-io`, or the URL of the crates.io git or sparse index.
+#[must_use]
+pub fn patches_crates_io(key: &str) -> bool {
+    let url = key.trim_end_matches('/');
+    key == "crates-io"
+        || url == CRATES_IO_INDEX
+        || url.strip_prefix("sparse+").is_some_and(is_crates_io)
+}
+
 /// The `source` identifier of a sparse registry, as `cargo` spells it in
 /// `.cargo/config.toml` and in `Cargo.lock`.
 #[must_use]
@@ -25,10 +39,11 @@ pub fn sparse_source(index_url: &str) -> String {
     format!("sparse+{}/", index_url.trim_end_matches('/'))
 }
 
-/// The `source` a `Cargo.lock` records for packages taken from `index_url`.
-/// crates.io keeps the canonical git identifier `cargo` itself writes even
-/// when the sparse index served the metadata; every other registry is named
-/// by its sparse index.
+/// The source identifier of the registry `index_url` addresses, which is
+/// what a dependency naming a registry is measured against. crates.io keeps
+/// the canonical git identifier `cargo` itself writes even when the sparse
+/// index served the metadata; every other registry is named by its sparse
+/// index.
 #[must_use]
 pub fn registry_source(index_url: &str) -> String {
     if is_crates_io(index_url) { CRATES_IO_SOURCE.to_string() } else { sparse_source(index_url) }
@@ -59,11 +74,20 @@ pub(crate) struct Registry {
 
 impl Registry {
     pub(crate) fn new(index_files: &BTreeMap<String, String>, source: &str) -> Result<Self> {
-        let mut packages = BTreeMap::new();
+        let mut registry = Self::empty(source);
+        registry.add_entries(index_files)?;
+        Ok(registry)
+    }
+
+    pub(crate) fn empty(source: &str) -> Self {
+        Self { packages: BTreeMap::new(), source: source.to_string() }
+    }
+
+    pub(crate) fn add_entries(&mut self, index_files: &BTreeMap<String, String>) -> Result<()> {
         for (name, contents) in index_files {
-            packages.insert(normalize_name(name), parse_index_file(name, contents)?);
+            self.packages.insert(normalize_name(name), parse_index_file(name, contents)?);
         }
-        Ok(Self { packages, source: source.to_string() })
+        Ok(())
     }
 
     /// Reject a dependency that names a registry other than the one being
@@ -108,6 +132,62 @@ pub fn latest_version(name: &str, index_file: &str) -> Result<String> {
         .find(|version| !version.yanked && version.version.pre.is_empty())
         .map(|version| version.version.to_string())
         .ok_or_else(|| miette::miette!("crate {name} has no stable, non-yanked version"))
+}
+
+/// The entries of `features` that version `version` of crate `name` does
+/// not define, read from its sparse-index entry. A dependency declaration
+/// that enables one of them cannot resolve to that version.
+pub fn missing_features(
+    name: &str,
+    index_file: &str,
+    version: &Version,
+    features: &[String],
+) -> Result<Vec<String>> {
+    let registry = Registry::new(
+        &BTreeMap::from([(name.to_string(), index_file.to_string())]),
+        CRATES_IO_SOURCE,
+    )?;
+    let package = registry
+        .package(name)?
+        .iter()
+        .find(|candidate| candidate.version == *version)
+        .ok_or_else(|| miette::miette!("crate {name} has no version {version} in its index"))?;
+    Ok(crate::features::missing_features(package, features)
+        .into_iter()
+        .map(str::to_string)
+        .collect())
+}
+
+/// Return the newest non-yanked version from a crates.io sparse-index entry
+/// matching `requirement`, or the newest stable non-yanked version when
+/// `requirement` is `None`.
+pub fn latest_matching_version(
+    name: &str,
+    index_file: &str,
+    requirement: Option<&VersionReq>,
+) -> Result<Option<Version>> {
+    let registry = Registry::new(
+        &BTreeMap::from([(name.to_string(), index_file.to_string())]),
+        CRATES_IO_SOURCE,
+    )?;
+    let versions = registry.package(name)?;
+    let selected = match requirement {
+        Some(req) => versions
+            .iter()
+            .rev()
+            .find(|version| !version.yanked && req.matches(&version.version)),
+        None => versions
+            .iter()
+            .rev()
+            .find(|version| !version.yanked && version.version.pre.is_empty())
+            .or_else(|| {
+                versions
+                    .iter()
+                    .rev()
+                    .find(|version| !version.yanked)
+            }),
+    };
+    Ok(selected.map(|version| version.version.clone()))
 }
 
 fn parse_index_file(name: &str, contents: &str) -> Result<Vec<RegistryVersion>> {
@@ -170,6 +250,24 @@ fn registry_dependency_from_index(dependency: IndexDependency<'_>) -> Result<Reg
     })
 }
 
+/// The compatibility lines `requirement` is met on, oldest first, each
+/// paired with the newest non-yanked version on it.
+///
+/// `cargo` lets semver-incompatible versions of a crate coexist, so a
+/// requirement spanning several lines may be met on any one of them.
+pub(crate) fn matching_lines(
+    versions: &[RegistryVersion],
+    requirement: &VersionReq,
+) -> Vec<(String, Version)> {
+    // Ascending, so the last version recorded for a line is its newest.
+    let newest = matching_versions(versions, requirement)
+        .map(|version| (compatibility_line(&version.version), version.version.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut lines = newest.into_iter().collect::<Vec<_>>();
+    lines.sort_by(|left, right| left.1.cmp(&right.1));
+    lines
+}
+
 pub(crate) fn matching_versions<'a>(
     versions: &'a [RegistryVersion],
     requirement: &'a VersionReq,
@@ -179,7 +277,7 @@ pub(crate) fn matching_versions<'a>(
         .filter(|version| !version.yanked && requirement.matches(&version.version))
 }
 
-fn is_crates_io_source(registry: &str) -> bool {
+pub(crate) fn is_crates_io_source(registry: &str) -> bool {
     matches!(registry, CRATES_IO_SOURCE | CRATES_IO_INDEX | CRATES_IO_SPARSE_SOURCE)
 }
 

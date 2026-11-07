@@ -32,6 +32,8 @@ const readInstalledPackages = jest.fn<() => Promise<[]>>().mockResolvedValue([])
 const summaryDebug = jest.fn()
 const activateGlobalInstall = jest.fn<(opts: unknown) => Promise<Set<string>>>().mockResolvedValue(new Set(['pnpm']))
 const cleanupReplacedGlobalInstalls = jest.fn<(opts: unknown) => Promise<void>>().mockResolvedValue(undefined)
+const getActualBinNames = jest.fn<(opts: unknown) => Promise<Set<string>>>().mockResolvedValue(new Set(['pnpm']))
+const DIR_SYMLINK_TYPE = process.platform === 'win32' ? 'junction' : 'dir'
 
 jest.unstable_mockModule('@pnpm/core-loggers', () => ({ summaryLogger: { debug: summaryDebug } }))
 jest.unstable_mockModule('@pnpm/global.packages', () => ({
@@ -51,6 +53,7 @@ jest.unstable_mockModule('../src/installGlobalPackages.js', () => ({ installGlob
 jest.unstable_mockModule('../src/globalActivation.js', () => ({
   activateGlobalInstall,
   cleanupReplacedGlobalInstalls,
+  getActualBinNames,
 }))
 jest.unstable_mockModule('../src/promptApproveGlobalBuilds.js', () => ({ promptApproveGlobalBuilds }))
 jest.unstable_mockModule('../src/readInstalledPackages.js', () => ({ readInstalledPackages }))
@@ -66,6 +69,7 @@ beforeEach(() => {
   findGlobalPackage.mockReturnValue(null)
   getInstalledBinNames.mockResolvedValue(['pnpm'])
   activateGlobalInstall.mockResolvedValue(new Set(['pnpm']))
+  getActualBinNames.mockResolvedValue(new Set(['pnpm']))
   scanGlobalPackages.mockReturnValue([])
 })
 
@@ -111,7 +115,7 @@ test('global add still replaces exact aliases in mixed existing groups', () => {
   }, aliases, replacementAliases)).toBe(true)
 })
 
-test('global add activates before cleaning up a same-hash pnpm replacement', async () => {
+test('global add does not inspect survivors when every replaced bin is retained', async () => {
   const existingPnpm = {
     dependencies: { pnpm: '12.0.0-alpha.2' },
     hash: 'old-pnpm',
@@ -129,7 +133,10 @@ test('global add activates before cleaning up a same-hash pnpm replacement', asy
     return alias === 'pnpm' ? existingPnpm : null
   })
   scanGlobalPackages.mockReturnValue([existingPnpm, survivor])
-  getInstalledBinNames.mockImplementation(async (pkg) => pkg === existingPnpm ? ['pnpm'] : ['eslint'])
+  getInstalledBinNames.mockImplementation(async (pkg) => {
+    if (pkg === existingPnpm) return ['pnpm']
+    throw new Error('unrelated survivor manifest is unreadable')
+  })
   activateGlobalInstall.mockResolvedValue(activatedBins)
   checkGlobalBinConflicts.mockImplementation(async (opts) => {
     expect(opts.shouldSkip(existingPnpm)).toBe(true)
@@ -142,7 +149,7 @@ test('global add activates before cleaning up a same-hash pnpm replacement', asy
     globalPkgDir: '/global/v11',
     registriesByScope: {},
     updateResolutionPolicyManifest,
-  } as any, ['file:/tmp/pnpm'], {}) // eslint-disable-line @typescript-eslint/no-explicit-any
+  } as any, ['file:/tmp/pnpm'], {}) // eslint-disable-line @typescript-eslint/no-explicit-any -- the test passes only the options the handler reads
 
   expect(findGlobalPackage).toHaveBeenCalledWith('/global/v11', '@pnpm/exe')
   expect(findGlobalPackage).toHaveBeenCalledWith('/global/v11', 'pnpm')
@@ -152,6 +159,8 @@ test('global add activates before cleaning up a same-hash pnpm replacement', asy
     globalBinDir: '/global/bin',
     pkgs: [],
     binsToSkip: new Set(),
+    requiredBinNames: new Set(['pnpm']),
+    nodePathOptions: expect.any(Object),
   })
   expect(cleanupReplacedGlobalInstalls).toHaveBeenCalledWith({
     groups: [{ info: existingPnpm, binNames: ['pnpm'] }],
@@ -159,16 +168,49 @@ test('global add activates before cleaning up a same-hash pnpm replacement', asy
     globalBinDir: '/global/bin',
     activeHash: 'old-pnpm',
     activatedBins,
-    protectedBins: new Set(['eslint']),
+    protectedBins: new Set(),
   })
-  expect(getInstalledBinNames).toHaveBeenCalledTimes(2)
+  expect(getInstalledBinNames).toHaveBeenCalledTimes(1)
   expect(getInstalledBinNames).toHaveBeenCalledWith(existingPnpm)
-  expect(getInstalledBinNames).toHaveBeenCalledWith(survivor)
+  expect(scanGlobalPackages).not.toHaveBeenCalled()
   for (const callOrder of getInstalledBinNames.mock.invocationCallOrder) {
     expect(callOrder).toBeLessThan(activateGlobalInstall.mock.invocationCallOrder[0])
   }
   expect(activateGlobalInstall.mock.invocationCallOrder[0]).toBeLessThan(cleanupReplacedGlobalInstalls.mock.invocationCallOrder[0])
   expect(cleanupReplacedGlobalInstalls.mock.invocationCallOrder[0]).toBeLessThan(updateResolutionPolicyManifest.mock.invocationCallOrder[0])
+})
+
+test('global add inspects survivors when a declared retained bin target is missing', async () => {
+  const existingPnpm = {
+    dependencies: { pnpm: '12.0.0-alpha.2' },
+    hash: 'old-pnpm',
+    installDir: '/global/v11/old-pnpm',
+  }
+  const survivor = {
+    dependencies: { 'other-package': '1.0.0' },
+    hash: 'survivor',
+    installDir: '/global/v11/survivor',
+  }
+  const survivorError = Object.assign(new Error('survivor package.json is missing'), { code: 'ENOENT' })
+  findGlobalPackage.mockImplementation((_globalDir: string, alias: string) => {
+    return alias === 'pnpm' ? existingPnpm : null
+  })
+  scanGlobalPackages.mockReturnValue([existingPnpm, survivor])
+  getActualBinNames.mockResolvedValue(new Set())
+  getInstalledBinNames.mockImplementation(async (pkg) => {
+    if (pkg === existingPnpm) return ['pnpm']
+    throw survivorError
+  })
+
+  await expect(handleGlobalAdd({
+    bin: '/global/bin',
+    dir: '/project',
+    globalPkgDir: '/global/v11',
+    registriesByScope: {},
+  } as any, ['file:/tmp/pnpm'], {})).rejects.toBe(survivorError) // eslint-disable-line @typescript-eslint/no-explicit-any -- the test passes only the options the handler reads
+
+  expect(getInstalledBinNames).toHaveBeenCalledWith(survivor)
+  expect(activateGlobalInstall).not.toHaveBeenCalled()
 })
 
 test('global add retries safely and activates from a complete replacement ownership snapshot after repair', async () => {
@@ -185,7 +227,7 @@ test('global add retries safely and activates from a complete replacement owners
   fs.mkdirSync(globalBinDir, { recursive: true })
   fs.writeFileSync(oldMarker, 'old install\n')
   fs.writeFileSync(path.join(survivorInstallDir, 'marker'), 'survivor install\n')
-  fs.symlinkSync(oldInstallDir, oldHashLink, process.platform === 'win32' ? 'junction' : 'dir')
+  fs.symlinkSync(oldInstallDir, oldHashLink, DIR_SYMLINK_TYPE)
 
   const existingPnpm = {
     dependencies: { pnpm: '12.0.0-alpha.2' },
@@ -201,8 +243,7 @@ test('global add retries safely and activates from a complete replacement owners
   const freshInstallDirs: string[] = []
   createInstallDir.mockImplementation(() => {
     const freshInstallDir = path.join(globalDir, `fresh-install-${freshInstallDirs.length + 1}`)
-    const relative = path.relative(root, freshInstallDir)
-    expect(path.isAbsolute(relative) || relative === '..' || relative.startsWith(`..${path.sep}`)).toBe(false)
+    expect(isInsideDir(root, freshInstallDir)).toBe(true)
     fs.mkdirSync(freshInstallDir, { recursive: true })
     fs.writeFileSync(path.join(freshInstallDir, 'marker'), 'fresh install\n')
     freshInstallDirs.push(freshInstallDir)
@@ -213,6 +254,7 @@ test('global add retries safely and activates from a complete replacement owners
     return alias === 'pnpm' ? existingPnpm : null
   })
   scanGlobalPackages.mockReturnValue([existingPnpm, survivor])
+  getActualBinNames.mockResolvedValue(new Set())
   let ownershipBroken = true
   getInstalledBinNames.mockImplementation(async (pkg) => {
     if (pkg === existingPnpm && ownershipBroken) throw enumerationError
@@ -224,7 +266,7 @@ test('global add retries safely and activates from a complete replacement owners
     dir: root,
     globalPkgDir: globalDir,
     registriesByScope: {},
-  } as any, ['file:/tmp/pnpm'], {}) // eslint-disable-line @typescript-eslint/no-explicit-any
+  } as any, ['file:/tmp/pnpm'], {}) // eslint-disable-line @typescript-eslint/no-explicit-any -- the test passes only the options the handler reads
   const snapshotBeforeActivation = (): unknown => ({
     binEntries: fs.readdirSync(globalBinDir).sort(),
     globalEntries: fs.readdirSync(globalDir).sort(),
@@ -234,12 +276,7 @@ test('global add retries safely and activates from a complete replacement owners
   })
   const before = snapshotBeforeActivation()
   const assertFailedAttempt = async (attempt: number): Promise<void> => {
-    let failure: unknown
-    try {
-      await add()
-    } catch (err) {
-      failure = err
-    }
+    const failure = await captureRejection(add)
     expect({ attempt, failure }).toStrictEqual({ attempt, failure: enumerationError })
     expect(snapshotBeforeActivation()).toStrictEqual(before)
     expect(fs.existsSync(freshInstallDirs[attempt - 1])).toBe(false)
@@ -257,7 +294,7 @@ test('global add retries safely and activates from a complete replacement owners
       ownershipReadsAtSwitch = getInstalledBinNames.mock.calls.length
       const installDir = (opts as { installDir: string }).installDir
       fs.unlinkSync(oldHashLink)
-      fs.symlinkSync(installDir, oldHashLink, process.platform === 'win32' ? 'junction' : 'dir')
+      fs.symlinkSync(installDir, oldHashLink, DIR_SYMLINK_TYPE)
       return new Set(['pnpm'])
     })
 
@@ -271,7 +308,7 @@ test('global add retries safely and activates from a complete replacement owners
       globalDir,
       activeHash: 'old-pnpm',
       activatedBins: new Set(['pnpm']),
-      protectedBins: new Set(['eslint']),
+      protectedBins: new Set(),
     })
     expect(getInstalledBinNames).toHaveBeenCalledTimes(ownershipReadsAtSwitch)
     expect(freshInstallDirs).toHaveLength(3)
@@ -301,7 +338,7 @@ test('global add preserves ownership state and both errors when fresh install cl
   fs.writeFileSync(path.join(survivorInstallDir, 'marker'), 'survivor install\n')
   fs.writeFileSync(path.join(freshInstallDir, 'marker'), 'fresh install\n')
   fs.writeFileSync(oldBin, 'old pnpm shim\n')
-  fs.symlinkSync(oldInstallDir, oldHashLink, process.platform === 'win32' ? 'junction' : 'dir')
+  fs.symlinkSync(oldInstallDir, oldHashLink, DIR_SYMLINK_TYPE)
 
   const existingPnpm = {
     dependencies: { pnpm: '12.0.0-alpha.2' },
@@ -346,7 +383,7 @@ test('global add preserves ownership state and both errors when fresh install cl
         dir: root,
         globalPkgDir: globalDir,
         registriesByScope: {},
-      } as any, ['file:/tmp/pnpm'], {}) // eslint-disable-line @typescript-eslint/no-explicit-any
+      } as any, ['file:/tmp/pnpm'], {}) // eslint-disable-line @typescript-eslint/no-explicit-any -- the test passes only the options the handler reads
     } catch (err) {
       thrown = err
     }
@@ -376,8 +413,22 @@ test('global add does not clean up or persist policy when activation fails', asy
     globalPkgDir: '/global/v11',
     registriesByScope: {},
     updateResolutionPolicyManifest,
-  } as any, ['file:/tmp/pnpm'], {})).rejects.toBe(activationError) // eslint-disable-line @typescript-eslint/no-explicit-any
+  } as any, ['file:/tmp/pnpm'], {})).rejects.toBe(activationError) // eslint-disable-line @typescript-eslint/no-explicit-any -- the test passes only the options the handler reads
 
   expect(cleanupReplacedGlobalInstalls).not.toHaveBeenCalled()
   expect(updateResolutionPolicyManifest).not.toHaveBeenCalled()
 })
+
+function isInsideDir (parentDir: string, dir: string): boolean {
+  const relative = path.relative(parentDir, dir)
+  return !(path.isAbsolute(relative) || relative === '..' || relative.startsWith(`..${path.sep}`))
+}
+
+async function captureRejection (run: () => Promise<unknown>): Promise<unknown> {
+  try {
+    await run()
+  } catch (err) {
+    return err
+  }
+  return undefined
+}

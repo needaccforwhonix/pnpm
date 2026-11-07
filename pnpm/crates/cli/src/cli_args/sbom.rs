@@ -8,8 +8,8 @@ use crate::{
     cli_args::{
         install::resolve_bool_override,
         recursive::{
-            AutoExcludeRoot, discover_workspace_projects, no_projects_matched_message,
-            notice_workspace_dir, select_recursive_projects, selected_importer_ids,
+            AutoExcludeRoot, discover_workspace_projects, print_no_projects_matched,
+            select_recursive_projects, selected_workspace_importer_ids, selectors_narrow_the_run,
         },
     },
 };
@@ -17,36 +17,41 @@ use clap::Args;
 use collection::collect_components;
 use cyclonedx::{CycloneDxOpts, serialize_cyclonedx};
 use indexmap::IndexMap;
+use license::classify_license;
 use metadata::{
-    base64_to_hex, build_purl, classify_license, extract_bugs_url, extract_repository,
+    base64_to_hex, build_purl, extract_bugs_url, extract_description, extract_repository,
     generate_uuid_v4, integrity_string, normalize_link_path, peer_names_from_manifest,
     platform_incompatible_optional, read_pkg_metadata_from_store, sanitize_package_name,
     sanitize_path_segment, tarball_url_for_component,
 };
 use pnpm_config::Config;
 use pnpm_lockfile::{
-    LazyLockfile, Lockfile, LockfileResolution, PackageKey, PackageMetadata, PkgName,
-    PkgNameVerPeer, SnapshotEntry,
+    LazyLockfile, Lockfile, LockfileResolution, PackageKey, PackageMetadata, PeerSatisfactionEdges,
+    PkgName, PkgNameVerPeer, SnapshotEntry,
 };
 use pnpm_package_is_installable::{
     InstallabilityOptions, WantedPlatformRef, platform_is_supported_with_inference,
 };
 use pnpm_package_manager::{importer_root_dir, validate_importer_id};
-use pnpm_package_manifest::{extract_author, extract_homepage, safe_read_package_json_from_dir};
+use pnpm_package_manifest::{
+    extract_author, extract_homepage, extract_license, safe_read_package_json_from_dir,
+    safe_read_project_manifest_from_dir,
+};
+use pnpm_resolving_git_resolver::{HostedGit, HostedOpts};
 use spdx::serialize_spdx;
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
     fmt::Display,
     hash::Hash,
-    io::Write,
     path::{Path, PathBuf},
 };
 use walk::{
-    ImporterComponents, WalkContext, WalkStores, component_walk_context, walk_importer_components,
+    ImporterComponents, TransitiveEdges, WalkContext, WalkStores, component_walk_context,
+    walk_importer_components,
 };
 use workspace::{
     merged_dedicated_lockfile_state, required_sbom_lockfile, select_importer_ids,
-    selectors_narrow_the_run, sorted_importer_ids,
+    sorted_importer_ids,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -120,11 +125,7 @@ pub struct SbomDependencyArgs {
     pub exclude_peers: bool,
 }
 
-struct IncludeFilter {
-    dependencies: bool,
-    dev_dependencies: bool,
-    optional_dependencies: bool,
-}
+use pnpm_modules_yaml::IncludedDependencies as IncludeFilter;
 
 impl SbomArgs {
     fn include_filter(&self, include_optional: bool) -> IncludeFilter {
@@ -197,7 +198,7 @@ struct SbomResult {
 }
 
 /// Resolve a lockfile importer key to the on-disk directory whose
-/// `package.json` the SBOM reads, returning `None` when that directory does
+/// project manifest the SBOM reads, returning `None` when that directory does
 /// not stay inside the lockfile dir. Mirrors pnpm's SBOM importer handling
 /// (`sbom.ts`): `validate_importer_id` is the cheap lexical pre-filter, then
 /// both the lockfile dir and the importer dir are canonicalized so a
@@ -234,7 +235,7 @@ impl SbomArgs {
         if self.splits_output(&importer_ids) {
             return self.write_split_sboms(
                 &state,
-                &include,
+                include,
                 &authors,
                 &importer_ids,
                 virtual_store_dirs.as_deref(),
@@ -249,7 +250,7 @@ impl SbomArgs {
             });
         let result = collect_components(
             &state,
-            &include,
+            include,
             self.document.sbom_type,
             self.dependencies.exclude_peers,
             self.lockfile_only,
@@ -282,15 +283,13 @@ impl SbomArgs {
     }
 
     fn write_single_sbom(&self, result: &SbomResult, output: &str) -> miette::Result<()> {
-        let mut stdout = std::io::stdout();
         if let Some(out_template) = self.out.as_deref() {
             let file_path = sbom_output_path(out_template, result);
             write_sbom_file(&file_path, output)?;
-            let _ = writeln!(stdout, "{file_path}");
+            pnpm_diagnostics::println!("{file_path}");
         } else {
-            let _ = write!(stdout, "{output}");
+            pnpm_diagnostics::print!("{output}");
         }
-        let _ = stdout.flush();
         Ok(())
     }
 
@@ -347,7 +346,7 @@ impl SbomArgs {
     fn write_split_sboms(
         &self,
         state: &State,
-        include: &IncludeFilter,
+        include: IncludeFilter,
         authors: &[String],
         importer_ids: &[String],
         virtual_store_dirs: Option<&[PathBuf]>,
@@ -395,10 +394,8 @@ impl SbomArgs {
     }
 
     fn print_split_outputs(&self, files: &[String], ndjson_lines: &[String]) {
-        let mut stdout = std::io::stdout();
         if self.out.is_some() {
-            let _ = writeln!(
-                stdout,
+            pnpm_diagnostics::println!(
                 "Generated {} SBOMs:\n{}",
                 files.len(),
                 files
@@ -408,9 +405,8 @@ impl SbomArgs {
                     .join("\n"),
             );
         } else {
-            let _ = write!(stdout, "{}", ndjson_lines.join("\n"));
+            pnpm_diagnostics::print!("{}", ndjson_lines.join("\n"));
         }
-        let _ = stdout.flush();
     }
 }
 
@@ -457,6 +453,8 @@ mod spdx;
 mod workspace;
 
 mod walk;
+
+mod license;
 
 mod metadata;
 

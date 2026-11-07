@@ -39,10 +39,12 @@ fn resolved_location_matches_canonicalize_fallback_for_node_path() {
     let real_slot_pkg_dir = dunce::canonicalize(&slot_pkg_dir).unwrap();
     let via_fallback = super::super::shim_node_path(
         &PackageBinSource::new(alias.clone(), Arc::clone(&manifest)),
+        None,
         &extras,
     );
     let via_resolved = super::super::shim_node_path(
         &PackageBinSource::new(alias, manifest).with_resolved_location(real_slot_pkg_dir.clone()),
+        None,
         &extras,
     );
     assert_eq!(via_fallback, via_resolved);
@@ -62,19 +64,82 @@ fn resolved_location_matches_canonicalize_fallback_for_node_path() {
     );
 }
 
+#[test]
+fn a_project_node_path_comes_first_and_a_repeated_entry_keeps_its_first_position() {
+    let tmp = tempdir().unwrap();
+    let pkg_dir = tmp
+        .path()
+        .join("node_modules")
+        .join(".pnpm")
+        .join("foo@1.0.0")
+        .join("node_modules")
+        .join("foo");
+    let slot_dir = pkg_dir
+        .parent()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let project = tmp
+        .path()
+        .join("vendor")
+        .to_string_lossy()
+        .into_owned();
+    let hoisted = tmp
+        .path()
+        .join("node_modules")
+        .join(".pnpm")
+        .join("node_modules")
+        .to_string_lossy()
+        .into_owned();
+    let manifest = Arc::new(json!({"name": "foo", "version": "1.0.0", "bin": "cli.js"}));
+
+    let node_path = super::super::shim_node_path(
+        &PackageBinSource::new(tmp.path().join("vendor").join("foo"), manifest)
+            .with_resolved_location(pkg_dir.clone()),
+        Some(&project),
+        &[slot_dir.clone(), hoisted.clone()],
+    );
+
+    assert_eq!(
+        node_path,
+        [
+            project,
+            pkg_dir
+                .join("node_modules")
+                .to_string_lossy()
+                .into_owned(),
+            slot_dir,
+            hoisted,
+        ],
+    );
+}
+
 /// The pnpm CLI's own package opts out of the PowerShell shim
-/// ([`super::super::wants_powershell_shim`]), and a `.ps1` an earlier install
-/// wrote — a pre-v12 `@pnpm/exe` wrapper carried the same bin names —
-/// has to be deleted, not merely left unwritten: PowerShell would keep
+/// ([`super::super::windows_shim_policy::wants_powershell_shim`]), and a `.ps1` an earlier install
+/// wrote has to be deleted, not merely left unwritten: PowerShell would keep
 /// preferring it over the `.cmd` shim and run the version it points at.
 #[test]
 fn linking_the_pnpm_cli_deletes_a_stale_powershell_shim() {
+    assert_linking_the_pnpm_cli_deletes_a_stale_powershell_shim("pnpm");
+}
+
+/// `pnpm setup` of earlier releases installed the CLI as `@pnpm/exe`, and
+/// a setup rerun from such an install links it under that name again.
+#[test]
+fn linking_the_pnpm_cli_under_its_earlier_name_deletes_a_stale_powershell_shim() {
+    assert_linking_the_pnpm_cli_deletes_a_stale_powershell_shim("@pnpm/exe");
+}
+
+fn assert_linking_the_pnpm_cli_deletes_a_stale_powershell_shim(pkg_name: &str) {
     let tmp = tempdir().unwrap();
-    let pkg_dir = tmp.path().join("node_modules/pnpm");
+    let pkg_dir = tmp
+        .path()
+        .join("node_modules")
+        .join(pkg_name);
     create_dir_all(&pkg_dir).unwrap();
     write_file(
         pkg_dir.join("package.json"),
-        json!({"name": "pnpm", "version": "1.0.0", "bin": {"pnpm": "cli.js", "pn": "cli.js"}})
+        json!({"name": pkg_name, "version": "1.0.0", "bin": {"pnpm": "cli.js", "pn": "cli.js"}})
             .to_string(),
     )
     .unwrap();
@@ -114,6 +179,104 @@ fn linking_the_pnpm_cli_deletes_a_stale_powershell_shim() {
     write_file(bins_dir.join("pnpm.ps1"), "planted after the first link").unwrap();
     link_bins_of_packages::<Host>(&packages, &bins_dir, &LinkBinsOptions::default()).unwrap();
     assert!(!bins_dir.join("pnpm.ps1").exists());
+}
+
+/// The pnpm CLI's `.cmd` shims end their batch context before the CLI starts
+/// ([`super::super::windows_shim_policy::cmd_shim_batch`]). Every other package keeps the ordinary
+/// shim.
+#[test]
+#[cfg_attr(not(windows), ignore = "`.cmd` shims are written on Windows only")]
+fn only_the_pnpm_cli_cmd_shims_end_their_batch_context() {
+    let tmp = tempdir().unwrap();
+    let bins_dir = tmp.path().join("node_modules/.bin");
+    let mut packages = Vec::new();
+    for (pkg_name, bin_name) in [("pnpm", "pnpm"), ("@pnpm/exe", "pnpm-exe"), ("other", "other")] {
+        let pkg_dir = tmp
+            .path()
+            .join("node_modules")
+            .join(pkg_name);
+        create_dir_all(&pkg_dir).unwrap();
+        let manifest =
+            json!({"name": pkg_name, "version": "1.0.0", "bin": {bin_name: "native-binary"}});
+        write_file(pkg_dir.join("package.json"), manifest.to_string()).unwrap();
+        write_file(pkg_dir.join("native-binary"), "MZ").unwrap();
+        packages.push(PackageBinSource::new(pkg_dir, Arc::new(manifest)));
+    }
+    link_bins_of_packages::<Host>(&packages, &bins_dir, &LinkBinsOptions::default()).unwrap();
+
+    for (bin_name, ends_batch) in [("pnpm", true), ("pnpm-exe", true), ("other", false)] {
+        let cmd = read_to_string(bins_dir.join(format!("{bin_name}.cmd"))).unwrap();
+        assert_eq!(
+            cmd.contains("@GOTO #_undefined_# 2>NUL || "),
+            ends_batch,
+            "{bin_name}.cmd:\n{cmd}",
+        );
+    }
+}
+
+/// Linking the pnpm CLI's bins over a `pnpm.cmd` that keeps its batch lays
+/// the new shim out so that cmd.exe, when still running the old one, ends that
+/// batch (see [`crate::shim::end_replaced_cmd_shim_batch`]). Linking over that
+/// layout writes the plain shim, which a further link leaves alone.
+#[test]
+#[cfg_attr(not(windows), ignore = "`.cmd` shims are written on Windows only")]
+fn the_pnpm_cli_cmd_shim_ends_the_batch_of_the_shim_it_replaces() {
+    let tmp = tempdir().unwrap();
+    let bins_dir = tmp.path().join("bin");
+    let pkg_dir = tmp.path().join("node_modules/pnpm");
+    create_dir_all(&pkg_dir).unwrap();
+    let manifest = json!({"name": "pnpm", "version": "1.0.0", "bin": {"pnpm": "pnpm.exe"}});
+    write_file(pkg_dir.join("package.json"), manifest.to_string()).unwrap();
+    write_file(pkg_dir.join("pnpm.exe"), "MZ").unwrap();
+    let packages = vec![PackageBinSource::new(pkg_dir, Arc::new(manifest))];
+    let shim = bins_dir.join("pnpm.cmd");
+    create_dir_all(&bins_dir).unwrap();
+    let batch_kept = "@SETLOCAL\r\n@\"%~dp0\\..\\node_modules\\pnpm\\pnpm.exe\"  %*\r\n";
+    write_file(&shim, batch_kept).unwrap();
+
+    link_bins_of_packages::<Host>(&packages, &bins_dir, &LinkBinsOptions::default()).unwrap();
+    let laid_out = read_to_string(&shim).unwrap();
+    assert!(laid_out.starts_with("@GOTO :pnpm\r\n"), "{laid_out}");
+    assert!(
+        laid_out[batch_kept.len()..].starts_with("@EXIT /B %ERRORLEVEL%\r\n:pnpm\r\n@SETLOCAL\r\n"),
+        "{laid_out}",
+    );
+
+    link_bins_of_packages::<Host>(&packages, &bins_dir, &LinkBinsOptions::default()).unwrap();
+    let plain = read_to_string(&shim).unwrap();
+    assert!(plain.starts_with("@SETLOCAL\r\n"), "{plain}");
+    assert!(!plain.contains("@EXIT /B"), "{plain}");
+    assert!(laid_out.ends_with(&plain), "{laid_out}\n{plain}");
+
+    link_bins_of_packages::<Host>(&packages, &bins_dir, &LinkBinsOptions::default()).unwrap();
+    assert_eq!(read_to_string(&shim).unwrap(), plain);
+}
+
+/// A pnpm CLI run through an interpreter keeps its batch, so its shim is
+/// written as it is over a `pnpm.cmd` that keeps its batch too, and a further
+/// link leaves it alone.
+#[test]
+#[cfg_attr(not(windows), ignore = "`.cmd` shims are written on Windows only")]
+fn the_pnpm_cli_cmd_shim_for_an_interpreted_target_is_not_laid_out() {
+    let tmp = tempdir().unwrap();
+    let bins_dir = tmp.path().join("bin");
+    let pkg_dir = tmp.path().join("node_modules/pnpm");
+    create_dir_all(pkg_dir.join("bin")).unwrap();
+    let manifest = json!({"name": "pnpm", "version": "1.0.0", "bin": {"pnpm": "bin/pnpm.cjs"}});
+    write_file(pkg_dir.join("package.json"), manifest.to_string()).unwrap();
+    write_file(pkg_dir.join("bin/pnpm.cjs"), "#!/usr/bin/env node\n").unwrap();
+    let packages = vec![PackageBinSource::new(pkg_dir, Arc::new(manifest))];
+    let shim = bins_dir.join("pnpm.cmd");
+    create_dir_all(&bins_dir).unwrap();
+    write_file(&shim, "@SETLOCAL\r\n@\"%~dp0\\..\\node_modules\\pnpm\\pnpm.exe\"  %*\r\n").unwrap();
+
+    link_bins_of_packages::<Host>(&packages, &bins_dir, &LinkBinsOptions::default()).unwrap();
+    let written = read_to_string(&shim).unwrap();
+    assert!(written.starts_with("@SETLOCAL\r\n"), "{written}");
+    assert!(written.contains("node.exe"), "{written}");
+
+    link_bins_of_packages::<Host>(&packages, &bins_dir, &LinkBinsOptions::default()).unwrap();
+    assert_eq!(read_to_string(&shim).unwrap(), written);
 }
 
 /// A bin directory this run created holds nothing, so the shim goes
@@ -169,8 +332,11 @@ fn a_shim_in_a_freshly_created_bin_dir_is_written_without_reading_it_first() {
         }
     }
     impl FsEnsureExecutableBits for ReadCountingHost {
-        fn ensure_executable_bits(path: &Path) -> io::Result<()> {
-            <Host as FsEnsureExecutableBits>::ensure_executable_bits(path)
+        fn ensure_executable_bits(
+            path: &Path,
+            installed_modules_dir: Option<&Path>,
+        ) -> io::Result<()> {
+            <Host as FsEnsureExecutableBits>::ensure_executable_bits(path, installed_modules_dir)
         }
     }
 
@@ -192,6 +358,7 @@ fn a_shim_in_a_freshly_created_bin_dir_is_written_without_reading_it_first() {
     link(&fresh_bins);
     assert!(is_shim_pointing_at(
         &read_to_string(fresh_bins.join("foo")).unwrap(),
+        &fresh_bins.join("foo"),
         &pkg.join("cli.js"),
     ));
     assert_eq!(SHIM_READS.load(Ordering::Relaxed), 0, "nothing can occupy a dir we just made");
@@ -201,6 +368,7 @@ fn a_shim_in_a_freshly_created_bin_dir_is_written_without_reading_it_first() {
     link(&existing_bins);
     assert!(is_shim_pointing_at(
         &read_to_string(existing_bins.join("foo")).unwrap(),
+        &existing_bins.join("foo"),
         &pkg.join("cli.js"),
     ));
     assert_eq!(SHIM_READS.load(Ordering::Relaxed), 1, "a pre-existing dir is read first");
@@ -250,8 +418,11 @@ fn shared_shim_target_cache_probes_a_resolved_target_once() {
         }
     }
     impl FsEnsureExecutableBits for CountingHost {
-        fn ensure_executable_bits(path: &Path) -> io::Result<()> {
-            <Host as FsEnsureExecutableBits>::ensure_executable_bits(path)
+        fn ensure_executable_bits(
+            path: &Path,
+            installed_modules_dir: Option<&Path>,
+        ) -> io::Result<()> {
+            <Host as FsEnsureExecutableBits>::ensure_executable_bits(path, installed_modules_dir)
         }
     }
 
@@ -280,4 +451,17 @@ fn shared_shim_target_cache_probes_a_resolved_target_once() {
         assert!(modules.join(".bin/foo").exists());
     }
     assert_eq!(READ_HEAD_CALLS.load(Ordering::Relaxed), 1, "one probe for the shared target");
+}
+
+#[test]
+fn project_node_path_omits_paths_containing_the_path_list_delimiter() {
+    let tmp = tempdir().unwrap();
+    let delimiter = if cfg!(windows) { ';' } else { ':' };
+    let project = tmp
+        .path()
+        .join(format!("vendor{delimiter}other"));
+    let manifest = Arc::new(json!({"name": "foo", "version": "1.0.0", "bin": "cli.js"}));
+    let pkg = PackageBinSource::new(tmp.path().join("foo"), manifest);
+    let node_path = super::super::shim_node_path(&pkg, Some(&project.to_string_lossy()), &[]);
+    assert_eq!(node_path, Vec::<String>::new());
 }

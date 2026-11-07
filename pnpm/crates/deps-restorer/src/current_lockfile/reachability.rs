@@ -1,19 +1,144 @@
-use pnpm_lockfile::{Lockfile, PackageKey};
+use crate::platform_selection::{host_platform_selector, listed_link_platform};
+use pnpm_lockfile::{
+    Lockfile, PackageKey, PeerEdgeOptions, PeerSatisfactionEdges, PlatformSelector,
+};
 use pnpm_modules_yaml::IncludedDependencies;
+use pnpm_package_is_installable::SupportedArchitectures;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::Path,
+    sync::Arc,
 };
 
-pub(super) struct ReachableLockfileGraph {
-    pub(super) importer_ids: HashSet<String>,
-    pub(super) snapshot_keys: HashSet<PackageKey>,
+pub struct ReachableLockfileGraph {
+    pub importer_ids: HashSet<String>,
+    pub snapshot_keys: HashSet<PackageKey>,
 }
-pub(super) fn collect_reachable<ShouldSkip>(
+
+/// The dependency groups a lockfile walk includes, and the peer-satisfaction
+/// edges (see [`PeerSatisfactionEdges`]) it leaves out while it excludes one.
+///
+/// The classification is computed once per install and shared, since every
+/// walk of that install over the lockfile, or over a closure of it, skips the
+/// same edges. Every walk also follows the same platform variants: a variant
+/// with dependencies of its own is wired as its own snapshot, and the walk
+/// takes the one the install links.
+#[derive(Debug, Clone)]
+pub struct GroupSelection {
+    pub included: IncludedDependencies,
+    pub skipped_peer_edges: Arc<PeerSatisfactionEdges>,
+    /// The platform whose variant a registry package links, when
+    /// `supportedArchitectures` names one other than the host's.
+    pub linked_platform: Option<PlatformSelector>,
+    /// Which platform variants' own snapshots the walk follows.
+    pub variant_walk: VariantWalk,
+}
+
+/// Which platform variants' own snapshots (`<name>@<version>/variants/<tag>`)
+/// a walk follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VariantWalk {
+    /// Only the variant the install links, as the version's own snapshot.
+    Linked,
+    /// Every variant, each under its own key, as the wanted lockfile keeps
+    /// them for every platform.
+    Every,
+}
+
+impl GroupSelection {
+    /// `included`, with `lockfile`'s peer-satisfaction edges classified when
+    /// `included` leaves a group out.
+    #[must_use]
+    pub fn classify(
+        lockfile: &Lockfile,
+        included: IncludedDependencies,
+        peer_edges: PeerEdgeOptions,
+    ) -> Self {
+        let skipped_peer_edges = if included.excludes_a_group() {
+            PeerSatisfactionEdges::of_lockfile(lockfile, peer_edges)
+        } else {
+            PeerSatisfactionEdges::default()
+        };
+        GroupSelection {
+            included,
+            skipped_peer_edges: Arc::new(skipped_peer_edges),
+            linked_platform: None,
+            variant_walk: VariantWalk::Linked,
+        }
+    }
+
+    /// `included` without a peer classification, for a walk that only reads
+    /// which importers it reaches.
+    #[must_use]
+    pub fn following_every_edge(included: IncludedDependencies) -> Self {
+        GroupSelection {
+            included,
+            skipped_peer_edges: Arc::default(),
+            linked_platform: None,
+            variant_walk: VariantWalk::Linked,
+        }
+    }
+
+    /// This selection, walking the variants `supported` links a registry
+    /// package to.
+    #[must_use]
+    pub fn linking_for(mut self, supported: Option<&SupportedArchitectures>) -> Self {
+        self.linked_platform = listed_link_platform(supported);
+        self
+    }
+
+    /// This selection, walking every variant of each version it reaches.
+    #[must_use]
+    pub fn walking_every_variant(mut self) -> Self {
+        self.variant_walk = VariantWalk::Every;
+        self
+    }
+
+    /// This selection, walking the variants `other` walks.
+    #[must_use]
+    pub fn linking_as(mut self, other: &GroupSelection) -> Self {
+        self.linked_platform.clone_from(&other.linked_platform);
+        self
+    }
+
+    /// The platform whose variants the walk follows.
+    #[must_use]
+    pub fn walked_platform(&self) -> PlatformSelector {
+        match &self.linked_platform {
+            Some(platform) => platform.clone(),
+            None => host_platform_selector(),
+        }
+    }
+
+    /// Each version's variants' own snapshot keys in `lockfile` the walk
+    /// visits beside the version's: all of them when it walks every variant,
+    /// and none when it walks the one the install links.
+    fn variants_to_walk(&self, lockfile: &Lockfile) -> HashMap<PackageKey, Vec<PackageKey>> {
+        match self.variant_walk {
+            VariantWalk::Every => super::variant_snapshots::variant_keys_by_base(lockfile),
+            VariantWalk::Linked => HashMap::new(),
+        }
+    }
+
+    /// Every group, which leaves no edge out.
+    #[must_use]
+    pub fn all() -> Self {
+        Self::following_every_edge(IncludedDependencies {
+            dependencies: true,
+            dev_dependencies: true,
+            optional_dependencies: true,
+        })
+    }
+}
+
+/// The importers and snapshots `initial_importer_ids` reach through the
+/// edges `groups` selects, never entering a key `should_skip` accepts.
+#[must_use]
+pub fn collect_reachable<ShouldSkip>(
     lockfile: &Lockfile,
     workspace_root: &Path,
     initial_importer_ids: &HashSet<String>,
-    included: IncludedDependencies,
+    groups: &GroupSelection,
     should_skip: ShouldSkip,
 ) -> ReachableLockfileGraph
 where
@@ -37,21 +162,24 @@ where
                 (pnpm_fs::lexical_normalize(&crate::importer_root_dir(workspace_root, &id)), id)
             })
             .collect(),
-        included,
+        groups,
         should_skip,
+        variants_by_base: groups.variants_to_walk(lockfile),
 
-        importer_queue: initial_importer_ids
-            .iter()
-            .cloned()
-            .collect(),
-        snapshot_queue: VecDeque::new(),
+        queues: WalkQueues {
+            importers: initial_importer_ids
+                .iter()
+                .cloned()
+                .collect(),
+            snapshots: VecDeque::new(),
+        },
     };
 
-    while !walk.importer_queue.is_empty() || !walk.snapshot_queue.is_empty() {
-        while let Some(importer_id) = walk.importer_queue.pop_front() {
+    while !walk.queues.importers.is_empty() || !walk.queues.snapshots.is_empty() {
+        while let Some(importer_id) = walk.queues.importers.pop_front() {
             walk.visit_importer(&importer_id);
         }
-        while let Some(key) = walk.snapshot_queue.pop_front() {
+        while let Some(key) = walk.queues.snapshots.pop_front() {
             walk.visit_snapshot(&key);
         }
     }
@@ -67,10 +195,18 @@ pub(super) struct ReachableWalk<'a, ShouldSkip> {
     lockfile: &'a Lockfile,
     workspace_root: &'a Path,
     known_importers: HashMap<std::path::PathBuf, String>,
-    included: IncludedDependencies,
+    groups: &'a GroupSelection,
     should_skip: ShouldSkip,
-    importer_queue: VecDeque<String>,
-    snapshot_queue: VecDeque<PackageKey>,
+    /// Each version's variants' own snapshot keys, when the walk follows
+    /// every variant.
+    variants_by_base: HashMap<PackageKey, Vec<PackageKey>>,
+    queues: WalkQueues,
+}
+
+/// The importers and snapshots a walk has yet to visit.
+pub(super) struct WalkQueues {
+    importers: VecDeque<String>,
+    snapshots: VecDeque<PackageKey>,
 }
 impl<ShouldSkip: Fn(&PackageKey) -> bool> ReachableWalk<'_, ShouldSkip> {
     fn visit_importer(&mut self, importer_id: &str) {
@@ -81,11 +217,12 @@ impl<ShouldSkip: Fn(&PackageKey) -> bool> ReachableWalk<'_, ShouldSkip> {
             return;
         };
         self.reached.importer_ids.insert(importer_id.to_owned());
-        let included = self.included;
+        let included = self.groups.included;
         for map in [
             included.dependencies.then_some(importer.dependencies.as_ref()).flatten(),
             included.dev_dependencies.then_some(importer.dev_dependencies.as_ref()).flatten(),
-            included.optional_dependencies
+            included
+                .includes_project_optional_dependencies()
                 .then_some(importer.optional_dependencies.as_ref())
                 .flatten(),
         ]
@@ -110,21 +247,21 @@ impl<ShouldSkip: Fn(&PackageKey) -> bool> ReachableWalk<'_, ShouldSkip> {
         else {
             return;
         };
-        for map in [
-            snapshot.dependencies.as_ref(),
-            self.included.optional_dependencies
-                .then_some(snapshot.optional_dependencies.as_ref())
-                .flatten(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            for (alias, dep_ref) in map {
-                if let Some(target) = dep_ref.as_link_target() {
-                    self.enqueue_linked_importer(target);
-                } else if let Some(child) = dep_ref.resolve(alias) {
-                    self.enqueue_snapshot(child);
-                }
+        let entries = self.groups.skipped_peer_edges.followed_entries(
+            key,
+            snapshot,
+            self.groups.included.optional_dependencies,
+        );
+        for (alias, dep_ref) in entries {
+            if let Some(target) = dep_ref.as_link_target() {
+                self.enqueue_linked_importer(target);
+            } else if let Some(child) = dep_ref.resolve(alias) {
+                self.enqueue_snapshot(child);
+            }
+        }
+        if let Some(variants) = self.variants_by_base.get(key).cloned() {
+            for variant in variants {
+                self.enqueue_snapshot(variant);
             }
         }
     }
@@ -139,7 +276,7 @@ impl<ShouldSkip: Fn(&PackageKey) -> bool> ReachableWalk<'_, ShouldSkip> {
             .as_ref()
             .is_some_and(|snapshots| snapshots.contains_key(&key))
         {
-            self.snapshot_queue.push_back(key);
+            self.queues.snapshots.push_back(key);
         }
     }
 
@@ -147,7 +284,7 @@ impl<ShouldSkip: Fn(&PackageKey) -> bool> ReachableWalk<'_, ShouldSkip> {
         if let Some(importer_id) =
             linked_importer_id(self.workspace_root, target, &self.known_importers)
         {
-            self.importer_queue.push_back(importer_id);
+            self.queues.importers.push_back(importer_id);
         }
     }
 }

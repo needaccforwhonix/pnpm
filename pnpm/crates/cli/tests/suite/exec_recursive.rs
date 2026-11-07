@@ -1,8 +1,12 @@
-//! Recursive-exec integration tests. They drive the commands through a
-//! POSIX shell (`touch`, `sh -c`), so the whole file is gated to Unix —
-//! same as the recursive-run tests.
-#![cfg(unix)]
+//! Recursive-exec integration tests.
+//!
+//! `pacquet exec` spawns its command directly unless `-c` puts it through
+//! the platform shell, so the commands here are `node` invocations rather
+//! than the POSIX programs Windows has none of.
 
+#[cfg(unix)]
+use crate::_utils::terminal::{Terminal, spawn_without_terminal};
+use crate::_utils::{CHILD_DEADLINE, wait_for_child};
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
 use pnpm_testing_utils::{bin::CommandTempCwd, command_env::CommandTestExt};
@@ -11,8 +15,7 @@ use std::{
     collections::HashMap,
     fs,
     path::Path,
-    process::Command,
-    time::{Duration, Instant},
+    process::{Command, Stdio},
 };
 
 /// Write a `pnpm-workspace.yaml` listing `names` as packages, plus a
@@ -58,23 +61,86 @@ fn summary_statuses(workspace: &Path) -> HashMap<String, String> {
         .collect()
 }
 
+/// `pacquet exec` arguments that create `relative_path` as an empty file:
+/// the portable stand-in for `touch`, which Windows has no program for.
+fn marker_args(relative_path: &str) -> [String; 3] {
+    [
+        "node".to_owned(),
+        "-e".to_owned(),
+        format!("require('fs').writeFileSync('{relative_path}', '')"),
+    ]
+}
+
+/// The probe sits at the workspace root while `pacquet exec` runs with a
+/// project directory as its cwd, hence the `..` the returned arguments
+/// reach it through.
+fn write_exec_probe(workspace: &Path, file: &str, source: &str) -> [String; 2] {
+    fs::write(workspace.join(file), source).expect("write the exec probe");
+    ["node".to_owned(), format!("../{file}")]
+}
+
+/// The opening of an order-log probe: `name` is the project directory's
+/// own name, and `log()` appends it to the log the tests read back.
+const ORDER_PROBE_PRELUDE: &str = r"const fs = require('fs')
+const name = require('path').basename(process.cwd())
+const log = () => fs.appendFileSync('../order.log', name + '\n')
+";
+
+/// Names the file [`write_concurrency_probe`] writes, so the two move
+/// together.
+const CONCURRENCY_PROBE_ARGS: [&str; 2] = ["node", "../track-concurrency.cjs"];
+
+/// `mkdir` is the lock each run claims its slot with, because it fails
+/// rather than succeeding twice.
+///
+/// The claim is sampled repeatedly rather than once, because two runs
+/// whose starts are further apart than a single sampling delay still
+/// overlap, and one sample apiece can fall either side of that overlap.
 fn write_concurrency_probe(workspace: &Path) {
     fs::write(
-        workspace.join("track-concurrency.sh"),
-        r#"marker=../active-$(basename "$PWD")
-mkdir "$marker"
-sleep 0.2
-set -- ../active-*
-[ -e "$1" ] || set --
-[ "$#" -ge 2 ] && touch ../saw-parallel
-[ "$#" -gt 2 ] && touch ../exceeded-concurrency
-sleep 0.2
-rmdir "$marker"
-"#,
+        workspace.join("track-concurrency.cjs"),
+        r"const fs = require('fs')
+const path = require('path')
+const marker = path.join('..', 'active-' + path.basename(process.cwd()))
+fs.mkdirSync(marker)
+const until = Date.now() + 600
+const sample = () => {
+  const active = fs.readdirSync('..').filter((entry) => entry.startsWith('active-'))
+  if (active.length >= 2) fs.writeFileSync('../saw-parallel', '')
+  if (active.length > 2) fs.writeFileSync('../exceeded-concurrency', '')
+  if (Date.now() < until) setTimeout(sample, 20)
+  else fs.rmdirSync(marker)
+}
+setTimeout(sample, 20)
+",
     )
     .expect("write concurrency probe");
 }
 
+/// Each run waits, for up to 30 seconds, until `count` runs are running at
+/// once, and writes `all-running` when they are.
+fn write_all_running_probe(workspace: &Path, count: usize) -> [String; 2] {
+    let source = format!(
+        r"const fs = require('fs')
+const path = require('path')
+const marker = path.join('..', 'running-' + path.basename(process.cwd()))
+fs.mkdirSync(marker)
+const deadline = Date.now() + 30000
+const poll = () => {{
+  const running = fs.readdirSync('..').filter((entry) => entry.startsWith('running-'))
+  if (running.length === {count}) fs.writeFileSync('../all-running', '')
+  else if (!fs.existsSync('../all-running') && Date.now() < deadline) return setTimeout(poll, 20)
+  fs.rmdirSync(marker)
+}}
+poll()
+",
+    );
+    write_exec_probe(workspace, "await-all-running.cjs", &source)
+}
+
+/// A program that records its own process group and its parent's, for
+/// the one test whose subject is POSIX process groups.
+#[cfg(unix)]
 fn process_group_probe() -> &'static str {
     r#"child_group=$(ps -o pgid= -p $$ | tr -d ' ')
 parent_group=$(ps -o pgid= -p $PPID | tr -d ' ')
@@ -82,8 +148,8 @@ printf "%s %s\n" "$child_group" "$parent_group" > ../process-groups.txt"#
 }
 
 /// `pacquet -r exec <command>` runs the command once in every workspace
-/// project, each with cwd == its own package root — a relative `touch`
-/// lands a marker inside each package directory.
+/// project, each with cwd == its own package root, so a marker written at
+/// a relative path lands inside each package directory.
 #[test]
 fn recursive_exec_runs_command_in_every_project() {
     let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
@@ -92,8 +158,7 @@ fn recursive_exec_runs_command_in_every_project() {
     pacquet
         .with_arg("-r")
         .with_arg("exec")
-        .with_arg("touch")
-        .with_arg("ran.txt")
+        .with_args(marker_args("ran.txt"))
         .assert()
         .success();
 
@@ -110,30 +175,176 @@ fn recursive_exec_runs_command_in_every_project() {
     drop(root);
 }
 
-/// A single filtered command cannot run alongside a sibling, so it must
-/// stay in pacquet's own process group: a child moved into its own group
-/// is stopped the moment it reads from the terminal.
+/// pnpm's own options are parsed up to the command name, so `-r` after the
+/// `exec` keyword still selects every project rather than reaching the
+/// command.
 #[test]
-fn filtered_exec_keeps_single_command_in_foreground_process_group() {
+fn recursive_exec_accepts_its_options_after_the_exec_keyword() {
     let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
     write_workspace(&workspace, &["project-1", "project-2"]);
 
     pacquet
-        .with_args(["--filter", "project-1", "exec", "sh", "-c", process_group_probe()])
+        .with_arg("exec")
+        .with_arg("-r")
+        .with_args(marker_args("ran.txt"))
         .assert()
         .success();
 
-    let groups =
-        fs::read_to_string(workspace.join("process-groups.txt")).expect("read process groups");
-    let mut fields = groups.split_whitespace();
-    let child_group = fields.next().expect("child process group");
-    let parent_group = fields.next().expect("parent process group");
+    for name in ["project-1", "project-2"] {
+        assert!(
+            workspace
+                .join(name)
+                .join("ran.txt")
+                .exists(),
+            "{name} should have run the command in its own directory",
+        );
+    }
+
+    drop(root);
+}
+
+/// No symlink involved: `PWD` still points at the project directory the
+/// command runs in, not at the workspace root pacquet was invoked from
+/// ([pnpm/pnpm#1550](https://github.com/pnpm/pnpm/issues/1550)).
+#[test]
+#[cfg(unix)]
+fn recursive_exec_sets_pwd_to_each_project_dir() {
+    let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+    write_workspace(&workspace, &["project-1"]);
+
+    pacquet
+        .with_arg("-r")
+        .with_arg("exec")
+        .with_args(write_exec_probe(
+            &workspace,
+            "pwd-probe.cjs",
+            "require('fs').writeFileSync('pwd.txt', process.env.PWD)\n",
+        ))
+        .assert()
+        .success();
+
+    let pwd = fs::read_to_string(workspace.join("project-1/pwd.txt")).expect("read recorded PWD");
+    let expected =
+        dunce::canonicalize(&workspace).expect("canonicalize workspace").join("project-1");
+    assert_eq!(pwd, expected.to_string_lossy().as_ref(), "PWD should be the project directory");
+
+    drop(root);
+}
+
+/// A project reached through a symlink keeps its logical path as the
+/// command's `PWD`: shells report the path the workspace lists, not the
+/// resolved target ([pnpm/pnpm#1550](https://github.com/pnpm/pnpm/issues/1550)).
+#[test]
+#[cfg(unix)]
+fn recursive_exec_sets_pwd_to_logical_path_of_symlinked_project() {
+    let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+    fs::write(workspace.join("pnpm-workspace.yaml"), "packages:\n  - linked\n")
+        .expect("write pnpm-workspace.yaml");
+    fs::create_dir_all(workspace.join("real")).expect("create real project dir");
+    fs::write(
+        workspace.join("real/package.json"),
+        json!({ "name": "linked-project", "version": "1.0.0" }).to_string(),
+    )
+    .expect("write package.json");
+    std::os::unix::fs::symlink("real", workspace.join("linked")).expect("symlink project dir");
+
+    pacquet
+        .with_arg("-r")
+        .with_arg("exec")
+        .with_args(write_exec_probe(
+            &workspace,
+            "pwd-probe.cjs",
+            "require('fs').writeFileSync('pwd.txt', process.env.PWD)\n",
+        ))
+        .assert()
+        .success();
+
+    let pwd = fs::read_to_string(workspace.join("linked/pwd.txt")).expect("read recorded PWD");
+    // The workspace root is canonicalized before discovery, so the
+    // logical path builds on the canonical root.
+    let expected = dunce::canonicalize(&workspace).expect("canonicalize workspace").join("linked");
+    assert_eq!(
+        pwd,
+        expected.to_string_lossy().as_ref(),
+        "PWD should be the symlinked path, not the resolved one",
+    );
+
+    drop(root);
+}
+
+/// A single filtered command cannot run alongside a sibling, so at a
+/// terminal it stays in pacquet's own process group: a child moved into
+/// its own group is stopped the moment it reads from the terminal.
+///
+/// Unix-only by subject rather than by harness, as is its no-terminal
+/// counterpart below. POSIX process groups are what both tests read, and
+/// Windows governs terminal access through console process groups
+/// instead, so the guarantee wants its own tests there rather than a port
+/// of these.
+#[test]
+#[cfg(unix)]
+fn filtered_exec_keeps_single_command_in_foreground_process_group() {
+    let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+    write_workspace(&workspace, &["project-1", "project-2"]);
+
+    let terminal = Terminal::open();
+    let mut process = terminal.spawn_foreground(pacquet.with_args([
+        "--filter",
+        "project-1",
+        "exec",
+        "sh",
+        "-c",
+        process_group_probe(),
+    ]));
+    let status = process.wait().expect("wait for pacquet");
+    assert!(status.success(), "pacquet should succeed on the terminal");
+
+    let (child_group, parent_group) = read_process_groups(&workspace);
     assert_eq!(
         child_group, parent_group,
         "the child must share pacquet's process group to keep reading the terminal",
     );
 
     drop(root);
+}
+
+/// Without a terminal nothing but pacquet signals the command, and the
+/// shell running it may not pass a signal on, so the command gets a
+/// process group of its own for pacquet to address.
+#[test]
+#[cfg(unix)]
+fn filtered_exec_without_a_terminal_gives_the_command_its_own_process_group() {
+    let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+    write_workspace(&workspace, &["project-1", "project-2"]);
+
+    let mut process = spawn_without_terminal(pacquet.with_args([
+        "--filter",
+        "project-1",
+        "exec",
+        "sh",
+        "-c",
+        process_group_probe(),
+    ]));
+    let status = process.wait().expect("wait for pacquet");
+    assert!(status.success(), "pacquet should succeed without a terminal");
+
+    let (child_group, parent_group) = read_process_groups(&workspace);
+    assert_ne!(
+        child_group, parent_group,
+        "the child must lead a process group of its own for relayed signals",
+    );
+
+    drop(root);
+}
+
+#[cfg(unix)]
+fn read_process_groups(workspace: &Path) -> (String, String) {
+    let groups =
+        fs::read_to_string(workspace.join("process-groups.txt")).expect("read process groups");
+    let mut fields = groups.split_whitespace();
+    let child_group = fields.next().expect("child process group");
+    let parent_group = fields.next().expect("parent process group");
+    (child_group.to_string(), parent_group.to_string())
 }
 
 #[test]
@@ -143,7 +354,8 @@ fn recursive_exec_respects_workspace_concurrency() {
     write_concurrency_probe(&workspace);
 
     pacquet
-        .with_args(["--workspace-concurrency=2", "-r", "exec", "sh", "../track-concurrency.sh"])
+        .with_args(["--workspace-concurrency=2", "-r", "exec"])
+        .with_args(CONCURRENCY_PROBE_ARGS)
         .assert()
         .success();
 
@@ -151,6 +363,26 @@ fn recursive_exec_respects_workspace_concurrency() {
     assert!(
         !workspace.join("exceeded-concurrency").exists(),
         "no more than two commands should overlap",
+    );
+
+    drop(root);
+}
+
+#[test]
+fn recursive_exec_accepts_infinite_workspace_concurrency() {
+    let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+    write_workspace(&workspace, &["project-1", "project-2", "project-3"]);
+    let probe = write_all_running_probe(&workspace, 3);
+
+    pacquet
+        .with_args(["--workspace-concurrency=Infinity", "-r", "exec"])
+        .with_args(probe)
+        .assert()
+        .success();
+
+    assert!(
+        workspace.join("all-running").exists(),
+        "Infinity should run all three commands at once",
     );
 
     drop(root);
@@ -169,9 +401,12 @@ fn recursive_exec_no_sort_makes_reverse_and_resume_no_ops() {
             "--resume-from=m-middle",
             "-r",
             "exec",
-            "-c",
-            r#"echo "$(basename "$PWD")" >> ../order.log"#,
         ])
+        .with_args(write_exec_probe(
+            &workspace,
+            "order-probe.cjs",
+            &format!("{ORDER_PROBE_PRELUDE}log()\n"),
+        ))
         .assert()
         .success();
 
@@ -188,16 +423,17 @@ fn recursive_exec_no_sort_makes_reverse_and_resume_no_ops() {
 fn parallel_recursive_exec_has_no_workspace_concurrency_cap() {
     let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
     write_workspace(&workspace, &["project-1", "project-2", "project-3"]);
-    write_concurrency_probe(&workspace);
+    let probe = write_all_running_probe(&workspace, 3);
 
     pacquet
-        .with_args(["--parallel", "exec", "sh", "../track-concurrency.sh"])
+        .with_args(["--parallel", "exec"])
+        .with_args(probe)
         .assert()
         .success();
 
     assert!(
-        workspace.join("exceeded-concurrency").exists(),
-        "--parallel should start all three commands together",
+        workspace.join("all-running").exists(),
+        "--parallel should run all three commands at once",
     );
 
     drop(root);
@@ -216,8 +452,7 @@ fn recursive_exec_filter_selects_only_matching_project() {
         .with_arg("--filter")
         .with_arg("project-1")
         .with_arg("exec")
-        .with_arg("touch")
-        .with_arg("ran.txt")
+        .with_args(marker_args("ran.txt"))
         .assert()
         .success();
 
@@ -253,8 +488,7 @@ fn filter_without_recursive_flag_enters_recursive_exec() {
         .with_arg("--filter")
         .with_arg("project-1")
         .with_arg("exec")
-        .with_arg("touch")
-        .with_arg("ran.txt")
+        .with_args(marker_args("ran.txt"))
         .assert()
         .success();
 
@@ -306,8 +540,7 @@ fn recursive_exec_diff_selector_selects_changed_projects() {
         .with_arg("--filter")
         .with_arg("[HEAD~1]")
         .with_arg("exec")
-        .with_arg("touch")
-        .with_arg("ran.txt")
+        .with_args(marker_args("ran.txt"))
         .assert()
         .success();
 
@@ -330,24 +563,26 @@ fn recursive_exec_diff_selector_selects_changed_projects() {
 }
 
 /// A `--filter` that matches no project is a no-op: recursive exec exits
-/// 0 and writes no summary even with `--report-summary`, matching pnpm's
-/// main-dispatch exit-0 for an empty selection — rather than erroring on
-/// `--resume-from` or emitting an empty summary.
+/// 0, prints pnpm's empty-selection notice, and writes no summary even
+/// with `--report-summary`, matching pnpm's main-dispatch exit-0 for an
+/// empty selection — rather than erroring on `--resume-from` or emitting
+/// an empty summary.
 #[test]
 fn recursive_exec_filter_no_match_is_a_noop() {
     let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
     write_workspace(&workspace, &["project-1", "project-2"]);
 
-    pacquet
+    let assert = pacquet
         .with_arg("-r")
         .with_arg("--filter")
         .with_arg("does-not-exist")
         .with_arg("exec")
         .with_arg("--report-summary")
-        .with_arg("touch")
-        .with_arg("ran.txt")
+        .with_args(marker_args("ran.txt"))
         .assert()
         .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    assert!(stdout.contains("No projects matched the filters in"), "stdout: {stdout}");
 
     for name in ["project-1", "project-2"] {
         assert!(
@@ -366,6 +601,30 @@ fn recursive_exec_filter_no_match_is_a_noop() {
     drop(root);
 }
 
+#[test]
+fn recursive_exec_silent_suppresses_no_match_notice() {
+    let CommandTempCwd { root, workspace, .. } = CommandTempCwd::init();
+    write_workspace(&workspace, &["project-1", "project-2"]);
+
+    for flag in ["--silent", "--reporter=ndjson"] {
+        let assert = Command::cargo_bin("pnpm")
+            .expect("find pacquet binary")
+            .with_current_dir(&workspace)
+            .with_arg("-r")
+            .with_arg("--filter")
+            .with_arg("does-not-exist")
+            .with_arg(flag)
+            .with_arg("exec")
+            .with_args(marker_args("ran.txt"))
+            .assert()
+            .success();
+        let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+        assert!(!stdout.contains("No projects matched the filters in"), "stdout: {stdout}");
+    }
+
+    drop(root);
+}
+
 /// `--report-summary` writes `pnpm-exec-summary.json` with a `passed`
 /// entry for every project.
 #[test]
@@ -377,7 +636,7 @@ fn recursive_exec_report_summary_records_every_package_status() {
         .with_arg("-r")
         .with_arg("exec")
         .with_arg("--report-summary")
-        .with_arg("true")
+        .with_args(["node", "-e", ""])
         .assert()
         .success();
 
@@ -393,28 +652,56 @@ fn recursive_exec_bail_cancels_in_flight_processes() {
     let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
     write_workspace(&workspace, &["a-slow-1", "b-fails", "c-slow-2", "z-queued"]);
 
-    let start = Instant::now();
-    let output = pacquet
-        .with_args([
-            "--workspace-concurrency=3",
-            "--no-sort",
-            "--report-summary",
-            "-r",
-            "exec",
-            "-c",
-            r#"name=$(basename "$PWD"); if [ "$name" = a-slow-1 ] || [ "$name" = c-slow-2 ]; then touch ran.txt; sleep 5; elif [ "$name" = b-fails ]; then i=0; while [ ! -f ../a-slow-1/ran.txt ] || [ ! -f ../c-slow-2/ran.txt ]; do i=$((i + 1)); [ $i -lt 500 ] || exit 2; sleep 0.01; done; exit 1; else touch ran.txt; fi"#,
-        ])
-        .output()
-        .expect("spawn pacquet");
-    let elapsed = start.elapsed();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    eprintln!("STDERR:\n{stderr}\n");
-    assert!(!output.status.success(), "the failing project should fail the exec");
-    eprintln!("recursive exec elapsed: {elapsed:?}");
-    assert!(
-        elapsed < Duration::from_secs(4),
-        "bail should interrupt the five-second in-flight commands",
+    // The failure waits for both marks first, so both slow probes are in
+    // flight before bail cancels them.
+    let probe = write_exec_probe(
+        &workspace,
+        "bail-probe.cjs",
+        r"const fs = require('fs')
+const name = require('path').basename(process.cwd())
+const mark = () => fs.writeFileSync('ran.txt', '')
+if (name === 'a-slow-1' || name === 'c-slow-2') {
+  mark()
+  setTimeout(() => process.exit(0), Number(process.env.HOLD_MS))
+} else if (name === 'b-fails') {
+  const poll = () => {
+    if (fs.existsSync('../a-slow-1/ran.txt') && fs.existsSync('../c-slow-2/ran.txt')) {
+      process.exit(1)
+    }
+    setTimeout(poll, 10)
+  }
+  poll()
+} else {
+  mark()
+}
+",
     );
+
+    // The exec ending is the proof: these probes stop only when cancelled,
+    // and pnpm waits for the commands it started.
+    let hold_ms = (CHILD_DEADLINE * 2).as_millis();
+    let stderr_path = workspace.join("exec.stderr");
+    let mut run = pacquet
+        .with_args(["--workspace-concurrency=3", "--no-sort", "--report-summary", "-r", "exec"])
+        .with_args(probe)
+        .env("HOLD_MS", hold_ms.to_string())
+        .stdout(Stdio::null())
+        .stderr(fs::File::create(&stderr_path).expect("create the exec output"))
+        .spawn()
+        .expect("spawn pacquet");
+    let status = wait_for_child(&mut run);
+    let stderr = fs::read_to_string(&stderr_path).expect("read the exec output");
+    eprintln!("STDERR:\n{stderr}\n");
+    assert!(!status.success(), "the failing project should fail the exec");
+    for name in ["a-slow-1", "c-slow-2"] {
+        assert!(
+            workspace
+                .join(name)
+                .join("ran.txt")
+                .exists(),
+            "{name} must have started, or a `running` summary entry proves nothing",
+        );
+    }
 
     let statuses = summary_statuses(&workspace);
     dbg!(&statuses);
@@ -444,7 +731,7 @@ fn recursive_exec_no_bail_runs_all_then_fails() {
         .with_arg("exec")
         .with_arg("--no-bail")
         .with_arg("-c")
-        .with_arg("touch ran.txt && exit 1")
+        .with_arg(r#"node -e "require('fs').writeFileSync('ran.txt', '')" && exit 1"#)
         .output()
         .expect("spawn pacquet -r exec");
 
@@ -474,7 +761,7 @@ fn recursive_exec_bail_stops_at_first_failure() {
         .with_arg("-r")
         .with_arg("exec")
         .with_arg("-c")
-        .with_arg("touch ran.txt && exit 1")
+        .with_arg(r#"node -e "require('fs').writeFileSync('ran.txt', '')" && exit 1"#)
         .output()
         .expect("spawn pacquet -r exec");
 
@@ -518,8 +805,7 @@ fn recursive_exec_settings_only_workspace_enumerates_root_only() {
     pacquet
         .with_arg("-r")
         .with_arg("exec")
-        .with_arg("touch")
-        .with_arg("ran.txt")
+        .with_args(marker_args("ran.txt"))
         .assert()
         .success();
 
@@ -577,8 +863,7 @@ fn a_dir_selector_selects_the_project_in_that_dir() {
         .with_arg("--filter")
         .with_arg("{nested}")
         .with_arg("exec")
-        .with_arg("touch")
-        .with_arg("ran.txt")
+        .with_args(marker_args("ran.txt"))
         .assert()
         .success();
 
@@ -630,13 +915,36 @@ fn sorted_lines(stdout: &[u8]) -> Vec<String> {
     lines
 }
 
-/// Under `legacyDirFiltering` the selector matches by subtree instead: it
-/// names the projects strictly below the directory, and not the project in
-/// the directory itself.
+/// A directory selector reaches the glob matcher through the relative-path
+/// form, which is the only way a `{a,b}` alternative survives selector
+/// parsing: the `{...}` selector form cannot hold a nested `}`.
 #[test]
-fn legacy_dir_filtering_selects_the_subtree_below_the_dir() {
+fn a_relative_dir_selector_expands_brace_alternatives() {
     let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
-    write_workspace(&workspace, &["nested", "nested/inner"]);
+    write_workspace(&workspace, &["packages/pkg-a", "packages/pkg-b", "packages/pkg-c"]);
+
+    pacquet
+        .with_arg("-r")
+        .with_arg("--filter")
+        .with_arg("./packages/pkg-{a,c}")
+        .with_arg("exec")
+        .with_args(marker_args("ran.txt"))
+        .assert()
+        .success();
+
+    assert!(workspace.join("packages/pkg-a/ran.txt").exists(), "pkg-a is an alternative");
+    assert!(workspace.join("packages/pkg-c/ran.txt").exists(), "pkg-c is an alternative");
+    assert!(!workspace.join("packages/pkg-b/ran.txt").exists(), "pkg-b is not an alternative");
+
+    drop(root);
+}
+
+/// Under `legacyDirFiltering` the selector includes the project in the
+/// named directory and the projects below it.
+#[test]
+fn legacy_dir_filtering_selects_the_dir_and_its_subtree() {
+    let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+    write_workspace(&workspace, &["nested", "nested/inner", "nested-other"]);
     let workspace_yaml = fs::read_to_string(workspace.join("pnpm-workspace.yaml"))
         .expect("read pnpm-workspace.yaml");
     fs::write(
@@ -650,8 +958,7 @@ fn legacy_dir_filtering_selects_the_subtree_below_the_dir() {
         .with_arg("--filter")
         .with_arg("{nested}")
         .with_arg("exec")
-        .with_arg("touch")
-        .with_arg("ran.txt")
+        .with_args(marker_args("ran.txt"))
         .assert()
         .success();
 
@@ -660,8 +967,12 @@ fn legacy_dir_filtering_selects_the_subtree_below_the_dir() {
         "the project below {{nested}} should run under legacyDirFiltering",
     );
     assert!(
-        !workspace.join("nested/ran.txt").exists(),
-        "the subtree match excludes the directory it starts from",
+        workspace.join("nested/ran.txt").exists(),
+        "the subtree match includes the directory it starts from",
+    );
+    assert!(
+        !workspace.join("nested-other/ran.txt").exists(),
+        "a shared directory-name prefix does not select a sibling project",
     );
 
     drop(root);
@@ -669,8 +980,7 @@ fn legacy_dir_filtering_selects_the_subtree_below_the_dir() {
 
 /// The `!{<workspace-root>}` selector a recursive `run` / `exec` generates
 /// is pnpm's own, so `legacyDirFiltering` must not reach it: read as a
-/// subtree match it would name every project below the root and leave the
-/// root alone selected, which is the opposite of what it is for.
+/// subtree match it would exclude every project in the workspace.
 #[test]
 fn legacy_dir_filtering_leaves_the_generated_root_exclusion_alone() {
     let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
@@ -689,7 +999,8 @@ fn legacy_dir_filtering_leaves_the_generated_root_exclusion_alone() {
     .expect("write the root package.json");
 
     pacquet
-        .with_args(["-r", "--config.verify-deps-before-run=false", "exec", "touch", "ran.txt"])
+        .with_args(["-r", "--config.verify-deps-before-run=false", "exec"])
+        .with_args(marker_args("ran.txt"))
         .assert()
         .success();
 
@@ -706,8 +1017,8 @@ fn legacy_dir_filtering_leaves_the_generated_root_exclusion_alone() {
 }
 
 /// The `{<workspace-root>}` selector `--workspace-root` generates is pnpm's
-/// own as well: read as a subtree match it would name every project below
-/// the root and run the command everywhere but the root.
+/// own as well: read as a subtree match it would run the command throughout
+/// the workspace, instead of only at its root.
 #[test]
 fn legacy_dir_filtering_leaves_the_generated_root_inclusion_alone() {
     let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
@@ -726,14 +1037,8 @@ fn legacy_dir_filtering_leaves_the_generated_root_inclusion_alone() {
     .expect("write the root package.json");
 
     pacquet
-        .with_args([
-            "-r",
-            "--workspace-root",
-            "--config.verify-deps-before-run=false",
-            "exec",
-            "touch",
-            "ran.txt",
-        ])
+        .with_args(["-r", "--workspace-root", "--config.verify-deps-before-run=false", "exec"])
+        .with_args(marker_args("ran.txt"))
         .assert()
         .success();
 
@@ -788,14 +1093,12 @@ fn recursive_exec_no_bail_skips_dependents_of_a_failed_command() {
     );
 
     let output = pacquet
-        .with_args([
-            "--no-bail",
-            "-r",
-            "exec",
-            "--report-summary",
-            "-c",
-            r#"[ "$(basename "$PWD")" != project-b ] && echo "$(basename "$PWD")" >> ../order.log"#,
-        ])
+        .with_args(["--no-bail", "-r", "exec", "--report-summary"])
+        .with_args(write_exec_probe(
+            &workspace,
+            "order-probe.cjs",
+            &format!("{ORDER_PROBE_PRELUDE}if (name === 'project-b') process.exit(1)\nlog()\n"),
+        ))
         .output()
         .expect("run recursive exec");
     assert!(!output.status.success(), "the failed project must fail the run");
@@ -842,14 +1145,12 @@ fn recursive_exec_resume_from_skips_only_the_anchors_dependencies() {
     );
 
     pacquet
-        .with_args([
-            "--workspace-concurrency=1",
-            "--resume-from=project-3",
-            "-r",
-            "exec",
-            "-c",
-            r#"echo "$(basename "$PWD")" >> ../order.log"#,
-        ])
+        .with_args(["--workspace-concurrency=1", "--resume-from=project-3", "-r", "exec"])
+        .with_args(write_exec_probe(
+            &workspace,
+            "order-probe.cjs",
+            &format!("{ORDER_PROBE_PRELUDE}log()\n"),
+        ))
         .assert()
         .success();
 
@@ -880,10 +1181,17 @@ fn recursive_exec_resumes_from_exactly_the_projects_that_passed_before_a_failure
         ],
     );
     fs::write(workspace.join("fail"), "").expect("write failure marker");
-    let command = r#"name=$(basename "$PWD"); echo "$name" >> ../order.log; [ "$name" != dependency ] || [ ! -e ../fail ]"#;
+    let probe = write_exec_probe(
+        &workspace,
+        "order-probe.cjs",
+        &format!(
+            "{ORDER_PROBE_PRELUDE}log()\nif (name === 'dependency' && fs.existsSync('../fail')) process.exit(1)\n",
+        ),
+    );
 
     pacquet
-        .with_args(["--no-bail", "--workspace-concurrency=1", "-r", "exec", "sh", "-c", command])
+        .with_args(["--no-bail", "--workspace-concurrency=1", "-r", "exec"])
+        .with_args(probe.clone())
         .assert()
         .failure();
     let first_run = fs::read_to_string(workspace.join("order.log")).expect("read first run");
@@ -895,15 +1203,8 @@ fn recursive_exec_resumes_from_exactly_the_projects_that_passed_before_a_failure
     Command::cargo_bin("pnpm")
         .expect("find the pnpm binary")
         .with_current_dir(&workspace)
-        .with_args([
-            "--workspace-concurrency=1",
-            "--resume-from=anchor",
-            "-r",
-            "exec",
-            "sh",
-            "-c",
-            command,
-        ])
+        .with_args(["--workspace-concurrency=1", "--resume-from=anchor", "-r", "exec"])
+        .with_args(probe)
         .assert()
         .success();
 

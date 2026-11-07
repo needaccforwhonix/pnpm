@@ -1,7 +1,7 @@
 use super::{
     Arc, BTreeMap, DepPath, DirectDep, HashMap, HashSet, NodeId, ResolvePeersOptions, ResolvedTree,
-    assert_cyclic_alias_peer_graph_is_closed, cyclic_alias_peer_tree, named_registry_peer_tree,
-    package, package_with_peer_dependencies, resolve_peers, tree_node,
+    TreeChildren, assert_cyclic_alias_peer_graph_is_closed, cyclic_alias_peer_tree,
+    named_registry_peer_tree, package, package_with_peer_dependencies, resolve_peers, tree_node,
 };
 
 #[test]
@@ -16,7 +16,7 @@ fn own_peer_is_resolved_from_peer_relevant_child() {
         direct: vec![DirectDep {
             alias: "consumer".to_string(),
             node_id: consumer.clone(),
-            id: "consumer@1.0.0".to_string(),
+            id: "consumer@1.0.0".into(),
         }],
         packages: HashMap::from_iter([
             ("types@1.0.0".into(), package("types", "1.0.0", &[], true)),
@@ -74,12 +74,12 @@ fn reports_a_conflict_for_an_optional_peer_with_an_incompatible_provider() {
             DirectDep {
                 alias: "consumer".to_string(),
                 node_id: consumer.clone(),
-                id: "consumer@1.0.0".to_string(),
+                id: "consumer@1.0.0".into(),
             },
             DirectDep {
                 alias: "peer".to_string(),
                 node_id: provider.clone(),
-                id: "peer@2.0.0".to_string(),
+                id: "peer@2.0.0".into(),
             },
         ],
         packages: HashMap::from_iter([
@@ -124,7 +124,7 @@ fn alias_child_resolves_peer_by_real_package_name() {
         direct: vec![DirectDep {
             alias: "consumer".to_string(),
             node_id: consumer.clone(),
-            id: "consumer@1.0.0".to_string(),
+            id: "consumer@1.0.0".into(),
         }],
         packages: HashMap::from_iter([
             ("consumer@1.0.0".into(), package("consumer", "1.0.0", &[], false)),
@@ -170,16 +170,8 @@ fn transitive_pending_peer_uses_provider_final_suffix() {
 
     let mut tree = ResolvedTree {
         direct: vec![
-            DirectDep {
-                alias: "a".to_string(),
-                node_id: a_node_id.clone(),
-                id: "a@1.0.0".to_string(),
-            },
-            DirectDep {
-                alias: "c".to_string(),
-                node_id: c_node_id.clone(),
-                id: "c@1.0.0".to_string(),
-            },
+            DirectDep { alias: "a".to_string(), node_id: a_node_id.clone(), id: "a@1.0.0".into() },
+            DirectDep { alias: "c".to_string(), node_id: c_node_id.clone(), id: "c@1.0.0".into() },
         ],
         packages: HashMap::from_iter([
             ("a@1.0.0".into(), package("a", "1.0.0", &[("c", "*")], false)),
@@ -233,12 +225,12 @@ fn resolved_peer_providers_from_direct_outputs_are_last_write_wins() {
             DirectDep {
                 alias: "first".to_string(),
                 node_id: first.clone(),
-                id: "first@1.0.0".to_string(),
+                id: "first@1.0.0".into(),
             },
             DirectDep {
                 alias: "second".to_string(),
                 node_id: second.clone(),
-                id: "second@1.0.0".to_string(),
+                id: "second@1.0.0".into(),
             },
         ],
         packages: HashMap::from_iter([
@@ -275,17 +267,17 @@ fn peer_name_cycle_collapses_provider_suffixes() {
             DirectDep {
                 alias: "source-map-loader".to_string(),
                 node_id: loader.clone(),
-                id: "source-map-loader@1.0.0".to_string(),
+                id: "source-map-loader@1.0.0".into(),
             },
             DirectDep {
                 alias: "webpack-cli".to_string(),
                 node_id: webpack_cli.clone(),
-                id: "webpack-cli@6.0.0".to_string(),
+                id: "webpack-cli@6.0.0".into(),
             },
             DirectDep {
                 alias: "webpack".to_string(),
                 node_id: webpack.clone(),
-                id: "webpack@5.0.0".to_string(),
+                id: "webpack@5.0.0".into(),
             },
         ],
         packages: HashMap::from_iter([
@@ -360,7 +352,7 @@ fn missing_names_by_pkg_records_only_children_context_missing_peers() {
         direct: vec![DirectDep {
             alias: "parent".to_string(),
             node_id: parent.clone(),
-            id: "parent@1.0.0".to_string(),
+            id: "parent@1.0.0".into(),
         }],
         packages: HashMap::from_iter([
             (
@@ -413,7 +405,7 @@ fn own_peer_is_resolved_from_aliased_sibling_real_name() {
         direct: vec![DirectDep {
             alias: "parent".to_string(),
             node_id: parent.clone(),
-            id: "parent@1.0.0".to_string(),
+            id: "parent@1.0.0".into(),
         }],
         packages: HashMap::from_iter([
             ("peer-c@2.0.0".into(), package("peer-c", "2.0.0", &[], true)),
@@ -471,16 +463,8 @@ fn cached_optional_peer_resolution_does_not_match_later_parent_without_provider(
 
     let mut tree = ResolvedTree {
         direct: vec![
-            DirectDep {
-                alias: "core".to_string(),
-                node_id: core.clone(),
-                id: "core@1.0.0".to_string(),
-            },
-            DirectDep {
-                alias: "cli".to_string(),
-                node_id: cli.clone(),
-                id: "cli@1.0.0".to_string(),
-            },
+            DirectDep { alias: "core".to_string(), node_id: core.clone(), id: "core@1.0.0".into() },
+            DirectDep { alias: "cli".to_string(), node_id: cli.clone(), id: "cli@1.0.0".into() },
         ],
         packages: HashMap::from_iter([
             ("types@1.0.0".into(), package("types", "1.0.0", &[], true)),
@@ -536,16 +520,16 @@ fn same_package_child_replaces_inherited_parent_when_peer_diamond_conflicts() {
 
     let mut tree = ResolvedTree {
         direct: vec![
-            DirectDep { alias: "ts".to_string(), node_id: ts2.clone(), id: "ts@2.0.0".to_string() },
+            DirectDep { alias: "ts".to_string(), node_id: ts2.clone(), id: "ts@2.0.0".into() },
             DirectDep {
                 alias: "parser".to_string(),
                 node_id: parser_root.clone(),
-                id: "parser@1.0.0".to_string(),
+                id: "parser@1.0.0".into(),
             },
             DirectDep {
                 alias: "bundle".to_string(),
                 node_id: bundle.clone(),
-                id: "bundle@1.0.0".to_string(),
+                id: "bundle@1.0.0".into(),
             },
         ],
         packages: HashMap::from_iter([
@@ -588,6 +572,388 @@ fn same_package_child_replaces_inherited_parent_when_peer_diamond_conflicts() {
     );
 }
 
+/// Same diamond as above, but `plugin` sits under `wrapper`, a regular
+/// dependency of `shadow`, instead of being a direct child of the package that
+/// provides its own `parser`.
+/// <https://github.com/pnpm/pnpm/issues/12098>
+#[test]
+fn same_package_child_replaces_inherited_parent_when_descendant_closes_peer_diamond() {
+    let ts1 = NodeId::leaf("ts@1.0.0");
+    let ts2 = NodeId::leaf("ts@2.0.0");
+    let parser_root = NodeId::next();
+    let parser_child = NodeId::next();
+    let plugin = NodeId::next();
+    let wrapper = NodeId::next();
+    let shadow = NodeId::next();
+
+    let mut wrapper_children = BTreeMap::new();
+    wrapper_children.insert("plugin".to_string(), plugin.clone());
+
+    let mut shadow_children = BTreeMap::new();
+    shadow_children.insert("parser".to_string(), parser_child.clone());
+    shadow_children.insert("ts".to_string(), ts1.clone());
+    shadow_children.insert("wrapper".to_string(), wrapper.clone());
+
+    let mut tree = ResolvedTree {
+        direct: vec![
+            DirectDep { alias: "ts".to_string(), node_id: ts2.clone(), id: "ts@2.0.0".into() },
+            DirectDep {
+                alias: "parser".to_string(),
+                node_id: parser_root.clone(),
+                id: "parser@1.0.0".into(),
+            },
+            DirectDep {
+                alias: "shadow".to_string(),
+                node_id: shadow.clone(),
+                id: "shadow@1.0.0".into(),
+            },
+        ],
+        packages: HashMap::from_iter([
+            ("ts@1.0.0".into(), package("ts", "1.0.0", &[], true)),
+            ("ts@2.0.0".into(), package("ts", "2.0.0", &[], true)),
+            ("parser@1.0.0".into(), package("parser", "1.0.0", &[("ts", "*")], false)),
+            (
+                Arc::from("plugin@1.0.0".to_string()),
+                package("plugin", "1.0.0", &[("parser", "*"), ("ts", "*")], false),
+            ),
+            ("wrapper@1.0.0".into(), package("wrapper", "1.0.0", &[], false)),
+            ("shadow@1.0.0".into(), package("shadow", "1.0.0", &[], false)),
+        ]),
+        dependencies_tree: HashMap::from_iter([
+            (ts1, tree_node("ts@1.0.0", BTreeMap::new(), 1)),
+            (ts2, tree_node("ts@2.0.0", BTreeMap::new(), 0)),
+            (parser_root, tree_node("parser@1.0.0", BTreeMap::new(), 0)),
+            (parser_child, tree_node("parser@1.0.0", BTreeMap::new(), 1)),
+            (plugin, tree_node("plugin@1.0.0", BTreeMap::new(), 2)),
+            (wrapper, tree_node("wrapper@1.0.0", wrapper_children, 1)),
+            (shadow, tree_node("shadow@1.0.0", shadow_children, 0)),
+        ]),
+        all_peer_dep_names: HashSet::from_iter(["parser".to_string(), "ts".to_string()]),
+        policy_violations: Vec::new(),
+        applied_patches: HashSet::default(),
+        children_by_id: HashMap::default(),
+    };
+
+    let result = resolve_peers(&mut tree, ResolvePeersOptions::default());
+    let consistent = DepPath::from("plugin@1.0.0(parser@1.0.0(ts@1.0.0))(ts@1.0.0)");
+    let inconsistent = DepPath::from("plugin@1.0.0(parser@1.0.0(ts@2.0.0))(ts@1.0.0)");
+
+    assert!(
+        result.graph.contains_key(&consistent),
+        "plugin should use the nested parser context: {:#?}",
+        result.graph.keys().collect::<Vec<_>>(),
+    );
+    assert!(
+        !result.graph.contains_key(&inconsistent),
+        "plugin must not mix the root parser context with nested ts: {:#?}",
+        result.graph.keys().collect::<Vec<_>>(),
+    );
+}
+
+/// Same as above, but the walk meets another occurrence of `wrapper` first,
+/// one that has its own `parser`. Cycle pruning can give two occurrences of one
+/// package different children, so that occurrence must not stop the walk from
+/// reaching `plugin` through the `wrapper` that inherits the provider.
+#[test]
+fn descendant_walk_does_not_skip_a_package_seen_first_with_its_own_provider() {
+    let ts1 = NodeId::leaf("ts@1.0.0");
+    let ts2 = NodeId::leaf("ts@2.0.0");
+    let parser_root = NodeId::next();
+    let parser_child = NodeId::next();
+    let parser_in_wrapper = NodeId::next();
+    let plugin = NodeId::next();
+    let wrapper = NodeId::next();
+    let wrapper_with_parser = NodeId::next();
+    let zeta = NodeId::next();
+    let shadow = NodeId::next();
+
+    let mut wrapper_children = BTreeMap::new();
+    wrapper_children.insert("plugin".to_string(), plugin.clone());
+
+    let mut wrapper_with_parser_children = BTreeMap::new();
+    wrapper_with_parser_children.insert("parser".to_string(), parser_in_wrapper.clone());
+
+    let mut zeta_children = BTreeMap::new();
+    zeta_children.insert("wrapper".to_string(), wrapper_with_parser.clone());
+
+    // Child edges are popped in reverse alias order, so `zeta` is walked first.
+    let mut shadow_children = BTreeMap::new();
+    shadow_children.insert("parser".to_string(), parser_child.clone());
+    shadow_children.insert("ts".to_string(), ts1.clone());
+    shadow_children.insert("wrapper".to_string(), wrapper.clone());
+    shadow_children.insert("zeta".to_string(), zeta.clone());
+
+    let mut tree = ResolvedTree {
+        direct: vec![
+            DirectDep { alias: "ts".to_string(), node_id: ts2.clone(), id: "ts@2.0.0".into() },
+            DirectDep {
+                alias: "parser".to_string(),
+                node_id: parser_root.clone(),
+                id: "parser@1.0.0".into(),
+            },
+            DirectDep {
+                alias: "shadow".to_string(),
+                node_id: shadow.clone(),
+                id: "shadow@1.0.0".into(),
+            },
+        ],
+        packages: HashMap::from_iter([
+            ("ts@1.0.0".into(), package("ts", "1.0.0", &[], true)),
+            ("ts@2.0.0".into(), package("ts", "2.0.0", &[], true)),
+            ("parser@1.0.0".into(), package("parser", "1.0.0", &[("ts", "*")], false)),
+            (
+                Arc::from("plugin@1.0.0".to_string()),
+                package("plugin", "1.0.0", &[("parser", "*"), ("ts", "*")], false),
+            ),
+            ("wrapper@1.0.0".into(), package("wrapper", "1.0.0", &[], false)),
+            ("zeta@1.0.0".into(), package("zeta", "1.0.0", &[], false)),
+            ("shadow@1.0.0".into(), package("shadow", "1.0.0", &[], false)),
+        ]),
+        dependencies_tree: HashMap::from_iter([
+            (ts1, tree_node("ts@1.0.0", BTreeMap::new(), 1)),
+            (ts2, tree_node("ts@2.0.0", BTreeMap::new(), 0)),
+            (parser_root, tree_node("parser@1.0.0", BTreeMap::new(), 0)),
+            (parser_child, tree_node("parser@1.0.0", BTreeMap::new(), 1)),
+            (parser_in_wrapper, tree_node("parser@1.0.0", BTreeMap::new(), 3)),
+            (plugin, tree_node("plugin@1.0.0", BTreeMap::new(), 2)),
+            (wrapper, tree_node("wrapper@1.0.0", wrapper_children, 1)),
+            (wrapper_with_parser, tree_node("wrapper@1.0.0", wrapper_with_parser_children, 2)),
+            (zeta, tree_node("zeta@1.0.0", zeta_children, 1)),
+            (shadow, tree_node("shadow@1.0.0", shadow_children, 0)),
+        ]),
+        all_peer_dep_names: HashSet::from_iter(["parser".to_string(), "ts".to_string()]),
+        policy_violations: Vec::new(),
+        applied_patches: HashSet::default(),
+        children_by_id: HashMap::default(),
+    };
+
+    let result = resolve_peers(&mut tree, ResolvePeersOptions::default());
+    let consistent = DepPath::from("plugin@1.0.0(parser@1.0.0(ts@1.0.0))(ts@1.0.0)");
+    let inconsistent = DepPath::from("plugin@1.0.0(parser@1.0.0(ts@2.0.0))(ts@1.0.0)");
+
+    assert!(
+        result.graph.contains_key(&consistent),
+        "plugin should use the nested parser context: {:#?}",
+        result.graph.keys().collect::<Vec<_>>(),
+    );
+    assert!(
+        !result.graph.contains_key(&inconsistent),
+        "plugin must not mix the root parser context with nested ts: {:#?}",
+        result.graph.keys().collect::<Vec<_>>(),
+    );
+}
+
+/// `wrapper` has its own `parser` under an alias, so `plugin` below it doesn't
+/// inherit `shadow`'s `parser` and doesn't close the diamond. Nothing else
+/// does, so `consumer` keeps the inherited `parser`, as it would without
+/// `plugin`.
+#[test]
+fn descendant_walk_stops_at_an_aliased_copy_of_the_provider() {
+    let ts1 = NodeId::leaf("ts@1.0.0");
+    let ts2 = NodeId::leaf("ts@2.0.0");
+    let parser_root = NodeId::next();
+    let parser_child = NodeId::next();
+    let parser_aliased = NodeId::next();
+    let plugin = NodeId::next();
+    let wrapper = NodeId::next();
+    let consumer = NodeId::next();
+    let shadow = NodeId::next();
+
+    let mut wrapper_children = BTreeMap::new();
+    wrapper_children.insert("my-parser".to_string(), parser_aliased.clone());
+    wrapper_children.insert("plugin".to_string(), plugin.clone());
+
+    let mut shadow_children = BTreeMap::new();
+    shadow_children.insert("consumer".to_string(), consumer.clone());
+    shadow_children.insert("parser".to_string(), parser_child.clone());
+    shadow_children.insert("ts".to_string(), ts1.clone());
+    shadow_children.insert("wrapper".to_string(), wrapper.clone());
+
+    let mut tree = ResolvedTree {
+        direct: vec![
+            DirectDep { alias: "ts".to_string(), node_id: ts2.clone(), id: "ts@2.0.0".into() },
+            DirectDep {
+                alias: "parser".to_string(),
+                node_id: parser_root.clone(),
+                id: "parser@1.0.0".into(),
+            },
+            DirectDep {
+                alias: "shadow".to_string(),
+                node_id: shadow.clone(),
+                id: "shadow@1.0.0".into(),
+            },
+        ],
+        packages: HashMap::from_iter([
+            ("ts@1.0.0".into(), package("ts", "1.0.0", &[], true)),
+            ("ts@2.0.0".into(), package("ts", "2.0.0", &[], true)),
+            ("parser@1.0.0".into(), package("parser", "1.0.0", &[("ts", "*")], false)),
+            (
+                Arc::from("plugin@1.0.0".to_string()),
+                package("plugin", "1.0.0", &[("parser", "*"), ("ts", "*")], false),
+            ),
+            ("consumer@1.0.0".into(), package("consumer", "1.0.0", &[("parser", "*")], false)),
+            ("wrapper@1.0.0".into(), package("wrapper", "1.0.0", &[], false)),
+            ("shadow@1.0.0".into(), package("shadow", "1.0.0", &[], false)),
+        ]),
+        dependencies_tree: HashMap::from_iter([
+            (ts1, tree_node("ts@1.0.0", BTreeMap::new(), 1)),
+            (ts2, tree_node("ts@2.0.0", BTreeMap::new(), 0)),
+            (parser_root, tree_node("parser@1.0.0", BTreeMap::new(), 0)),
+            (parser_child, tree_node("parser@1.0.0", BTreeMap::new(), 1)),
+            (parser_aliased, tree_node("parser@1.0.0", BTreeMap::new(), 2)),
+            (plugin, tree_node("plugin@1.0.0", BTreeMap::new(), 2)),
+            (consumer, tree_node("consumer@1.0.0", BTreeMap::new(), 1)),
+            (wrapper, tree_node("wrapper@1.0.0", wrapper_children, 1)),
+            (shadow, tree_node("shadow@1.0.0", shadow_children, 0)),
+        ]),
+        all_peer_dep_names: HashSet::from_iter(["parser".to_string(), "ts".to_string()]),
+        policy_violations: Vec::new(),
+        applied_patches: HashSet::default(),
+        children_by_id: HashMap::default(),
+    };
+
+    let result = resolve_peers(&mut tree, ResolvePeersOptions::default());
+    let inherited = DepPath::from("consumer@1.0.0(parser@1.0.0(ts@2.0.0))");
+    let own = DepPath::from("consumer@1.0.0(parser@1.0.0(ts@1.0.0))");
+
+    assert!(
+        result.graph.contains_key(&inherited),
+        "consumer should keep the inherited parser: {:#?}",
+        result.graph.keys().collect::<Vec<_>>(),
+    );
+    assert!(
+        !result.graph.contains_key(&own),
+        "plugin below an aliased parser must not switch consumer to the nested parser: {:#?}",
+        result.graph.keys().collect::<Vec<_>>(),
+    );
+}
+
+/// `zed`'s only edge is the cycle edge back to its ancestor `app`, which the
+/// peer walk cuts. A lazy `zed` still lists it among its package edges, and a
+/// realized one keeps it as a record-only node. The descendant walk must drop
+/// it either way. Following it would reach `app`'s `plugin`, which is not below
+/// `shadow` and does not inherit `shadow`'s `parser`, and would switch
+/// `consumer` to `shadow`'s own `parser`.
+#[test]
+fn descendant_walk_skips_a_cut_cycle_edge_of_a_lazy_node() {
+    assert_descendant_walk_skips_cut_cycle_edge(false);
+}
+
+/// See [`descendant_walk_skips_a_cut_cycle_edge_of_a_lazy_node`].
+#[test]
+fn descendant_walk_skips_a_cut_cycle_edge_of_a_realized_node() {
+    assert_descendant_walk_skips_cut_cycle_edge(true);
+}
+
+fn assert_descendant_walk_skips_cut_cycle_edge(realized_zed: bool) {
+    let ts1 = NodeId::leaf("ts@1.0.0");
+    let ts2 = NodeId::leaf("ts@2.0.0");
+    let parser_root = NodeId::next();
+    let parser_child = NodeId::next();
+    let plugin = NodeId::next();
+    let consumer = NodeId::next();
+    let zed = NodeId::next();
+    let shadow = NodeId::next();
+    let app = NodeId::next();
+
+    let mut app_children = BTreeMap::new();
+    app_children.insert("plugin".to_string(), plugin.clone());
+    app_children.insert("shadow".to_string(), shadow.clone());
+
+    let mut shadow_children = BTreeMap::new();
+    shadow_children.insert("consumer".to_string(), consumer.clone());
+    shadow_children.insert("parser".to_string(), parser_child.clone());
+    shadow_children.insert("ts".to_string(), ts1.clone());
+    shadow_children.insert("zed".to_string(), zed.clone());
+
+    let edge = |alias: &str, pkg_id: &str| crate::resolved_tree::ChildEdge {
+        alias: alias.to_string(),
+        pkg_id: Arc::from(pkg_id),
+        optional: false,
+    };
+    let zed_node = if realized_zed {
+        let mut zed_children = BTreeMap::new();
+        zed_children.insert("app".to_string(), app.clone());
+        tree_node("zed@1.0.0", zed_children, 2)
+    } else {
+        crate::resolved_tree::DependenciesTreeNode::new(
+            Arc::from("zed@1.0.0"),
+            TreeChildren::Lazy,
+            2,
+        )
+    };
+
+    let mut tree = ResolvedTree {
+        direct: vec![
+            DirectDep { alias: "ts".to_string(), node_id: ts2.clone(), id: "ts@2.0.0".into() },
+            DirectDep {
+                alias: "parser".to_string(),
+                node_id: parser_root.clone(),
+                id: "parser@1.0.0".into(),
+            },
+            DirectDep { alias: "app".to_string(), node_id: app.clone(), id: "app@1.0.0".into() },
+        ],
+        packages: HashMap::from_iter([
+            ("ts@1.0.0".into(), package("ts", "1.0.0", &[], true)),
+            ("ts@2.0.0".into(), package("ts", "2.0.0", &[], true)),
+            ("parser@1.0.0".into(), package("parser", "1.0.0", &[("ts", "*")], false)),
+            (
+                Arc::from("plugin@1.0.0".to_string()),
+                package("plugin", "1.0.0", &[("parser", "*"), ("ts", "*")], false),
+            ),
+            ("consumer@1.0.0".into(), package("consumer", "1.0.0", &[("parser", "*")], false)),
+            ("zed@1.0.0".into(), package("zed", "1.0.0", &[], false)),
+            ("shadow@1.0.0".into(), package("shadow", "1.0.0", &[], false)),
+            ("app@1.0.0".into(), package("app", "1.0.0", &[], false)),
+        ]),
+        dependencies_tree: HashMap::from_iter([
+            (ts1, tree_node("ts@1.0.0", BTreeMap::new(), 2)),
+            (ts2, tree_node("ts@2.0.0", BTreeMap::new(), 0)),
+            (parser_root, tree_node("parser@1.0.0", BTreeMap::new(), 0)),
+            (parser_child, tree_node("parser@1.0.0", BTreeMap::new(), 2)),
+            (plugin, tree_node("plugin@1.0.0", BTreeMap::new(), 1)),
+            (consumer, tree_node("consumer@1.0.0", BTreeMap::new(), 2)),
+            (zed, zed_node),
+            (shadow, tree_node("shadow@1.0.0", shadow_children, 1)),
+            (app, tree_node("app@1.0.0", app_children, 0)),
+        ]),
+        all_peer_dep_names: HashSet::from_iter(["parser".to_string(), "ts".to_string()]),
+        policy_violations: Vec::new(),
+        applied_patches: HashSet::default(),
+        children_by_id: HashMap::from_iter([
+            (
+                Arc::from("app@1.0.0"),
+                Arc::new(vec![edge("plugin", "plugin@1.0.0"), edge("shadow", "shadow@1.0.0")]),
+            ),
+            (
+                Arc::from("shadow@1.0.0"),
+                Arc::new(vec![
+                    edge("consumer", "consumer@1.0.0"),
+                    edge("parser", "parser@1.0.0"),
+                    edge("ts", "ts@1.0.0"),
+                    edge("zed", "zed@1.0.0"),
+                ]),
+            ),
+            (Arc::from("zed@1.0.0"), Arc::new(vec![edge("app", "app@1.0.0")])),
+        ]),
+    };
+
+    let result = resolve_peers(&mut tree, ResolvePeersOptions::default());
+    let inherited = DepPath::from("consumer@1.0.0(parser@1.0.0(ts@2.0.0))");
+    let own = DepPath::from("consumer@1.0.0(parser@1.0.0(ts@1.0.0))");
+
+    assert!(
+        result.graph.contains_key(&inherited),
+        "consumer should keep the inherited parser: {:#?}",
+        result.graph.keys().collect::<Vec<_>>(),
+    );
+    assert!(
+        !result.graph.contains_key(&own),
+        "a cut cycle edge must not switch consumer to the nested parser: {:#?}",
+        result.graph.keys().collect::<Vec<_>>(),
+    );
+}
+
 // Parity check for <https://github.com/pnpm/pnpm/pull/12514>.
 //
 // A shared package (`styled-jsx`) declaring an *optional* peer (`@babel/core`)
@@ -619,12 +985,12 @@ fn shared_package_optional_transitive_peer_resolves_deterministically() {
                 DirectDep {
                     alias: "app".to_string(),
                     node_id: app.clone(),
-                    id: "app@1.0.0".to_string(),
+                    id: "app@1.0.0".into(),
                 },
                 DirectDep {
                     alias: "mid".to_string(),
                     node_id: mid.clone(),
-                    id: "mid@1.0.0".to_string(),
+                    id: "mid@1.0.0".into(),
                 },
             ],
             packages: HashMap::from_iter([

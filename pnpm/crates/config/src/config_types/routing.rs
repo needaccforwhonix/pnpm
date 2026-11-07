@@ -17,6 +17,7 @@ const PNPM_CONFIG_FILE_KEYS: &[&str] = &[
     "fetch-warn-timeout-ms",
     "fetch-min-speed-ki-bps",
     "fetching-concurrency",
+    "force-ignores-platform",
     "frozen-store",
     "git-checks",
     "git-shallow-hosts",
@@ -50,6 +51,8 @@ const PNPM_CONFIG_FILE_KEYS: &[&str] = &[
     "prefer-frozen-lockfile",
     "prefer-offline",
     "prefer-symlinked-executables",
+    "progress",
+    "publish-wait-timeout",
     "block-exotic-subdeps",
     "registry-supports-time-field",
     "reporter",
@@ -60,7 +63,9 @@ const PNPM_CONFIG_FILE_KEYS: &[&str] = &[
     "side-effects-cache-readonly",
     "state-dir",
     "store-dir",
+    "store-index-format",
     "strict-dep-builds",
+    "symlinked-lockfile-target-dirs",
     "trust-lockfile",
     "trust-policy",
     "trust-policy-exclude",
@@ -78,7 +83,7 @@ const PNPM_CONFIG_FILE_KEYS: &[&str] = &[
 /// Structured YAML settings parsed from `pnpm-workspace.yaml` / global
 /// `config.yaml` that have no scalar CLI config type
 /// (`structuredConfigFileKeys` in `configFileKey.ts`).
-const STRUCTURED_CONFIG_FILE_KEYS: &[&str] = &["named-registries", "registries"];
+const STRUCTURED_CONFIG_FILE_KEYS: &[&str] = &["macos-backup", "named-registries", "registries"];
 
 /// Keys present in `pnpmTypes` but excluded from the global config file
 /// (`excludedPnpmKeys` in `configFileKey.ts`) — CLI flags and workspace-only
@@ -141,6 +146,7 @@ const EXCLUDED_PNPM_KEYS: &[&str] = &[
     "reporter-hide-prefix",
     "save-catalog-name",
     "save-peer",
+    "save-types",
     "save-workspace-protocol",
     "shamefully-hoist",
     "shared-workspace-lockfile",

@@ -1,5 +1,5 @@
 use crate::{
-    features::active_dependencies_from_parts,
+    features::{DependencyOptions, dependencies_from_parts},
     model::{CargoMetadata, FeatureSelection, MetadataPackage, RegistryDependency},
 };
 use miette::{IntoDiagnostic, Result, WrapErr};
@@ -7,6 +7,23 @@ use std::collections::BTreeMap;
 
 pub(crate) fn parse_metadata(metadata: &str) -> Result<CargoMetadata> {
     serde_json::from_str(metadata).into_diagnostic().wrap_err("parse cargo metadata")
+}
+
+/// Git sources declared by the packages in a Cargo metadata document.
+/// The metadata need not contain a resolved dependency graph.
+pub fn git_dependency_sources(metadata: &str) -> Result<Vec<cargo_lock::SourceId>> {
+    parse_metadata(metadata)?.packages
+        .into_iter()
+        .flat_map(|package| package.dependencies)
+        .filter_map(|dependency| dependency.source)
+        .filter(|source| source.starts_with("git+"))
+        .map(|source| {
+            source
+                .parse()
+                .into_diagnostic()
+                .wrap_err("parse Cargo git dependency")
+        })
+        .collect()
 }
 
 /// The `cargo metadata` package keys that resolution reads and copies
@@ -104,7 +121,7 @@ pub(crate) fn root_dependencies(metadata: &CargoMetadata) -> Result<Vec<Registry
     metadata.packages
         .iter()
         .filter(|package| metadata.workspace_members.contains(&package.id))
-        .map(active_metadata_dependencies)
+        .map(locked_metadata_dependencies)
         .collect::<Result<Vec<_>>>()
         .map(|dependencies| {
             dependencies
@@ -115,7 +132,7 @@ pub(crate) fn root_dependencies(metadata: &CargoMetadata) -> Result<Vec<Registry
         })
 }
 
-pub(crate) fn active_metadata_dependencies(
+pub(crate) fn locked_metadata_dependencies(
     package: &MetadataPackage,
 ) -> Result<Vec<RegistryDependency>> {
     let dependencies = package.dependencies
@@ -134,7 +151,7 @@ pub(crate) fn active_metadata_dependencies(
                 .collect(),
         })
         .collect::<Vec<_>>();
-    active_dependencies_from_parts(
+    dependencies_from_parts(
         &dependencies,
         &package.features,
         &FeatureSelection {
@@ -144,6 +161,6 @@ pub(crate) fn active_metadata_dependencies(
                 .cloned()
                 .collect(),
         },
-        true,
+        DependencyOptions { include_dev: true, lockfile: true },
     )
 }

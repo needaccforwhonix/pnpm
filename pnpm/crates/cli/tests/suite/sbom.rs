@@ -1,6 +1,9 @@
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
-use pnpm_testing_utils::command_env::CommandTestExt;
+use pnpm_testing_utils::{
+    bin::{AddMockedRegistry, CommandTempCwd},
+    command_env::CommandTestExt,
+};
 use std::{collections::HashSet, ffi::OsStr, fs, path::Path, process::Command};
 use tempfile::TempDir;
 
@@ -228,10 +231,11 @@ fn sbom_dependencies_present() {
     assert!(
         depends_on
             .iter()
-            .any(|dep| dep
-                .as_str()
-                .unwrap()
-                .contains("is-positive")),
+            .any(|dep| {
+                dep.as_str()
+                    .unwrap()
+                    .contains("is-positive")
+            }),
     );
 }
 
@@ -592,7 +596,6 @@ fn sbom_cyclonedx_scoped_root_has_group() {
     let tmp = copy_fixture("workspace-sbom");
     // workspace-sbom root has name "workspace-sbom-root" (unscoped)
     // but app-a is "@test/app-a" - we need a scoped root to test group
-    // Create a temp fixture with scoped name
     fs::write(
         tmp.path().join("package.json"),
         r#"{"name":"@myorg/myapp","version":"2.0.0","license":"MIT"}"#,
@@ -734,6 +737,116 @@ fn parse_sbom_output(output: &std::process::Output) -> serde_json::Value {
     serde_json::from_slice(&output.stdout).expect("parse JSON output")
 }
 
+#[test]
+fn sbom_root_repository_shorthand_is_expanded_to_github_url() {
+    let tmp = copy_fixture("sbom-repository");
+    let parsed = run_sbom_json(tmp.path(), "cyclonedx", &[]);
+    let root = &parsed["metadata"]["component"];
+    let ext_refs = root["externalReferences"].as_array().expect("root externalReferences");
+    let vcs = ext_refs
+        .iter()
+        .find(|ext_ref| ext_ref["type"] == "vcs")
+        .expect("vcs reference");
+    assert_eq!(vcs["url"], "git+https://github.com/acme/sbom-repository-test.git");
+}
+
+#[test]
+fn sbom_spdx_root_repository_shorthand_is_expanded_to_github_url() {
+    let tmp = copy_fixture("sbom-repository");
+    let parsed = run_sbom_json(tmp.path(), "spdx", &[]);
+    let root = &parsed["packages"].as_array().expect("packages")[0];
+    assert_eq!(root["homepage"], "git+https://github.com/acme/sbom-repository-test.git");
+}
+
+#[test]
+fn sbom_root_repository_that_is_not_a_url_is_omitted() {
+    let tmp = copy_fixture("sbom-repository");
+    fs::write(
+        tmp.path().join("package.json"),
+        r#"{
+  "name": "sbom-repository-test",
+  "version": "1.0.0",
+  "license": "ISC",
+  "repository": "maintainers@example.com",
+  "dependencies": { "is-positive": "^3.1.0" }
+}"#,
+    )
+    .expect("write package.json");
+    let parsed = run_sbom_json(tmp.path(), "cyclonedx", &[]);
+    let root = &parsed["metadata"]["component"];
+    assert!(
+        !root
+            .get("externalReferences")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|ext_refs| ext_refs
+                .iter()
+                .any(|ext_ref| ext_ref["type"] == "vcs")),
+        "an email is not a repository URL and must not be published: {root}",
+    );
+}
+
+/// The fixture package's manifest carries `"repository": "pnpm/sbom-shorthand-repo"`.
+#[test]
+fn sbom_component_repository_shorthand_is_expanded_to_github_url() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    let registry = mock_instance.url();
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({
+            "name": "sbom-component-repository",
+            "version": "1.0.0",
+            "dependencies": { "@pnpm.e2e/sbom-shorthand-repo": "1.0.0" },
+        })
+        .to_string(),
+    )
+    .expect("write package.json");
+
+    pacquet
+        .with_args(["install"])
+        .with_arg(format!("--registry={registry}"))
+        .assert()
+        .success();
+
+    let output = Command::cargo_bin("pnpm")
+        .expect("find the pnpm binary")
+        .with_current_dir(&workspace)
+        .without_ambient_pnpm_config()
+        .with_args(["sbom", "--sbom-format", "cyclonedx"])
+        .with_arg(format!("--registry={registry}"))
+        .output()
+        .expect("run pacquet sbom");
+    assert!(
+        output.status.success(),
+        "pacquet sbom failed: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).expect("parse SBOM");
+    let component = parsed["components"]
+        .as_array()
+        .expect("components array")
+        .iter()
+        .find(|component| {
+            component["name"] == "sbom-shorthand-repo" && component["version"] == "1.0.0"
+        })
+        .expect("@pnpm.e2e/sbom-shorthand-repo component");
+    let ext_refs =
+        component["externalReferences"].as_array().expect("component externalReferences");
+    let vcs = ext_refs
+        .iter()
+        .find(|ext_ref| ext_ref["type"] == "vcs")
+        .expect("vcs reference");
+    assert_eq!(vcs["url"], "git+https://github.com/pnpm/sbom-shorthand-repo.git");
+
+    drop((root, mock_instance));
+}
+
 /// Gives the root manifest the string form of the `author` field.
 fn set_root_author(workspace: &Path, author: &str) {
     let manifest_path = workspace.join("package.json");
@@ -765,6 +878,110 @@ fn set_dependency_author(workspace: &Path, author_name: &str) {
     .expect("write the package manifest");
 }
 
+fn write_populated_workspace_root(workspace: &Path) {
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({
+            "name": "workspace-root",
+            "version": "1.0.0",
+            "author": "Acme Engineering",
+            "description": "The workspace root",
+            "license": "MIT",
+            "repository": "https://github.com/acme/workspace",
+            "bugs": { "url": "https://github.com/acme/workspace/issues" },
+        })
+        .to_string(),
+    )
+    .expect("write the root manifest");
+}
+
+fn write_app_a_manifest(workspace: &Path, manifest: &serde_json::Value) {
+    fs::write(workspace.join("app-a/package.json"), manifest.to_string())
+        .expect("write the app-a manifest");
+}
+
+#[test]
+fn sbom_filtered_single_project_inherits_workspace_root_metadata() {
+    let tmp = copy_fixture("workspace-sbom-populated");
+    write_populated_workspace_root(tmp.path());
+    write_app_a_manifest(
+        tmp.path(),
+        &serde_json::json!({ "name": "@test/app-a", "version": "2.0.0" }),
+    );
+
+    let cyclonedx = run_sbom_json(tmp.path(), "cyclonedx", &["--filter", "app-a"]);
+    let root = &cyclonedx["metadata"]["component"];
+    assert_eq!(root["name"], "app-a");
+    assert_eq!(root["version"], "2.0.0");
+    assert_eq!(root["authors"][0]["name"], "Acme Engineering");
+    assert_eq!(root["description"], "The workspace root");
+    assert_eq!(root["licenses"][0]["license"]["id"], "MIT");
+    let ext_refs = root["externalReferences"].as_array().expect("externalReferences");
+    dbg!(ext_refs);
+    assert!(ext_refs.contains(&serde_json::json!({
+        "type": "vcs",
+        "url": "https://github.com/acme/workspace",
+    })));
+    assert!(ext_refs.contains(&serde_json::json!({
+        "type": "issue-tracker",
+        "url": "https://github.com/acme/workspace/issues",
+    })));
+
+    let spdx = run_sbom_json(tmp.path(), "spdx", &["--filter", "app-a"]);
+    let spdx_root = spdx_package(&spdx, "@test/app-a");
+    assert_eq!(spdx_root["supplier"], "Person: Acme Engineering");
+    assert_eq!(spdx_root["description"], "The workspace root");
+    assert_eq!(spdx_root["homepage"], "https://github.com/acme/workspace");
+    assert_eq!(spdx_root["licenseConcluded"], "MIT");
+    assert_eq!(spdx_root["licenseDeclared"], "MIT");
+}
+
+#[test]
+fn sbom_filtered_single_project_does_not_inherit_over_its_own_declarations() {
+    let tmp = copy_fixture("workspace-sbom-populated");
+    write_populated_workspace_root(tmp.path());
+
+    let blank_fields = serde_json::json!({
+        "name": "@test/app-a",
+        "version": "2.0.0",
+        "author": "",
+        "description": "",
+        "license": "",
+        "repository": { "type": "git", "url": "" },
+        "bugs": { "url": "" },
+    });
+    let null_fields = serde_json::json!({
+        "name": "@test/app-a",
+        "version": "2.0.0",
+        "author": null,
+        "description": null,
+        "license": null,
+        "repository": null,
+        "bugs": null,
+    });
+
+    for declared in [blank_fields, null_fields] {
+        write_app_a_manifest(tmp.path(), &declared);
+
+        let cyclonedx = run_sbom_json(tmp.path(), "cyclonedx", &["--filter", "app-a"]);
+        let root = &cyclonedx["metadata"]["component"];
+        dbg!(&declared, root);
+        assert!(root.get("authors").is_none());
+        assert!(root.get("description").is_none());
+        assert!(root.get("licenses").is_none());
+        assert!(root.get("externalReferences").is_none());
+
+        let spdx = run_sbom_json(tmp.path(), "spdx", &["--filter", "app-a"]);
+        let spdx_root = spdx_package(&spdx, "@test/app-a");
+        dbg!(spdx_root);
+        assert!(spdx_root.get("supplier").is_none());
+        assert!(spdx_root.get("description").is_none());
+        assert!(spdx_root.get("homepage").is_none());
+        assert_eq!(spdx_root["licenseConcluded"], "NOASSERTION");
+        assert_eq!(spdx_root["licenseDeclared"], "NOASSERTION");
+    }
+}
+
 fn cyclonedx_component<'a>(bom: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
     bom["components"]
         .as_array()
@@ -783,6 +1000,6 @@ fn spdx_package<'a>(document: &'a serde_json::Value, name: &str) -> &'a serde_js
         .unwrap_or_else(|| panic!("find the {name} package"))
 }
 
-mod workspace;
-
+mod license;
 mod metadata;
+mod workspace;

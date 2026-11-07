@@ -11,14 +11,24 @@ Lives in the [pnpm monorepo](https://github.com/pnpm/pnpm) under
 ## Install
 
 ```sh
-pnpm add -g @pnpm/pnpr
+pnpm add -g @pnpm/pnpr@next
 ```
+
+Until the first stable release, every pnpr version is a prerelease published
+under the `next` dist-tag, so install `@pnpm/pnpr@next`.
 
 The wrapper resolves to the native binary published under
 `@pnpm/pnpr.<platform>-<arch>` (e.g. `@pnpm/pnpr.linux-x64`). Prebuilt
 binaries are available for `linux-x64`, `linux-arm64`, `linux-x64-musl`,
 `linux-arm64-musl`, `darwin-x64`, `darwin-arm64`, `win32-x64`, and
 `win32-arm64`.
+
+To browse the server in a web browser, also install the web UI. pnpr serves it
+at `/-/ui/`:
+
+```sh
+pnpm add -g @pnpm/pnpr@next,@pnpm/pnpr-ui@next
+```
 
 ## Usage
 
@@ -32,7 +42,7 @@ It listens on `127.0.0.1:7677` and proxies `https://registry.npmjs.org/`
 by default. Point a client at it with:
 
 ```sh
-pnpm config set registry http://127.0.0.1:7677/
+pnpm config set registry http://127.0.0.1:7677/npm/
 ```
 
 ### Install accelerator
@@ -70,7 +80,7 @@ Everything pnpr reads is cached for every client that follows.
 | `--storage <path>` | Override the storage directory from the loaded config. |
 | `--cache <path>` | Override the disposable proxy-cache directory (the mirror of upstream registries plus the resolver cache). Defaults to a `.pnpr-cache` subdirectory of `--storage`. |
 | `--public-url <url>` | URL clients should use to reach the server, used when rewriting `dist.tarball` in served packuments. Defaults to `http://<listen>`. |
-| `--packument-ttl-secs <n>` | Seconds before a cached packument is considered stale and refetched. |
+| `--packument-ttl <interval>` | Duration before a cached packument is considered stale and refetched (e.g. `5m`, `300s`, or bare seconds). |
 | `--osv` | Enable local OSV npm vulnerability checks. Requires a local OSV npm database at `--osv-db` or `<cache>/osv/npm/all.zip`. |
 | `--osv-db <path>` | Path to the local OSV npm database zip or extracted JSON directory. |
 | `--disable-registry` | Disable the npm-registry surface (packument and tarball reads, publish, unpublish, dist-tag, search). |
@@ -80,7 +90,7 @@ Everything pnpr reads is cached for every client that follows.
 Every flag can also be set through an environment variable named after
 it: `PNPR_` followed by the flag name in upper case with dashes replaced
 by underscores. `--public-url` becomes `PNPR_PUBLIC_URL` and
-`--packument-ttl-secs` becomes `PNPR_PACKUMENT_TTL_SECS`. A flag given on
+`--packument-ttl` becomes `PNPR_PACKUMENT_TTL`. A flag given on
 the command line wins over its environment variable. Boolean flags such
 as `--disable-registry` accept `true`, `1`, `yes`, `on`, `false`, `0`,
 `no`, and `off`.
@@ -90,28 +100,29 @@ variable (e.g. `RUST_LOG=debug pnpr`).
 
 ## Configuration
 
-`pnpr` uses a [verdaccio](https://verdaccio.org/docs/configuration)-shaped
-YAML config. A minimal example:
+`pnpr` uses a YAML config. A minimal example:
 
 ```yaml
 storage: ./storage
 
-uplinks:
+registries:
+  local:
+    type: hosted
+    packages:
+      '@mycompany/*':
+        access: $authenticated
+        publish: $authenticated
+
   npmjs:
+    type: upstream
     url: https://registry.npmjs.org/
+    public: true
 
-packages:
-  '@*/*':
-    access: $all
-    publish: $authenticated
-    unpublish: $authenticated
-    proxy: npmjs
+  main:
+    type: router
+    sources: [local, npmjs]
 
-  '**':
-    access: $all
-    publish: $authenticated
-    unpublish: $authenticated
-    proxy: npmjs
+defaultRegistry: main
 ```
 
 Pass it with `-c`:
@@ -154,7 +165,15 @@ s3:
   # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY environment variables.
   accessKeyId: ${PNPR_S3_ACCESS_KEY_ID}
   secretAccessKey: ${PNPR_S3_SECRET_ACCESS_KEY}
+
+metadata:
+  # Package metadata of a hosted registry on S3 lives in a libSQL database.
+  url: libsql://<your-db>.turso.io
+  authToken: ${PNPR_LIBSQL_TOKEN}
 ```
+
+A registry that hosts packages on S3 needs `metadata.url` to name a libSQL
+database. pnpr refuses to start without one.
 
 | Key | Required | Description |
 | --- | --- | --- |
@@ -189,16 +208,13 @@ s3:
   region: auto
   endpoint: https://abc123def456.r2.cloudflarestorage.com
 
-uplinks:
+registries:
   npmjs:
+    type: upstream
     url: https://registry.npmjs.org/
+    public: true
 
-packages:
-  '**':
-    access: $all
-    publish: $authenticated
-    unpublish: $authenticated
-    proxy: npmjs
+defaultRegistry: npmjs
 ```
 
 ```sh
@@ -243,7 +259,7 @@ Database drivers are Cargo-feature gated:
 | Backend | Config key | Cargo feature |
 | --- | --- | --- |
 | libsql / Turso | `backend.libsql` | `backend-libsql` (enabled by default) |
-| PostgreSQL | `backend.postgres` or `backend.postgresql` | `backend-postgres` |
+| PostgreSQL | `backend.postgres` | `backend-postgres` |
 | MySQL-compatible | `backend.mysql` | `backend-mysql` |
 
 Token lookups happen on the request hot path, so the database should be
@@ -267,7 +283,7 @@ backend:
 | `url` | yes | Database URL — `libsql://<db>.turso.io` (Turso) or `http://<host>:<port>` (self-hosted `sqld`). |
 | `authToken` | no | Bearer token for the database. Omit for an unauthenticated local `sqld`. |
 | `replicaPath` | no | Path to a local **embedded replica**. When set, reads (token lookups) hit this local file instead of a network round-trip; writes still go to the primary. Absent ⇒ every read is a remote query. |
-| `syncIntervalSecs` | no | How often (seconds) the embedded replica pulls from the primary. Only meaningful with `replicaPath`; bounds how stale a read can be (token-revocation lag). `0` disables background sync. Defaults to `60`. |
+| `syncInterval` | no | How often the embedded replica pulls from the primary (e.g. `60s`, `1m`, or integer seconds). Only meaningful with `replicaPath`; bounds how stale a read can be (token-revocation lag). `0` disables background sync. Defaults to `60s`. |
 
 Token lookups happen on the request hot path, so for a remote primary
 (e.g. Turso) set `replicaPath` to serve reads from a local replica:
@@ -278,12 +294,12 @@ backend:
     url: ${PNPR_LIBSQL_URL}
     authToken: ${PNPR_LIBSQL_TOKEN}
     replicaPath: ./auth-replica.db
-    syncIntervalSecs: 60
+    syncInterval: 60s
 ```
 
 The trade-off is read freshness: an embedded replica reflects another
 replica's writes (a token issued or revoked elsewhere) only after the
-next background sync, so lower `syncIntervalSecs` means less
+next background sync, so a lower positive `syncInterval` means less
 revocation lag. Omit `replicaPath` to always read the primary directly.
 
 PostgreSQL:
@@ -309,7 +325,7 @@ feature, for example `cargo build -p pnpr --features backend-postgres`.
 
 When the `backend:` block is absent, auth stays on local disk and the
 `auth.htpasswd` / `auth.tokens` settings apply as before. The
-`auth.htpasswd.max_users` registration cap is honored either way.
+`auth.htpasswd.maxUsers` registration cap is honored either way.
 
 ### Running several replicas
 

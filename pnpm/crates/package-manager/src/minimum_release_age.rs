@@ -1,4 +1,4 @@
-use std::{marker::PhantomData, path::Path};
+use std::{io::Write, marker::PhantomData, path::Path};
 
 use derive_more::{Display, Error};
 use miette::Diagnostic;
@@ -112,10 +112,19 @@ impl ApprovalPrompt for DialoguerPrompt {
     async fn confirm(&mut self, message: &str) -> dialoguer::Result<bool> {
         let message = message.to_owned();
         tokio::task::spawn_blocking(move || {
-            dialoguer::Confirm::new()
-                .with_prompt(message)
+            let (list, question) =
+                message.rsplit_once('\n').expect("approval question follows the version list");
+            // Dialoguer only clears the last line when it renders the answer.
+            writeln!(std::io::stderr(), "{list}")?;
+            #[cfg(not(target_family = "wasm"))]
+            let result = dialoguer::Confirm::new()
+                .with_prompt(question)
                 .default(false)
-                .interact()
+                .interact();
+            #[cfg(target_family = "wasm")]
+            let result =
+                pnpm_wasm_host::confirm(question, Some(false)).map_err(dialoguer::Error::IO);
+            result
         })
         .await
         .map_err(|error| dialoguer::Error::IO(std::io::Error::other(error)))?
@@ -134,6 +143,7 @@ where
     ReporterImpl: Reporter,
     Prompt: ApprovalPrompt,
 {
+    let workspace_dir = config.target_workspace_dir.as_deref().unwrap_or(workspace_dir);
     let strict = config.resolved_minimum_release_age_strict();
     if !strict && policy_excludes != PolicyExcludes::Persist {
         return Ok(());
@@ -220,6 +230,7 @@ fn sorted_immature_violations(
         .filter(|violation| violation.code == MINIMUM_RELEASE_AGE_VIOLATION_CODE)
         .collect();
     immature.sort_by_cached_key(|violation| format!("{}@{}", violation.name, violation.version));
+    immature.dedup_by(|left, right| left.name == right.name && left.version == right.version);
     immature
 }
 

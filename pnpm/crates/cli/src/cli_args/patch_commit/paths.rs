@@ -1,6 +1,6 @@
 use super::{
-    Component, PatchCommitError, Path, PathBuf, PkgFilesForDiff, State, Write, create_short_hash,
-    fs, io, is_subdir, lexical_normalize,
+    Component, PatchCommitError, Path, PathBuf, PkgFilesForDiff, State, create_short_hash, fs, io,
+    is_subdir, lexical_normalize,
 };
 
 pub(super) struct PatchFileWriteContext {
@@ -98,15 +98,6 @@ fn lstat_if_exists(path: &Path) -> Result<Option<fs::Metadata>, PatchCommitError
             Err(PatchCommitError::ReadPatchFileMetadata { path: path.to_path_buf(), source })
         }
     }
-}
-
-pub(super) fn write_patch_file_atomically(target: &Path, content: &[u8]) -> io::Result<()> {
-    let parent = target.parent().unwrap_or_else(|| Path::new("."));
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-    tmp.write_all(content)?;
-    tmp.as_file().sync_all()?;
-    tmp.persist(target).map_err(|error| error.error)?;
-    Ok(())
 }
 
 pub(super) fn clean_source_dir(state: &State, patch_dir: &Path) -> PathBuf {

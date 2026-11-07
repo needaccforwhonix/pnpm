@@ -1,5 +1,4 @@
 use crate::GitSourceCache;
-use pnpm_executor::ScriptsPrependNodePath;
 use pnpm_store_dir::{StoreDir, StoreIndexWriter};
 use std::{path::Path, sync::Arc};
 
@@ -8,14 +7,24 @@ pub struct PrepareScriptOptions<'a> {
     pub ignore: bool,
     pub unsafe_perm: bool,
     pub user_agent: Option<&'a str>,
-    pub prepend_node_path: ScriptsPrependNodePath,
     pub shell: Option<&'a Path>,
     pub node_execpath: Option<&'a Path>,
     pub npm_execpath: Option<&'a Path>,
+    pub running_pnpm: RunningPnpm<'a>,
+}
+
+/// The pnpm that runs the install, as the dependency's build sees it.
+#[derive(Default, Clone, Copy)]
+pub struct RunningPnpm<'a> {
     /// The running pnpm, used to provide the package manager the
     /// dependency's build needs. `None` leaves the build to whatever is
     /// installed on the host.
-    pub pnpm_execpath: Option<&'a Path>,
+    pub execpath: Option<&'a Path>,
+    /// The `pmOnFail` setting of the install, as config spells it. The
+    /// pnpm that prepares the dependency runs with it too, and any value
+    /// but `download` has the running pnpm prepare a dependency whatever
+    /// pnpm version it pins.
+    pub pm_on_fail: Option<&'a str>,
 }
 
 #[derive(Clone, Copy)]

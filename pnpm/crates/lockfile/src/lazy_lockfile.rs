@@ -61,6 +61,7 @@ impl LazyLockfile {
         cell.set(LoadedWantedLockfile {
             lockfile: lockfile.map(Arc::new),
             pre_merge_importers: None,
+            merged_conflict_files: 0,
         })
         .expect("a fresh OnceLock accepts the first set");
         LazyLockfile { source: None, cell, fix_cell: OnceLock::new(), prefetch: Mutex::new(None) }
@@ -122,6 +123,14 @@ impl LazyLockfile {
         Ok(self.load_for_fix()?.pre_merge_importers())
     }
 
+    fn merged_conflict_files(&self) -> Result<usize, LoadLockfileError> {
+        Ok(self.load()?.merged_conflict_files)
+    }
+
+    fn merged_conflict_files_for_fix(&self) -> Result<usize, LoadLockfileError> {
+        Ok(self.load_for_fix()?.merged_conflict_files())
+    }
+
     fn load(&self) -> Result<&LoadedWantedLockfile, LoadLockfileError> {
         if let Some(loaded) = self.cell.get() {
             return Ok(loaded);
@@ -163,6 +172,12 @@ impl LazyLockfile {
         Ok(self.fix_cell.get_or_init(|| loaded))
     }
 
+    /// The wanted lockfile when it is already parsed, without loading it.
+    #[must_use]
+    pub fn loaded(&self) -> Option<&Lockfile> {
+        self.cell.get().and_then(|loaded| loaded.lockfile.as_deref())
+    }
+
     /// Whether a wanted lockfile is known to be available: the parsed
     /// document when already loaded, otherwise
     /// [`Lockfile::wanted_exists`]'s semantic-presence probe —
@@ -179,14 +194,13 @@ impl LazyLockfile {
         }
         self.source
             .as_ref()
-            .is_some_and(|(dir, selection)| Lockfile::wanted_exists(dir, &selection.file_name))
+            .is_some_and(|(dir, selection)| selection.wanted_exists_on_disk(dir))
     }
 }
 
 /// A wanted lockfile that is either already parsed (callers that
 /// re-resolve after a manifest mutation hold one) or lazily loadable.
-/// `Copy` so it threads through the install pipeline like the
-/// `Option<&Lockfile>` it replaces.
+/// `Copy` so it threads through the install pipeline.
 #[derive(Clone, Copy)]
 pub enum MaybeLazyLockfile<'a> {
     Loaded(Option<&'a Lockfile>),
@@ -236,6 +250,16 @@ impl<'a> MaybeLazyLockfile<'a> {
         }
     }
 
+    /// The wanted lockfile when it is already parsed, without forcing a
+    /// parse in the lazy case.
+    #[must_use]
+    pub fn loaded(self) -> Option<&'a Lockfile> {
+        match self {
+            MaybeLazyLockfile::Loaded(lockfile) => lockfile,
+            MaybeLazyLockfile::Lazy(lazy) | MaybeLazyLockfile::Repair(lazy) => lazy.loaded(),
+        }
+    }
+
     /// Whether a wanted lockfile is available, without forcing a parse
     /// in the lazy case. See [`LazyLockfile::is_loaded_or_on_disk`].
     #[must_use]
@@ -258,6 +282,15 @@ impl<'a> MaybeLazyLockfile<'a> {
             MaybeLazyLockfile::Loaded(_) => Ok(None),
             MaybeLazyLockfile::Lazy(lazy) => lazy.pre_merge_importers(),
             MaybeLazyLockfile::Repair(lazy) => lazy.pre_merge_importers_for_fix(),
+        }
+    }
+
+    /// Number of wanted or branch lockfiles whose Git conflict markers were merged while loading.
+    pub fn merged_conflict_files(self) -> Result<usize, LoadLockfileError> {
+        match self {
+            MaybeLazyLockfile::Loaded(_) => Ok(0),
+            MaybeLazyLockfile::Lazy(lazy) => lazy.merged_conflict_files(),
+            MaybeLazyLockfile::Repair(lazy) => lazy.merged_conflict_files_for_fix(),
         }
     }
 }

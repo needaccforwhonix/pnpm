@@ -13,11 +13,21 @@ use pnpm_testing_utils::fs::is_symlink_or_junction;
 use std::{collections::HashMap, fs, path::PathBuf, sync::Mutex};
 use tempfile::tempdir;
 
+fn group_ids(groups: Vec<super::task_groups::ImporterTaskGroup<'_>>) -> Vec<Vec<&str>> {
+    groups
+        .into_iter()
+        .map(|group| group.importer_ids)
+        .collect()
+}
+
 #[test]
 fn importer_task_groups_fold_filesystem_name_aliases() {
     let dir = tempdir().expect("tempdir");
     fs::create_dir_all(dir.path().join("packages/app")).expect("create project dir");
-    let groups = super::importer_task_groups(dir.path(), vec![".", "packages/App", "packages/app"]);
+    let groups = group_ids(super::importer_task_groups(
+        dir.path(),
+        vec![".", "packages/App", "packages/app"],
+    ));
     // Self-conditioning on the host filesystem: where names fold (the
     // alias resolves), the aliased keys must share one group; where
     // they don't, the keys are genuinely distinct directories.
@@ -42,8 +52,10 @@ fn importer_task_groups_serialize_all_missing_dirs_together() {
     let dir = tempdir().expect("tempdir");
     let nfc = "packages/caf\u{e9}";
     let nfd = "packages/cafe\u{301}";
-    let groups =
-        super::importer_task_groups(dir.path(), vec!["packages/Ghost", nfc, nfd, "packages/ghost"]);
+    let groups = group_ids(super::importer_task_groups(
+        dir.path(),
+        vec!["packages/Ghost", nfc, nfd, "packages/ghost"],
+    ));
     assert_eq!(groups, vec![vec!["packages/Ghost", nfc, nfd, "packages/ghost"]]);
 }
 
@@ -56,7 +68,7 @@ fn importer_task_groups_fold_unicode_normalization_aliases() {
     let nfc = "packages/caf\u{e9}";
     let nfd = "packages/cafe\u{301}";
     fs::create_dir_all(dir.path().join(nfc)).expect("create project dir");
-    let groups = super::importer_task_groups(dir.path(), vec![nfc, nfd]);
+    let groups = group_ids(super::importer_task_groups(dir.path(), vec![nfc, nfd]));
     assert_eq!(groups, vec![vec![nfc, nfd]], "normalization aliases must share a task");
 }
 
@@ -89,7 +101,7 @@ fn emits_pnpm_root_added_per_direct_dependency() {
     let mut config = Config::new();
     config.store_dir = dir.path().join("pacquet-store").into();
     config.modules_dir = modules_dir.clone();
-    config.virtual_store_dir = virtual_store_dir.clone();
+    config.install_state_dir = virtual_store_dir.clone();
     let config = config.leak();
 
     // The symlink targets must exist for the test to work on
@@ -144,7 +156,7 @@ fn emits_pnpm_root_added_per_direct_dependency() {
         context: crate::ImporterLinkContext {
             config,
             layout: &crate::VirtualStoreLayout::legacy(
-                config.virtual_store_dir.clone(),
+                config.install_state_dir.clone(),
                 config.virtual_store_dir_max_length as usize,
             ),
             workspace_root: &project_root,
@@ -164,7 +176,9 @@ fn emits_pnpm_root_added_per_direct_dependency() {
         dependency_groups: [DependencyGroup::Prod, DependencyGroup::Dev],
 
         package_manifests: None,
+        package_bins: None,
         requires_build_by_snapshot: None,
+        scheduled_builds: None,
     }
     .run::<RecordingReporter>()
     .expect("symlink should succeed");
@@ -253,7 +267,7 @@ fn duplicate_dep_across_groups_collapses_to_one_entry() {
     let mut config = Config::new();
     config.store_dir = dir.path().join("pacquet-store").into();
     config.modules_dir = modules_dir;
-    config.virtual_store_dir = virtual_store_dir.clone();
+    config.install_state_dir = virtual_store_dir.clone();
     let config = config.leak();
 
     // Same name in `dependencies` and `optionalDependencies`. The
@@ -301,7 +315,7 @@ fn duplicate_dep_across_groups_collapses_to_one_entry() {
         context: crate::ImporterLinkContext {
             config,
             layout: &crate::VirtualStoreLayout::legacy(
-                config.virtual_store_dir.clone(),
+                config.install_state_dir.clone(),
                 config.virtual_store_dir_max_length as usize,
             ),
             workspace_root: &project_root,
@@ -322,7 +336,9 @@ fn duplicate_dep_across_groups_collapses_to_one_entry() {
         dependency_groups: [DependencyGroup::Prod, DependencyGroup::Optional],
 
         package_manifests: None,
+        package_bins: None,
         requires_build_by_snapshot: None,
+        scheduled_builds: None,
     }
     .run::<RecordingReporter>()
     .expect("symlink should succeed");
@@ -371,7 +387,7 @@ fn cross_importer_link_dep_symlinks_to_sibling_rootdir() {
     let mut config = Config::new();
     config.store_dir = dir.path().join("pacquet-store").into();
     config.modules_dir = workspace_root.join("node_modules");
-    config.virtual_store_dir = workspace_root.join("node_modules/.pacquet");
+    config.install_state_dir = workspace_root.join("node_modules/.pacquet");
     let config = config.leak();
 
     // Materialize the dependee project so the symlink target exists
@@ -401,7 +417,7 @@ fn cross_importer_link_dep_symlinks_to_sibling_rootdir() {
         context: crate::ImporterLinkContext {
             config,
             layout: &crate::VirtualStoreLayout::legacy(
-                config.virtual_store_dir.clone(),
+                config.install_state_dir.clone(),
                 config.virtual_store_dir_max_length as usize,
             ),
             workspace_root: &workspace_root,
@@ -421,7 +437,9 @@ fn cross_importer_link_dep_symlinks_to_sibling_rootdir() {
         dependency_groups: [DependencyGroup::Prod],
 
         package_manifests: None,
+        package_bins: None,
         requires_build_by_snapshot: None,
+        scheduled_builds: None,
     }
     .run::<RecordingReporter>()
     .expect("symlink should succeed");
@@ -451,7 +469,15 @@ fn cross_importer_link_dep_symlinks_to_sibling_rootdir() {
         .into_owned();
     assert_eq!(prefix, expected_prefix.as_str());
     assert_eq!(added.name, "shared");
-    assert_eq!(added.version.as_deref(), Some("link:../shared"));
+    // The target travels in `linked_from`, which `hideLinkedPkgsDiff`
+    // relies on to tell a linked entry apart.
+    assert_eq!(added.version, None);
+    let expected_from = workspace_root
+        .join("packages")
+        .join("shared")
+        .display()
+        .to_string();
+    assert_eq!(added.linked_from.as_deref(), Some(expected_from.as_str()));
 
     drop(dir);
 }
@@ -470,12 +496,12 @@ fn empty_importers_is_a_no_op() {
     let mut config = Config::new();
     config.store_dir = dir.path().join("pacquet-store").into();
     config.modules_dir = project_root.join("node_modules");
-    config.virtual_store_dir = project_root.join("node_modules/.pacquet");
+    config.install_state_dir = project_root.join("node_modules/.pacquet");
     let config = config.leak();
 
     let importers = HashMap::new();
     let layout = crate::VirtualStoreLayout::legacy(
-        config.virtual_store_dir.clone(),
+        config.install_state_dir.clone(),
         config.virtual_store_dir_max_length as usize,
     );
     let result = SymlinkDirectDependencies {
@@ -499,7 +525,9 @@ fn empty_importers_is_a_no_op() {
         dependency_groups: [DependencyGroup::Prod],
 
         package_manifests: None,
+        package_bins: None,
         requires_build_by_snapshot: None,
+        scheduled_builds: None,
     }
     .run::<SilentReporter>();
 
@@ -534,7 +562,7 @@ fn reused_symlinks_do_not_emit_pnpm_root_added() {
     let mut config = Config::new();
     config.store_dir = dir.path().join("pacquet-store").into();
     config.modules_dir = modules_dir;
-    config.virtual_store_dir = virtual_store_dir.clone();
+    config.install_state_dir = virtual_store_dir.clone();
     let config = config.leak();
 
     let target = virtual_store_dir
@@ -559,7 +587,7 @@ fn reused_symlinks_do_not_emit_pnpm_root_added() {
     let mut importers = HashMap::new();
     importers.insert(Lockfile::ROOT_IMPORTER_KEY.to_string(), project_snapshot);
     let layout = crate::VirtualStoreLayout::legacy(
-        config.virtual_store_dir.clone(),
+        config.install_state_dir.clone(),
         config.virtual_store_dir_max_length as usize,
     );
     let link = || {
@@ -584,7 +612,9 @@ fn reused_symlinks_do_not_emit_pnpm_root_added() {
             dependency_groups: [DependencyGroup::Prod],
 
             package_manifests: None,
+            package_bins: None,
             requires_build_by_snapshot: None,
+            scheduled_builds: None,
         }
         .run::<RecordingReporter>()
         .expect("symlink should succeed");
@@ -636,7 +666,7 @@ fn per_importer_prefix_in_pnpm_root_events() {
     let mut config = Config::new();
     config.store_dir = dir.path().join("pacquet-store").into();
     config.modules_dir = workspace_root.join("node_modules");
-    config.virtual_store_dir = virtual_store_dir.clone();
+    config.install_state_dir = virtual_store_dir.clone();
     let config = config.leak();
 
     // Materialize the virtual-store targets each importer's symlink
@@ -687,7 +717,7 @@ fn per_importer_prefix_in_pnpm_root_events() {
         context: crate::ImporterLinkContext {
             config,
             layout: &crate::VirtualStoreLayout::legacy(
-                config.virtual_store_dir.clone(),
+                config.install_state_dir.clone(),
                 config.virtual_store_dir_max_length as usize,
             ),
             workspace_root: &workspace_root,
@@ -707,7 +737,9 @@ fn per_importer_prefix_in_pnpm_root_events() {
         dependency_groups: [DependencyGroup::Prod],
 
         package_manifests: None,
+        package_bins: None,
         requires_build_by_snapshot: None,
+        scheduled_builds: None,
     }
     .run::<RecordingReporter>()
     .unwrap();
@@ -760,7 +792,7 @@ fn custom_modules_dir_propagates_to_each_importer() {
     // Use a non-default name so a regression to the hard-coded
     // `node_modules` would fail the assertion below.
     config.modules_dir = workspace_root.join("custom_modules");
-    config.virtual_store_dir = virtual_store_dir.clone();
+    config.install_state_dir = virtual_store_dir.clone();
     let config = config.leak();
 
     let target = virtual_store_dir
@@ -790,7 +822,7 @@ fn custom_modules_dir_propagates_to_each_importer() {
         context: crate::ImporterLinkContext {
             config,
             layout: &crate::VirtualStoreLayout::legacy(
-                config.virtual_store_dir.clone(),
+                config.install_state_dir.clone(),
                 config.virtual_store_dir_max_length as usize,
             ),
             workspace_root: &workspace_root,
@@ -810,7 +842,9 @@ fn custom_modules_dir_propagates_to_each_importer() {
         dependency_groups: [DependencyGroup::Prod],
 
         package_manifests: None,
+        package_bins: None,
         requires_build_by_snapshot: None,
+        scheduled_builds: None,
     }
     .run::<SilentReporter>()
     .expect("symlink should succeed");

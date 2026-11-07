@@ -8,30 +8,6 @@ use super::{
 /// moreTypes: true}).unpack(bytes)` decodes to the same JS shape pnpm
 /// produces itself.
 ///
-/// ## Why not `rmp_serde::to_vec_named`?
-///
-/// `rmp_serde` emits plain `MessagePack` — every struct becomes a `fixmap`
-/// / `map16` / `map32`. That's a perfectly valid `MessagePack` encoding,
-/// but msgpackr with `useRecords: true` interprets *every* msgpack map
-/// (no matter the nesting depth) as a JS `Map` object, including the
-/// top-level `PackageFilesIndex`. pnpm's reader then does
-/// `pkgIndex.files` (a property access) on what is actually a `Map`,
-/// gets `undefined`, and crashes with `files is not iterable`.
-///
-/// pnpm itself sidesteps this because it packs the outer struct with
-/// `useRecords: true`, which makes msgpackr emit a **record**: the
-/// `d4 72 <slot>` fixext1 header followed by a field-name array and the
-/// values. Records decode back as plain JS objects, while legitimate JS
-/// `Map` values (pnpm's `files` / `sideEffects` / `added`) are still
-/// encoded as msgpack maps and decode back as `Map`. The decoder can
-/// tell the two apart because records are marked with the fixext1
-/// envelope; plain maps aren't.
-///
-/// So to interop with pnpm, pacquet has to emit records for the Rust
-/// `struct`s (object-shape on the pnpm side) and keep plain msgpack
-/// maps for the Rust `HashMap`s (`Map`-shape on the pnpm side). That's
-/// what this encoder does.
-///
 /// ## Slot allocation
 ///
 /// Slot `0x40` is reserved for the top-level [`PackageFilesIndex`] —
@@ -69,8 +45,7 @@ use super::{
 ///   record schema entirely when `None` rather than written as `nil`,
 ///   so the presence of `checkedAt` determines the shape and thus
 ///   the slot. When `Some`, it's written as `float 64` (see
-///   [`CafsFileInfo::checked_at`] for why — msgpackr reads `uint 64`
-///   as `BigInt`, which crashes pnpm's `mtimeMs - (checkedAt ?? 0)`).
+///   [`CafsFileInfo::checked_at`] for why).
 /// - **`SideEffectsDiff`**: `added`, `deleted`, and `remoteOrigin` are
 ///   optional; each field set gets its own slot on first use.
 pub fn encode_package_files_index(index: &PackageFilesIndex) -> Result<Vec<u8>, EncodeError> {
@@ -106,18 +81,9 @@ pub enum EncodeError {
 /// distinct shape — see [`EncodeState::allocate_slot`].
 pub(super) const PKG_FILES_INDEX_SLOT: u8 = SLOT_LO;
 
-// 0x40
 pub(super) const FIRST_INNER_SLOT: u8 = SLOT_LO + 1;
 
-// 0x41
-
 /// Tracks which shapes have been defined and what slot each got.
-/// Mirrors msgpackr's own strategy: when it sees a new record instance
-/// whose field set differs from anything previously packed, it
-/// allocates a new slot rather than redefining an existing one — so
-/// same-shape instances downstream collapse to a single bare-slot byte
-/// (the point of records), and mixed-shape streams still decode
-/// correctly without per-instance re-defs.
 ///
 /// Shape keys are small bitmasks over the optional fields of each
 /// record type, see [`cafs_shape`] / [`side_effects_shape`]. Each type has
@@ -138,12 +104,7 @@ pub(super) struct EncodeState {
     /// far inside a manifest value. Shape keys are owned `Vec<String>`
     /// because the field names are read from a borrowed
     /// `serde_json::Map` whose lifetime ends before the next encode
-    /// call wants the lookup. msgpackr does the equivalent thing for
-    /// arbitrary JS objects under `useRecords: true`; pacquet has to
-    /// match so a pnpm reader sees the manifest's nested objects as JS
-    /// `Object`s (record-decoded) rather than `Map`s (plain-msgpack-
-    /// decoded), which is what pnpm's bin linker reads with
-    /// `manifest.bin` / `manifest.directories?.bin` property access.
+    /// call wants the lookup.
     pub(super) json_object_slots: HashMap<Vec<String>, u8>,
     /// Next unused slot in the 0x41..=0x7f range. Starts above
     /// [`PKG_FILES_INDEX_SLOT`] because the top-level record always
@@ -211,6 +172,15 @@ fn encode_pkg_files_index_value(
         write_str(writer, name);
         encode_cafs_file_info(writer, state, info)?;
     }
+    encode_side_effects_fields(writer, state, idx)
+}
+
+/// The fields after `files`, in the order [`pkg_files_index_fields`] names them.
+fn encode_side_effects_fields(
+    writer: &mut Vec<u8>,
+    state: &mut EncodeState,
+    idx: &PackageFilesIndex,
+) -> Result<(), EncodeError> {
     if let Some(side_effects) = &idx.side_effects {
         write_map_header(writer, side_effects.len());
         for (platform, diff) in sorted_by_key(side_effects) {
@@ -225,17 +195,20 @@ fn encode_pkg_files_index_value(
             write_string_array(writer, digests);
         }
     }
+    if let Some(tar_integrity) = &idx.tar_integrity {
+        write_str(writer, tar_integrity);
+    }
 
     Ok(())
 }
 
 /// Field order `[algo, requiresBuild?, requiresPrepare?, manifest?, files,
-/// sideEffects?, remoteSideEffectsQuarantine?]`. Optional fields are omitted
+/// sideEffects?, remoteSideEffectsQuarantine?, tarIntegrity?]`. Optional fields are omitted
 /// from the schema when `None`, matching msgpackr's field-omit-when-absent
 /// shape so a pnpm reader sees the same JS object regardless of whether
 /// pacquet or pnpm wrote the row.
 fn pkg_files_index_fields(idx: &PackageFilesIndex) -> Vec<&'static str> {
-    let mut fields: Vec<&str> = Vec::with_capacity(7);
+    let mut fields: Vec<&str> = Vec::with_capacity(8);
     fields.push("algo");
     if idx.requires_build.is_some() {
         fields.push("requiresBuild");
@@ -253,6 +226,9 @@ fn pkg_files_index_fields(idx: &PackageFilesIndex) -> Vec<&'static str> {
     if idx.remote_side_effects_quarantine.is_some() {
         fields.push("remoteSideEffectsQuarantine");
     }
+    if idx.tar_integrity.is_some() {
+        fields.push("tarIntegrity");
+    }
     fields
 }
 
@@ -264,10 +240,7 @@ fn write_string_array(writer: &mut Vec<u8>, values: &[String]) {
 }
 
 /// Sort a `HashMap` by key into a `Vec` of `(key, value)`
-/// references. Used by the msgpackr-records encoder so every map
-/// it writes — `PackageFilesIndex.files`, `…side_effects`,
-/// `SideEffectsDiff.added` — comes out in lexicographic key
-/// order. Without this the row payload depends on
+/// references. Without this the row payload depends on
 /// `HashMap`'s randomised iteration and isn't reproducible.
 fn sorted_by_key<Value>(map: &HashMap<String, Value>) -> Vec<(&String, &Value)> {
     let mut entries: Vec<(&String, &Value)> = map.iter().collect();
@@ -392,10 +365,7 @@ fn encode_cafs_file_info(
         // Float 64 — not uint 64 — because msgpackr decodes `uint 64`
         // as a JS `BigInt`, and pnpm's integrity check does
         // `mtimeMs - (checkedAt ?? 0)` which throws `TypeError: Cannot
-        // mix BigInt and other types`. Packing as a double matches
-        // what pnpm writes for the same millisecond-epoch value (JS
-        // Number is a double, so msgpackr emits `cb` + 8 bytes for
-        // values past int32 range).
+        // mix BigInt and other types`.
         write_float64(writer, v as f64);
     }
     Ok(())

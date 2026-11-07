@@ -1,7 +1,7 @@
 use super::{
     Arc, DirectDep, HashMap, HashSet, ImporterPeerInput, NodeId, PeerCycleShape,
-    ResolvePeersOptions, ResolvedTree, order_test_shape, package, peer_cycle_fixture,
-    peer_cycle_graph_keys, resolve_peers, resolve_peers_workspace,
+    ResolvePeersOptions, ResolvedTree, TreeChildren, WorkspacePeerSettings, order_test_shape,
+    package, peer_cycle_fixture, peer_cycle_graph_keys, resolve_peers, resolve_peers_workspace,
 };
 
 /// End-to-end shape of a cycle package under canonical cycle-breaking:
@@ -116,20 +116,18 @@ fn backedge_bindings_do_not_depend_on_importer_order() {
                 node_id.clone(),
                 crate::resolved_tree::DependenciesTreeNode::new(
                     Arc::from(pkg_id),
-                    crate::resolved_tree::TreeChildren::Lazy {
-                        parent_ids: Arc::new(Vec::new()).into(),
-                    },
+                    TreeChildren::Lazy,
                     0,
-                    true,
                 ),
             );
-            DirectDep { alias: alias.to_string(), node_id, id: pkg_id.to_string() }
+            DirectDep { alias: alias.to_string(), node_id, id: pkg_id.into() }
         };
         let importer = |id: &str, direct: Vec<DirectDep>| ImporterPeerInput {
             id: id.to_string(),
             direct,
             root_dir: std::path::PathBuf::from(format!("/repo/{id}")),
             modules_dir: None,
+            rejected_optional_peers: HashSet::default(),
         };
         let root = importer(".", vec![direct_dep("p@1.0.0", "p")]);
         let importer_a =
@@ -157,9 +155,7 @@ fn backedge_bindings_do_not_depend_on_importer_order() {
             &mut tree,
             &importers,
             std::path::Path::new("/repo"),
-            false,
-            false,
-            true,
+            WorkspacePeerSettings { resolve_peers_from_workspace_root: true, ..Default::default() },
             ResolvePeersOptions::default(),
         );
         let mut keys: Vec<String> = result.graph

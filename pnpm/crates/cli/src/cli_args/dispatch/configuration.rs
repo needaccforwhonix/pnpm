@@ -1,10 +1,12 @@
 use super::{
-    CliArgs, CliCommand, Config, Context, DefaultReporter, Host, IntoDiagnostic, NdjsonReporter,
-    Path, PathBuf, ReporterType, SilentReporter, SummaryScope, apply_state_dir_override,
-    apply_store_dir_override, configure_color, default_pnpm_home_dir, now_millis, prepare_config,
-    prints_json_errors,
+    CliArgs, CliCommand, Config, ConfigWarnings, Context, DefaultReporterSetup, Host,
+    IntoDiagnostic, Path, PathBuf, ReporterType, SummaryScope, configure_default_reporter,
+    configure_max_log_level, default_pnpm_home_dir, now_millis, prepare_config, prints_json_errors,
+    seed_config, warn_shared_workspace_lockfile_outside_workspace,
 };
-use crate::config_overrides::apply_registry_override;
+use crate::{cli_args::reporter::CliReporter, config_overrides::ConfigOverrides};
+use pnpm_hooks::PnpmfileHooks;
+use std::sync::Arc;
 
 /// The directories a run is anchored at.
 pub(super) struct RunAnchors {
@@ -33,7 +35,7 @@ impl RunAnchors {
     /// becomes `config.dir` (used as the install `lockfileDir`, threaded
     /// into every event's `prefix`).
     pub(super) fn resolve(args: &CliArgs) -> miette::Result<Self> {
-        let dir = dunce::canonicalize(&args.paths.dir)
+        let dir = pnpm_fs::canonicalize_preserving_mapped_drive(&args.paths.dir)
             .into_diagnostic()
             .wrap_err_with(|| {
                 format!("canonicalizing the `--dir` argument: {}", args.paths.dir.display())
@@ -41,9 +43,11 @@ impl RunAnchors {
         let cli_dir = if args.paths.dir_from_command_line {
             dir.clone()
         } else {
-            std::env::current_dir().and_then(dunce::canonicalize).unwrap_or_else(|_| dir.clone())
+            std::env::current_dir()
+                .and_then(|cwd| pnpm_fs::canonicalize_preserving_mapped_drive(&cwd))
+                .unwrap_or_else(|_| dir.clone())
         };
-        let manifest_path = dir.join("package.json");
+        let manifest_path = pnpm_workspace::project_manifest_path(&dir);
         let global_config = default_pnpm_home_dir::<Host>().unwrap_or_else(|| dir.clone());
         Ok(RunAnchors { dir, cli_dir, manifest_path, global_config })
     }
@@ -53,7 +57,6 @@ impl RunAnchors {
 /// the run began.
 pub(super) struct RunSetup {
     pub(super) started_at: u128,
-    pub(super) reporter: ReporterType,
     pub(super) is_install_family: bool,
     pub(super) print_json_errors: bool,
     pub(super) recursive_by_default: bool,
@@ -66,7 +69,6 @@ impl RunSetup {
     pub(super) fn of(args: &CliArgs) -> Self {
         RunSetup {
             started_at: now_millis(),
-            reporter: args.effective_reporter(),
             is_install_family: matches!(
                 &args.command,
                 CliCommand::Add(_)
@@ -89,6 +91,7 @@ impl RunSetup {
                     // the same progress events, so it shares the `Done in ...`
                     // footer.
                     | CliCommand::Rebuild(_)
+                    | CliCommand::Rb(_)
                     | CliCommand::PatchCommit(_)
                     | CliCommand::PatchRemove(_),
             ),
@@ -101,73 +104,130 @@ impl RunSetup {
     }
 }
 
-/// The config every load starts from. `npmrc_auth_file` is seeded from the
-/// CLI flag before `current()` reads `.npmrc`, so the override redirects the
-/// user-level read. Mirrors pnpm's `--npmrc-auth-file`. Production callers
-/// turbofish `Host` explicitly so the dependency-injection plumbing is
-/// visible at the call site. See
-/// [pnpm/pacquet#339](https://github.com/pnpm/pacquet/issues/339).
-pub(super) fn seed_config(npmrc_auth_file: Option<&Path>, ignore_workspace: bool) -> Config {
-    Config {
-        npmrc_auth_file: npmrc_auth_file.map(Path::to_path_buf),
-        ignore_workspace,
-        ..Config::default()
+/// Where a command's config is loaded from, and what that command does
+/// with the package store.
+#[derive(Clone, Copy)]
+pub(super) struct ConfigTarget<'a> {
+    pub(super) anchor: &'a Path,
+    pub(super) is_global: bool,
+    pub(super) store_use: StoreUse,
+    pub(super) warnings: crate::cli_args::config_warnings::ConfigWarnings,
+}
+
+/// How a command uses the package store, which decides whether its config
+/// load places the default store. Placing it probes for hardlink support
+/// by writing a temporary file into the project directory, and file
+/// watchers such as the Nx daemon pick that write up.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum StoreUse {
+    /// The command reads or writes the store.
+    Opens,
+    /// The command touches the store only to install the project's
+    /// `configDependencies` before it runs the `updateConfig` hooks.
+    ConfigDependencies,
+    /// The command never touches the store.
+    Never,
+}
+
+fn talks_only_to_the_registry(command: &CliCommand) -> bool {
+    matches!(
+        command,
+        CliCommand::Access(_)
+            | CliCommand::Bugs(_)
+            | CliCommand::Deprecate(_)
+            | CliCommand::DistTag(_)
+            | CliCommand::Docs(_)
+            | CliCommand::Login(_)
+            | CliCommand::Logout(_)
+            | CliCommand::Owner(_)
+            | CliCommand::Ping(_)
+            | CliCommand::Profile(_)
+            | CliCommand::Repo(_)
+            | CliCommand::Search(_)
+            | CliCommand::Star(_)
+            | CliCommand::Stars(_)
+            | CliCommand::Team(_)
+            | CliCommand::Undeprecate(_)
+            | CliCommand::Unpublish(_)
+            | CliCommand::Unstar(_)
+            | CliCommand::Whoami(_),
+    )
+}
+
+impl StoreUse {
+    /// A command missing from these lists only pays for an unneeded probe.
+    pub(super) fn of(command: &CliCommand) -> Self {
+        match command {
+            CliCommand::View(_)
+            | CliCommand::Config(_)
+            | CliCommand::Get(_)
+            | CliCommand::Set(_)
+            | CliCommand::Root(_)
+            | CliCommand::Prefix(_)
+            | CliCommand::Bin(_) => StoreUse::Never,
+            command if talks_only_to_the_registry(command) => StoreUse::Never,
+            CliCommand::Exec(_)
+            | CliCommand::Run(_)
+            | CliCommand::Test(_)
+            | CliCommand::Start(_)
+            | CliCommand::Stop(_)
+            | CliCommand::Restart(_)
+            | CliCommand::External(_) => StoreUse::ConfigDependencies,
+            _ => StoreUse::Opens,
+        }
+    }
+
+    /// Load the command's config through `load`, whose argument says
+    /// whether to place the store. A config loaded without placing it is
+    /// loaded again with it placed when the command turns out to need it.
+    pub(super) fn load<Error>(
+        self,
+        mut load: impl FnMut(bool) -> Result<Config, Error>,
+    ) -> Result<Config, Error> {
+        let config = load(self == StoreUse::Opens)?;
+        if config.skip_store_dir_resolution && self.needs_store_placed(&config) {
+            return load(true);
+        }
+        Ok(config)
+    }
+
+    fn needs_store_placed(self, config: &Config) -> bool {
+        match self {
+            StoreUse::Opens => true,
+            StoreUse::ConfigDependencies => config.config_dependencies
+                .as_ref()
+                .is_some_and(|deps| !deps.is_empty()),
+            StoreUse::Never => false,
+        }
     }
 }
 
-/// `--color` wins over `--no-color`, and both over the configured value.
-pub(super) fn apply_color_override(
-    cfg: &mut Config,
-    color: Option<pnpm_config::ColorMode>,
-    no_color: bool,
-) {
-    cfg.color = match (color, no_color) {
-        (Some(color), _) => color,
-        (None, true) => pnpm_config::ColorMode::Never,
-        (None, false) => cfg.color,
-    };
-    configure_color(cfg.color);
-}
-
-/// The CLI overrides that redirect where pnpm reads and writes.
-pub(super) fn apply_location_overrides(
-    cfg: &mut Config,
-    anchor: &Path,
-    registry: Option<&str>,
-    store_dir: Option<&Path>,
-    state_dir: Option<&Path>,
-) -> miette::Result<()> {
-    if let Some(registry) = registry {
-        apply_registry_override(cfg, registry);
-    }
-    if let Some(store_dir) = store_dir {
-        apply_store_dir_override::<Host>(cfg, store_dir, anchor)?;
-    }
-    if let Some(state_dir) = state_dir {
-        apply_state_dir_override::<Host>(cfg, state_dir, anchor);
-    }
-    Ok(())
-}
-
-/// `--recursive` / `--filter` / `--filter-prod` / `--workspace-root` /
-/// `--fail-if-no-match` are CLI-only upstream (not `.npmrc` / yaml
-/// keys), so the global flags are threaded in here. Mirrors pnpm's
-/// `Config.recursive` / `.filter` / `.filterProd` / `.workspaceRoot` /
-/// `.failIfNoMatch`.
+/// `--recursive` / `--filter` / `--filter-prod` / `--workspace-root` are
+/// CLI-only upstream (not `.npmrc` / yaml keys), so the global flags are
+/// threaded in here. Mirrors pnpm's `Config.recursive` / `.filter` /
+/// `.filterProd` / `.workspaceRoot`.
 pub(super) struct ProjectSelectors<'a> {
     pub(super) recursive: bool,
+    pub(super) recursive_from_command_line: bool,
     pub(super) recursive_by_default_command: bool,
     pub(super) filter: &'a [String],
     pub(super) filter_prod: &'a [String],
     pub(super) workspace_root: bool,
-    pub(super) fail_if_no_match: bool,
 }
 
 pub(super) fn apply_project_selectors(cfg: &mut Config, selectors: &ProjectSelectors<'_>) {
     cfg.recursive = selectors.recursive;
     cfg.filter = selectors.filter.to_vec();
     cfg.filter_prod = selectors.filter_prod.to_vec();
-    if selectors.recursive_by_default_command
+    if !cfg.filter.is_empty() {
+        cfg.cli_settings.insert("filter".to_string());
+    }
+    if !cfg.filter_prod.is_empty() {
+        cfg.cli_settings.insert("filterProd".to_string());
+    }
+    if selectors.recursive_from_command_line {
+        cfg.recursive_install = true;
+    } else if selectors.recursive_by_default_command
         && cfg.recursive
         && !cfg.recursive_install
         && cfg.filter.is_empty()
@@ -176,7 +236,6 @@ pub(super) fn apply_project_selectors(cfg: &mut Config, selectors: &ProjectSelec
         cfg.filter.push("{.}...".to_string());
     }
     cfg.workspace_root = selectors.workspace_root;
-    cfg.fail_if_no_match = selectors.fail_if_no_match;
 }
 
 /// The CLI flags that shape what the command prints and how much of it
@@ -192,22 +251,27 @@ pub(super) struct OutputOverrides<'a> {
 
 pub(super) fn apply_output_overrides(cfg: &mut Config, overrides: &OutputOverrides<'_>) {
     if overrides.reporter_hide_prefix || overrides.no_reporter_hide_prefix {
+        cfg.cli_settings.insert("reporterHidePrefix".to_string());
         cfg.reporter_hide_prefix = Some(overrides.reporter_hide_prefix);
     }
     if !overrides.workspace_packages.is_empty() {
+        cfg.cli_settings.insert("workspacePackagePatterns".to_string());
         cfg.workspace_package_patterns = Some(overrides.workspace_packages.to_vec());
     }
     // Unlike the CLI-only selectors, these two are genuine config keys —
     // the flag overrides yaml / env only when actually given.
     if !overrides.test_pattern.is_empty() {
+        cfg.cli_settings.insert("testPattern".to_string());
         cfg.test_pattern = overrides.test_pattern.to_vec();
     }
     if !overrides.changed_files_ignore_pattern.is_empty() {
+        cfg.cli_settings.insert("changedFilesIgnorePattern".to_string());
         cfg.changed_files_ignore_pattern = overrides
             .changed_files_ignore_pattern
             .to_vec();
     }
     if let Some(workspace_concurrency) = overrides.workspace_concurrency {
+        cfg.cli_settings.insert("workspaceConcurrency".to_string());
         cfg.workspace_concurrency =
             pnpm_config::resolve_child_concurrency(Some(workspace_concurrency));
     }
@@ -226,14 +290,158 @@ pub(super) fn apply_output_overrides(cfg: &mut Config, overrides: &OutputOverrid
 pub(in super::super) async fn apply_update_config(
     config: &mut Config,
     dir: &Path,
-    reporter: ReporterType,
-) -> miette::Result<()> {
-    match reporter {
-        ReporterType::Default | ReporterType::AppendOnly => {
-            prepare_config::<DefaultReporter>(config, dir).await?
+) -> miette::Result<Vec<Arc<dyn PnpmfileHooks>>> {
+    prepare_config::<CliReporter>(config, dir).await
+}
+
+pub(super) fn warn_fast_path_config(config_overrides: &ConfigOverrides, config: &Config) {
+    warn_shared_workspace_lockfile_outside_workspace(
+        config_overrides.shared_workspace_lockfile(),
+        config.workspace_dir.as_deref(),
+    );
+}
+
+fn apply_workspace_execution_config(
+    cfg: &mut Config,
+    execution: &crate::cli_args::cli_command::WorkspaceExecutionArgs,
+) {
+    if execution.bail || execution.no_bail {
+        cfg.cli_settings.insert("bail".to_string());
+    }
+    cfg.bail = super::resolve_bool_override(execution.bail, execution.no_bail, cfg.bail);
+}
+
+fn apply_lifecycle_output_config(
+    cfg: &mut Config,
+    output: &crate::cli_args::cli_command::CliOutputArgs,
+    progress_enabled: bool,
+) {
+    if output.presentation.progress || output.presentation.no_progress {
+        cfg.cli_settings.insert("progress".to_string());
+    }
+    cfg.progress = progress_enabled;
+    if output.lifecycle.stream {
+        cfg.cli_settings.insert("stream".to_string());
+    }
+    cfg.stream |= output.lifecycle.stream;
+    if output.lifecycle.aggregate_output {
+        cfg.cli_settings.insert("aggregateOutput".to_string());
+    }
+    cfg.aggregate_output |= output.lifecycle.aggregate_output;
+    if output.lifecycle.use_stderr {
+        cfg.cli_settings.insert("useStderr".to_string());
+    }
+    cfg.use_stderr |= output.lifecycle.use_stderr;
+}
+
+fn apply_workspace_ordering_and_selection_config(
+    cfg: &mut Config,
+    workspace: &crate::cli_args::cli_command::CliWorkspaceArgs,
+) {
+    if workspace.ordering.sort || workspace.ordering.no_sort {
+        cfg.cli_settings.insert("sort".to_string());
+    }
+    cfg.sort =
+        super::resolve_bool_override(workspace.ordering.sort, workspace.ordering.no_sort, cfg.sort);
+    if workspace.ordering.reverse || workspace.ordering.no_reverse {
+        cfg.cli_settings.insert("reverse".to_string());
+    }
+    cfg.reverse = super::resolve_bool_override(
+        workspace.ordering.reverse,
+        workspace.ordering.no_reverse,
+        cfg.reverse,
+    );
+    apply_selection_settings(cfg, &workspace.selection.settings);
+}
+
+fn apply_selection_settings(
+    cfg: &mut Config,
+    settings: &crate::cli_args::cli_command::SelectionSettingArgs,
+) {
+    if settings.include_workspace_root || settings.no_include_workspace_root {
+        cfg.cli_settings.insert("includeWorkspaceRoot".to_string());
+    }
+    cfg.include_workspace_root = super::resolve_bool_override(
+        settings.include_workspace_root,
+        settings.no_include_workspace_root,
+        cfg.include_workspace_root,
+    );
+    if settings.fail_if_no_match || settings.no_fail_if_no_match {
+        cfg.cli_settings.insert("failIfNoMatch".to_string());
+    }
+    cfg.fail_if_no_match = super::resolve_bool_override(
+        settings.fail_if_no_match,
+        settings.no_fail_if_no_match,
+        cfg.fail_if_no_match,
+    );
+}
+
+pub(super) fn apply_run_output_config(args: &CliArgs, cfg: &mut Config) {
+    apply_workspace_execution_config(cfg, &args.workspace.execution);
+    apply_lifecycle_output_config(cfg, &args.output, args.progress_enabled(cfg.progress));
+    apply_workspace_ordering_and_selection_config(cfg, &args.workspace);
+    apply_output_overrides(
+        cfg,
+        &OutputOverrides {
+            reporter_hide_prefix: args.output.lifecycle.hide_prefix,
+            no_reporter_hide_prefix: args.output.lifecycle.no_hide_prefix,
+            workspace_packages: &args.paths.workspace_packages,
+            test_pattern: &args.workspace.selection.test_pattern,
+            changed_files_ignore_pattern: &args.workspace.selection.changed_files_ignore_pattern,
+            workspace_concurrency: args.workspace.ordering.concurrency,
+        },
+    );
+}
+
+impl CliArgs {
+    pub(super) fn load_config_at(
+        &self,
+        anchor: &Path,
+        place_store: bool,
+        config_overrides: &ConfigOverrides,
+        warnings: ConfigWarnings,
+    ) -> miette::Result<Config> {
+        let mut seed = seed_config(
+            self.paths.npmrc_auth_file.as_deref(),
+            self.paths.ignore_workspace,
+            config_overrides,
+            self.network.registry.as_deref(),
+        );
+        seed.skip_store_dir_resolution = !place_store;
+        seed.current_keeping_warnings::<Host>(anchor)
+            .map_err(|failure| {
+                warnings.report_failed_load(&failure.warnings);
+                miette::Report::new(failure.error)
+            })
+            .wrap_err("load configuration")
+    }
+
+    pub(super) fn configure_run_reporter(
+        &self,
+        cfg: &Config,
+        reporter: ReporterType,
+        setup: &RunSetup,
+        anchors: &RunAnchors,
+    ) {
+        pnpm_default_reporter::set_progress(cfg.progress);
+        if self.output.presentation.loglevel.is_none()
+            && let Some(config_loglevel) = cfg.loglevel
+        {
+            configure_max_log_level(Some(config_loglevel.into()));
         }
-        ReporterType::Ndjson => prepare_config::<NdjsonReporter>(config, dir).await?,
-        ReporterType::Silent => prepare_config::<SilentReporter>(config, dir).await?,
-    };
-    Ok(())
+        configure_default_reporter(&DefaultReporterSetup {
+            reporter,
+            dir: &anchors.dir,
+            summary_scope: setup.summary_scope,
+            reports_scope: setup.reports_scope,
+            hide_added_pkgs_progress: false,
+            is_recursive: self.workspace.recursive,
+            lifecycle: crate::cli_args::reporter::LifecycleReporterSetup {
+                use_stderr: cfg.use_stderr || setup.uses_stderr_reporter,
+                stream_output: cfg.stream,
+                aggregate_output: cfg.aggregate_output,
+                hide_prefix: cfg.reporter_hide_prefix.unwrap_or(false),
+            },
+        });
+    }
 }

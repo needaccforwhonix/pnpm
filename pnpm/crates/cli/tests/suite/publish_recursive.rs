@@ -1,11 +1,7 @@
-//! Recursive-publish integration tests. The no-registry tests exercise the
-//! `publish --recursive` dispatch, `--filter` selection, the private-package
-//! skip, the empty-selection no-op, the `--report-summary` output, and batch
-//! publishing. The registry tests drive the real binary against
-//! a `mockito` registry (pnpr's `TestRegistry` is proxy-mode and rejects
-//! path-less publishes) to cover the actual publish loop: the not-yet-published
-//! probe, the per-package `PUT`, `--force`, and the summary / `--json` shapes —
-//! porting the plain token-auth scenarios from pnpm's `recursivePublish.ts`.
+//! Recursive-publish integration tests. The registry tests drive the real
+//! binary against a `mockito` registry (pnpr's `TestRegistry` is proxy-mode
+//! and rejects path-less publishes), porting the plain token-auth scenarios
+//! from pnpm's `recursivePublish.ts`.
 
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
@@ -165,7 +161,7 @@ fn recursive_publish_batches_selected_packages() {
     );
     write_registry_npmrc(&workspace, &format!("{}/", server.url()));
     let batch = server
-        .mock("PUT", "/-/pnpm/v1/publish")
+        .mock("PUT", "/-/pnpr/v0/publish")
         .match_body(Matcher::PartialJson(serde_json::json!({
             "packages": [
                 { "name": "project-1" },
@@ -237,13 +233,13 @@ fn recursive_batch_publish_runs_completed_group_postpublish_scripts_before_a_lat
     .expect("enable workspace linking");
     write_registry_npmrc(&workspace, &format!("{}/", first_registry.url()));
     let first_batch = first_registry
-        .mock("PUT", "/-/pnpm/v1/publish")
+        .mock("PUT", "/-/pnpr/v0/publish")
         .with_status(201)
         .with_body(r#"{"ok":true}"#)
         .expect(1)
         .create();
     let second_batch = second_registry
-        .mock("PUT", "/-/pnpm/v1/publish")
+        .mock("PUT", "/-/pnpr/v0/publish")
         .with_status(500)
         .with_body(r#"{"error":"publish failed"}"#)
         .expect(1)
@@ -259,6 +255,128 @@ fn recursive_batch_publish_runs_completed_group_postpublish_scripts_before_a_lat
     second_batch.assert();
     assert!(workspace.join("project-1/post-published").exists());
     assert!(!workspace.join("project-2/post-published").exists());
+
+    drop(root);
+}
+
+/// Whether every package in a batch body has attachments, and every one of
+/// them names a staged archive by integrity rather than carrying `data`.
+fn references_staged_archives(body: &Value) -> bool {
+    body["packages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .all(|package| {
+            package["_attachments"]
+                .as_object()
+                .is_some_and(|attachments| {
+                    !attachments.is_empty() && attachments.values().all(names_staged_archive)
+                })
+        })
+}
+
+/// Whether `attachment` names a staged archive by integrity rather than
+/// carrying `data`.
+fn names_staged_archive(attachment: &Value) -> bool {
+    attachment.get("data").is_none()
+        && attachment["integrity"]
+            .as_str()
+            .is_some_and(|integrity| integrity.starts_with("sha512-"))
+}
+
+/// A batch bound for a registry declared `serverType: pnpr` uploads each
+/// archive on its own request first, and the commit names them by
+/// integrity. An archive the registry holds staged already is not sent again.
+#[test]
+fn recursive_batch_publish_to_pnpr_stages_archives_before_the_commit() {
+    let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+    let mut server = mockito::Server::new();
+    write_workspace(
+        &workspace,
+        &[("project-1", public_pkg("project-1")), ("project-2", public_pkg("project-2"))],
+    );
+    let registry = format!("{}/", server.url());
+    write_registry_npmrc(&workspace, &registry);
+    let workspace_yaml = fs::read_to_string(workspace.join("pnpm-workspace.yaml")).unwrap();
+    fs::write(
+        workspace.join("pnpm-workspace.yaml"),
+        format!("{workspace_yaml}registries:\n  '{registry}':\n    serverType: pnpr\n"),
+    )
+    .expect("declare the registry pnpr");
+    let lookups = server
+        .mock("HEAD", "/-/pnpr/v0/artifacts/blob")
+        .match_query(Matcher::Regex("^integrity=sha512-".to_string()))
+        .with_status(404)
+        .expect(2)
+        .create();
+    let uploads = server
+        .mock("PUT", "/-/pnpr/v0/artifacts/blob")
+        .match_query(Matcher::Regex("^integrity=sha512-".to_string()))
+        .match_header("content-type", "application/octet-stream")
+        .with_status(201)
+        .expect(2)
+        .create();
+    let batch = server
+        .mock("PUT", "/-/pnpr/v0/publish")
+        .match_request(|request| {
+            let body: Value =
+                serde_json::from_str(&request.utf8_lossy_body().expect("body")).expect("JSON body");
+            body["packages"]
+                .as_array()
+                .is_some_and(|packages| packages.len() == 2)
+                && references_staged_archives(&body)
+        })
+        .with_status(201)
+        .with_body(r#"{"ok":true}"#)
+        .expect(1)
+        .create();
+
+    clear_ci(pacquet)
+        .with_args(["-r", "publish", "--batch", "--force", "--no-git-checks"])
+        .assert()
+        .success();
+    lookups.assert();
+    uploads.assert();
+    batch.assert();
+
+    drop(root);
+}
+
+/// A registry not declared `serverType: pnpr` gets today's batch: every
+/// archive inline, and no staging requests.
+#[test]
+fn recursive_batch_publish_to_another_registry_carries_archives_inline() {
+    let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+    let mut server = mockito::Server::new();
+    write_workspace(&workspace, &[("project-1", public_pkg("project-1"))]);
+    write_registry_npmrc(&workspace, &format!("{}/", server.url()));
+    let staging = ["HEAD", "PUT"].map(|method| {
+        server
+            .mock(method, "/-/pnpr/v0/artifacts/blob")
+            .match_query(Matcher::Any)
+            .expect(0)
+            .create()
+    });
+    let batch = server
+        .mock("PUT", "/-/pnpr/v0/publish")
+        .match_request(|request| {
+            let body: Value =
+                serde_json::from_str(&request.utf8_lossy_body().expect("body")).expect("JSON body");
+            body["packages"][0]["_attachments"]["project-1-1.0.0.tgz"]["data"].is_string()
+        })
+        .with_status(201)
+        .with_body(r#"{"ok":true}"#)
+        .expect(1)
+        .create();
+
+    clear_ci(pacquet)
+        .with_args(["-r", "publish", "--batch", "--force", "--no-git-checks"])
+        .assert()
+        .success();
+    for mock in staging {
+        mock.assert();
+    }
+    batch.assert();
 
     drop(root);
 }
@@ -281,7 +399,7 @@ fn recursive_batch_publish_rejects_mixed_credentials_for_one_registry() {
     )
     .expect("write .npmrc");
     let batch = server
-        .mock("PUT", "/-/pnpm/v1/publish")
+        .mock("PUT", "/-/pnpr/v0/publish")
         .expect(0)
         .create();
 
@@ -315,7 +433,7 @@ fn recursive_batch_publish_accepts_one_scope_credential_for_every_package() {
     )
     .expect("write .npmrc");
     let batch = server
-        .mock("PUT", "/-/pnpm/v1/publish")
+        .mock("PUT", "/-/pnpr/v0/publish")
         .match_header("authorization", "Bearer scoped-token")
         .with_status(201)
         .with_body(r#"{"ok":true}"#)
@@ -338,7 +456,7 @@ fn recursive_batch_publish_reports_an_unsupported_registry() {
     write_workspace(&workspace, &[("project-1", public_pkg("project-1"))]);
     write_registry_npmrc(&workspace, &format!("{}/", server.url()));
     let batch = server
-        .mock("PUT", "/-/pnpm/v1/publish")
+        .mock("PUT", "/-/pnpr/v0/publish")
         .with_status(404)
         .expect(1)
         .create();
@@ -756,3 +874,149 @@ fn recursive_publish_json_prints_the_published_array() {
 
     drop(root);
 }
+
+#[test]
+fn recursive_publish_filter_uses_workspace_root_npmrc_registry() {
+    let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+    let mut server = mockito::Server::new();
+    write_workspace(
+        &workspace,
+        &[("project-1", public_pkg("project-1")), ("project-2", public_pkg("project-2"))],
+    );
+    write_registry_npmrc(&workspace, &format!("{}/", server.url()));
+
+    let probe = server
+        .mock("GET", "/project-1")
+        .with_status(404)
+        .expect(1)
+        .create();
+    let put = server
+        .mock("PUT", "/project-1")
+        .with_status(200)
+        .with_body("{}")
+        .expect(1)
+        .create();
+
+    clear_ci(pacquet)
+        .with_arg("--filter=project-1")
+        .with_arg("publish")
+        .with_arg("--no-git-checks")
+        .assert()
+        .success();
+
+    probe.assert();
+    put.assert();
+    drop(root);
+}
+
+#[test]
+fn recursive_publish_uses_the_publish_config_scoped_registry() {
+    let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+    let mut npmrc_scoped_registry = mockito::Server::new();
+    let mut publish_registry = mockito::Server::new();
+    write_workspace(
+        &workspace,
+        &[(
+            "project-1",
+            json!({
+                "name": "@scope/project-1",
+                "version": "1.0.0",
+                "publishConfig": { "@scope:registry": format!("{}/", publish_registry.url()) },
+            }),
+        )],
+    );
+    fs::write(
+        workspace.join(".npmrc"),
+        format!("@scope:registry={}/\n", npmrc_scoped_registry.url()),
+    )
+    .expect("write .npmrc");
+
+    let wrong_probe = npmrc_scoped_registry
+        .mock("GET", Matcher::Any)
+        .expect(0)
+        .create();
+    let wrong_put = npmrc_scoped_registry
+        .mock("PUT", Matcher::Any)
+        .expect(0)
+        .create();
+    let probe = publish_registry
+        .mock("GET", Matcher::Any)
+        .with_status(404)
+        .expect(1)
+        .create();
+    let put = publish_registry
+        .mock("PUT", "/@scope%2fproject-1")
+        .with_status(200)
+        .with_body("{}")
+        .expect(1)
+        .create();
+
+    clear_ci(pacquet)
+        .with_arg("-r")
+        .with_arg("publish")
+        .with_arg("--no-git-checks")
+        .assert()
+        .success();
+
+    wrong_probe.assert();
+    wrong_put.assert();
+    probe.assert();
+    put.assert();
+    drop(root);
+}
+
+#[test]
+fn recursive_publish_resolves_workspace_protocol_without_node_modules() {
+    let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+    let mut server = mockito::Server::new();
+    write_workspace(
+        &workspace,
+        &[
+            ("project-1", json!({ "name": "project-1", "version": "1.0.0" })),
+            (
+                "project-2",
+                json!({
+                    "name": "project-2",
+                    "version": "1.0.0",
+                    "dependencies": {
+                        "project-1": "workspace:^",
+                    },
+                }),
+            ),
+        ],
+    );
+    write_registry_npmrc(&workspace, &format!("{}/", server.url()));
+
+    let _probe1 = server
+        .mock("GET", "/project-1")
+        .with_status(404)
+        .create();
+    let put1 = server
+        .mock("PUT", "/project-1")
+        .with_status(200)
+        .with_body("{}")
+        .create();
+    let _probe2 = server
+        .mock("GET", "/project-2")
+        .with_status(404)
+        .create();
+    let put2 = server
+        .mock("PUT", "/project-2")
+        .match_body(Matcher::Regex(r#""project-1":\s*"\^1\.0\.0""#.to_string()))
+        .with_status(200)
+        .with_body("{}")
+        .create();
+
+    clear_ci(pacquet)
+        .with_arg("-r")
+        .with_arg("publish")
+        .with_arg("--no-git-checks")
+        .assert()
+        .success();
+
+    put1.assert();
+    put2.assert();
+    drop(root);
+}
+
+mod wait;

@@ -1,10 +1,16 @@
-use super::{PublishArgs, PublishFlags, run_publish_scripts};
+use super::{PublishArgs, PublishFlags, configured_publish_branch, run_publish_scripts};
+use crate::{
+    boolean_values::resolve_boolean_values,
+    cli_args::{CliArgs, cli_command::CliCommand},
+};
+use clap::Parser;
 use pnpm_config::Config;
 use pnpm_network::{AuthHeaders, ThrottledClient};
 use pnpm_publish::{Access, PublishNetwork};
 use pnpm_reporter::SilentReporter;
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use std::ffi::OsString;
 
 /// A `PublishArgs` with every flag at its default; a test overrides only the
 /// field it exercises.
@@ -26,19 +32,27 @@ fn publish_flags() -> PublishFlags {
             tag: None,
             access: None,
             provenance: false,
+            no_provenance: false,
             otp: None,
+            publish_wait_timeout: None,
         },
         manifest: crate::cli_args::publish::PublishManifestArgs {
             embed_readme: false,
             no_embed_readme: false,
             skip_manifest_obfuscation: false,
             no_skip_manifest_obfuscation: false,
+            notes: super::arguments::PublishNotesArgs {
+                release_notes: None,
+                no_release_notes: false,
+                publication_name: None,
+            },
         },
         git: crate::cli_args::publish::PublishGitArgs {
             publish_branch: None,
             no_git_checks: false,
         },
         output: crate::cli_args::publish::PublishOutputArgs { json: false, report_summary: false },
+        variants: crate::cli_args::publish::PublishVariantArgs::default(),
     }
 }
 
@@ -52,6 +66,13 @@ fn should_ignore_scripts_ors_the_flag_with_the_config() {
             .should_ignore_scripts(&config_off),
     );
     assert!(publish_args().should_ignore_scripts(&config_on));
+}
+
+#[test]
+fn publish_branch_flag_overrides_the_workspace_setting() {
+    let config = Config { publish_branch: Some("production".to_owned()), ..Config::default() };
+    assert_eq!(configured_publish_branch(None, &config), Some("production"));
+    assert_eq!(configured_publish_branch(Some("release"), &config), Some("release"));
 }
 
 #[test]
@@ -86,6 +107,53 @@ fn publish_options_applies_tag_access_provenance_and_dry_run() {
     assert_eq!(options.registry.otp, None);
 }
 
+#[test]
+fn publish_options_layers_the_provenance_flags_over_the_config() {
+    let with_flags = |provenance, no_provenance| {
+        publish_args_with(PublishFlags {
+            registry: crate::cli_args::publish::PublishRegistryArgs {
+                provenance,
+                no_provenance,
+                ..publish_flags().registry
+            },
+            ..publish_flags()
+        })
+    };
+    let resolve = |args: &PublishArgs, configured| {
+        let config = Config { provenance: configured, ..Default::default() };
+        args.publish_options(&config, None, false).registry.provenance
+    };
+    let unset = with_flags(false, false);
+    let on = with_flags(true, false);
+    let off = with_flags(false, true);
+    assert_eq!(resolve(&unset, None), None);
+    assert_eq!(resolve(&unset, Some(false)), Some(false));
+    assert_eq!(resolve(&unset, Some(true)), Some(true));
+    assert_eq!(resolve(&off, None), Some(false));
+    assert_eq!(resolve(&off, Some(true)), Some(false));
+    assert_eq!(resolve(&on, Some(false)), Some(true));
+}
+
+#[test]
+fn provenance_false_on_the_command_line_parses_as_no_provenance() {
+    let parse = |parts: &[&str]| {
+        let argv = parts
+            .iter()
+            .map(OsString::from)
+            .collect();
+        match CliArgs::try_parse_from(resolve_boolean_values(argv)).expect("parses").command {
+            CliCommand::Publish(publish) => publish.flags.registry,
+            other => panic!("expected publish, got {other:?}"),
+        }
+    };
+    for spelling in ["--provenance=false", "--no-provenance"] {
+        let flags = parse(&["pnpm", "publish", spelling]);
+        assert!(!flags.provenance && flags.no_provenance, "{spelling}");
+    }
+    let flags = parse(&["pnpm", "publish", "--no-provenance", "--provenance"]);
+    assert!(flags.provenance && !flags.no_provenance);
+}
+
 #[tokio::test]
 async fn pack_for_publish_writes_a_tarball_and_returns_the_manifest() {
     let dir = tempfile::tempdir().expect("a source dir");
@@ -95,11 +163,17 @@ async fn pack_for_publish_writes_a_tarball_and_returns_the_manifest() {
 
     let args = publish_args_with(PublishFlags { ignore_scripts: true, ..publish_flags() });
     let result = args
-        .pack_for_publish::<SilentReporter>(dir.path(), &Config::default(), dest.path(), &[])
+        .pack_for_publish::<SilentReporter>(
+            dir.path(),
+            &Config::default(),
+            dest.path(),
+            &[],
+            (None, &[]),
+        )
         .await
         .expect("packing succeeds");
 
-    assert_eq!(result.published_manifest["name"], "pkg");
+    assert_eq!(result.archives[0].result.published_manifest["name"], "pkg");
     let wrote_tarball = std::fs::read_dir(dest.path())
         .expect("read the destination")
         .flatten()
@@ -163,9 +237,17 @@ async fn publish_directory_errors_when_no_manifest_is_present() {
     let network = PublishNetwork { client: &client, auth_headers: &auth_headers };
 
     let err = args
-        .publish_directory::<SilentReporter>(dir.path(), &config, &opts, &network, &[])
+        .publish_directory::<SilentReporter>(
+            dir.path(),
+            &config,
+            &opts,
+            &network,
+            &[],
+            super::PublishScope::Single { summary: None },
+        )
         .await
-        .expect_err("an empty directory has no package.json");
+        .expect_err("an empty directory has no package.json")
+        .error;
 
     assert_eq!(
         err.code()

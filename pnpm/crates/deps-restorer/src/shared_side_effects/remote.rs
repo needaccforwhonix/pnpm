@@ -1,63 +1,59 @@
 use super::{
-    ApplySharedSideEffectsOptions, BaseCasPaths, artifact_platform, decoded_trusted_keys,
-    dependency_package, insert_side_effects_map, non_empty, planning::CandidateGroup,
-    quarantine_remote_side_effects, store_holds,
+    BaseCasPaths, artifact_platform, decoded_trusted_keys, dependency_package,
+    insert_side_effects_map, non_empty, planning::CandidateGroup, quarantine_remote_side_effects,
+    store_holds,
 };
 use crate::{RemoteSideEffectsQuarantineBySnapshot, SideEffectsMapsBySnapshot};
 use pnpm_config::Config;
-use pnpm_lockfile::{PackageKey, SnapshotEntry};
+use pnpm_lockfile::ProjectSnapshot;
 use pnpm_pnpr_client::{
-    ArtifactBlobRequest, ArtifactFile, OwnerScope, PnprClient, PnprClientError, RejectedArtifact,
-    ResolveArtifactsOptions, blob_id,
+    ArtifactBlobRequest, ArtifactFile, ArtifactStore, OwnerScope, PnprClientError,
+    RejectedArtifact, ResolveArtifactsOptions, blob_id,
 };
-use pnpm_store_dir::{CafsFileInfo, RemoteSideEffectsOrigin, SideEffectsDiff, StoreIndexWriter};
+use pnpm_store_dir::{
+    CafsFileInfo, RemoteSideEffectsOrigin, SideEffectsDiff, SideEffectsOverlay, StoreIndexWriter,
+    side_effects_overlay,
+};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    path::PathBuf,
     sync::Arc,
 };
 
-/// Resolve the groups' artifacts on the configured pnpr server,
-/// quarantine the rejected ones and overlay the rest.
-pub(super) async fn fetch_remote_artifacts(
-    options: &mut ApplySharedSideEffectsOptions<'_>,
-    setup: &RemoteCacheSetup,
-    groups: &BTreeMap<String, CandidateGroup>,
+pub(super) struct ApplyResolvedRemoteArtifacts<'a> {
+    pub config: &'a Config,
+    pub setup: &'a RemoteCacheSetup,
+    pub groups: &'a BTreeMap<String, CandidateGroup>,
+    pub base_cas_paths: &'a BaseCasPaths,
+    pub side_effects_maps_by_snapshot: &'a mut SideEffectsMapsBySnapshot,
+    pub store_index_writer: &'a Arc<StoreIndexWriter>,
+}
+
+/// Quarantine the rejected artifacts and overlay the resolved ones.
+pub(super) async fn apply_resolved_remote_artifacts(
+    inputs: ApplyResolvedRemoteArtifacts<'_>,
+    resolved: Option<(BTreeMap<String, pnpm_pnpr_client::VerifiedArtifact>, Vec<RejectedArtifact>)>,
 ) {
-    let config = options.config;
-    let Some(server) = config.pnpr_server.as_deref() else { return };
-    let client = PnprClient::new(server);
-    let authorization = config.auth_headers.for_url(server);
-    let Some((resolved, rejected_artifacts)) = resolve_remote_artifacts(
-        &client,
-        setup,
-        groups,
-        options.cached.quarantine_by_snapshot,
-        server,
-        authorization.as_deref(),
-    )
-    .await
-    else {
+    let server = inputs.setup.store.channel();
+    let Some((resolved, rejected_artifacts)) = resolved else {
         return;
     };
     for rejected in rejected_artifacts {
-        quarantine_remote_side_effects(&rejected, groups, server, options.store_index_writer);
+        quarantine_remote_side_effects(&rejected, inputs.groups, server, inputs.store_index_writer);
     }
 
     for (input_key, artifact) in resolved {
         apply_resolved_artifact(
             &ResolvedArtifactContext {
-                config,
-                client: &client,
+                config: inputs.config,
+                store: &inputs.setup.store,
                 server,
-                authorization: authorization.as_deref(),
-                groups,
-                base_cas_paths: options.cached.base_cas_paths,
-                store_index_writer: options.store_index_writer,
+                groups: inputs.groups,
+                base_cas_paths: inputs.base_cas_paths,
+                store_index_writer: inputs.store_index_writer,
             },
             &input_key,
             &artifact,
-            options.side_effects_maps_by_snapshot,
+            inputs.side_effects_maps_by_snapshot,
         )
         .await;
     }
@@ -66,6 +62,7 @@ pub(super) async fn fetch_remote_artifacts(
 /// `None` when the cache is off, misconfigured, or the host platform is
 /// not one the shared-artifact protocol describes.
 pub(super) struct RemoteCacheSetup {
+    pub(super) store: ArtifactStore,
     pub(super) supported_tags: Vec<String>,
     pub(super) trusted_keys: BTreeMap<String, Vec<u8>>,
     pub(super) owner: OwnerScope,
@@ -74,13 +71,21 @@ pub(super) struct RemoteCacheSetup {
 }
 pub(super) fn remote_cache_setup(
     config: &Config,
-    snapshots: &HashMap<PackageKey, SnapshotEntry>,
+    importers: &HashMap<String, ProjectSnapshot>,
 ) -> Option<RemoteCacheSetup> {
     if config.ignore_scripts {
         return None;
     }
-    let settings = config.remote_side_effects_cache.as_ref()?;
-    let platform = artifact_platform(snapshots)?;
+    let eligible_packages = &config.remote_side_effects_cache.as_ref()?.packages;
+    let settings = config.remote_cache_settings();
+    let store = match ArtifactStore::from_config(config, &settings) {
+        Ok(store) => store?,
+        Err(error) => {
+            tracing::warn!(target: "pacquet::install", %error, "remote side-effects cache is unusable");
+            return None;
+        }
+    };
+    let platform = artifact_platform(importers)?;
     let supported_tags = match platform.supported_tags() {
         Ok(tags) => tags,
         Err(error) => {
@@ -88,13 +93,14 @@ pub(super) fn remote_cache_setup(
             return None;
         }
     };
-    let trusted_keys = decoded_trusted_keys(settings)?;
-    let organization = non_empty(&settings.org)?;
+    let trusted_keys = decoded_trusted_keys(&settings)?;
+    let organization = non_empty(settings.org.as_deref()?)?;
     Some(RemoteCacheSetup {
+        store,
         supported_tags,
         trusted_keys,
         owner: OwnerScope::organization(organization.to_string()),
-        eligible_packages: settings.packages
+        eligible_packages: eligible_packages
             .iter()
             .cloned()
             .collect(),
@@ -105,27 +111,26 @@ pub(super) fn remote_cache_setup(
 /// `None` when the lookup could not run: a failed handshake or query is
 /// a cache miss, never an install failure.
 pub(super) async fn resolve_remote_artifacts(
-    client: &PnprClient,
     setup: &RemoteCacheSetup,
     groups: &BTreeMap<String, CandidateGroup>,
     remote_side_effects_quarantine_by_snapshot: &RemoteSideEffectsQuarantineBySnapshot,
-    server: &str,
-    authorization: Option<&str>,
 ) -> Option<(BTreeMap<String, pnpm_pnpr_client::VerifiedArtifact>, Vec<RejectedArtifact>)> {
     tracing::debug!(
         target: "pacquet::install",
         candidates = groups.len(),
         "querying remote side-effects cache",
     );
-    if let Err(error) = client.handshake_artifacts().await {
+    if let Err(error) = setup.store.handshake().await {
         tracing::warn!(target: "pacquet::install", %error, "remote side-effects cache handshake failed");
         return None;
     }
-    let quarantined_envelope_digests =
-        quarantined_digests(groups, remote_side_effects_quarantine_by_snapshot, server);
-    let rejected_artifacts = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let rejected_artifacts_for_callback = Arc::clone(&rejected_artifacts);
-    let resolved = match client.resolve_artifacts(ResolveArtifactsOptions {
+    let quarantined_envelope_digests = quarantined_digests(
+        groups,
+        remote_side_effects_quarantine_by_snapshot,
+        setup.store.channel(),
+    );
+    let (rejected_artifacts, on_rejected_artifact) = rejected_artifact_collector();
+    let resolved = match setup.store.resolve_artifacts(ResolveArtifactsOptions {
         candidates: groups
             .values()
             .map(|group| group.candidate.clone())
@@ -133,13 +138,8 @@ pub(super) async fn resolve_remote_artifacts(
         supported_tags: setup.supported_tags.clone(),
         trusted_keys: setup.trusted_keys.clone(),
         quarantined_envelope_digests,
-        on_rejected_artifact: Some(Arc::new(move |rejected| {
-            rejected_artifacts_for_callback
-                .lock()
-                .unwrap()
-                .push(rejected);
-        })),
-        authorization: authorization.map(str::to_owned),
+        on_rejected_artifact: Some(on_rejected_artifact),
+        authorization: None,
         build_policy: artifact_build_policy(setup, groups),
     })
     .await
@@ -152,6 +152,19 @@ pub(super) async fn resolve_remote_artifacts(
     };
     let rejected_artifacts = std::mem::take(&mut *rejected_artifacts.lock().unwrap());
     Some((resolved, rejected_artifacts))
+}
+type RejectedArtifacts = Arc<std::sync::Mutex<Vec<RejectedArtifact>>>;
+
+/// A list, and the callback that collects the artifacts a lookup rejects
+/// into it.
+fn rejected_artifact_collector() -> (RejectedArtifacts, Arc<dyn Fn(RejectedArtifact) + Send + Sync>)
+{
+    let rejected_artifacts = RejectedArtifacts::default();
+    let collected = Arc::clone(&rejected_artifacts);
+    let on_rejected_artifact = Arc::new(move |rejected| {
+        collected.lock().unwrap().push(rejected);
+    });
+    (rejected_artifacts, on_rejected_artifact)
 }
 fn artifact_build_policy(
     setup: &RemoteCacheSetup,
@@ -191,9 +204,8 @@ pub(super) fn quarantined_digests(
 /// What one resolved artifact needs to be staged into the store.
 pub(super) struct ResolvedArtifactContext<'a> {
     config: &'a Config,
-    client: &'a PnprClient,
+    store: &'a ArtifactStore,
     server: &'a str,
-    authorization: Option<&'a str>,
     groups: &'a BTreeMap<String, CandidateGroup>,
     base_cas_paths: &'a BaseCasPaths,
     store_index_writer: &'a Arc<StoreIndexWriter>,
@@ -221,41 +233,52 @@ pub(super) async fn apply_resolved_artifact(
     }
     let Some((first_snapshot, _, _)) = group.snapshots.first() else { return };
     let Some(base) = context.base_cas_paths.get(first_snapshot) else { return };
-    let staged = match stage_artifact(context, artifact, base).await {
+    let staged = match stage_artifact(context, input_key, artifact, base).await {
         Ok(staged) => staged,
         Err((error, quarantine)) => {
             report_rejected_artifact(context, input_key, artifact, group, &error, quarantine);
             return;
         }
     };
-    let diff = remote_diff(context, artifact, staged.added);
-    record_group(context, group, &staged.overlay, &diff, side_effects_maps_by_snapshot);
+    record_group(context, group, &staged.overlay, &staged.diff, side_effects_maps_by_snapshot);
 }
-/// The artifact's file map over the group's base, with every added
-/// file staged in the CAFS.
+/// The artifact as a side-effects diff, with every added blob staged in
+/// the CAFS, and its overlay over the group's base.
 pub(super) struct StagedArtifact {
-    overlay: HashMap<String, PathBuf>,
-    added: HashMap<String, CafsFileInfo>,
+    overlay: SideEffectsOverlay,
+    diff: SideEffectsDiff,
 }
 pub(super) async fn stage_artifact(
     context: &ResolvedArtifactContext<'_>,
+    input_key: &str,
     artifact: &pnpm_pnpr_client::VerifiedArtifact,
-    base: &HashMap<String, PathBuf>,
+    base: &pnpm_fs::CasPaths,
 ) -> Result<StagedArtifact, (String, bool)> {
-    let mut overlay = base.clone();
     let mut downloaded = HashMap::<String, Vec<u8>>::new();
-    let mut stored = HashMap::<(String, u32), PathBuf>::new();
+    let mut stored = HashMap::<(String, u32), pnpm_fs::StoreFile>::new();
     let mut added = HashMap::<String, CafsFileInfo>::new();
-    for deleted in &artifact.payload.manifest.deleted {
-        overlay.remove(deleted);
-    }
+    let mut staged_modes = HashMap::<String, u32>::new();
     for file in &artifact.payload.manifest.added {
-        let (path, info) =
+        let (blob, info) =
             stage_artifact_blob(context, artifact, file, &mut stored, &mut downloaded).await?;
-        overlay.insert(file.path.clone(), path);
+        if let Some(mode) = blob.mode() {
+            staged_modes.insert(file.path.clone(), mode);
+        }
         added.insert(file.path.clone(), info);
     }
-    Ok(StagedArtifact { overlay, added })
+    let diff = remote_diff(context, artifact, added);
+    // The same derivation a persisted row goes through, so a symlink the
+    // artifact records is restored under the same rules or not at all.
+    let overlay = side_effects_overlay(&context.config.store_dir, input_key, &diff, base)
+        .ok_or_else(|| {
+            ("the artifact records an entry that cannot be restored".to_string(), true)
+        })?;
+    for (name, mode) in staged_modes {
+        if let Some(file) = overlay.files.get(&name) {
+            file.record_mode(mode);
+        }
+    }
+    Ok(StagedArtifact { overlay, diff })
 }
 pub(super) fn remote_diff(
     context: &ResolvedArtifactContext<'_>,
@@ -280,7 +303,7 @@ pub(super) fn remote_diff(
 pub(super) fn record_group(
     context: &ResolvedArtifactContext<'_>,
     group: &CandidateGroup,
-    overlay: &HashMap<String, PathBuf>,
+    overlay: &SideEffectsOverlay,
     diff: &SideEffectsDiff,
     side_effects_maps_by_snapshot: &mut SideEffectsMapsBySnapshot,
 ) {
@@ -333,9 +356,9 @@ pub(super) async fn stage_artifact_blob(
     context: &ResolvedArtifactContext<'_>,
     artifact: &pnpm_pnpr_client::VerifiedArtifact,
     file: &ArtifactFile,
-    stored: &mut HashMap<(String, u32), PathBuf>,
+    stored: &mut HashMap<(String, u32), pnpm_fs::StoreFile>,
     downloaded: &mut HashMap<String, Vec<u8>>,
-) -> Result<(PathBuf, CafsFileInfo), (String, bool)> {
+) -> Result<(pnpm_fs::StoreFile, CafsFileInfo), (String, bool)> {
     let storage_key = (file.integrity.clone(), file.mode);
     let digest = blob_id(&file.integrity).map_err(|error| (error.to_string(), true))?;
     let info = |digest: String| CafsFileInfo {
@@ -344,45 +367,42 @@ pub(super) async fn stage_artifact_blob(
         size: file.size,
         checked_at: None,
     };
-    if let Some(path) = stored.get(&storage_key) {
-        return Ok((path.clone(), info(digest)));
+    if let Some(blob) = stored.get(&storage_key) {
+        return Ok((blob.clone(), info(digest)));
     }
     if !downloaded.contains_key(&file.integrity) {
-        if let Some(path) = stored_blob_path(context.config, file, &digest).await? {
-            stored.insert(storage_key, path.clone());
-            return Ok((path, info(digest)));
+        if let Some(blob) = stored_blob(context.config, file, &digest).await? {
+            stored.insert(storage_key, blob.clone());
+            return Ok((blob, info(digest)));
         }
         let bytes = download_artifact_file(context, artifact, file).await?;
         downloaded.insert(file.integrity.clone(), bytes);
     }
-    let (path, _) = context.config.store_dir
+    let blob = context.config.store_dir
         .write_cas_file(&downloaded[&file.integrity], pnpm_fs::file_mode::is_executable(file.mode))
-        .map_err(|error| (error.to_string(), false))?;
-    stored.insert(storage_key, path.clone());
-    Ok((path, info(digest)))
+        .map_err(|error| (error.to_string(), false))?
+        .file;
+    stored.insert(storage_key, blob.clone());
+    Ok((blob, info(digest)))
 }
 pub(super) async fn download_artifact_file(
     context: &ResolvedArtifactContext<'_>,
     artifact: &pnpm_pnpr_client::VerifiedArtifact,
     file: &ArtifactFile,
 ) -> Result<Vec<u8>, (String, bool)> {
-    let bytes = context.client
+    context.store
         .download_artifact_blob(
             &ArtifactBlobRequest {
                 owner: artifact.payload.owner.clone(),
                 integrity: file.integrity.clone(),
             },
-            context.authorization,
+            file.size,
         )
         .await
         .map_err(|error| {
             let quarantine = matches!(error, PnprClientError::Protocol(_));
             (error.to_string(), quarantine)
-        })?;
-    if bytes.len() as u64 != file.size {
-        return Err(("shared artifact blob does not match its declared size".to_string(), true));
-    }
-    Ok(bytes)
+        })
 }
 /// The store's own copy of a blob, when it holds one.
 ///
@@ -395,22 +415,26 @@ pub(super) async fn download_artifact_file(
 /// store by `is_executable`, so they cannot disagree about where a mode
 /// belongs. The manifest only carries 0o644 and 0o755 today, but the
 /// agreement must not rest on that.
-pub(super) async fn stored_blob_path(
+pub(super) async fn stored_blob(
     config: &Config,
     file: &ArtifactFile,
     digest: &str,
-) -> Result<Option<PathBuf>, (String, bool)> {
+) -> Result<Option<pnpm_fs::StoreFile>, (String, bool)> {
     let Some(path) = config.store_dir.cas_file_path_by_mode(digest, file.mode) else {
         return Ok(None);
     };
     if !store_holds(&path, digest).await.map_err(|error| (error, false))? {
         return Ok(None);
     }
-    if !tokio::fs::metadata(&path).await.is_ok_and(|metadata| metadata.len() == file.size) {
+    let metadata = tokio::fs::metadata(&path).await
+        .ok()
+        .filter(|metadata| metadata.len() == file.size);
+    let Some(metadata) = metadata else {
         return Err((
             "stored shared artifact blob does not match its declared size".to_string(),
             true,
         ));
-    }
-    Ok(Some(path))
+    };
+    let mode = pnpm_fs::file_mode::metadata_mode(&metadata);
+    Ok(Some(pnpm_fs::StoreFile::with_mode(path, mode)))
 }

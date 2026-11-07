@@ -11,12 +11,12 @@ use sha2::Digest as _;
 #[tokio::test]
 async fn resolves_a_package() {
     let registry = TestRegistry::start();
-    let (pnpr_url, pnpr_auth, _storage) = start_pnpr(&registry.url()).await;
+    let (pnpr_url, pnpr_auth, _storage) = start_pnpr(registry.url()).await;
 
     let client = PnprClient::new(pnpr_url);
 
     let outcome = client
-        .resolve(options(&registry.url(), &pnpr_auth, deps([("@foo/no-deps", "1.0.0")])))
+        .resolve(options(registry.url(), &pnpr_auth, deps([("@foo/no-deps", "1.0.0")])))
         .await
         .expect("install should succeed");
 
@@ -88,7 +88,7 @@ async fn publishes_resolves_and_verifies_an_organization_artifact() {
     let client = PnprClient::new(pnpr_url);
     client.handshake_artifacts().await.expect("artifact capability");
 
-    let (publish, public_key, expected_blob) = signed_artifact_fixture();
+    let (publish, public_key, expected_blob, _blobs) = signed_artifact_fixture();
     client
         .publish_artifact(&publish, Some(&pnpr_auth))
         .await
@@ -197,6 +197,7 @@ async fn publishes_resolves_and_verifies_an_organization_artifact() {
                 owner: candidate.owner,
                 integrity: artifact.payload.manifest.added[0].integrity.clone(),
             },
+            artifact.payload.manifest.added[0].size,
             Some(&pnpr_auth),
         )
         .await
@@ -206,7 +207,7 @@ async fn publishes_resolves_and_verifies_an_organization_artifact() {
 
 #[tokio::test]
 async fn artifact_lookup_preserves_script_eligibility_and_allow_build_policy() {
-    let (publish, public_key, _) = signed_artifact_fixture();
+    let (publish, public_key, _, _blobs) = signed_artifact_fixture();
     let candidate = ArtifactCandidate {
         key: publish.key,
         subject: ArtifactSubject::dependency_side_effects(
@@ -250,7 +251,7 @@ async fn concurrent_artifact_publications_apply_the_variant_limit_at_read_time()
     const PUBLICATIONS: usize = 16;
 
     let (pnpr_url, pnpr_auth, _storage) = start_pnpr_artifacts().await;
-    let (fixture, _, _) = signed_artifact_fixture_for_platform(0);
+    let (fixture, _, _, _blobs) = signed_artifact_fixture_for_platform(0);
     let (payload, _) = fixture.envelope.decode_payload().expect("decode fixture payload");
     let candidate =
         ArtifactCandidate { key: fixture.key, subject: payload.subject, owner: payload.owner };
@@ -260,8 +261,9 @@ async fn concurrent_artifact_publications_apply_the_variant_limit_at_read_time()
         let barrier = Arc::clone(&barrier);
         let pnpr_url = pnpr_url.clone();
         let pnpr_auth = pnpr_auth.clone();
-        let (publish, _, _) = signed_artifact_fixture_for_platform(index);
+        let (publish, _, _, blobs) = signed_artifact_fixture_for_platform(index);
         publications.push(tokio::spawn(async move {
+            let _blobs = blobs;
             barrier.wait().await;
             PnprClient::new(pnpr_url).publish_artifact(&publish, Some(&pnpr_auth)).await
         }));
@@ -327,7 +329,7 @@ async fn artifact_blob_misses_and_errors_are_caller_scoped() {
 async fn organization_artifact_existence_is_not_exposed_to_another_owner() {
     let (pnpr_url, pnpr_auth, _storage) = start_pnpr_artifacts().await;
     let client = PnprClient::new(pnpr_url);
-    let (publish, public_key, _) = signed_artifact_fixture();
+    let (publish, public_key, _, _blobs) = signed_artifact_fixture();
     client
         .publish_artifact(&publish, Some(&pnpr_auth))
         .await
@@ -374,13 +376,17 @@ async fn resolves_a_scope_from_the_registry_declared_for_it() {
     // A default registry that is allowlisted but serves nothing: reaching it
     // for the scoped package is the failure this test is looking for.
     let dead_default = "http://127.0.0.1:9/";
-    let (pnpr_url, pnpr_auth, _storage) =
-        start_pnpr_inner(None, Vec::new(), vec![registry.url(), dead_default.to_string()], false)
-            .await;
+    let (pnpr_url, pnpr_auth, _storage) = start_pnpr_inner(
+        None,
+        Vec::new(),
+        vec![registry.url().to_string(), dead_default.to_string()],
+        false,
+    )
+    .await;
 
     let mut opts = options(dead_default, &pnpr_auth, deps([("@foo/no-deps", "1.0.0")]));
-    opts.routing.registries = BTreeMap::from([(
-        registry.url(),
+    opts.routing.registries = indexmap::IndexMap::from([(
+        registry.url().to_string(),
         RegistryDeclaration {
             scopes: Some(vec!["@foo".to_string()]),
             ..RegistryDeclaration::default()
@@ -408,10 +414,10 @@ async fn resolves_a_scope_from_the_registry_declared_for_it() {
 #[tokio::test]
 async fn a_declared_registry_the_resolve_never_reaches_is_not_rejected() {
     let registry = TestRegistry::start();
-    let (pnpr_url, pnpr_auth, _storage) = start_pnpr(&registry.url()).await;
+    let (pnpr_url, pnpr_auth, _storage) = start_pnpr(registry.url()).await;
 
-    let mut opts = options(&registry.url(), &pnpr_auth, deps([("@foo/no-deps", "1.0.0")]));
-    opts.routing.registries = BTreeMap::from([(
+    let mut opts = options(registry.url(), &pnpr_auth, deps([("@foo/no-deps", "1.0.0")]));
+    opts.routing.registries = indexmap::IndexMap::from([(
         "http://169.254.169.254/".to_string(),
         RegistryDeclaration {
             scopes: Some(vec!["@never-resolved".to_string()]),
@@ -433,10 +439,10 @@ async fn a_declared_registry_the_resolve_never_reaches_is_not_rejected() {
 #[tokio::test]
 async fn a_declared_registry_the_resolve_reaches_is_refused() {
     let registry = TestRegistry::start();
-    let (pnpr_url, pnpr_auth, _storage) = start_pnpr(&registry.url()).await;
+    let (pnpr_url, pnpr_auth, _storage) = start_pnpr(registry.url()).await;
 
-    let mut opts = options(&registry.url(), &pnpr_auth, deps([("@foo/no-deps", "1.0.0")]));
-    opts.routing.registries = BTreeMap::from([(
+    let mut opts = options(registry.url(), &pnpr_auth, deps([("@foo/no-deps", "1.0.0")]));
+    opts.routing.registries = indexmap::IndexMap::from([(
         "http://169.254.169.254/".to_string(),
         RegistryDeclaration {
             scopes: Some(vec!["@foo".to_string()]),

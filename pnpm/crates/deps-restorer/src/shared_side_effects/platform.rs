@@ -1,11 +1,12 @@
-use crate::install_frozen_lockfile::find_runtime_node_major;
+use crate::{install_frozen_lockfile::find_runtime_node_major, process::Command};
+
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use pnpm_lockfile::{PackageKey, SnapshotEntry};
+use pnpm_lockfile::{PackageKey, ProjectSnapshot};
 use pnpm_pnpr_client::{
     LinuxGlibcPlatform, MacOsPlatform, WindowsPlatform, linux_glibc_supported_tags,
     linux_glibc_tag, macos_supported_tags, macos_tag, windows_supported_tags, windows_tag,
 };
-use std::{collections::HashMap, process::Command};
+use std::collections::HashMap;
 #[cfg(windows)]
 use sysinfo::System;
 
@@ -45,14 +46,14 @@ impl ArtifactPlatform<'_> {
     }
 }
 pub(super) fn artifact_platform(
-    snapshots: &HashMap<PackageKey, SnapshotEntry>,
+    importers: &HashMap<String, ProjectSnapshot>,
 ) -> Option<ArtifactPlatform<'static>> {
     let architecture = pnpm_graph_hasher::host_arch();
     if !matches!(architecture, "x64" | "arm64") {
         return None;
     }
     let node_major =
-        find_runtime_node_major(Some(snapshots)).or_else(pnpm_graph_hasher::detect_node_major)?;
+        find_runtime_node_major(importers).or_else(pnpm_graph_hasher::detect_node_major)?;
     match pnpm_graph_hasher::host_platform() {
         "linux" => {
             let (glibc_major, glibc_minor) = pnpm_detect_libc::glibc_version()?;
@@ -101,7 +102,10 @@ pub(super) fn parse_macos_product_version(value: &str) -> Option<(u32, u32)> {
 }
 #[cfg(windows)]
 pub(super) fn windows_kernel_version() -> Option<(u32, u32, u32)> {
-    let build = System::kernel_version()?.parse().ok()?;
+    let build = System::kernel_version()
+        .ok()?
+        .parse()
+        .ok()?;
     // Windows 10 and 11 both use NT kernel version 10.0; sysinfo provides the build number.
     validate_windows_kernel_version(10, 0, build)
 }

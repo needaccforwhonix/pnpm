@@ -1,14 +1,14 @@
 use super::{
     AllowBuild, AuditConfig, AuditLevel, AuditSettings, BTreeMap, BTreeSet, CargoSettings,
-    CatalogMode, ConfigDependency, Deserialize, Deserializer, DroppedKeys, ErrorKind,
-    GLOBAL_CONFIG_YAML_FILENAME, HashMap, HoistingLimits, IgnoredAny, IndexMap, InitType,
-    LinkWorkspacePackages, LoadWorkspaceYamlError, NodeLinker, NodePackageMapType,
-    PackageConfigsSetting, PackageExtension, PackageImportMethod, Path, PathBuf,
-    PeerDependencyRules, Pipe, PmOnFail, PnpmfileSetting, PythonSettings, RegistryEntry,
-    RemoteSideEffectsCacheSettings, ResolutionMode, RuntimeOnFail, SCHEMA_DIRECTIVE_KEY,
-    SaveWorkspaceProtocol, ScriptsPrependNodePath, SideEffectsCacheSetting, SupportedArchitectures,
+    CatalogMode, ConfigDependency, Deserialize, Deserializer, HashMap, HoistingLimits, IndexMap,
+    InitType, LinkWorkspacePackages, LoadWorkspaceYamlError, LockfileSetting, NodeLinkerSetting,
+    NodePackageMapMode, NodePackageMapType, PackageConfigsSetting, PackageExtension,
+    PackageImportMethod, PackagePermissions, Path, PathBuf, PeerDependencyRules, PmOnFail,
+    PnpmfileSetting, PythonSettings, RegistryEntry, RemoteCacheSettings,
+    RemoteSideEffectsCacheSettings, ResolutionMode, RuntimeOnFail, SaveWorkspaceProtocol,
+    SideEffectsCacheSetting, SkillsSettings, StoreIndexFormat, SupportedArchitectures, SystemEnv,
     TaskSettings, TrustPolicy, UpdateConfig, UpdateSettings, VerifyDepsBeforeRun, VirtualStoreType,
-    WORKSPACE_MANIFEST_FILENAME, WorkspaceKeyIssues, fs, redact_and_sanitize,
+    WORKSPACE_MANIFEST_FILENAME, WorkspaceKeyIssues, parse_settings, read_workspace_document,
 };
 
 /// `serde` helper for fields that need to distinguish "missing key"
@@ -24,6 +24,24 @@ where
     De: Deserializer<'de>,
 {
     Option::<Value>::deserialize(deserializer).map(Some)
+}
+
+/// The `macosBackup` section accepted only from trusted machine-level
+/// configuration and `PNPM_CONFIG_*` environment variables.
+#[derive(Debug, Default, PartialEq, serde::Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct MacosBackupSettings {
+    pub exclude_modules_dir: Option<bool>,
+    pub exclude_store_dir: Option<bool>,
+}
+
+/// The `nodePackageMap` section.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct NodePackageMapSettings {
+    pub mode: Option<NodePackageMapMode>,
+    #[serde(rename = "type")]
+    pub map_type: Option<NodePackageMapType>,
 }
 
 /// Settings readable from `pnpm-workspace.yaml`.
@@ -49,6 +67,9 @@ where
 /// settings such as `allowBuilds`) from this file rather than from
 /// `package.json`'s `pnpm` field, resolving those settings against the
 /// workspace dir.
+///
+/// The settings a repository must not control are no fields of this struct
+/// but of [`MachineSettings`](super::MachineSettings).
 #[derive(Debug, Default, PartialEq, serde::Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 #[cfg_attr(
@@ -60,9 +81,11 @@ where
 )]
 pub struct WorkspaceSettings {
     pub bail: Option<bool>,
-    pub ci: Option<bool>,
+    pub progress: Option<bool>,
     pub update_notifier: Option<bool>,
     pub color: Option<crate::ColorMode>,
+    pub loglevel: Option<crate::LogLevel>,
+    pub reporter: Option<crate::ReporterType>,
     pub embed_readme: Option<bool>,
     pub ignore_workspace_root_check: Option<bool>,
     pub optional: Option<bool>,
@@ -91,9 +114,12 @@ pub struct WorkspaceSettings {
     pub public_hoist_pattern: Option<Option<Vec<String>>>,
     pub shamefully_hoist: Option<bool>,
     pub store_dir: Option<String>,
-    pub state_dir: Option<String>,
     pub modules_dir: Option<String>,
-    pub node_linker: Option<NodeLinker>,
+    pub node_linker: Option<NodeLinkerSetting>,
+    /// `nodePackageMap`. Wins over the deprecated
+    /// `nodeExperimentalPackageMap` and `nodePackageMapType` set in the same
+    /// source; see [`Self::apply_to`].
+    pub node_package_map: Option<NodePackageMapSettings>,
     pub node_experimental_package_map: Option<bool>,
     pub node_package_map_type: Option<NodePackageMapType>,
     pub symlink: Option<bool>,
@@ -109,11 +135,6 @@ pub struct WorkspaceSettings {
     /// `virtualStoreOnly` from `pnpm-workspace.yaml`. See
     /// [`Config::virtual_store_only`](crate::settings::Config::virtual_store_only).
     pub virtual_store_only: Option<bool>,
-    /// `globalShims` from `pnpm-workspace.yaml` or the global
-    /// `config.yaml`. One layer of the record; merged key-wise into
-    /// [`Config::global_shims`](crate::settings::Config::global_shims) rather than assigned
-    /// wholesale. See [`crate::GlobalShims`].
-    pub global_shims: Option<crate::GlobalShimsSetting>,
     /// `enableModulesDir` from `pnpm-workspace.yaml`. See
     /// [`Config::enable_modules_dir`](crate::settings::Config::enable_modules_dir).
     pub enable_modules_dir: Option<bool>,
@@ -121,23 +142,11 @@ pub struct WorkspaceSettings {
     /// against the workspace dir like the other path-valued fields.
     /// When set, overrides the derived `<store_dir>/links` path.
     pub global_virtual_store_dir: Option<String>,
-    /// `globalDir` from the global `config.yaml` or the environment. A
-    /// relative value resolves against the directory pnpm runs in, which
-    /// is where pnpm itself resolves it. See [`Config::global_dir`](crate::settings::Config::global_dir).
-    ///
-    /// No repo-committed file may set it — see [`crate::refused_keys`].
-    pub global_dir: Option<String>,
-    /// `globalBinDir` from the global `config.yaml` or the environment. A
-    /// relative value resolves against the directory pnpm runs in, which
-    /// is where pnpm itself resolves it. See [`Config::global_bin_dir`](crate::settings::Config::global_bin_dir).
-    ///
-    /// No repo-committed file may set it — see [`crate::refused_keys`].
-    pub global_bin_dir: Option<String>,
     pub package_import_method: Option<PackageImportMethod>,
     pub modules_cache_max_age: Option<u64>,
     pub virtual_store_dir_max_length: Option<u64>,
     pub peers_suffix_max_length: Option<u64>,
-    pub lockfile: Option<bool>,
+    pub lockfile: Option<LockfileSetting>,
     /// `lockfileDir` from `pnpm-workspace.yaml` or the global
     /// `config.yaml`. Resolved against the workspace dir like the other
     /// path-valued fields. See [`Config::lockfile_dir`](crate::settings::Config::lockfile_dir).
@@ -157,20 +166,22 @@ pub struct WorkspaceSettings {
     pub prefer_offline: Option<bool>,
     pub lockfile_include_tarball_url: Option<bool>,
     pub registry: Option<String>,
-    pub scope: Option<String>,
     /// The registries the project declares. Keyed by registry URL, with the
     /// routes to each registry inside its entry; a map of plain strings is the
     /// older `<scope>: <url>` shape and is read as one.
-    pub registries: Option<BTreeMap<String, RegistryEntry>>,
+    pub registries: Option<IndexMap<String, RegistryEntry>>,
     pub pnpr_server: Option<String>,
     pub cargo: Option<CargoSettings>,
     pub python: Option<PythonSettings>,
     pub remote_side_effects_cache: Option<RemoteSideEffectsCacheSettings>,
+    pub remote_cache: Option<RemoteCacheSettings>,
     pub https_proxy: Option<String>,
     pub http_proxy: Option<String>,
     pub no_proxy: Option<serde_json::Value>,
     pub proxy: Option<String>,
     pub noproxy: Option<serde_json::Value>,
+    pub strict_ssl: Option<bool>,
+    pub local_address: Option<String>,
 
     /// User-defined named-registry aliases. Outer key is the alias
     /// name (`gh`, `work`, ...); inner string is the registry URL the
@@ -228,24 +239,31 @@ pub struct WorkspaceSettings {
     pub external_dependencies: Option<BTreeSet<String>>,
     pub dedupe_peer_dependents: Option<bool>,
     pub dedupe_peers: Option<bool>,
+    pub auto_dedupe: Option<bool>,
     pub dedupe_direct_deps: Option<bool>,
     pub prefer_workspace_packages: Option<bool>,
     pub dedupe_injected_deps: Option<bool>,
     pub strict_peer_dependencies: Option<bool>,
     pub ignore_compatibility_db: Option<bool>,
+    pub add_missing_peer_types: Option<bool>,
     pub resolve_peers_from_workspace_root: Option<bool>,
+    pub project_scoped_optional_peers: Option<bool>,
     pub block_exotic_subdeps: Option<bool>,
     pub verify_store_integrity: Option<bool>,
     pub strict_store_pkg_content_check: Option<bool>,
     pub include_workspace_root: Option<bool>,
+    pub fail_if_no_match: Option<bool>,
     pub ignore_workspace_cycles: Option<bool>,
     pub disallow_workspace_cycles: Option<bool>,
     /// `frozenStore` from `pnpm-workspace.yaml`. Opens the store
     /// read-only and suppresses every store write — see
-    /// [`Config::frozen_store`]. Default `false`.
+    /// [`Config::frozen_store`].
     ///
     /// [`Config::frozen_store`]: crate::Config::frozen_store
     pub frozen_store: Option<bool>,
+    /// `storeIndexFormat` from `pnpm-workspace.yaml`. See
+    /// [`crate::Config::store_index_format`].
+    pub store_index_format: Option<StoreIndexFormat>,
     /// `sideEffectsCache`: whether a build is restored, whether one is saved,
     /// and where from. A bare boolean sets reading and writing together.
     pub side_effects_cache: Option<SideEffectsCacheSetting>,
@@ -257,7 +275,7 @@ pub struct WorkspaceSettings {
     pub fetch_retry_maxtimeout: Option<u64>,
     pub network_concurrency: Option<usize>,
     /// `maxSockets` — per-origin concurrent-connection cap. See
-    /// [`Config::max_sockets`](crate::settings::Config::max_sockets). Default unset (no per-origin cap).
+    /// [`Config::max_sockets`](crate::settings::Config::max_sockets).
     pub max_sockets: Option<usize>,
     /// `maxsockets` — npm's spelling of [`Self::max_sockets`], which pnpm
     /// reads too. A field of its own rather than a serde alias, because a
@@ -272,6 +290,9 @@ pub struct WorkspaceSettings {
     /// The `fetchMinSpeedKiBps` YAML value in KiB/s. [`None`] leaves
     /// [`Config::fetch_min_speed_ki_bps`](crate::settings::Config::fetch_min_speed_ki_bps) unchanged.
     pub fetch_min_speed_ki_bps: Option<u64>,
+    /// The `maxTarballUnpackedSize` YAML value in bytes. [`None`] leaves
+    /// [`Config::max_tarball_unpacked_size`](crate::settings::Config::max_tarball_unpacked_size) unchanged.
+    pub max_tarball_unpacked_size: Option<u64>,
     pub user_agent: Option<String>,
     /// `npmrcAuthFile` is read only from the global `config.yaml`
     /// (consumed by [`crate::Config::current`] to choose the user-level
@@ -286,18 +307,9 @@ pub struct WorkspaceSettings {
     /// [`pnpm_patching::resolve_and_group`] so the yaml layer
     /// stays pure data.
     ///
-    /// [`IndexMap`] (not [`BTreeMap`]) — pnpm's JS-object iteration
-    /// preserves the user's order, and that order leaks into
-    /// `PATCH_KEY_CONFLICT` diagnostics that list matched ranges.
-    /// Sorting the keys here would surface as a divergence in
-    /// error messages.
-    ///
     /// pnpm 10+ moved `patchedDependencies` out of
     /// `package.json#pnpm` into `pnpm-workspace.yaml`; pacquet
-    /// matches that. The legacy `package.json#pnpm.patchedDependencies`
-    /// shape is no longer consulted.
-    ///
-    /// [`BTreeMap`]: std::collections::BTreeMap
+    /// matches that.
     pub patched_dependencies: Option<IndexMap<String, String>>,
 
     pub patches_dir: Option<String>,
@@ -331,6 +343,14 @@ pub struct WorkspaceSettings {
     /// `pnpm-workspace.yaml` alongside other install settings.
     pub allow_builds: Option<HashMap<String, AllowBuild>>,
 
+    /// Map of `name[@version]` → [`PackagePermissions`]: what each package
+    /// may do. Its `build` capability outranks the package's
+    /// [`allow_builds`](Self::allow_builds) entry.
+    pub permissions: Option<IndexMap<String, PackagePermissions>>,
+
+    /// `skills` from `pnpm-workspace.yaml`. See [`SkillsSettings`].
+    pub skills: Option<SkillsSettings>,
+
     /// The workspace-structural keys of `pnpm-workspace.yaml`, carried so
     /// `pnpm config get` / `pnpm config list` can show them. Installs read
     /// them from the workspace-manifest layer, not from [`Config`](crate::settings::Config), so
@@ -357,46 +377,65 @@ pub struct WorkspaceSettings {
 
     /// `strictDepBuilds` from `pnpm-workspace.yaml`. When `true` (the
     /// default), an install that ignored any dependency build script
-    /// fails instead of only warning. Default `true`.
+    /// fails instead of only warning.
     pub strict_dep_builds: Option<bool>,
 
     /// `ignoreScripts` from `pnpm-workspace.yaml`. When `true`, no
     /// lifecycle scripts run and ignored dependency builds aren't
     /// collected. See [`Config::ignore_scripts`](crate::settings::Config::ignore_scripts). The `--ignore-scripts`
-    /// CLI flag ORs on top of this. Default `false`.
+    /// CLI flag ORs on top of this.
     pub ignore_scripts: Option<bool>,
 
     /// `ignorePnpmfile` from `pnpm-workspace.yaml`. When `true`, no pnpmfile
     /// hooks run. See [`Config::ignore_pnpmfile`](crate::settings::Config::ignore_pnpmfile). The `--ignore-pnpmfile` CLI
     /// flag ORs on top of this. Cleared by
     /// [`Self::clear_workspace_only_fields`], so the global `config.yaml`
-    /// cannot set it. Default `false`.
+    /// cannot set it.
     pub ignore_pnpmfile: Option<bool>,
 
     /// `gitChecks` from `pnpm-workspace.yaml`. When `false`, `pnpm publish`
     /// skips its git working-tree checks. See [`Config::git_checks`](crate::settings::Config::git_checks). The
-    /// `--no-git-checks` CLI flag forces it off on top of this. Default
-    /// `true`.
+    /// `--no-git-checks` CLI flag forces it off on top of this.
     pub git_checks: Option<bool>,
+    /// See [`Config::git_tag_version`](crate::settings::Config::git_tag_version).
+    pub git_tag_version: Option<bool>,
+    /// See [`Config::publish_branch`](crate::settings::Config::publish_branch).
+    pub publish_branch: Option<String>,
+
+    /// See [`Config::publish_wait_timeout`](crate::settings::Config::publish_wait_timeout).
+    pub publish_wait_timeout: Option<u64>,
+
+    /// See [`Config::provenance`](crate::settings::Config::provenance).
+    pub provenance: Option<bool>,
+
+    /// `tagVersionPrefix` from `pnpm-workspace.yaml`. See
+    /// [`Config::tag_version_prefix`](crate::settings::Config::tag_version_prefix).
+    /// Unset falls through to the `"v"` default. An empty string removes
+    /// the prefix.
+    pub tag_version_prefix: Option<String>,
 
     /// `engineStrict` from `pnpm-workspace.yaml` / global `config.yaml`.
-    /// See [`Config::engine_strict`](crate::settings::Config::engine_strict). Default `false`.
+    /// See [`Config::engine_strict`](crate::settings::Config::engine_strict).
     pub engine_strict: Option<bool>,
 
+    /// `forceIgnoresPlatform` from `pnpm-workspace.yaml` / global
+    /// `config.yaml`. See
+    /// [`Config::force_ignores_platform`](crate::settings::Config::force_ignores_platform).
+    pub force_ignores_platform: Option<bool>,
+
     /// `nodeVersion` from `pnpm-workspace.yaml` / global `config.yaml`.
-    /// See [`Config::node_version`](crate::settings::Config::node_version). Default unset (auto-detect).
+    /// See [`Config::node_version`](crate::settings::Config::node_version).
     pub node_version: Option<String>,
+
+    /// `runtime` from `pnpm-workspace.yaml`. `false` sets
+    /// [`Config::skip_runtimes`](crate::settings::Config::skip_runtimes).
+    pub runtime: Option<bool>,
 
     /// `runtimeOnFail` from `pnpm-workspace.yaml` / global `config.yaml`.
     pub runtime_on_fail: Option<RuntimeOnFail>,
 
     /// Per-release-channel Node.js download mirrors.
     pub node_download_mirrors: Option<HashMap<String, String>>,
-
-    /// `scriptsPrependNodePath` from `pnpm-workspace.yaml`. Tri-state
-    /// — yaml accepts `true` / `false` / `"warn-only"`. Custom serde
-    /// shape, see [`ScriptsPrependNodePath`]'s `Deserialize` impl.
-    pub scripts_prepend_node_path: Option<ScriptsPrependNodePath>,
 
     /// `enablePrePostScripts` from `pnpm-workspace.yaml`. See
     /// [`Config::enable_pre_post_scripts`](crate::settings::Config::enable_pre_post_scripts).
@@ -434,11 +473,16 @@ pub struct WorkspaceSettings {
     /// `workspaceConcurrency` from `pnpm-workspace.yaml` / global
     /// `config.yaml`. Resolved through
     /// [`crate::resolve_child_concurrency`] in `apply_to`, the same
-    /// way `childConcurrency` is. Signed `i32` so negative values
-    /// (interpreted as `parallelism - |value|`) round-trip cleanly.
+    /// way `childConcurrency` is.
     /// A genuine config-file key (so it is kept, not cleared, in
     /// [`Self::clear_workspace_only_fields`]).
     pub workspace_concurrency: Option<i32>,
+
+    /// `concurrencyGroups` from `pnpm-workspace.yaml` / global
+    /// `config.yaml`. Merged into
+    /// [`Config::concurrency_groups`](crate::settings::Config::concurrency_groups)
+    /// entry by entry in `apply_to`.
+    pub concurrency_groups: Option<IndexMap<String, u32>>,
 
     /// `gitShallowHosts` from `pnpm-workspace.yaml`. Overrides
     /// [`Config::git_shallow_hosts`](crate::settings::Config::git_shallow_hosts) wholesale when set —
@@ -463,6 +507,10 @@ pub struct WorkspaceSettings {
     /// `syncInjectedDepsAfterScripts` from `pnpm-workspace.yaml` — see
     /// [`Config::sync_injected_deps_after_scripts`](crate::settings::Config::sync_injected_deps_after_scripts).
     pub sync_injected_deps_after_scripts: Option<Vec<String>>,
+
+    /// `requiredScripts` from `pnpm-workspace.yaml` — see
+    /// [`Config::required_scripts`](crate::settings::Config::required_scripts).
+    pub required_scripts: Option<Vec<String>>,
 
     /// `supportedArchitectures` from `pnpm-workspace.yaml`. Drives the
     /// optional-dependency platform check at install time: a
@@ -498,14 +546,7 @@ pub struct WorkspaceSettings {
     /// `None` so the overrides key is dropped entirely.
     ///
     /// pnpm 10+ moved `overrides` out of `package.json#pnpm` into
-    /// `pnpm-workspace.yaml`. Pacquet matches that — the legacy
-    /// `package.json#pnpm.overrides` shape is no longer consulted.
-    ///
-    /// Lockfile drift: the raw map is recorded in `pnpm-lock.yaml`'s
-    /// `overrides:` field. On a subsequent install,
-    /// `pnpm_lockfile::check_lockfile_settings` compares this
-    /// against `lockfile.overrides` and raises `OverridesChanged`
-    /// on mismatch.
+    /// `pnpm-workspace.yaml`. Pacquet matches that.
     pub overrides: Option<IndexMap<String, String>>,
 
     /// `cacheDir` from `pnpm-workspace.yaml`. Resolved against the
@@ -526,8 +567,7 @@ pub struct WorkspaceSettings {
     pub minimum_release_age_exclude: Option<Vec<String>>,
 
     /// `minimumReleaseAgeExcludePrune` from `pnpm-workspace.yaml`.
-    /// See [`Config::minimum_release_age_exclude_prune`](crate::settings::Config::minimum_release_age_exclude_prune). Default
-    /// `false`.
+    /// See [`Config::minimum_release_age_exclude_prune`](crate::settings::Config::minimum_release_age_exclude_prune).
     pub minimum_release_age_exclude_prune: Option<bool>,
 
     /// `minimumReleaseAgeIgnoreMissingTime` from `pnpm-workspace.yaml`.
@@ -622,7 +662,7 @@ pub struct WorkspaceSettings {
     pub trust_policy_exclude: Option<Vec<String>>,
 
     /// `trustPolicyExcludePrune` from `pnpm-workspace.yaml`.
-    /// See [`Config::trust_policy_exclude_prune`](crate::settings::Config::trust_policy_exclude_prune). Default `false`.
+    /// See [`Config::trust_policy_exclude_prune`](crate::settings::Config::trust_policy_exclude_prune).
     pub trust_policy_exclude_prune: Option<bool>,
 
     /// `trustPolicyIgnoreAfter` from `pnpm-workspace.yaml`. Minutes.
@@ -656,7 +696,7 @@ pub struct WorkspaceSettings {
     pub catalog_mode: Option<CatalogMode>,
 
     /// `catalogPrune` from `pnpm-workspace.yaml`. See
-    /// [`Config::catalog_prune`](crate::settings::Config::catalog_prune). Default `false`.
+    /// [`Config::catalog_prune`](crate::settings::Config::catalog_prune).
     pub catalog_prune: Option<bool>,
 
     /// `catalogPrune`'s former name, still accepted. [`Self::catalog_prune`]
@@ -669,6 +709,11 @@ pub struct WorkspaceSettings {
     /// [`Config::save_catalog_name`]: crate::Config::save_catalog_name
     pub save_catalog_name: Option<String>,
 
+    /// `tag` from `pnpm-workspace.yaml`. See [`Config::tag`].
+    ///
+    /// [`Config::tag`]: crate::Config::tag
+    pub tag: Option<String>,
+
     /// `savePrefix` from `pnpm-workspace.yaml`. See
     /// [`Config::save_prefix`].
     ///
@@ -676,16 +721,19 @@ pub struct WorkspaceSettings {
     pub save_prefix: Option<String>,
 
     /// `saveExact` from `pnpm-workspace.yaml`. See
-    /// [`Config::save_exact`]. Default `false`.
+    /// [`Config::save_exact`].
     ///
     /// [`Config::save_exact`]: crate::Config::save_exact
     pub save_exact: Option<bool>,
 
     /// `savePeer` from `pnpm-workspace.yaml`. See
-    /// [`Config::save_peer`]. Default `false`.
+    /// [`Config::save_peer`].
     ///
     /// [`Config::save_peer`]: crate::Config::save_peer
     pub save_peer: Option<bool>,
+
+    /// Whether add also saves available `DefinitelyTyped` packages.
+    pub save_types: Option<bool>,
 
     /// `registrySupportsTimeField` from `pnpm-workspace.yaml`. See
     /// [`Config::registry_supports_time_field`].
@@ -725,6 +773,9 @@ pub struct WorkspaceSettings {
     /// job.
     pub pipelines: Option<IndexMap<String, Vec<String>>>,
 
+    /// `bootConfig` from `pnpm-workspace.yaml`. See [`crate::BootConfig`].
+    pub boot_config: Option<crate::BootConfig>,
+
     /// `pipelineBase` from `pnpm-workspace.yaml`: the git ref
     /// `pnpm pipeline` resolves its affected-selection merge base against.
     pub pipeline_base: Option<String>,
@@ -735,98 +786,49 @@ pub struct WorkspaceSettings {
     /// warnings/error in `pnpm-cli`'s `config_warnings`).
     #[serde(skip)]
     pub key_issues: WorkspaceKeyIssues,
+
+    /// The include index of the file this was parsed from. Its local sources
+    /// are merged into these settings. Not a setting.
+    #[serde(skip)]
+    pub includes: Option<pnpm_workspace::WorkspaceIncludes>,
 }
 
 impl WorkspaceSettings {
-    /// Read the global config.yaml at `<config_dir>/config.yaml`, if
-    /// present.
-    ///
-    /// This file uses the same parser as `pnpm-workspace.yaml`, but a
-    /// key-filter pass ([`Self::clear_workspace_only_fields`]) drops
-    /// workspace-only knobs (`nodeLinker`, `hoist`, `lockfile`, ...)
-    /// so they cannot be set globally.
-    ///
-    /// Returns `Ok(None)` when the file does not exist. Read or parse
-    /// failures propagate.
-    pub fn load_global(config_dir: &Path) -> Result<Option<Self>, LoadWorkspaceYamlError> {
-        let path = config_dir.join(GLOBAL_CONFIG_YAML_FILENAME);
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(source) => return Err(LoadWorkspaceYamlError::ReadFile { path, source }),
-        };
-        let mut settings: WorkspaceSettings = serde_saphyr::from_str(&text)
-            .map_err(Box::new)
-            .map_err(|source| LoadWorkspaceYamlError::ParseYaml { path: path.clone(), source })?;
-        settings.validate_registries()?;
-        settings.validate_tasks()?;
-        settings.validate_pipelines()?;
-        settings.clear_workspace_only_fields();
-        settings.warn_about_dropped_keys(&text, &path);
-        Ok(Some(settings))
-    }
-
-    /// Warn about the keys of the global `config.yaml` that never reach the
-    /// settings, in the three messages pnpm emits for that file.
-    ///
-    /// What survived is read back off `self` rather than off a second list of
-    /// key names, which would drift from the struct: a key serde did not
-    /// recognize is absent from the serialized settings, and one
-    /// [`Self::clear_workspace_only_fields`] zeroed is null there.
-    ///
-    /// A dropped camelCase key pnpm's `isConfigFileKey` accepts stays silent:
-    /// pnpm honors it in this file, so the fix is to honor it too, and until
-    /// then a warning would diverge from pnpm's output on the same file.
-    fn warn_about_dropped_keys(&self, text: &str, path: &Path) {
-        let Ok(document) = serde_saphyr::from_str::<IndexMap<String, Option<IgnoredAny>>>(text)
-        else {
-            return;
-        };
-        let Ok(serde_json::Value::Object(kept)) = serde_json::to_value(self) else {
-            return;
-        };
-
-        let mut dropped = DroppedKeys::default();
-        for key in document
-            .iter()
-            .filter(|(_, value)| value.is_some())
-            .map(|(key, _)| key)
-        {
-            if key == SCHEMA_DIRECTIVE_KEY
-                || matches!(kept.get(key), Some(value) if !value.is_null())
-            {
-                continue;
-            }
-            // The key comes from a file the machine's user controls, but the
-            // same rendering serves the project file, so it is sanitized here
-            // too rather than only where it must be.
-            dropped.classify(&redact_and_sanitize(key));
-        }
-        dropped.warn(path);
-    }
-
     /// Read `<dir>/pnpm-workspace.yaml` without walking ancestors.
     /// Returns `Ok(None)` only when nothing exists at that exact path;
     /// every other error (including `EISDIR` for a directory named
     /// `pnpm-workspace.yaml`, or permission denied) propagates, matching
     /// pnpm where `ENOENT` is the only silent case.
     pub fn load_at(dir: &Path) -> Result<Option<Self>, LoadWorkspaceYamlError> {
-        let path = dir.join(WORKSPACE_MANIFEST_FILENAME);
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(source) => return Err(LoadWorkspaceYamlError::ReadFile { path, source }),
-        };
-        let mut settings: WorkspaceSettings = text
-            .pipe_as_ref(serde_saphyr::from_str)
-            .map_err(Box::new)
-            .map_err(|source| LoadWorkspaceYamlError::ParseYaml { path: path.clone(), source })?;
+        Self::read_at(dir, crate::SettingsRead::All)
+    }
+
+    /// [`Self::load_at`], reading the settings `settings_read` selects.
+    fn read_at(
+        dir: &Path,
+        settings_read: crate::SettingsRead,
+    ) -> Result<Option<Self>, LoadWorkspaceYamlError> {
+        read_workspace_document(dir)?
+            .map(|document| {
+                Self::read_document(document, settings_read, |text, path| {
+                    Self::read_valid(text, path)
+                })
+            })
+            .transpose()
+    }
+
+    /// Parse and validate the text of the `pnpm-workspace.yaml` at `path`.
+    fn read_valid(text: &str, path: &Path) -> Result<Self, LoadWorkspaceYamlError> {
+        let settings = parse_settings::<SystemEnv, Self>(text)
+            .map_err(|source| LoadWorkspaceYamlError::ParseYaml {
+                path: path.to_path_buf(),
+                source,
+            })?;
         settings.validate_registries()?;
         settings.validate_tasks()?;
         settings.validate_pipelines()?;
-        settings.reject_repo_controlled_trust_material(&path)?;
-        settings.collect_key_issues(&text);
-        Ok(Some(settings))
+        settings.reject_repo_controlled_trust_material(path)?;
+        Ok(settings)
     }
 
     /// Walk up from `start_dir` looking for a readable `pnpm-workspace.yaml`.
@@ -835,8 +837,16 @@ impl WorkspaceSettings {
     pub fn find_and_load(
         start_dir: &Path,
     ) -> Result<Option<(PathBuf, Self)>, LoadWorkspaceYamlError> {
+        Self::find_and_read(start_dir, crate::SettingsRead::All)
+    }
+
+    /// [`Self::find_and_load`], with [`Self::read_at`]'s `settings_read`.
+    pub(crate) fn find_and_read(
+        start_dir: &Path,
+        settings_read: crate::SettingsRead,
+    ) -> Result<Option<(PathBuf, Self)>, LoadWorkspaceYamlError> {
         for dir in start_dir.ancestors() {
-            if let Some(settings) = Self::load_at(dir)? {
+            if let Some(settings) = Self::read_at(dir, settings_read)? {
                 return Ok(Some((dir.join(WORKSPACE_MANIFEST_FILENAME), settings)));
             }
         }

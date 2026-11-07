@@ -1,6 +1,6 @@
 use super::{
-    Duration, NetworkSettings, PerRegistryTls, ProxyConfig, ThrottledClient, TlsConfig,
-    client_with_fetch_timeout, drain_until_timed_out,
+    Duration, NetworkSettings, NoProxySetting, PerRegistryTls, ProxyConfig, ThrottledClient,
+    TlsConfig, client_with_fetch_timeout, drain_until_timed_out,
 };
 
 /// Regression test for <https://github.com/pnpm/pnpm/issues/14604>.
@@ -188,6 +188,50 @@ async fn max_sockets_caps_concurrent_sockets_per_origin() {
     .expect("the origin's slot should be free after the first guard drops");
 }
 
+/// A saturated origin hands its next free `maxSockets` slot to a queued
+/// metadata request before a download that queued earlier, so resolution
+/// does not wait behind the tarballs of packages it already resolved.
+#[tokio::test]
+async fn max_sockets_serves_queued_metadata_before_queued_downloads() {
+    use std::sync::{Arc, Mutex};
+
+    let client = Arc::new(ThrottledClient::new_for_installs().with_max_sockets_per_host(Some(1)));
+    let held = client.acquire_for_url("https://registry.example.com/held").await;
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let download = tokio::spawn({
+        let (client, order) = (Arc::clone(&client), Arc::clone(&order));
+        async move {
+            let _slot =
+                client.acquire_for_url_with_priority("https://registry.example.com/a.tgz", 100)
+                    .await;
+            order.lock().unwrap().push("download");
+        }
+    });
+    wait_for_socket_waiters(&client, "https://registry.example.com", 1).await;
+    let metadata = tokio::spawn({
+        let (client, order) = (Arc::clone(&client), Arc::clone(&order));
+        async move {
+            let _slot = client.acquire_for_url("https://registry.example.com/pkg").await;
+            order.lock().unwrap().push("metadata");
+        }
+    });
+    wait_for_socket_waiters(&client, "https://registry.example.com", 2).await;
+    drop(held);
+    metadata.await.unwrap();
+    download.await.unwrap();
+    assert_eq!(*order.lock().unwrap(), vec!["metadata", "download"]);
+}
+
+async fn wait_for_socket_waiters(client: &ThrottledClient, origin: &str, count: usize) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while client.origin_limits.sockets.queued_waiters(origin) < count {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the requests queue at the maxSockets cap");
+}
+
 /// Without a `maxSockets` cap, many concurrent requests to one origin all
 /// acquire immediately (bounded only by the global concurrency semaphore).
 #[tokio::test]
@@ -205,7 +249,122 @@ async fn no_max_sockets_leaves_per_origin_uncapped() {
 }
 
 #[tokio::test]
-async fn stalled_consumers_release_permits_on_deadline_or_cancellation() {
+async fn proxied_requests_share_proxy_origin_socket_limit() {
+    let proxy = ProxyConfig {
+        https_proxy: Some("http://proxy.example.com:8080".into()),
+        http_proxy: None,
+        no_proxy: Some(NoProxySetting::List(vec!["bypass.example.com".into()])),
+    };
+    let client = ThrottledClient::for_installs(
+        &proxy,
+        &TlsConfig::default(),
+        &PerRegistryTls::default(),
+        &NetworkSettings::default(),
+    )
+    .unwrap()
+    .with_max_sockets_per_host(Some(1));
+
+    let held = client.acquire_for_url("https://registry.example.com/a").await;
+
+    let blocked = tokio::time::timeout(
+        Duration::from_millis(150),
+        client.acquire_for_url("https://other.example.com/b"),
+    )
+    .await;
+    assert!(
+        blocked.is_err(),
+        "proxied requests to different hosts should share the proxy socket cap",
+    );
+
+    tokio::time::timeout(
+        Duration::from_millis(150),
+        client.acquire_for_url("https://bypass.example.com/c"),
+    )
+    .await
+    .expect("no_proxy bypassed origin should not be blocked by the proxy origin cap");
+
+    drop(held);
+    tokio::time::timeout(
+        Duration::from_millis(150),
+        client.acquire_for_url("https://other.example.com/b"),
+    )
+    .await
+    .expect("slot should be free after first guard drops");
+}
+
+#[tokio::test]
+async fn default_proxy_socket_limit_caps_at_fifty() {
+    let proxy = ProxyConfig {
+        https_proxy: Some("http://proxy.example.com:8080".into()),
+        http_proxy: None,
+        no_proxy: Some(NoProxySetting::List(vec!["bypass.example.com".into()])),
+    };
+    let client = ThrottledClient::for_installs(
+        &proxy,
+        &TlsConfig::default(),
+        &PerRegistryTls::default(),
+        &NetworkSettings { network_concurrency: 64, ..NetworkSettings::default() },
+    )
+    .unwrap();
+
+    let mut guards = Vec::new();
+    for i in 0..50 {
+        guards.push(client.acquire_for_url(&format!("https://registry.example.com/{i}")).await);
+    }
+
+    let blocked = tokio::time::timeout(
+        Duration::from_millis(150),
+        client.acquire_for_url("https://registry.example.com/extra"),
+    )
+    .await;
+    assert!(blocked.is_err(), "51st proxied request should block on the 50-socket proxy cap");
+
+    tokio::time::timeout(
+        Duration::from_millis(150),
+        client.acquire_for_url("https://bypass.example.com/direct"),
+    )
+    .await
+    .expect("bypassed request should not block on the proxy socket limit");
+
+    guards.pop();
+    tokio::time::timeout(
+        Duration::from_millis(150),
+        client.acquire_for_url("https://registry.example.com/extra"),
+    )
+    .await
+    .expect("releasing one guard should free a proxy slot");
+}
+
+#[tokio::test]
+async fn zero_max_sockets_leaves_proxied_origins_uncapped() {
+    let proxy = ProxyConfig {
+        https_proxy: Some("http://proxy.example.com:8080".into()),
+        http_proxy: None,
+        no_proxy: None,
+    };
+    let client = ThrottledClient::for_installs(
+        &proxy,
+        &TlsConfig::default(),
+        &PerRegistryTls::default(),
+        &NetworkSettings { network_concurrency: 64, ..NetworkSettings::default() },
+    )
+    .unwrap()
+    .with_max_sockets_per_host(Some(0));
+
+    let mut guards = Vec::new();
+    for i in 0..51 {
+        let guard = tokio::time::timeout(
+            Duration::from_millis(150),
+            client.acquire_for_url(&format!("https://registry.example.com/{i}")),
+        )
+        .await
+        .expect("max_sockets=0 should leave proxied connections uncapped");
+        guards.push(guard);
+    }
+}
+
+#[tokio::test]
+async fn stalled_consumers_release_permits_on_timeout_or_cancellation() {
     use futures_util::StreamExt;
 
     let mut server = mockito::Server::new_async().await;
@@ -234,7 +393,7 @@ async fn stalled_consumers_release_permits_on_deadline_or_cancellation() {
         } else {
             let guard = tokio::time::timeout(Duration::from_secs(1), client.acquire_for_url(&url))
                 .await
-                .expect("deadline releases a stalled stream's permits");
+                .expect("the timeout releases a stalled stream's permits");
             drop(guard);
             drain_until_timed_out(&mut stream).await;
         }

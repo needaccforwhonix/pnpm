@@ -173,6 +173,21 @@ fn list_json_with_package_arg_omits_unsaved_dependencies() {
     drop(root);
 }
 
+#[test]
+fn list_only_projects_omits_unsaved_dependencies() {
+    let CommandTempCwd { root, workspace, .. } = CommandTempCwd::init();
+    write_project_with_extraneous_dep(&workspace);
+
+    let output = run_ok(&workspace, &["list", "--only-projects", "--parseable"]);
+    assert_eq!(output, format!("{}\n", canonical(&workspace)));
+
+    let output = run_ok(&workspace, &["list", "--only-projects", "--json"]);
+    let roots: Vec<Value> = serde_json::from_str(&output).expect("parse list JSON");
+    assert_eq!(roots[0].get("unsavedDependencies"), None, "{output}");
+
+    drop(root);
+}
+
 // --- ports of the TypeScript listing command tests ---------------------------
 //
 // Sources: pnpm11/deps/inspection/commands/test/listing/{index.ts,json.ts,
@@ -295,7 +310,7 @@ fn listing_packages_of_a_project_with_an_external_lockfile() {
     assert_eq!(
         output,
         format!(
-            "{LEGEND}\n\npkg@1.0.0 {dir}\n\u{2502}\n\u{2502}   dependencies:\n\u{2514}\u{2500}\u{2500} {PKG}@100.0.0\n\n1 package in 2 projects\n"
+            "{LEGEND}\n\npkg@1.0.0 {dir}\n\u{2502}\n\u{2502}   dependencies:\n\u{2514}\u{2500}\u{2500} {PKG}@100.0.0\n\n1 package\n"
         ),
     );
 }
@@ -606,6 +621,45 @@ fn list_returns_correct_paths_with_global_virtual_store() {
     assert!(
         Path::new(sub_dep_path).join("package.json").exists(),
         "subdep package.json should exist: {sub_dep_path}",
+    );
+}
+
+/// Port of upstream's `pnpm list returns correct paths when nodeLinker is hoisted`
+/// (`pnpm/test/list.ts`).
+#[test]
+fn list_returns_correct_paths_with_hoisted_node_linker() {
+    let (_root, workspace, _registry) = setup_registry();
+    fs::write(
+        workspace.join("package.json"),
+        json!({
+            "name": "project",
+            "version": "0.0.0",
+            "dependencies": { PKG: "100.0.0" },
+        })
+        .to_string(),
+    )
+    .expect("write package.json");
+    let mut yaml =
+        fs::read_to_string(workspace.join("pnpm-workspace.yaml")).expect("read workspace yaml");
+    yaml.push_str("nodeLinker: hoisted\n");
+    fs::write(workspace.join("pnpm-workspace.yaml"), yaml).expect("write workspace yaml");
+    run_ok(&workspace, &["install"]);
+
+    let output = run_ok(&workspace, &["list", "--json", "--depth=Infinity"]);
+    let parsed: Vec<Value> = serde_json::from_str(&output).expect("parse list JSON");
+
+    let pkg_path = parsed[0]["dependencies"][PKG]["path"].as_str().expect("pkg path");
+    let real_pkg = dunce::canonicalize(workspace.join("node_modules").join(PKG))
+        .expect("resolve installed package");
+    assert_eq!(dunce::canonicalize(Path::new(pkg_path)).expect("canonicalize pkg_path"), real_pkg);
+
+    let sub_dep_path =
+        parsed[0]["dependencies"][PKG]["dependencies"][DEP]["path"].as_str().expect("subdep path");
+    let real_sub_dep = dunce::canonicalize(workspace.join("node_modules").join(DEP))
+        .expect("resolve hoisted subdep");
+    assert_eq!(
+        dunce::canonicalize(Path::new(sub_dep_path)).expect("canonicalize sub_dep_path"),
+        real_sub_dep,
     );
 }
 

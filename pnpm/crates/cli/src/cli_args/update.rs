@@ -2,6 +2,7 @@ use crate::{
     State,
     cli_args::{
         lockfile_dir::LockfileDirArg,
+        parse_depth_limit,
         pipelines::InstallFamilySelection,
         recursive,
         supported_architectures::SupportedArchitecturesArgs,
@@ -15,7 +16,7 @@ use miette::{Context, Diagnostic};
 use pnpm_config::Config;
 use pnpm_github_actions as github_actions;
 use pnpm_matcher::Matcher;
-use pnpm_package_manager::{Update, build_workspace_packages_map, included_direct_groups};
+use pnpm_package_manager::{Update, build_workspace_packages_map};
 use pnpm_package_manifest::DependencyGroup;
 use pnpm_registry::RangeSpecStyle;
 use pnpm_reporter::Reporter;
@@ -37,6 +38,9 @@ pub struct UpdateDependencyOptions {
     /// Don't update packages in "optionalDependencies".
     #[clap(long, overrides_with = "optional")]
     no_optional: bool,
+    /// Also update packages in "peerDependencies".
+    #[clap(long)]
+    peer: bool,
 }
 
 impl UpdateDependencyOptions {
@@ -66,7 +70,17 @@ impl UpdateDependencyOptions {
             .chain(dependencies.then_some(DependencyGroup::Prod))
             .chain(dev_dependencies.then_some(DependencyGroup::Dev))
             .chain(optional_dependencies.then_some(DependencyGroup::Optional))
+            .chain(self.peer.then_some(DependencyGroup::Peer))
             .collect()
+    }
+
+    pub(crate) fn explicit_groups(&self) -> pnpm_package_manager::UpdateExplicitGroups {
+        pnpm_package_manager::UpdateExplicitGroups {
+            prod: self.prod,
+            dev: self.dev,
+            optional: self.optional,
+            no_optional: self.no_optional,
+        }
     }
 }
 
@@ -108,8 +122,9 @@ pub struct UpdateSelectionArgs {
     #[clap(long)]
     pub patches: bool,
     /// How deep to inspect dependencies. `0` means top-level
-    /// dependencies only. Defaults to unlimited.
-    #[clap(long)]
+    /// dependencies only. Defaults to unlimited, which `Infinity` also
+    /// selects.
+    #[clap(long, value_parser = parse_depth_limit)]
     pub depth: Option<usize>,
     /// Show outdated dependencies and select which ones to update.
     #[clap(short = 'i', long)]
@@ -138,7 +153,7 @@ pub struct UpdateSaveArgs {
     #[clap(long = "no-save")]
     pub no_save: bool,
     /// Generate a changeset file declaring a patch bump for every workspace
-    /// package whose production dependencies were changed by the update.
+    /// package whose production dependencies the update changed.
     #[clap(long, overrides_with = "no_changeset")]
     pub changeset: bool,
     /// Do not generate a changeset, even when `updateConfig.changeset` enables
@@ -166,16 +181,22 @@ pub struct UpdateInstallArgs {
 #[diagnostic(code(ERR_PNPM_PATCHES_WITH_SELECTOR))]
 struct PatchesWithSelectorError;
 
+#[derive(Debug, Display, Error, Diagnostic)]
+#[display("--peer cannot be combined with --interactive")]
+#[diagnostic(code(ERR_PNPM_INTERACTIVE_PEER_UNSUPPORTED))]
+struct InteractivePeerUnsupportedError;
+
 impl UpdateArgs {
     pub(crate) fn apply_cli_config(&self, config: &mut Config) {
         self.scripts.apply(config);
         if let Some(pnpr_server) = self.install.pnpr_server.clone() {
+            config.cli_settings.insert("pnprServer".to_string());
             config.pnpr_server = Some(pnpr_server);
         }
     }
 
     pub async fn run<Reporter: self::Reporter + 'static>(self, state: State) -> miette::Result<()> {
-        self.run_inner::<Reporter>(state, None).await
+        Box::pin(self.run_inner::<Reporter>(state, None)).await
     }
 
     pub(crate) async fn run_selected<Reporter: self::Reporter + 'static>(
@@ -183,7 +204,7 @@ impl UpdateArgs {
         state: State,
         selection: InstallFamilySelection,
     ) -> miette::Result<()> {
-        self.run_inner::<Reporter>(state, Some(selection)).await
+        Box::pin(self.run_inner::<Reporter>(state, Some(selection))).await
     }
 
     fn interactive_options<'a>(
@@ -250,6 +271,15 @@ impl UpdateArgs {
         .await
     }
 
+    /// The style a rewritten specifier falls back to: `--save-exact` layered
+    /// over the `saveExact` and `savePrefix` settings.
+    fn range_spec_style(&self, config: &Config) -> RangeSpecStyle {
+        RangeSpecStyle::from_save_options(
+            self.save.exact || config.save_exact,
+            config.save_prefix.as_deref(),
+        )
+    }
+
     /// `pnpm update -g`: reinstall each matching global package group,
     /// within its existing range or (with `--latest`) to the newest
     /// version. Delegates to [`crate::cli_args::global::handle_global_update`].
@@ -257,32 +287,26 @@ impl UpdateArgs {
         self,
         config: &'static Config,
     ) -> miette::Result<()> {
-        self.check_patches_options()?;
-        self.check_workspace_option(None)?;
-        if crate::cli_args::global::selects_pnpm_cli(&self.packages) {
-            return Err(crate::cli_args::global::GlobalError::GlobalPnpmInstall.into());
-        }
-        let selected_hashes: Option<HashSet<String>> = if self.selection.interactive {
-            match crate::cli_args::update_interactive::select_global_package_groups::<Reporter>(
-                config,
-                &self.packages,
-                self.selection.latest,
-                self.prompt,
-            )
-            .await?
-            {
-                Some(selected) => Some(selected),
-                None => return Ok(()),
-            }
+        self.check_global_options()?;
+        let supported_architectures =
+            self.supported_architectures.apply_to(config.supported_architectures.clone());
+        let range_spec_style = self.range_spec_style(config);
+        // Before the interactive selection, so the migrated groups are
+        // offered too.
+        Box::pin(crate::cli_args::global::migrate_legacy_global_packages::<Reporter>(
+            config,
+            range_spec_style,
+            supported_architectures.clone(),
+        ))
+        .await?;
+        let selected_hashes = if self.selection.interactive {
+            let Some(selected) = self.select_global_groups::<Reporter>(config).await? else {
+                return Ok(());
+            };
+            Some(selected)
         } else {
             None
         };
-        let supported_architectures =
-            self.supported_architectures.apply_to(config.supported_architectures.clone());
-        let range_spec_style = RangeSpecStyle::from_save_options(
-            self.save.exact || config.save_exact,
-            config.save_prefix.as_deref(),
-        );
         Box::pin(crate::cli_args::global::handle_global_update::<Reporter>(
             config,
             &self.packages,
@@ -292,6 +316,31 @@ impl UpdateArgs {
             supported_architectures,
         ))
         .await
+    }
+
+    /// The groups `--interactive` picked, or `None` when the prompt was
+    /// cancelled.
+    async fn select_global_groups<Reporter: self::Reporter + 'static>(
+        &self,
+        config: &'static Config,
+    ) -> miette::Result<Option<HashSet<String>>> {
+        crate::cli_args::update_interactive::select_global_package_groups::<Reporter>(
+            config,
+            &self.packages,
+            self.selection.latest,
+            self.prompt,
+        )
+        .await
+    }
+
+    fn check_global_options(&self) -> miette::Result<()> {
+        self.check_patches_options()?;
+        self.check_interactive_peer_options()?;
+        self.check_workspace_option(None)?;
+        if crate::cli_args::global::selects_pnpm_cli(&self.packages) {
+            return Err(crate::cli_args::global::GlobalError::GlobalPnpmInstall.into());
+        }
+        Ok(())
     }
 
     /// Validate `--workspace` against the rest of the invocation,
@@ -321,6 +370,13 @@ impl UpdateArgs {
         Ok(())
     }
 
+    fn check_interactive_peer_options(&self) -> miette::Result<()> {
+        if self.selection.interactive && self.dependency_options.peer {
+            return Err(InteractivePeerUnsupportedError.into());
+        }
+        Ok(())
+    }
+
     fn can_delegate_patch_refresh(
         &self,
         update_actions: bool,
@@ -329,11 +385,44 @@ impl UpdateArgs {
         let all_dependency_groups =
             [DependencyGroup::Prod, DependencyGroup::Dev, DependencyGroup::Optional];
         self.selection.patches
-            && self.selection.depth.is_none()
+            && self.selection.depth.is_none_or(|depth| depth == usize::MAX)
             && !update_actions
+            && !self.dependency_options.no_optional
             && all_dependency_groups
                 .iter()
                 .all(|group| include_direct.contains(group))
+    }
+
+    fn patch_refresh_dependency_groups(&self, state: &State) -> Vec<DependencyGroup> {
+        let prior_included = pnpm_modules_yaml::read_modules_layout::<pnpm_modules_yaml::Host>(
+            &state.config.modules_dir,
+        )
+        .ok()
+        .flatten()
+        .map(|layout| layout.included);
+
+        let explicit = self.dependency_options.explicit_groups();
+        let (prod, dev, optional) = if let Some(included) = prior_included {
+            (
+                included.dependencies || explicit.prod,
+                included.dev_dependencies || explicit.dev,
+                !explicit.no_optional
+                    && (explicit.optional
+                        || (included.optional_dependencies && state.config.optional)),
+            )
+        } else {
+            (
+                true,
+                !explicit.prod || explicit.dev,
+                !explicit.no_optional && (explicit.optional || state.config.optional),
+            )
+        };
+
+        std::iter::empty()
+            .chain(prod.then_some(DependencyGroup::Prod))
+            .chain(dev.then_some(DependencyGroup::Dev))
+            .chain(optional.then_some(DependencyGroup::Optional))
+            .collect()
     }
 
     fn pnpr_patch_link<'path>(
@@ -342,7 +431,7 @@ impl UpdateArgs {
         lockfile_path: &'path Path,
     ) -> super::install::PnprLink<'path> {
         super::install::PnprLink {
-            dependency_groups: included_direct_groups(state.config.optional).collect(),
+            dependency_groups: self.patch_refresh_dependency_groups(state),
             supported_architectures: self.supported_architectures.apply_to(
                 state.config.supported_architectures.clone(),
             ),
@@ -377,4 +466,5 @@ impl UpdateArgs {
 #[cfg(test)]
 mod tests;
 
+mod config_dependencies;
 mod execution;

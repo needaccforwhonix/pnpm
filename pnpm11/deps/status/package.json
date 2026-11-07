@@ -1,6 +1,6 @@
 {
   "name": "@pnpm/deps.status",
-  "version": "1100.1.22",
+  "version": "1100.1.34",
   "description": "Check dependencies status",
   "keywords": [
     "pnpm",
@@ -35,21 +35,28 @@
   "dependencies": {
     "@pnpm/catalogs.resolver": "workspace:*",
     "@pnpm/catalogs.types": "workspace:*",
+    "@pnpm/config.normalize-registries": "workspace:*",
     "@pnpm/config.parse-overrides": "workspace:*",
     "@pnpm/config.reader": "workspace:*",
     "@pnpm/constants": "workspace:*",
     "@pnpm/crypto.object-hasher": "workspace:*",
+    "@pnpm/deps.path": "workspace:*",
     "@pnpm/error": "workspace:*",
+    "@pnpm/hooks.read-package-hook": "workspace:*",
     "@pnpm/installing.context": "workspace:*",
     "@pnpm/lockfile.fs": "workspace:*",
     "@pnpm/lockfile.settings-checker": "workspace:*",
+    "@pnpm/lockfile.utils": "workspace:*",
     "@pnpm/lockfile.verification": "workspace:*",
+    "@pnpm/resolving.local-resolver": "workspace:*",
     "@pnpm/resolving.resolver-base": "workspace:*",
     "@pnpm/types": "workspace:*",
     "@pnpm/workspace.projects-reader": "workspace:*",
+    "@pnpm/workspace.spec-parser": "workspace:*",
     "@pnpm/workspace.state": "workspace:*",
     "@pnpm/workspace.workspace-manifest-reader": "workspace:*",
-    "ramda": "catalog:"
+    "ramda": "catalog:",
+    "semver": "catalog:"
   },
   "peerDependencies": {
     "@pnpm/logger": "catalog:"
@@ -59,7 +66,8 @@
     "@pnpm/deps.status": "workspace:*",
     "@pnpm/prepare": "workspace:*",
     "@pnpm/workspace.project-manifest-writer": "workspace:*",
-    "@types/ramda": "catalog:"
+    "@types/ramda": "catalog:",
+    "@types/semver": "catalog:"
   },
   "engines": {
     "node": ">=22.13"

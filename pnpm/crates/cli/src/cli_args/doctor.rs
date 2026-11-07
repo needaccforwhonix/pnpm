@@ -7,7 +7,8 @@
 //! pipeline runs this same command against a freshly published version before
 //! moving its dist-tags, so what gates a release is what ships to users.
 
-use crate::cli_args::ping::PingArgs;
+use crate::{cli_args::ping::PingArgs, process::Command};
+
 use clap::Args;
 use pnpm_config::{Config, PNPM_VERSION};
 use serde::Serialize;
@@ -15,9 +16,10 @@ use std::{
     fmt::Write as _,
     fs,
     path::{Path, PathBuf},
-    process::Command,
     time::Instant,
 };
+
+const DOCTOR_FETCH_TIMEOUT: u64 = 15_000;
 
 #[derive(Debug, Args)]
 pub struct DoctorArgs {
@@ -156,7 +158,7 @@ impl DoctorArgs {
             return CheckResult::pass(title, "skipped (--offline)");
         }
         let started = Instant::now();
-        match (PingArgs { registry: None }).run(config).await {
+        match (PingArgs { registry: None }).run(&connectivity_config(config)).await {
             Ok(_) => CheckResult::pass(
                 title,
                 format!("{} ({}ms)", config.registry, started.elapsed().as_millis()),
@@ -168,6 +170,10 @@ impl DoctorArgs {
             ),
         }
     }
+}
+
+fn connectivity_config(config: &Config) -> Config {
+    Config { fetch_timeout: DOCTOR_FETCH_TIMEOUT, ..config.clone() }
 }
 
 fn check_versions() -> CheckResult {
@@ -231,7 +237,7 @@ fn check_global_bin_dir(config: &Config) -> CheckResult {
             r#"Run "pnpm setup" to add it to your shell configuration."#,
         );
     };
-    let path_dirs: Vec<PathBuf> = std::env::split_paths(&path_var).collect();
+    let path_dirs: Vec<PathBuf> = pnpm_fs::split_paths(&path_var).collect();
 
     let Some(bin_dir) = candidates.iter().find(|dir| dir_is_in_path(dir, &path_dirs)) else {
         return CheckResult::warn(
@@ -333,6 +339,11 @@ fn symlink_file(source: &Path, link: &Path) -> std::io::Result<()> {
     std::os::unix::fs::symlink(source, link)
 }
 
+#[cfg(target_os = "wasi")]
+fn symlink_file(source: &Path, link: &Path) -> std::io::Result<()> {
+    pnpm_fs::create_symlink(source, link, false)
+}
+
 #[cfg(windows)]
 fn symlink_file(source: &Path, link: &Path) -> std::io::Result<()> {
     std::os::windows::fs::symlink_file(source, link)
@@ -380,8 +391,8 @@ fn run_install_smoke_test(base: &Path) -> Result<(), String> {
     // A throwaway store keeps the probe from writing into the real one. The
     // fixture is a temp directory with no lockfile and no workspace above it,
     // so nothing here depends on the lockfile or workspace flags.
-    let current_exe = std::env::current_exe().map_err(|error| error.to_string())?;
-    let output = Command::new(current_exe)
+    let pnpm = pnpm_executor::current_pnpm_exe().map_err(|error| error.to_string())?;
+    let output = Command::new(pnpm)
         .current_dir(&consumer)
         .args(["install", "--offline", "--ignore-scripts"])
         .arg(format!("--store-dir={}", store.display()))
@@ -410,7 +421,7 @@ fn last_line(text: &str) -> String {
 }
 
 fn can_write_to_dir(dir: &Path) -> bool {
-    let probe = dir.join(format!(".pnpm-doctor-write-{}", std::process::id()));
+    let probe = dir.join(format!(".pnpm-doctor-write-{}", pnpm_fs::process_id()));
     let written = fs::write(&probe, b"").is_ok();
     let _ = fs::remove_file(&probe);
     written

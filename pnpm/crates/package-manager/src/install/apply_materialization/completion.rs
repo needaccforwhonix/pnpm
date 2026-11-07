@@ -1,10 +1,10 @@
 use super::super::{
-    BTreeSet, Catalogs, Config, GlobalLog, HashSet, Host, InstallError, Lockfile, LogEvent,
-    LogLevel, NodeLinker, PackageManifest, Path, PathBuf, ProjectScriptsInputs, Reporter,
-    SummaryLog, drain_settled_projects, project_lifecycle_graph, projects_running_own_scripts,
-    run_projects_lifecycle_scripts,
+    BTreeSet, Config, GlobalLog, HashSet, Host, InstallError, Lockfile, LogEvent, LogLevel,
+    NodeLinker, PackageManifest, Path, PathBuf, ProjectScriptsInputs, Reporter, SummaryLog,
+    drain_settled_projects, project_lifecycle_graph, project_script_stages,
+    projects_running_own_scripts, run_projects_lifecycle_scripts,
 };
-use crate::peer_dependency_issues::report_peer_dependency_issues;
+use crate::peer_dependency_issues::{PeerReportWorkspace, report_peer_dependency_issues};
 use pnpm_store_dir::VerifiedFileIntegrity;
 use std::time::Duration;
 
@@ -13,8 +13,7 @@ pub(super) struct ResolveOnlyCompletionInputs<'a> {
     pub(crate) peers: crate::install::state_options::PeerIssueLockfiles<'a>,
     pub(super) prefix: &'a str,
     pub(super) config: &'static Config,
-    pub(super) catalogs: Option<&'a Catalogs>,
-    pub(super) workspace_root: &'a Path,
+    pub(super) peer_workspace: PeerReportWorkspace<'a>,
     pub(super) installed_importer_ids: &'a HashSet<String>,
 }
 pub(super) fn complete_resolve_only<Reporter: self::Reporter>(
@@ -44,9 +43,8 @@ pub(super) fn complete_resolve_only<Reporter: self::Reporter>(
             inputs.peers.fresh,
             inputs.peers.importer_ids,
             inputs.installed_importer_ids,
-            inputs.workspace_root,
+            inputs.peer_workspace,
             inputs.config,
-            inputs.catalogs,
         )?;
     }
     Reporter::emit(&LogEvent::Summary(SummaryLog {
@@ -56,16 +54,17 @@ pub(super) fn complete_resolve_only<Reporter: self::Reporter>(
     Ok(true)
 }
 #[derive(Clone, Copy)]
-pub(super) struct MaterializedProjectScriptsInputs<'a, 'selection> {
+pub(in crate::install) struct MaterializedProjectScriptsInputs<'a, 'selection> {
     pub(crate) request: crate::install::state_options::ProjectScriptSelection<'a, 'selection>,
-    pub(super) config: &'static Config,
-    pub(super) node_linker: NodeLinker,
-    pub(super) workspace_root: &'a Path,
-    pub(super) project_manifests: &'a [(PathBuf, &'a PackageManifest)],
-    pub(super) materialized_project_manifests: &'a [(PathBuf, &'a PackageManifest)],
-    pub(super) materialized_current_lockfile: Option<&'a Lockfile>,
+    pub(crate) config: &'static Config,
+    pub(crate) node_linker: NodeLinker,
+    pub(crate) workspace_root: &'a Path,
+    pub(crate) project_manifests: &'a [(PathBuf, &'a PackageManifest)],
+    pub(crate) materialized_project_manifests: &'a [(PathBuf, &'a PackageManifest)],
+    pub(crate) materialized_current_lockfile: Option<&'a Lockfile>,
+    pub(crate) root_preinstall_ran: bool,
 }
-pub(super) fn run_materialized_project_scripts<Reporter: self::Reporter>(
+pub(in crate::install) fn run_materialized_project_scripts<Reporter: self::Reporter>(
     inputs: MaterializedProjectScriptsInputs<'_, '_>,
 ) -> Result<(), InstallError> {
     let projects_to_run = materialized_script_projects(&inputs);
@@ -82,6 +81,8 @@ pub(super) fn run_materialized_project_scripts<Reporter: self::Reporter>(
                 inputs.config,
                 inputs.node_linker,
                 inputs.workspace_root,
+                inputs.root_preinstall_ran,
+                project_script_stages(inputs.request.mutation, inputs.request.include_dev),
             )?;
         }
         if let Some(rebuild) = inputs.request.rebuild {
@@ -113,6 +114,7 @@ pub(super) fn materialized_script_projects<'a>(
             workspace_root: inputs.workspace_root,
             active_project_dir: inputs.request.manifest_dir,
             selected_dirs: inputs.request.workspace.map(|selection| selection.selected_dirs),
+            edited_dirs: inputs.request.workspace.and_then(|selection| selection.edited_dirs),
             project_manifests: inputs.project_manifests,
             materialized_project_manifests: inputs.materialized_project_manifests,
         })
@@ -129,6 +131,7 @@ pub(super) struct ReportInstallCompletionInputs<'a> {
     pub(super) resolved_lockfile: Option<&'a Lockfile>,
     pub(super) peer_issue_importer_ids: &'a HashSet<String>,
     pub(super) installed_importer_ids: &'a HashSet<String>,
+    pub(super) can_prompt: bool,
 }
 pub(super) fn report_install_completion<Reporter: self::Reporter>(
     inputs: ReportInstallCompletionInputs<'_>,
@@ -140,9 +143,12 @@ pub(super) fn report_install_completion<Reporter: self::Reporter>(
         inputs.resolved_lockfile,
         inputs.peer_issue_importer_ids,
         inputs.installed_importer_ids,
-        inputs.workspace.workspace_root,
+        PeerReportWorkspace {
+            lockfile_dir: inputs.workspace.workspace_root,
+            catalogs: inputs.workspace.catalogs,
+            project_manifests: inputs.workspace.project_manifests,
+        },
         inputs.workspace.config,
-        inputs.workspace.catalogs,
     )?;
     // `pnpm:summary` closes the install and lets the reporter render
     // the accumulated `pnpm:root` events as a "+N -M" block. Must
@@ -168,8 +174,12 @@ pub(super) fn report_install_completion<Reporter: self::Reporter>(
     // than recalling the `allowBuilds` shape. Written before the strict
     // failure below, which is the very run whose message it answers.
     // `--ignore-workspace` opts out: the run disowned the workspace
-    // manifest, so it must not write to one either.
+    // manifest, so it must not write to one either. So does a run nobody
+    // is at the terminal for, such as CI or a dependency-update bot: no
+    // one there edits the line, and it would land in the committed
+    // manifest as a value that is not a decision.
     if !inputs.ignored_builds.is_empty()
+        && inputs.can_prompt
         && !is_global_install
         && !inputs.workspace.config.ignore_workspace
     {

@@ -1,5 +1,8 @@
-use super::find_own_runtime_node_major;
-use pnpm_lockfile::{PkgName, SnapshotDepRef, SnapshotEntry};
+use super::{find_own_runtime_node_major, find_runtime_node_major};
+use pnpm_lockfile::{
+    ImporterDepVersion, PkgName, ProjectSnapshot, ResolvedDependencySpec, SnapshotDepRef,
+    SnapshotEntry,
+};
 use pretty_assertions::assert_eq;
 use std::collections::HashMap;
 
@@ -55,8 +58,9 @@ fn empty_dependencies_yields_none() {
 
 #[tokio::test]
 async fn load_custom_fetcher_session_is_none_without_a_pnpmfile() {
-    let session =
-        super::load_custom_fetcher_session(None).await.expect("a missing pnpmfile is not an error");
+    let session = super::load_custom_fetcher_session(None, &pnpm_config::Config::new())
+        .await
+        .expect("a missing pnpmfile is not an error");
     assert!(session.is_none());
 }
 
@@ -66,7 +70,8 @@ async fn load_custom_fetcher_session_is_none_when_pnpmfile_exports_no_fetchers()
     std::fs::write(tmp.path().join(".pnpmfile.cjs"), "module.exports = { hooks: {} }\n")
         .expect("write pnpmfile");
     let hooks = pnpm_hooks::finder::load_pnpmfile(tmp.path());
-    let session = super::load_custom_fetcher_session(hooks.as_ref()).await
+    let session = super::load_custom_fetcher_session(hooks.as_ref(), &pnpm_config::Config::new())
+        .await
         .expect("a fetchers-less pnpmfile is not an error");
     assert!(session.is_none());
 }
@@ -80,7 +85,8 @@ async fn load_custom_fetcher_session_loads_exported_fetchers() {
     )
     .expect("write pnpmfile");
     let hooks = pnpm_hooks::finder::load_pnpmfile(tmp.path());
-    let session = super::load_custom_fetcher_session(hooks.as_ref()).await
+    let session = super::load_custom_fetcher_session(hooks.as_ref(), &pnpm_config::Config::new())
+        .await
         .expect("a well-formed fetchers export must load");
     assert!(session.is_some());
 }
@@ -95,7 +101,9 @@ async fn load_custom_fetcher_session_propagates_a_broken_pnpmfile() {
     std::fs::write(tmp.path().join(".pnpmfile.cjs"), "throw new Error('pnpmfile exploded')\n")
         .expect("write pnpmfile");
     let hooks = pnpm_hooks::finder::load_pnpmfile(tmp.path());
-    let Err(err) = super::load_custom_fetcher_session(hooks.as_ref()).await else {
+    let Err(err) =
+        super::load_custom_fetcher_session(hooks.as_ref(), &pnpm_config::Config::new()).await
+    else {
         panic!("a throwing pnpmfile must fail the load");
     };
     assert!(
@@ -106,4 +114,38 @@ async fn load_custom_fetcher_session_propagates_a_broken_pnpmfile() {
         ),
         "expected the pnpmfile error to propagate, got {err:?}",
     );
+}
+
+/// The install-wide engine follows the root project's own pin. A pin that
+/// only another workspace project declares does not reach the root's
+/// `node_modules/.bin`, so dependency builds do not run it either.
+#[test]
+fn runtime_node_major_comes_from_the_root_importer() {
+    let pinning = |version: &str| ProjectSnapshot {
+        dev_dependencies: Some(
+            std::iter::once((
+                PkgName::parse("node").expect("parse pkg name"),
+                ResolvedDependencySpec {
+                    specifier: format!("runtime:{version}"),
+                    version: ImporterDepVersion::Regular(
+                        format!("runtime:{version}").parse().expect("parse ver-peer"),
+                    ),
+                },
+            ))
+            .collect(),
+        ),
+        ..ProjectSnapshot::default()
+    };
+
+    let importers = HashMap::from([
+        (".".to_string(), pinning("24.1.0")),
+        ("app".to_string(), pinning("22.11.0")),
+    ]);
+    assert_eq!(find_runtime_node_major(&importers), Some(24));
+
+    let importers = HashMap::from([
+        (".".to_string(), ProjectSnapshot::default()),
+        ("app".to_string(), pinning("22.11.0")),
+    ]);
+    assert_eq!(find_runtime_node_major(&importers), None);
 }

@@ -1,8 +1,11 @@
 use super::{
-    Arc, CurrentPkg, GitResolveError, NoMatchingVersionError, Path, PreferredVersionsOverlay,
-    RegistryResponseError, ResolveDependencyTreeError, ResolveError, ResolveOptions, Resolver,
-    SharedWorkspaceWantedKey, TreeCtx, WantedDependency, WantedKey, WorkspaceFinalWantedKey,
-    lock_recoverable, render_specifier,
+    Arc, CurrentPkg, GitResolveError, NoMatchingVersionError, Path, PickPackageError,
+    PreferredVersionsOverlay, RegistryResponseError, ResolveDependencyTreeError, ResolveError,
+    ResolveOptions, Resolver, SharedWorkspaceWantedKey, TreeCtx, UnsupportedProtocolError,
+    WantedDependency, WantedKey, WorkspaceFinalWantedKey, cached_workspace_final,
+    completed_resolved_wanted, lock_recoverable,
+    manifest_hooks::{apply_manifest_hooks, original_manifest_opts},
+    render_specifier, wanted_key_admission,
 };
 
 /// Convert a workspace directory resolution into the representation shared by
@@ -102,7 +105,9 @@ pub(super) fn shared_workspace_key(
     #[cfg(not(debug_assertions))]
     let _ = opts;
     let bare_specifier = wanted.bare_specifier.as_deref()?;
-    if !bare_specifier.starts_with("workspace:") || bare_specifier.starts_with("workspace:.") {
+    if !bare_specifier.starts_with("workspace:")
+        || pnpm_workspace_spec::is_workspace_path_specifier(bare_specifier)
+    {
         return None;
     }
     #[cfg(debug_assertions)]
@@ -145,9 +150,14 @@ pub(super) async fn resolve_wanted_cached<Chain>(
 where
     Chain: Resolver + ?Sized,
 {
-    let cached =
-        lock_recoverable(&ctx.workspace.cache.resolved_by_wanted).get(&cache_key).map(Arc::clone);
-    if let Some(result) = cached {
+    if let Some(result) = completed_resolved_wanted(ctx, &cache_key) {
+        return Ok(result);
+    }
+    // Admit one resolver per wanted key; waiters re-check the cache
+    // after the holder finishes, so concurrent first callers run the
+    // resolver chain and manifest hooks once.
+    let _key_guard = wanted_key_admission(ctx, &cache_key).await;
+    if let Some(result) = completed_resolved_wanted(ctx, &cache_key) {
         return Ok(result);
     }
     let owned_opts = per_wanted_opts(opts, pick_overlay, &cache_key);
@@ -165,15 +175,9 @@ where
     .await?;
     let workspace_final_key =
         workspace_result_key(shared_workspace_key, canonical_workspace.as_deref(), &result.id);
-    if let Some(key) = workspace_final_key.as_ref()
-        && let Some(cached) =
-            lock_recoverable(&ctx.workspace.cache.resolved_workspace_final_by_wanted)
-                .get(key)
-                .map(Arc::clone)
-    {
-        // Both return paths record the project-scoped entry, so the lookup at
-        // the top of this function stays authoritative: a repeat of this edge
-        // costs one lookup rather than a shared-key rebuild and a re-render.
+    if let Some(cached) = cached_workspace_final(ctx, workspace_final_key.as_ref()) {
+        // Both return paths record the project-scoped entry, so the
+        // lookup at the top of this function stays authoritative.
         lock_recoverable(&ctx.workspace.cache.resolved_by_wanted)
             .entry(cache_key)
             .or_insert_with(|| Arc::clone(&cached));
@@ -184,56 +188,9 @@ where
             Some(Arc::new(fallback_manifest(wanted, opts.refresh.current_pkg.as_ref())));
     }
     apply_manifest_hooks(ctx, &mut result).await?;
+    stamp_fallback_identity(&mut result);
 
     Ok(cache_resolved_wanted(ctx, cache_key, workspace_final_key, result))
-}
-
-/// Apply the configured manifest hooks to the resolved manifest fragment
-/// before anything downstream sees it. `readPackageHook` (today:
-/// `packageExtensions`) clones the inner `Value` only when it modifies it, so
-/// unrelated manifests keep sharing the resolver's cached `Arc`. Overrides run
-/// last so a pnpmfile hook that replaced the manifest cannot erase them — see
-/// `WorkspaceTreeCtx::overrides_hook`.
-pub(super) async fn apply_manifest_hooks(
-    ctx: &TreeCtx,
-    result: &mut pnpm_resolving_resolver_base::ResolveResult,
-) -> Result<(), ResolveDependencyTreeError> {
-    if let Some(hook) = ctx.workspace.hooks.manifests.manifest_hook.as_ref()
-        && let Some(manifest) = result.package.manifest.take()
-    {
-        result.package.manifest = Some(hook(manifest));
-    }
-
-    if let Some(pnpmfile_hook) = ctx.workspace.hooks.manifests.pnpmfile_hook.as_ref()
-        && let Some(manifest) = result.package.manifest.take()
-    {
-        let log = ctx.workspace.hooks.read_package_log
-            .clone()
-            .unwrap_or_else(|| Arc::new(|_| {}));
-        // Directory resolutions carry their directory so the hook can tell a
-        // workspace project's dependency instance apart from a registry
-        // manifest — see `HookContext::dir`.
-        let dir = match &result.resolution {
-            pnpm_lockfile::LockfileResolution::Directory(directory_resolution) => {
-                Some(directory_resolution.directory.clone())
-            }
-            _ => None,
-        };
-        let hook_ctx = pnpm_hooks::HookContext { log, dir };
-
-        let updated = pnpmfile_hook
-            .read_package((*manifest).clone(), hook_ctx)
-            .await
-            .map_err(ResolveDependencyTreeError::PnpmfileHook)?;
-        result.package.manifest = Some(updated);
-    }
-
-    if let Some(hook) = ctx.workspace.hooks.manifests.overrides_hook.as_ref()
-        && let Some(manifest) = result.package.manifest.take()
-    {
-        result.package.manifest = Some(hook(manifest));
-    }
-    Ok(())
 }
 
 /// Render the shared workspace resolution when one is already cached for this
@@ -271,7 +228,8 @@ where
             &opts.project.lockfile_dir,
         ));
     }
-    let result = resolver.resolve(wanted, opts).await.map_err(map_resolve_error)?;
+    let opts = original_manifest_opts(ctx, opts).await?;
+    let result = resolver.resolve(wanted, &opts).await.map_err(map_resolve_error)?;
     let Some(result) = result else {
         return Err(ResolveDependencyTreeError::SpecNotSupported {
             specifier: render_specifier(wanted),
@@ -331,19 +289,38 @@ pub(super) fn per_wanted_opts(
 /// keys no `packages:` row. A package with no `package.json` of its own
 /// still has to install, so it borrows an identity; `0.0.0` is the
 /// version pnpm writes into `packages:` for such a package.
+///
+/// The fallback identity version `0.0.0` is stamped by
+/// [`stamp_fallback_identity`] *after* manifest hooks have run, so ranged
+/// `packageExtensions` selectors (e.g. `@<X`, `@*`, `@^X`) do not match
+/// an archive that ships no manifest.
+fn manifest_from_current_pkg(
+    current: &CurrentPkg,
+) -> Option<pnpm_resolving_resolver_base::DependencyManifest> {
+    if let Some(manifest) = &current.manifest {
+        let mut manifest = (**manifest).clone();
+        if manifest.get("version").and_then(serde_json::Value::as_str) == Some("0.0.0")
+            && let Some(obj) = manifest.as_object_mut()
+        {
+            obj.remove("version");
+        }
+        return Some(manifest);
+    }
+    let name = current.name
+        .as_deref()
+        .filter(|name| !name.is_empty())?;
+    let version = current.version
+        .as_deref()
+        .filter(|version| !version.is_empty() && *version != "0.0.0")?;
+    Some(serde_json::json!({ "name": name, "version": version }))
+}
+
 pub(super) fn fallback_manifest(
     wanted: &WantedDependency,
     current_pkg: Option<&CurrentPkg>,
 ) -> pnpm_resolving_resolver_base::DependencyManifest {
-    if let Some(current) = current_pkg
-        && let Some(name) = current.name
-            .as_deref()
-            .filter(|name| !name.is_empty())
-        && let Some(version) = current.version
-            .as_deref()
-            .filter(|version| !version.is_empty())
-    {
-        return serde_json::json!({ "name": name, "version": version });
+    if let Some(manifest) = current_pkg.and_then(manifest_from_current_pkg) {
+        return manifest;
     }
     let name = match wanted.alias
         .as_deref()
@@ -360,14 +337,31 @@ pub(super) fn fallback_manifest(
             .next()
             .unwrap_or_default(),
     };
-    serde_json::json!({ "name": name, "version": "0.0.0" })
+    serde_json::json!({ "name": name })
+}
+
+/// Default identity version `0.0.0` for packages without a manifest or
+/// version, stamped after manifest hooks have run so ranged
+/// `packageExtensions` selectors don't misfire against an unknown version.
+fn stamp_fallback_identity(result: &mut pnpm_resolving_resolver_base::ResolveResult) {
+    if let Some(manifest) = result.package.manifest.as_mut()
+        && manifest.get("version").is_none()
+    {
+        let mut updated = (**manifest).clone();
+        if let Some(obj) = updated.as_object_mut() {
+            obj.insert("version".to_string(), serde_json::Value::String("0.0.0".to_string()));
+        }
+        *manifest = Arc::new(updated);
+    }
 }
 
 /// Wrap a resolver-chain failure, keeping the pnpm error code of the ones
 /// that carry one. The chain hands back a type-erased
 /// [`ResolveError`], which drops the `miette::Diagnostic` facet, so the codes
-/// that are part of pnpm's public contract are recovered by downcast; every
-/// other failure keeps the generic envelope.
+/// that are part of pnpm's public contract are recovered by downcast —
+/// [`PickPackageError`] included, so `ERR_PNPM_NO_OFFLINE_META` and its
+/// legacy-mirror hint reach the CLI instead of collapsing to a plain
+/// string; every other failure keeps the generic envelope.
 pub(super) fn map_resolve_error(err: ResolveError) -> ResolveDependencyTreeError {
     let err = match err.downcast::<NoMatchingVersionError>() {
         Ok(no_matching_version) => {
@@ -379,9 +373,17 @@ pub(super) fn map_resolve_error(err: ResolveError) -> ResolveDependencyTreeError
         Ok(response) => return ResolveDependencyTreeError::RegistryResponse(*response),
         Err(err) => err,
     };
-    match err.downcast::<GitResolveError>() {
-        Ok(git) => ResolveDependencyTreeError::GitResolve(*git),
-        Err(err) => ResolveDependencyTreeError::Resolve(err.to_string()),
+    let err = match err.downcast::<GitResolveError>() {
+        Ok(git) => return ResolveDependencyTreeError::GitResolve(*git),
+        Err(err) => err,
+    };
+    let err = match err.downcast::<UnsupportedProtocolError>() {
+        Ok(unsupported) => return ResolveDependencyTreeError::UnsupportedProtocol(*unsupported),
+        Err(err) => err,
+    };
+    match err.downcast::<PickPackageError>() {
+        Ok(pick) => ResolveDependencyTreeError::Pick(*pick),
+        Err(err) => ResolveDependencyTreeError::Resolve(err),
     }
 }
 

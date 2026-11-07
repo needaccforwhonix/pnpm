@@ -6,7 +6,11 @@
 //! never populated with package contents — the client fetches every
 //! tarball itself.
 
-use std::{collections::HashSet, path::Path, sync::Arc};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use dashmap::DashMap;
 use pnpm_catalogs_types::Catalogs;
@@ -31,8 +35,14 @@ mod install;
 pub enum ResolveError {
     Io(std::io::Error),
     Manifest(String),
-    Install(String),
+    Install { message: String, code: Option<String> },
     NoLockfile,
+}
+
+impl ResolveError {
+    pub fn install(message: impl Into<String>) -> Self {
+        Self::Install { message: message.into(), code: None }
+    }
 }
 
 impl std::fmt::Display for ResolveError {
@@ -40,7 +50,7 @@ impl std::fmt::Display for ResolveError {
         match self {
             ResolveError::Io(err) => write!(f, "{err}"),
             ResolveError::Manifest(msg) => write!(f, "failed to read manifest: {msg}"),
-            ResolveError::Install(msg) => write!(f, "resolution failed: {msg}"),
+            ResolveError::Install { message, .. } => write!(f, "resolution failed: {message}"),
             ResolveError::NoLockfile => write!(f, "resolution produced no lockfile"),
         }
     }
@@ -50,6 +60,14 @@ impl From<std::io::Error> for ResolveError {
     fn from(err: std::io::Error) -> Self {
         ResolveError::Io(err)
     }
+}
+
+/// What writing a request's importers left in the temp workspace.
+struct Workspace<'a> {
+    /// The importer dirs below the root, in request order.
+    member_dirs: Vec<&'a str>,
+    /// Whether one of the importers was the root itself.
+    wrote_root: bool,
 }
 
 /// Resolve a request lockfile-only and return the produced lockfile.
@@ -62,14 +80,6 @@ impl From<std::io::Error> for ResolveError {
 /// `pnpm-workspace.yaml` listing their dirs — so pacquet's install path
 /// discovers and resolves every importer in one pass, producing a lockfile
 /// keyed by the same POSIX importer dirs the client sent.
-/// What writing a request's importers left in the temp workspace.
-struct Workspace<'a> {
-    /// The importer dirs below the root, in request order.
-    member_dirs: Vec<&'a str>,
-    /// Whether one of the importers was the root itself.
-    wrote_root: bool,
-}
-
 pub async fn resolve(
     config: &'static Config,
     client: &Arc<ThrottledClient>,
@@ -77,36 +87,48 @@ pub async fn resolve(
     auth_headers: &Arc<AuthHeaders>,
     observer: Option<Arc<dyn ResolutionObserver>>,
 ) -> Result<Lockfile, ResolveError> {
-    let projects = request.projects_normalized();
-
     let temp = tempfile::Builder::new().prefix("pnpr-resolve-").tempdir()?;
     let dir = temp.path();
 
-    let Workspace { member_dirs, wrote_root } = write_importer_manifests(dir, &projects).await?;
-    write_workspace_manifest(dir, &member_dirs).await?;
-
-    let manifest = root_manifest(dir, wrote_root)?;
-
-    let input_lockfile = request.lockfile.as_ref();
-    let lockfile_path = dir.join(Lockfile::FILE_NAME);
-    if let Some(lockfile) = input_lockfile {
-        lockfile
-            .save_to_path(&lockfile_path)
-            .map_err(|err| ResolveError::Install(err.to_string()))?;
-    }
+    let manifest = prepare_resolve_workspace(dir, request).await?;
+    let lockfile_path = write_input_lockfile(dir, request.lockfile.as_ref())?;
 
     let resolved_packages: ResolvedPackages = DashMap::new();
     ResolutionInstall { config, client, request, auth_headers, observer }
         .build(&resolved_packages, &manifest, &lockfile_path)
         .run::<SilentReporter>()
         .await
-        .map_err(|err| ResolveError::Install(err.to_string()))?;
+        .map_err(|err| {
+            let code = miette::Diagnostic::code(&err).map(|code| code.to_string());
+            ResolveError::Install { message: err.to_string(), code }
+        })?;
 
-    let lockfile = Lockfile::load_wanted_from_dir(dir)
-        .map_err(|err| ResolveError::Install(err.to_string()))?
-        .ok_or(ResolveError::NoLockfile)?;
+    Lockfile::load_wanted_from_dir(dir)
+        .map_err(|err| ResolveError::install(err.to_string()))?
+        .ok_or(ResolveError::NoLockfile)
+}
 
-    Ok(lockfile)
+async fn prepare_resolve_workspace(
+    dir: &Path,
+    request: &ResolveRequest,
+) -> Result<PackageManifest, ResolveError> {
+    let projects = request.projects_normalized();
+    let Workspace { member_dirs, wrote_root } = write_importer_manifests(dir, &projects).await?;
+    write_workspace_manifest(dir, &member_dirs).await?;
+    root_manifest(dir, wrote_root)
+}
+
+fn write_input_lockfile(
+    dir: &Path,
+    input_lockfile: Option<&Lockfile>,
+) -> Result<PathBuf, ResolveError> {
+    let lockfile_path = dir.join(Lockfile::FILE_NAME);
+    if let Some(lockfile) = input_lockfile {
+        lockfile
+            .save_to_path(&lockfile_path, pnpm_lockfile::SymlinkedLockfile::Refuse)
+            .map_err(|err| ResolveError::install(err.to_string()))?;
+    }
+    Ok(lockfile_path)
 }
 
 /// Install needs an active manifest, but keeping this stand-in in
@@ -137,7 +159,7 @@ async fn write_workspace_manifest(dir: &Path, member_dirs: &[&str]) -> Result<()
         // `-`, ...) stays a plain string instead of being reparsed as a
         // mapping or breaking the document.
         let quoted =
-            serde_json::to_string(member).map_err(|err| ResolveError::Install(err.to_string()))?;
+            serde_json::to_string(member).map_err(|err| ResolveError::install(err.to_string()))?;
         yaml.push_str("  - ");
         yaml.push_str(&quoted);
         yaml.push('\n');
@@ -160,7 +182,7 @@ async fn write_importer_manifests<'a>(
         // to `.`): writing the same `package.json` twice would silently
         // drop the earlier project's dependency map.
         if !seen_dirs.insert(rel) {
-            return Err(ResolveError::Install(format!("duplicate importer dir: {rel:?}")));
+            return Err(ResolveError::install(format!("duplicate importer dir: {rel:?}")));
         }
         let project_dir = if rel == "." {
             wrote_root = true;
@@ -187,17 +209,9 @@ async fn write_importer_manifest(
     rel: &str,
     project: &ProjectDeps,
 ) -> Result<(), ResolveError> {
-    let name = project.name.clone().unwrap_or_else(|| importer_manifest_name(rel));
-    let version = project.version.as_deref().unwrap_or("0.0.0");
-    let manifest_json = serde_json::json!({
-        "name": name,
-        "version": version,
-        "dependencies": project.dependencies,
-        "devDependencies": project.dev_dependencies,
-        "optionalDependencies": project.optional_dependencies,
-    });
+    let manifest_json = importer_manifest_json(project, rel);
     let manifest_bytes =
-        serde_json::to_vec(&manifest_json).map_err(|err| ResolveError::Install(err.to_string()))?;
+        serde_json::to_vec(&manifest_json).map_err(|err| ResolveError::install(err.to_string()))?;
     let opened = tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -206,7 +220,7 @@ async fn write_importer_manifest(
     let mut file = match opened {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Err(ResolveError::Install(format!(
+            return Err(ResolveError::install(format!(
                 "duplicate importer dir: {rel:?} resolves to a directory already written by another importer",
             )));
         }
@@ -217,6 +231,19 @@ async fn write_importer_manifest(
     // to be flushed before it is read back.
     file.flush().await?;
     Ok(())
+}
+
+/// The manifest the server resolves the importer at `rel` from.
+fn importer_manifest_json(project: &ProjectDeps, rel: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": project.name.clone().unwrap_or_else(|| importer_manifest_name(rel)),
+        "version": project.version.as_deref().unwrap_or("0.0.0"),
+        "publishConfig": project.publish_config,
+        "dependencies": project.dependencies,
+        "devDependencies": project.dev_dependencies,
+        "optionalDependencies": project.optional_dependencies,
+        "peerDependencies": project.peer_dependencies,
+    })
 }
 
 /// Return the caller's frozen input lockfile when pacquet's freshness
@@ -257,18 +284,11 @@ pub fn fresh_frozen_input_lockfile(config: &Config, request: &ResolveRequest) ->
         .tempdir()
         .ok()?;
     let manifest_path = temp.path().join("package.json");
-    let manifest_json = serde_json::json!({
-        "name": project.name.as_deref().unwrap_or("pnpr-resolve"),
-        "version": project.version.as_deref().unwrap_or("0.0.0"),
-        "dependencies": project.dependencies,
-        "devDependencies": project.dev_dependencies,
-        "optionalDependencies": project.optional_dependencies,
-    });
+    let manifest_json = importer_manifest_json(&project, &project.dir);
     std::fs::write(&manifest_path, serde_json::to_vec(&manifest_json).ok()?).ok()?;
     let manifest = PackageManifest::from_path(manifest_path).ok()?;
-    // The synthesized manifest carries no `peerDependencies`, so the
-    // auto-install-peers fold is a no-op; pass pnpm's default anyway.
-    satisfies_package_manifest(importer, &manifest, true, &|_: &str| false).ok()?;
+    satisfies_package_manifest(importer, &manifest, config.auto_install_peers, &|_: &str| false)
+        .ok()?;
 
     Some(lockfile.clone())
 }
@@ -319,7 +339,7 @@ fn sanitized_importer_dir(dir: &str) -> Result<&str, ResolveError> {
             .split('/')
             .any(|component| component.is_empty() || component == "." || component == "..")
     {
-        return Err(ResolveError::Install(format!("unsafe importer dir: {dir:?}")));
+        return Err(ResolveError::install(format!("unsafe importer dir: {dir:?}")));
     }
     Ok(dir)
 }
@@ -353,18 +373,24 @@ fn check_frozen_settings(
     check_lockfile_settings(
         lockfile,
         LockfileSettingsCheck {
+            // The client validated `lockfile.integrityTarget` against the
+            // lockfile before sending a frozen request.
+            integrity_target: lockfile.integrity_target(),
             catalogs: request.catalogs.as_ref().unwrap_or(&no_catalogs),
             overrides: None,
             package_extensions_checksum: None,
             ignored_optional_dependencies: None,
             patched_dependencies: None,
+            project_scoped_optional_peers: config.project_scoped_optional_peers_take_effect(),
             resolution: pnpm_lockfile::ResolutionSettingsCheck {
                 auto_install_peers: config.auto_install_peers,
                 dedupe_peers: config.dedupe_peers,
                 exclude_links_from_lockfile: config.exclude_links_from_lockfile,
+                add_missing_peer_types: config.add_missing_peer_types,
                 inject_workspace_packages: config.inject_workspace_packages,
                 peers_suffix_max_length: config.peers_suffix_max_length,
                 pnpmfile_checksum: PnpmfileChecksumCheck::Skip,
+                resolution_settings: None,
             },
         },
     )

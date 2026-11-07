@@ -15,11 +15,10 @@
 // payload it ships node-gyp in. The placeholder's installs usually do carry
 // that package, and the binary is taken from there.
 //
-// The download itself is `get-pnpm`, the package behind https://get.pnpm.io,
+// The download itself is `get-pnpm`, the installer in ../../get-pnpm,
 // which already knows how to verify one; it travels in that same `dist/`
-// payload. What is left here is Corepack's environment, which it does not know:
-// where to download from, what credentials to use, and whose signature to trust.
-import { Buffer } from 'node:buffer'
+// payload, and reads the registry, credentials, and signing keys from pnpm's
+// and Corepack's config.
 import { spawnSync } from 'node:child_process'
 import console from 'node:console'
 import fs from 'node:fs'
@@ -36,8 +35,10 @@ const DOWNLOADED_BINARY = path.join(
   process.platform === 'win32' ? 'pnpm-native.exe' : 'pnpm-native'
 )
 const GET_PNPM = new URL('../dist/node_modules/get-pnpm/lib/index.js', import.meta.url)
-const DEFAULT_REGISTRY = 'https://registry.npmjs.org'
 
+if ('webcontainer' in process.versions) {
+  fail('The pnpm package runs a native binary, which WebContainers cannot execute. Install @pnpm/wasm instead.')
+}
 run(await nativeBinary())
 
 function run (binary) {
@@ -66,76 +67,23 @@ async function nativeBinary () {
     return DOWNLOADED_BINARY
   }
 
-  if (process.env.COREPACK_ENABLE_NETWORK === '0') {
-    fail('Network access is disabled by the environment, so the pnpm binary cannot be downloaded.')
-  }
-
   const { version } = readWrapperManifest()
-  console.error(`Downloading the pnpm ${version} binary for ${process.platform}-${process.arch}...`)
-  const { downloadPnpmExecutable } = await import(GET_PNPM).catch((err) => {
+  const { corepackDownloadOptions, downloadPnpmExecutable } = await import(GET_PNPM).catch((err) => {
     fail(`This copy of the pnpm package is missing the downloader it needs: ${err.message}`)
   })
+  let options
   try {
-    await downloadPnpmExecutable({
-      version,
-      registry: process.env.COREPACK_NPM_REGISTRY || DEFAULT_REGISTRY,
-      destPath: DOWNLOADED_BINARY,
-      headers: registryHeaders(),
-      ...signaturePolicy(),
-    })
+    options = corepackDownloadOptions()
+  } catch (err) {
+    fail(err.message)
+  }
+  console.error(`Downloading the pnpm ${version} binary for ${process.platform}-${process.arch}...`)
+  try {
+    await downloadPnpmExecutable({ version, destPath: DOWNLOADED_BINARY, ...options })
   } catch (err) {
     fail(`Could not download the pnpm ${version} binary: ${err.message}`)
   }
   return DOWNLOADED_BINARY
-}
-
-/**
- * Credentials for the registry, read the way Corepack reads its own. `get-pnpm`
- * keeps them on that registry's origin, so a download host it names never
- * receives them.
- */
-function registryHeaders () {
-  const { COREPACK_NPM_TOKEN, COREPACK_NPM_USERNAME, COREPACK_NPM_PASSWORD } = process.env
-  if (COREPACK_NPM_TOKEN) {
-    return { authorization: `Bearer ${COREPACK_NPM_TOKEN}` }
-  }
-  if (COREPACK_NPM_USERNAME && COREPACK_NPM_PASSWORD) {
-    const credentials = Buffer.from(`${COREPACK_NPM_USERNAME}:${COREPACK_NPM_PASSWORD}`, 'utf8')
-    return { authorization: `Basic ${credentials.toString('base64')}` }
-  }
-  return undefined
-}
-
-/**
- * Whose signature over the download to trust, following `COREPACK_INTEGRITY_KEYS`
- * exactly as Corepack does: npm's own keys when it is unset, the keys it names
- * when it holds a key set, and no signature check at all when it is `0` or
- * empty — which is the state a registry that re-publishes packages, and
- * therefore carries no npm signatures, already has to be in for Corepack to
- * have installed this wrapper from it.
- */
-function signaturePolicy () {
-  const configured = process.env.COREPACK_INTEGRITY_KEYS
-  if (configured == null) {
-    return {}
-  }
-  if (configured === '' || configured === '0') {
-    return { verifySignature: false }
-  }
-  let keys
-  try {
-    keys = JSON.parse(configured).npm
-  } catch (err) {
-    fail(`COREPACK_INTEGRITY_KEYS is not readable as JSON: ${err.message}`)
-  }
-  // An absent or malformed `npm` entry would otherwise be passed on as no keys
-  // at all, which falls back to npm's own — the opposite of what setting the
-  // variable asked for. An empty set is left alone: it names no key to trust,
-  // and Corepack reads it the same way, so every download is refused.
-  if (!Array.isArray(keys)) {
-    fail('COREPACK_INTEGRITY_KEYS holds no "npm" key set to verify the pnpm binary against.')
-  }
-  return { keys }
 }
 
 function fail (message) {

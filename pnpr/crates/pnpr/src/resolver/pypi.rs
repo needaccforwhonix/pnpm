@@ -23,14 +23,14 @@
 //! installed environment.
 
 mod metadata;
+mod response;
 use metadata::{
-    CachedDocument, metadata_from_wheel, metadata_url, parse_metadata, parse_page,
-    project_page_url, text, verify_digest,
+    CachedDocument, metadata_from_wheel, parse_metadata, parse_page, project_page_url, text,
+    verify_digest,
 };
 
 use std::{
     collections::BTreeMap,
-    io::Cursor,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -42,19 +42,17 @@ use std::{
 use axum::{http::StatusCode, response::Response};
 use pnpm_network::{AuthHeaders, MetadataCacheScope, RetryOpts, ThrottledClient};
 use pnpm_python_resolver::{
-    Candidate, Inputs, Lockfile, Packages, Step, Target, WheelMetadata, candidates_from_page,
-    parse_requirement, validate_url,
+    IndexCandidate, Offered, Packages, Step, Target, WheelMetadata, candidates_from_page,
+    metadata_url, parse_requirement, validate_url,
 };
+use pnpr_pypi::archive::MAX_METADATA_BYTES;
 use pnpr_route::{Footprint, url_has_inline_credentials};
 
 use crate::server::StripedLocks;
 
 use super::{
-    Resolver, json_error,
-    package_route::PackageRoute,
-    protocol::PypiResolveRequest,
-    request_validation::forbidden_off_allowlist,
-    wire::{error_frame, ndjson_single_frame, pypi_done_frame},
+    Resolver, json_error, json_error_with_code, package_route::PackageRoute,
+    protocol::PypiResolveRequest, request_validation::forbidden_off_allowlist,
 };
 
 /// How many requirements one request may name. A project's manifest
@@ -78,9 +76,6 @@ const MAX_METADATA_READS: usize = 20_000;
 
 /// Cap on a single Simple API page.
 const MAX_PAGE_BYTES: usize = 32 * 1024 * 1024;
-
-/// Cap on a single `METADATA` document.
-const MAX_METADATA_BYTES: usize = 8 * 1024 * 1024;
 
 /// Cap on a wheel read for its metadata, which only an index that
 /// publishes no metadata files forces. Well above an ordinary wheel: the
@@ -121,25 +116,19 @@ pub(super) async fn handle_resolve(
         Err(err) => return json_error(StatusCode::BAD_REQUEST, &super::report_message(&err)),
     };
 
-    let reader = IndexReader::new(runtime, identity, index);
-    let inputs = Inputs::new(&requirements, &request.target, reader.index.as_str());
-    match resolve(&reader, &requirements, &request.target).await {
-        Ok(packages) => {
-            let solution = packages.0;
-            match Lockfile::new(
-                &packages.1,
-                &request.target,
-                &requirements,
-                solution,
-                inputs,
-                request.requires_python,
-            ) {
-                Ok(lockfile) => ndjson_single_frame(&pypi_done_frame(&lockfile)),
-                Err(err) => ndjson_single_frame(&error_frame(&super::report_message(&err))),
-            }
-        }
-        Err(err) => ndjson_single_frame(&error_frame(&err)),
+    if requirements
+        .iter()
+        .any(|requirement| {
+            matches!(requirement.version_or_url, Some(pep508_rs::VersionOrUrl::Url(_)))
+        })
+    {
+        return json_error_with_code(
+            StatusCode::BAD_REQUEST,
+            "Python direct URL requirements must be resolved by the client",
+            Some("ERR_PNPM_PYPI_CLIENT_RESOLVE_REQUIRED"),
+        );
     }
+    response::resolve_request(runtime, identity, index, request, requirements).await
 }
 
 type Solved = (BTreeMap<pep508_rs::PackageName, pep440_rs::Version>, Packages);
@@ -158,32 +147,64 @@ async fn resolve(
             .map_err(|err| super::report_message(&err))?;
         match step {
             Step::Solved(solution) => return Ok((solution, packages)),
+            Step::Backtrack(message) => return Err(message),
+            Step::NeedUrl(name, _) => {
+                return Err(format!(
+                    "Python direct URL requirement for {name} must be resolved by the client",
+                ));
+            }
             Step::NeedCandidates(name) => {
                 if packages.candidates.len() >= MAX_DISTRIBUTIONS {
                     return Err(format!(
                         "resolving this project needs more than {MAX_DISTRIBUTIONS} distributions",
                     ));
                 }
-                let candidates = reader.candidates(&name, target).await?;
-                packages.candidates.insert(name, candidates);
+                let offered = reader.candidates(&name, target).await?;
+                packages.candidates.insert(name.clone(), offered.candidates);
+                packages.excluded.insert(name, offered.excluded);
             }
             Step::NeedMetadata(name, version) => {
-                if packages.metadata.len() >= MAX_METADATA_READS {
-                    return Err(format!(
-                        "resolving this project needs the metadata of more than \
-                         {MAX_METADATA_READS} wheels",
-                    ));
-                }
-                let candidate = packages.candidates
-                    .get(&name)
-                    .and_then(|versions| versions.get(&version))
-                    .ok_or_else(|| format!("{name} {version} is not a candidate"))?;
+                let candidate = readable_wheel(&packages, &name, &version)?;
                 let metadata = reader.metadata(&name, &version, candidate).await?;
                 packages.metadata.insert((name, version), metadata);
             }
         }
         tokio::task::yield_now().await;
     }
+}
+
+/// The wheel whose `METADATA` the resolution asked for.
+///
+/// A server answers from an index and the metadata published beside a
+/// wheel. A release whose requirements are in the wheel its source
+/// distribution builds needs an interpreter and a build, which a client
+/// has and a server does not, so the project goes back to the client.
+fn readable_wheel<'a>(
+    packages: &'a Packages,
+    name: &pep508_rs::PackageName,
+    version: &pep440_rs::Version,
+) -> Result<&'a IndexCandidate, String> {
+    let offered = packages.candidates
+        .get(name)
+        .and_then(|versions| versions.get(version))
+        .ok_or_else(|| format!("{name} {version} is not a candidate"))?;
+    // Answered before the read budget, so a project this server cannot
+    // resolve at all is handed back rather than refused for a limit
+    // that was never the reason.
+    if offered.sdist().is_some() {
+        return Err(format!(
+            "Python source distribution for {name} must be resolved by the client",
+        ));
+    }
+    if packages.metadata.len() >= MAX_METADATA_READS {
+        return Err(format!(
+            "resolving this project needs the metadata of more than \
+             {MAX_METADATA_READS} wheels",
+        ));
+    }
+    offered
+        .from_index()
+        .ok_or_else(|| format!("{name} {version} is not a candidate"))
 }
 
 /// Reads a Python index for one resolve: cache first, then the index.
@@ -223,7 +244,7 @@ impl IndexReader {
         &self,
         name: &pep508_rs::PackageName,
         target: &Target,
-    ) -> Result<BTreeMap<pep440_rs::Version, Candidate>, String> {
+    ) -> Result<Offered, String> {
         let canonical_name = canonical_project_name(name)?;
         let page_url = project_page_url(&self.index, &canonical_name)?;
         let auth = self.auth_for(&canonical_name);
@@ -265,7 +286,7 @@ impl IndexReader {
         &self,
         name: &pep508_rs::PackageName,
         version: &pep440_rs::Version,
-        candidate: &Candidate,
+        candidate: &IndexCandidate,
     ) -> Result<WheelMetadata, String> {
         let canonical_name = canonical_project_name(name)?;
         let wheel_url = url::Url::parse(&candidate.wheel.url)
@@ -316,7 +337,7 @@ impl IndexReader {
         document: &str,
         name: &pep508_rs::PackageName,
         version: &pep440_rs::Version,
-        candidate: &Candidate,
+        candidate: &IndexCandidate,
     ) -> Result<WheelMetadata, String> {
         if let Some(digests) = &candidate.core_metadata {
             verify_digest(document.as_bytes(), digests, "metadata file", &candidate.wheel.name)?;
@@ -393,7 +414,7 @@ impl IndexReader {
     /// Where `url`'s document is cached. The route scope keys the
     /// namespace, so a private index cached under one caller's credential
     /// is never read back for a caller who does not reproduce that scope.
-    /// Where the document read from `url` is cached. `derived_from` is the
+    /// `derived_from` is the
     /// digest of the artifact a document was extracted from rather than
     /// read whole, and joins the key so a republished artifact is read
     /// again rather than answered from what came out of the old one.
@@ -435,7 +456,7 @@ impl IndexReader {
             let parent = path.parent()?;
             std::fs::create_dir_all(parent).ok()?;
             let bytes = serde_json::to_vec(&document).ok()?;
-            pnpm_fs::write_atomic(&path, &bytes).ok()
+            pnpm_fs::write_atomic_private_if_new(&path, &bytes).ok()
         })
         .await;
     }

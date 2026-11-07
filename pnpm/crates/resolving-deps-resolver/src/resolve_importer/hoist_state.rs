@@ -10,7 +10,7 @@ pub(super) struct ImporterHoistPolicy {
 
 impl ImporterHoistPolicy {
     pub(super) fn should_hoist_peers(&self) -> bool {
-        self.peers.auto_install_peers || self.peers.dedupe_peer_dependents
+        self.peers.auto_install_peers || self.peers.dedupe_peer_dependents.dedupes()
     }
 }
 
@@ -50,6 +50,9 @@ pub(super) struct ImporterHoistDependencies {
     /// Empty until the caller assigns it; see
     /// [`crate::ImporterPeerOptions::resolve_peers_from_workspace_root`].
     pub(super) workspace_root_deps: Arc<Vec<WorkspaceRootDep>>,
+    /// `alias → version` of the workspace root's direct dependencies,
+    /// assigned together with `workspace_root_deps`.
+    pub(super) workspace_root_dep_versions: Arc<HashMap<String, String>>,
     /// `alias → bare_specifier` as declared. Stands in wherever the
     /// resolver reports no normalized form — a plain `"19.2.0"` arrives
     /// as `None`.
@@ -62,6 +65,8 @@ pub(super) struct ImporterHoistDependencies {
     pub(super) hoisted_peer_provider_node_ids: HashSet<crate::NodeId>,
     pub(super) parent_pkg_aliases: HashSet<String>,
     pub(super) all_missing_optional_peers: BTreeMap<String, Vec<String>>,
+    /// See [`crate::ImporterPeerInput::rejected_optional_peers`].
+    pub(super) rejected_optional_peers: HashSet<String>,
 }
 
 pub(super) struct ImporterHoistSelection {
@@ -71,7 +76,6 @@ pub(super) struct ImporterHoistSelection {
     /// [`TreeCtx::preferred_versions_for_names`] — instead of
     /// maintaining a per-importer copy of the whole run history.
     pub(super) preferred_versions: Arc<PreferredVersions>,
-    pub(super) locked_names: Arc<HashSet<String>>,
     pub(super) locked_versions: Arc<HashMap<String, HashSet<String>>>,
     pub(super) override_bare_specifier: Option<Arc<DependencyOverrider>>,
 }
@@ -98,14 +102,15 @@ impl super::ImporterHoistState {
             dependencies: ImporterHoistDependencies {
                 direct,
                 workspace_root_deps: Arc::default(),
+                workspace_root_dep_versions: Arc::default(),
                 wanted_specifier_by_alias: seeds.wanted_specifier_by_alias,
                 hoisted_peer_provider_node_ids: HashSet::default(),
                 parent_pkg_aliases: seeds.parent_pkg_aliases,
                 all_missing_optional_peers: BTreeMap::new(),
+                rejected_optional_peers: HashSet::default(),
             },
             selection: ImporterHoistSelection {
                 preferred_versions: settings.all_preferred_versions,
-                locked_names: locked.names,
                 locked_versions: locked.versions,
                 override_bare_specifier: settings.override_bare_specifier,
             },

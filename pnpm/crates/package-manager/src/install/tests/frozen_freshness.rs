@@ -13,18 +13,45 @@ use text_block_macros::text_block;
 #[tokio::test]
 async fn should_error_when_frozen_lockfile_is_requested_but_none_exists() {
     let dirs = InstallDirs::new();
+    let manifest = manifest_with_a_dependency(&dirs);
 
-    let manifest_path = dirs.path().join("package.json");
-    let manifest = PackageManifest::create_if_needed(manifest_path).unwrap();
+    let result = frozen_install_without_lockfile(&dirs, &manifest, true).await;
 
+    assert!(matches!(result, Err(InstallError::NoLockfile)));
+    drop(dirs.dir);
+}
+
+/// pnpm requires the lockfile only when some project has a dependency for
+/// it to be out of date with (<https://github.com/pnpm/pnpm/issues/16477>).
+#[tokio::test]
+async fn frozen_lockfile_without_a_lockfile_installs_a_project_with_no_dependencies() {
+    let dirs = InstallDirs::new();
+    let manifest = PackageManifest::create_if_needed(dirs.path().join("package.json")).unwrap();
+
+    frozen_install_without_lockfile(&dirs, &manifest, true).await
+        .expect("a project with no dependencies needs no lockfile");
+    drop(dirs.dir);
+}
+
+fn manifest_with_a_dependency(dirs: &InstallDirs) -> PackageManifest {
+    let mut manifest = PackageManifest::create_if_needed(dirs.path().join("package.json")).unwrap();
+    manifest.add_dependency("is-positive", "1.0.0", DependencyGroup::Prod).unwrap();
+    manifest
+}
+
+async fn frozen_install_without_lockfile(
+    dirs: &InstallDirs,
+    manifest: &PackageManifest,
+    lockfile: bool,
+) -> Result<(), InstallError> {
     let mut config = Config::new();
-    config.lockfile = true;
+    config.lockfile = lockfile;
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
     let config = config.leak();
 
-    let result = Install {
+    Install {
         lockfile_policy: crate::InstallLockfilePolicy {
             frozen: true,
             prefer_frozen: None,
@@ -53,7 +80,7 @@ async fn should_error_when_frozen_lockfile_is_requested_but_none_exists() {
         context: crate::InstallInvocation {
             http_client: &Default::default(),
             config,
-            manifest: &manifest,
+            manifest,
             emit_initial_manifest: true,
             lockfile: MaybeLazyLockfile::Loaded(None),
             lockfile_path: None,
@@ -69,14 +96,14 @@ async fn should_error_when_frozen_lockfile_is_requested_but_none_exists() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
-    .await;
-
-    assert!(matches!(result, Err(InstallError::NoLockfile)));
-    drop(dirs.dir);
+    .await
 }
+
 #[tokio::test]
 async fn should_error_when_frozen_lockfile_and_update_checksums_are_both_set() {
     let dirs = InstallDirs::new();
@@ -88,7 +115,7 @@ async fn should_error_when_frozen_lockfile_and_update_checksums_are_both_set() {
     config.lockfile = true;
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
     let config = config.leak();
 
     let result = Install {
@@ -136,6 +163,8 @@ async fn should_error_when_frozen_lockfile_and_update_checksums_are_both_set() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -145,12 +174,7 @@ async fn should_error_when_frozen_lockfile_and_update_checksums_are_both_set() {
     drop(dirs.dir);
 }
 /// `--frozen-lockfile` passed on the CLI must take precedence over
-/// `config.lockfile=false`. Before this fix the dispatch matched on
-/// `(config.lockfile, frozen_lockfile, lockfile)` in an order that
-/// treated `config.lockfile=false` as "skip lockfile entirely",
-/// silently dropping the CLI flag and resolving from the registry
-/// instead — the very regression the integrated benchmark was
-/// measuring. Pin the new priority: frozen flag + lockfile present
+/// `config.lockfile=false`. Pin the priority: frozen flag + lockfile present
 /// → `InstallFrozenLockfile`, regardless of `config.lockfile`.
 ///
 /// We don't need the full install to succeed here — any error that
@@ -170,7 +194,7 @@ async fn frozen_lockfile_flag_overrides_config_lockfile_false() {
     config.lockfile = false;
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
     let config = config.leak();
 
     // Minimal v9 lockfile with no snapshots — the frozen path will
@@ -232,6 +256,8 @@ async fn frozen_lockfile_flag_overrides_config_lockfile_false() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -242,71 +268,13 @@ async fn frozen_lockfile_flag_overrides_config_lockfile_false() {
 }
 /// Symmetric negative: `--frozen-lockfile` with no lockfile
 /// loadable must surface `NoLockfile`, even when `config.lockfile`
-/// is `false` (which used to fall through to the no-lockfile path
-/// and silently succeed).
+/// is `false`.
 #[tokio::test]
 async fn frozen_lockfile_flag_with_no_lockfile_errors() {
     let dirs = InstallDirs::new();
+    let manifest = manifest_with_a_dependency(&dirs);
 
-    let manifest_path = dirs.path().join("package.json");
-    let manifest = PackageManifest::create_if_needed(manifest_path).unwrap();
-
-    let mut config = Config::new();
-    config.lockfile = false;
-    config.store_dir = dirs.store_dir.clone().into();
-    config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
-    let config = config.leak();
-
-    let result = Install {
-        lockfile_policy: crate::InstallLockfilePolicy {
-            frozen: true,
-            prefer_frozen: None,
-            ignore_manifest_check: false,
-            trust: false,
-            update_checksums: false,
-            excludes: PolicyExcludes::Persist,
-            disable_optimistic_repeat: false,
-        },
-        execution: crate::InstallExecution {
-            skip_runtimes: false,
-            mutation: ProjectMutation::InstallWorkspace,
-            installs_only: true,
-            node_linker: pnpm_config::NodeLinker::default(),
-            lockfile_only: false,
-            dry_run: false,
-        },
-        resolution: crate::ResolutionInputs {
-            update_seed_policy: crate::UpdateSeedPolicy::KeepAll,
-            preferred_versions_override: None,
-            auth_override: None,
-            observer: None,
-            peer_issues_sink: None,
-            deps_requiring_build_sink: None,
-        },
-        context: crate::InstallInvocation {
-            http_client: &Default::default(),
-            config,
-            manifest: &manifest,
-            emit_initial_manifest: true,
-            lockfile: MaybeLazyLockfile::Loaded(None),
-            lockfile_path: None,
-        },
-        fetching: crate::InstallFetching {
-            tarball_mem_cache: Default::default(),
-            http_client_arc: std::sync::Arc::new(Default::default()),
-            resolved_packages: &Default::default(),
-        },
-        projects: crate::InstallProjects {
-            dependency_groups: [DependencyGroup::Prod],
-            supported_architectures: None,
-            catalogs_override: None,
-            pnpmfile_hook_override: None,
-            workspace_projects_override: None,
-        },
-    }
-    .run::<SilentReporter>()
-    .await;
+    let result = frozen_install_without_lockfile(&dirs, &manifest, false).await;
 
     assert!(matches!(result, Err(InstallError::NoLockfile)));
     drop(dirs.dir);
@@ -343,7 +311,7 @@ pub(super) async fn frozen_lockfile_errors_when_manifest_drifts_from_lockfile() 
     let mut config = Config::new();
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
     let config = config.leak();
 
     let lockfile: Lockfile = serde_saphyr::from_str(PARTIAL_INSTALL_LOCKFILE)
@@ -394,6 +362,8 @@ pub(super) async fn frozen_lockfile_errors_when_manifest_drifts_from_lockfile() 
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -420,7 +390,7 @@ async fn frozen_lockfile_errors_when_overrides_drift_from_lockfile() {
     let mut config = Config::new();
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
     // Config declares an override the lockfile doesn't carry → drift.
     let mut overrides = indexmap::IndexMap::new();
     overrides.insert("placeholder".to_string(), "9.9.9".to_string());
@@ -480,6 +450,8 @@ async fn frozen_lockfile_errors_when_overrides_drift_from_lockfile() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -520,7 +492,7 @@ async fn frozen_lockfile_applies_overrides_to_manifest_before_freshness_check() 
     let mut config = Config::new();
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
     let mut overrides = indexmap::IndexMap::new();
     overrides.insert("placeholder".to_string(), "1.0.0".to_string());
     config.overrides = Some(overrides);
@@ -541,7 +513,7 @@ async fn frozen_lockfile_applies_overrides_to_manifest_before_freshness_check() 
         "        version: 1.0.0"
         "packages:"
         "  placeholder@1.0.0:"
-        "    resolution: {integrity: sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA, tarball: 'http://invalid.local/placeholder.tgz'}"
+        "    resolution: {integrity: sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA, tarball: 'http://0.0.0.0:1/placeholder.tgz'}"
         "snapshots:"
         "  placeholder@1.0.0: {}"
     })
@@ -592,6 +564,8 @@ async fn frozen_lockfile_applies_overrides_to_manifest_before_freshness_check() 
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -651,7 +625,7 @@ async fn frozen_lockfile_resolves_catalog_protocol_in_overrides_before_freshness
     let mut config = Config::new();
     config.store_dir = store_dir.into();
     config.modules_dir = modules_dir.clone();
-    config.virtual_store_dir = virtual_store_dir;
+    config.install_state_dir = virtual_store_dir;
     // Override value is `catalog:`, which must resolve to the
     // catalog's `placeholder: 1.0.0` entry before the freshness
     // comparison. The lockfile records the *resolved* `1.0.0`, so a
@@ -673,7 +647,7 @@ async fn frozen_lockfile_resolves_catalog_protocol_in_overrides_before_freshness
         "        version: 1.0.0"
         "packages:"
         "  placeholder@1.0.0:"
-        "    resolution: {integrity: sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA, tarball: 'http://invalid.local/placeholder.tgz'}"
+        "    resolution: {integrity: sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA, tarball: 'http://0.0.0.0:1/placeholder.tgz'}"
         "snapshots:"
         "  placeholder@1.0.0: {}"
     })
@@ -724,14 +698,16 @@ async fn frozen_lockfile_resolves_catalog_protocol_in_overrides_before_freshness
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
     .await;
 
-    // The freshness check must accept the install; before the fix
-    // pacquet would surface `OutdatedLockfile::OverridesChanged`
-    // because `catalog:` ≠ `1.0.0` as raw strings. (The install may
+    // The freshness check must accept the install; it must not surface
+    // `OutdatedLockfile::OverridesChanged` over `catalog:` ≠ `1.0.0`
+    // as raw strings. (The install may
     // still fail later for unrelated reasons in this minimal fixture,
     // but the overrides gate must pass.)
     if let Err(InstallError::OutdatedLockfile { reason }) = &result {
@@ -744,18 +720,21 @@ async fn frozen_lockfile_resolves_catalog_protocol_in_overrides_before_freshness
 /// `importers["."]` entry for the project being installed. Distinct
 /// from `NoLockfile` (file missing entirely) — here the file is
 /// well-formed but doesn't describe this project. Should surface as
-/// `NoImporter`, also before any fetch attempt.
+/// `NoImporter`, also before any fetch attempt. The project declares a
+/// dependency, since a missing entry for a dependency-free project is
+/// accepted.
 #[tokio::test]
 async fn frozen_lockfile_errors_when_lockfile_has_no_root_importer() {
     let dirs = InstallDirs::new();
 
     let manifest_path = dirs.path().join("package.json");
-    let manifest = PackageManifest::create_if_needed(manifest_path).unwrap();
+    let mut manifest = PackageManifest::create_if_needed(manifest_path).unwrap();
+    manifest.add_dependency("is-positive", "1.0.0", DependencyGroup::Prod).unwrap();
 
     let mut config = Config::new();
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
     let config = config.leak();
 
     // Empty-importers lockfile — valid v9 shape, but no entry for
@@ -808,6 +787,8 @@ async fn frozen_lockfile_errors_when_lockfile_has_no_root_importer() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -833,8 +814,7 @@ async fn frozen_lockfile_errors_when_lockfile_has_no_root_importer() {
 /// enough to prove the wiring runs end-to-end without panicking and
 /// that the registry entry actually lands on disk; the GVS-shaped
 /// per-package path layout itself is unit-tested inside the
-/// [`crate::VirtualStoreLayout`] module, and the e2e GVS cases (with
-/// non-empty snapshots) are tracked as a follow-up.
+/// [`crate::VirtualStoreLayout`] module.
 #[tokio::test]
 async fn frozen_lockfile_under_gvs_registers_project_and_runs_clean() {
     let dirs = InstallDirs::new();
@@ -855,7 +835,7 @@ async fn frozen_lockfile_under_gvs_registers_project_and_runs_clean() {
     config.lockfile = false;
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
     // Pin the GVS root to a known location under the test temp dirs.dir
     // so any future assertions can target it without walking the
     // SmartDefault'd cwd-based fallback.
@@ -917,6 +897,8 @@ async fn frozen_lockfile_under_gvs_registers_project_and_runs_clean() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()

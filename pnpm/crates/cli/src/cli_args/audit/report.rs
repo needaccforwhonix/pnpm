@@ -14,6 +14,12 @@ pub(crate) enum AuditError {
     #[diagnostic(code(ERR_PNPM_AUDIT_NO_LOCKFILE))]
     NoLockfile,
 
+    #[display(
+        r#"pnpm-lock.yaml has no entry for these selected workspace projects: {importer_ids}. Run "pnpm install" to update it."#
+    )]
+    #[diagnostic(code(ERR_PNPM_AUDIT_MISSING_IMPORTERS))]
+    MissingImporters { importer_ids: String },
+
     #[display("No installed packages found to audit")]
     #[diagnostic(code(ERR_PNPM_AUDIT_NO_PACKAGES))]
     NoPackages,
@@ -29,6 +35,11 @@ pub(crate) enum AuditError {
     #[display("Invalid value for --fix: {value}. Should be one of \"override\" or \"update\"")]
     #[diagnostic(code(ERR_PNPM_INVALID_FIX_OPTION))]
     InvalidFixOption { value: String },
+
+    /// A fix flow writes no ignores, so the ignore flag would be dropped.
+    #[display(r#""{fix_flag}" may not be used with "{ignore_flag}""#)]
+    #[diagnostic(code(ERR_PNPM_AUDIT_FIX_WITH_IGNORE))]
+    FixWithIgnore { fix_flag: &'static str, ignore_flag: &'static str },
 
     #[display(
         "Cannot ignore advisory {id} ({module_name}): the registry did not provide a GHSA id or a resolvable url."
@@ -305,22 +316,6 @@ pub(crate) fn normalize_ghsa_id(ghsa_id: &str) -> String {
         return trimmed.to_ascii_uppercase();
     };
     format!("{}{}", trimmed[..dash].to_ascii_uppercase(), trimmed[dash..].to_ascii_lowercase())
-}
-
-pub(crate) fn normalize_registry(registry: &str) -> String {
-    if registry.ends_with('/') { registry.to_string() } else { format!("{registry}/") }
-}
-
-pub(crate) fn redact_url_userinfo(url: &str) -> String {
-    let Ok(mut parsed) = reqwest::Url::parse(url) else {
-        return url.to_string();
-    };
-    if parsed.username().is_empty() && parsed.password().is_none() {
-        return url.to_string();
-    }
-    let _ = parsed.set_username("");
-    let _ = parsed.set_password(None);
-    parsed.to_string()
 }
 
 pub(crate) fn truncate_chars(value: &str, max_chars: usize) -> String {

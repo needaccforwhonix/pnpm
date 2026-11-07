@@ -9,26 +9,22 @@
 //! (`pnpm_config` is not a dependency of this crate, so it is not
 //! linked here.)
 
+use crate::include::{IncludeError, read_workspace_manifest_document};
 use derive_more::{Display, Error};
 use miette::Diagnostic;
 use pnpm_catalogs_types::{Catalog, Catalogs};
 use serde::Deserialize;
 use std::{
-    fs,
-    io::{self, ErrorKind},
+    io,
     path::{Path, PathBuf},
 };
 
 /// Basename of the workspace manifest.
 pub const WORKSPACE_MANIFEST_FILENAME: &str = "pnpm-workspace.yaml";
 
-/// Subset of `pnpm-workspace.yaml` consumed by project enumeration.
-///
-/// The settings half (`storeDir`, `registry`, lifecycle policies, ...)
-/// is read separately by `pnpm_config::WorkspaceSettings`.
-/// Keeping the two readers apart keeps each focused on the shape its
-/// callers actually need and avoids a monolithic struct that has to
-/// grow with every new pnpm setting.
+/// Subset of `pnpm-workspace.yaml` consumed by project enumeration. The
+/// settings half (`storeDir`, `registry`, lifecycle policies, ...) is read
+/// separately by `pnpm_config::WorkspaceSettings`.
 #[derive(Debug, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceManifest {
@@ -92,6 +88,8 @@ pub enum ReadWorkspaceManifestError {
     },
     #[diagnostic(transparent)]
     Invalid(#[error(source)] InvalidWorkspaceManifestError),
+    #[diagnostic(transparent)]
+    Include(#[error(source)] IncludeError),
 }
 
 /// Resolve `pnpm-workspace.yaml` `packages:` into the workspace package
@@ -103,7 +101,8 @@ pub fn workspace_package_patterns(manifest: &WorkspaceManifest) -> Vec<String> {
         .unwrap_or_else(|| vec![".".to_string()])
 }
 
-/// Read and validate the `pnpm-workspace.yaml` under `dir`.
+/// Read and validate the `pnpm-workspace.yaml` under `dir`, with the files it
+/// includes merged in.
 ///
 /// Returns `Ok(None)` when the file does not exist (`ENOENT` means "no
 /// manifest", not an error). Every other read or parse failure
@@ -111,25 +110,36 @@ pub fn workspace_package_patterns(manifest: &WorkspaceManifest) -> Vec<String> {
 pub fn read_workspace_manifest(
     dir: &Path,
 ) -> Result<Option<WorkspaceManifest>, ReadWorkspaceManifestError> {
-    let path = dir.join(WORKSPACE_MANIFEST_FILENAME);
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(source) => return Err(ReadWorkspaceManifestError::ReadFile { path, source }),
+    let document = match read_workspace_manifest_document(dir) {
+        Ok(Some(document)) => document,
+        Ok(None) => return Ok(None),
+        Err(IncludeError::ReadRoot { path, source }) => {
+            return Err(ReadWorkspaceManifestError::ReadFile { path, source });
+        }
+        Err(error) => return Err(ReadWorkspaceManifestError::Include(error)),
     };
+    parse_workspace_manifest(&document.path, &document.text).map(Some)
+}
 
+/// Parse and validate `text` as a `pnpm-workspace.yaml`. `path` only labels
+/// errors.
+pub fn parse_workspace_manifest(
+    path: &Path,
+    text: &str,
+) -> Result<WorkspaceManifest, ReadWorkspaceManifestError> {
     // An empty workspace manifest is valid and means "no settings, no
     // packages" — same as `{}`. `serde_saphyr` would otherwise reject
     // an empty document; short-circuit to the default value.
     if text.trim().is_empty() {
-        return Ok(Some(WorkspaceManifest::default()));
+        return Ok(WorkspaceManifest::default());
     }
 
-    let manifest: WorkspaceManifest = serde_saphyr::from_str(&text)
+    let manifest: WorkspaceManifest = serde_saphyr::from_str::<Option<WorkspaceManifest>>(text)
         .map_err(|source| ReadWorkspaceManifestError::ParseYaml {
-            path: path.clone(),
+            path: path.to_path_buf(),
             source: Box::new(source),
-        })?;
+        })?
+        .unwrap_or_default();
 
     // serde_saphyr already enforces the array shape and string type
     // for `packages:` at deserialization. The remaining invariant —
@@ -145,7 +155,7 @@ pub fn read_workspace_manifest(
         }
     }
 
-    Ok(Some(manifest))
+    Ok(manifest)
 }
 
 #[cfg(test)]

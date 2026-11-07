@@ -10,7 +10,7 @@ import { rimrafSync } from '@zkochan/rimraf'
 import { safeExeca as execa } from 'execa'
 
 const pnpmBin = path.join(import.meta.dirname, '../../../pnpm/bin/pnpm.mjs')
-const REGISTRY = `http://localhost:${REGISTRY_MOCK_PORT}/`
+const REGISTRY = `http://localhost:${REGISTRY_MOCK_PORT}/npm/`
 
 describe('cache delete', () => {
   let cacheDir: string
@@ -27,6 +27,10 @@ describe('cache delete', () => {
       `--store-dir=${storeDir}`,
       `--cache-dir=${cacheDir}`,
       '--config.resolution-mode=highest',
+      // The update check resolves `pnpm@latest` through the same cache, which
+      // would add a `pnpm.jsonl` entry to what these tests expect to find. It
+      // is off under CI, so leaving it on would only fail locally.
+      '--config.update-notifier=false',
       `--registry=${REGISTRY}`,
     ])
     rimrafSync('node_modules')
@@ -39,6 +43,7 @@ describe('cache delete', () => {
       `--store-dir=${storeDir}`,
       `--cache-dir=${cacheDir}`,
       '--config.resolution-mode=highest',
+      '--config.update-notifier=false',
     ])
   })
   test('delete all metadata from the cache that matches a pattern', async () => {
@@ -53,7 +58,7 @@ describe('cache delete', () => {
       pnpmHomeDir: storeDir,
     }, ['list'])
 
-    expect(result).toBe(`http%3A+localhost+${REGISTRY_MOCK_PORT}/is-negative.jsonl
+    expect(result).toBe(`http%3A+localhost+${REGISTRY_MOCK_PORT}%2Fnpm/is-negative.jsonl
 https%3A+registry.npmjs.org/is-negative.jsonl`)
   })
 })

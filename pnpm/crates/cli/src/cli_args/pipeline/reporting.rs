@@ -1,9 +1,10 @@
 use super::{
-    Config, ExecutionStatus, GraphPkg, HashMap, IndexMap, IntoDiagnostic, Mutex, Path,
-    PipelineInvocation, PipelineResults, ProjectGraph, Status, TaskCache, TaskCompletion,
-    TaskGraph, TaskKey, TaskNode, Value, cache, format_task, render_task_graph_dry_run,
-    task_environment, task_graph_to_json,
+    Config, ExecutionStatus, GraphPkg, HashMap, HashSet, IndexMap, IntoDiagnostic, Mutex, Path,
+    PathBuf, PipelineInvocation, PipelineOutcome, PipelineResults, PipelineRun, ProjectGraph,
+    RunReport, SelectionMode, Status, TaskCache, TaskCompletion, TaskGraph, TaskKey, TaskNode,
+    Value, cache, format_task, render_task_graph_dry_run, task_environment, task_graph_to_json,
 };
+use pnpm_reporter::{LogEvent, LogLevel, PnpmLog};
 
 pub(super) struct StatusCounts {
     pub(super) failed: usize,
@@ -41,11 +42,47 @@ pub(super) fn print_dry_run(
 ) -> miette::Result<()> {
     if invocation.json {
         let document = task_graph_to_json(task_graph, workspace_root);
-        println!("{}", serde_json::to_string_pretty(&document).into_diagnostic()?);
+        pnpm_diagnostics::println!(
+            "{}",
+            serde_json::to_string_pretty(&document).into_diagnostic()?,
+        );
     } else {
-        println!("{}", render_task_graph_dry_run(task_graph, sequenced_tasks, workspace_root));
+        pnpm_diagnostics::println!(
+            "{}",
+            render_task_graph_dry_run(task_graph, sequenced_tasks, workspace_root),
+        );
     }
     Ok(())
+}
+
+impl PipelineRun<'_> {
+    /// Nothing is selected, so nothing runs. A dry run writes no report, and
+    /// with `--json` prints the empty plan.
+    pub(super) fn conclude_empty_selection(
+        &self,
+        report: &RunReport,
+        mode: SelectionMode,
+        base: &str,
+    ) -> miette::Result<PipelineOutcome> {
+        if self.invocation.dry_run && self.invocation.json {
+            print_dry_run(self.invocation, &TaskGraph::default(), &[], self.workspace_root)?;
+            return Ok(PipelineOutcome::without_upload());
+        }
+        self.info(empty_selection_message(mode, base));
+        if self.invocation.dry_run {
+            return Ok(PipelineOutcome::without_upload());
+        }
+        self.conclude(report, None, 0)
+    }
+}
+
+fn empty_selection_message(mode: SelectionMode, base: &str) -> String {
+    match mode {
+        SelectionMode::Affected => {
+            format!("No projects are affected since {base} — nothing to run.")
+        }
+        SelectionMode::Full => "No projects are selected — nothing to run.".to_string(),
+    }
 }
 
 /// Record one task's status. A task that could not run at all aborts the
@@ -79,8 +116,10 @@ pub(super) fn compute_task_keys(
     graph: &ProjectGraph<GraphPkg<'_>>,
     cache: &TaskCache,
     config: &Config,
+    emit: fn(&LogEvent),
 ) -> miette::Result<HashMap<TaskKey, Option<String>>> {
     let mut keys: HashMap<TaskKey, Option<String>> = HashMap::with_capacity(task_graph.len());
+    let mut warned_projects: HashSet<PathBuf> = HashSet::new();
     for key in sequenced_tasks {
         let node = &task_graph[key];
         let manifest = graph[node.project.as_path()].package.project.manifest.value();
@@ -105,9 +144,35 @@ pub(super) fn compute_task_keys(
                 &config.extra_env_with_node_options(),
             ),
         })?;
+        if task_key.is_none() {
+            warn_without_git_inputs(cache, &node.project, &mut warned_projects, emit);
+        }
         keys.insert(key.clone(), task_key);
     }
     Ok(keys)
+}
+
+/// Explain a task that runs without a cache key because git cannot
+/// enumerate its project, once per project.
+fn warn_without_git_inputs(
+    cache: &TaskCache,
+    project: &Path,
+    warned_projects: &mut HashSet<PathBuf>,
+    emit: fn(&LogEvent),
+) {
+    let unavailable = cache.inputs_unavailable(project);
+    if !matches!(unavailable, Some(cache::InputsUnavailable::NoGit))
+        || !warned_projects.insert(project.to_path_buf())
+    {
+        return;
+    }
+    emit(&LogEvent::Pnpm(PnpmLog {
+        level: LogLevel::Warn,
+        message: "Cannot enumerate the tracked files of the project with git; running its tasks \
+                  without a cache key."
+            .to_string(),
+        prefix: project.to_string_lossy().into_owned(),
+    }));
 }
 
 fn task_script_bodies(

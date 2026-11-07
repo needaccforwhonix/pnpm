@@ -8,6 +8,8 @@ use crate::_utils;
 /// every package out of `node_modules/.pnpm`.
 mod workspace_yaml;
 
+mod quiet_output;
+
 mod dependency_build_scripts;
 
 /// `.modules.yaml`'s `pendingBuilds` — the record of builds
@@ -36,7 +38,15 @@ mod project_scripts_in_a_workspace;
 mod script_shell;
 
 /// `shellEmulator` extends to every lifecycle script an install runs,
-/// not only to `pnpm run`. Each test points `scriptShell` at a path that
-/// could never be spawned, so an install that still succeeds proves the
-/// built-in shell took over.
+/// not only to `pnpm run`, when `scriptShell` is unset.
 mod shell_emulator;
+
+/// A `scriptShell` that does not exist fails the spawn with an error that
+/// names it, not only the package directory the script was to run in.
+mod missing_script_shell;
+
+/// A project script that exits while a process it started in the
+/// background still holds its output pipes does not stall the install.
+/// Unix-only: the script backgrounds a POSIX `sleep`.
+#[cfg(unix)]
+mod background_output;

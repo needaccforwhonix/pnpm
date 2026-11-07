@@ -15,7 +15,9 @@ name = "pnpm"
 path = "src/bin/main.rs"
 
 [dependencies]
+pnpm-process = { path = "../process" }
 pnpm-python-installer = { workspace = true }
+pnpm-rust-toolchain = { workspace = true }
 pnpm-package-name = { workspace = true }
 cargo-util-schemas = { workspace = true }
 pnpm-auth-commands = { workspace = true }
@@ -40,6 +42,7 @@ pnpm-graph-hasher = { workspace = true }
 pnpm-hooks = { workspace = true }
 pnpm-injected-deps-syncer = { workspace = true }
 pnpm-install-coordinator = { workspace = true }
+pnpm-local-spec = { workspace = true }
 pnpm-lockfile = { workspace = true }
 pnpm-lockfile-import = { workspace = true }
 pnpm-lockfile-preferred-versions = { workspace = true }
@@ -49,6 +52,7 @@ pnpm-modules-yaml = { workspace = true }
 pnpm-network = { workspace = true }
 pnpm-network-web-auth = { workspace = true }
 pnpm-config = { workspace = true }
+pnpm-env-replace = { workspace = true }
 pnpm-config-parse-overrides = { workspace = true }
 pnpm-default-reporter = { workspace = true }
 pnpm-deps-inspection = { workspace = true }
@@ -63,9 +67,12 @@ pnpm-package-manager = { workspace = true }
 pnpm-patching = { workspace = true }
 pnpm-package-is-installable = { workspace = true }
 pnpm-registry = { workspace = true }
+pnpm-release-notes = { workspace = true }
 pnpm-reporter = { workspace = true }
+pnpm-resolving-deps-resolver = { workspace = true }
 pnpm-resolving-default-resolver = { workspace = true }
 pnpm-resolving-git-resolver = { workspace = true }
+pnpm-resolving-local-resolver = { workspace = true }
 pnpm-resolving-npm-resolver = { workspace = true }
 pnpm-resolving-parse-wanted-dependency = { workspace = true }
 pnpm-resolving-resolver-base = { workspace = true }
@@ -73,8 +80,10 @@ pnpm-semver-include-prerelease = { workspace = true }
 pnpm-store-dir = { workspace = true }
 pnpm-tarball = { workspace = true }
 pnpm-text-sanitize = { workspace = true }
+pnpm-text-section = { workspace = true }
 pnpm-diagnostics = { workspace = true }
 pnpm-directory-fetcher = { workspace = true }
+pnpm-tool-protocol = { workspace = true }
 pnpm-versioning = { workspace = true }
 pnpm-workspace = { workspace = true }
 pnpm-workspace-manifest-writer = { workspace = true }
@@ -93,43 +102,44 @@ dunce = { workspace = true }
 flate2 = { workspace = true }
 futures-util = { workspace = true }
 getrandom = { workspace = true }
-home = { workspace = true }
 indexmap = { workspace = true }
-is_ci = { workspace = true }
 node-semver = { workspace = true }
 miette = { workspace = true }
 owo-colors.workspace = true
 p256 = { workspace = true }
 pathdiff = { workspace = true }
+pep440_rs = { workspace = true }
+percent-encoding = { workspace = true }
 pipe-trait = { workspace = true }
 pubgrub = { workspace = true }
 rayon = { workspace = true }
 rustc-hash = { workspace = true }
 reflink-copy = { workspace = true }
 regex = { workspace = true }
-reqwest = { workspace = true }
+regress = { workspace = true, features = ["utf16"] }
 rmp-serde = { workspace = true }
 same-file = { workspace = true }
 serde = { workspace = true }
+serde-saphyr = { workspace = true }
 serde_json = { workspace = true }
 semver = { workspace = true }
 shell-words = { workspace = true }
+spdx = { workspace = true }
 ssri = { workspace = true }
 strum = { workspace = true }
 tabled = { workspace = true }
 tar = { workspace = true }
 tempfile = { workspace = true }
 toml = { workspace = true }
-tokio = { workspace = true, features = ["process"] }
+tokio = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
-which = { workspace = true }
 base64 = { workspace = true }
 wax = { workspace = true }
 
 # Windows has no process groups, so a Job Object ties the lifetime of spawned
 # children (lifecycle scripts and their descendants) to pacquet's. See
-# `src/job_control.rs`.
+# `pnpm/crates/executor/PROCESS_LIFETIME.md`.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
   "Win32_Storage_FileSystem",
@@ -140,23 +150,46 @@ windows-sys = { workspace = true, features = [
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
+# Keep in sync with the `#[global_allocator]` in `src/bin/main.rs`.
+[target.'cfg(all(any(target_os = "linux", target_os = "macos", target_os = "windows"), any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+mimalloc = { workspace = true }
+
 [dev-dependencies]
+pnpm-fs-packlist = { workspace = true }
 pnpm-network-web-auth-testing = { workspace = true }
 pnpm-testing-utils = { workspace = true }
 pnpr = { workspace = true }
+pnpr-fixtures = { workspace = true }
 
 assert_cmd = { workspace = true }
 command-extra = { workspace = true }
 dialoguer = { workspace = true }
+flate2 = { workspace = true }
 insta = { workspace = true }
 mockito = { workspace = true }
 pretty_assertions = { workspace = true }
-serde-saphyr = { workspace = true }
 sha2 = { workspace = true }
 ssri = { workspace = true }
+tar = { workspace = true }
 text-block-macros = { workspace = true }
 walkdir = { workspace = true }
 zip = { workspace = true }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+which = { workspace = true }
+home = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true, features = ["net", "process", "signal"] }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+pnpm-which = { workspace = true }
+pnpm-wasm-host = { path = "../wasm-host" }
+libc = { workspace = true }
+pnpm-http = { workspace = true }
+
+# The process-lifetime tests close a private console through its window.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Win32_UI_WindowsAndMessaging"] }
 
 [lints]
 workspace = true

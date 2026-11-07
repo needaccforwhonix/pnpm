@@ -1,10 +1,11 @@
-use crate::{
-    port_to_url::port_to_url, runtime_storage, seed_storage::seed_runtime_storage, workspace_root,
-};
+use crate::{port_to_url::port_to_url, seed_storage::seed_runtime_storage, workspace_root};
 use std::{
-    env,
+    env, fs,
+    hash::{DefaultHasher, Hash, Hasher},
+    io,
     path::{Path, PathBuf},
     process::Command,
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 /// Locate the `pnpr` binary built into the cargo workspace's
@@ -53,7 +54,7 @@ fn pnpr_binary() -> PathBuf {
 /// and anything else (e.g. extra npm packages the benchmark lockfile
 /// pulls) is fetched from npmjs.org on demand.
 ///
-/// `--packument-ttl-secs 31536000` (one year) keeps the fixture
+/// `--packument-ttl 31536000` (one year) keeps the fixture
 /// packuments authoritative across a test run: their on-disk
 /// mtime is whenever the npm tarball was built, which is far older
 /// than any sane TTL, so a short TTL would mark them stale and try
@@ -63,7 +64,7 @@ fn pnpr_binary() -> PathBuf {
 /// `cargo build -p pnpr` once before invoking the mock if
 /// it isn't already built. `--public-url` defaults to
 /// `http://localhost:<port>` so the tarball URLs the registry rewrites
-/// match the URL pacquet's tests expect via `port_to_url`. The
+/// sit under the URL [`crate::RegistryInfo::url`] returns. The
 /// integrated benchmark can override it when a proxy fronts the registry
 /// port: packuments served by pnpr must advertise the proxy URL, or
 /// tarball downloads bypass the emulated registry link.
@@ -79,15 +80,27 @@ pub fn pnpr_command(port: u16, public_url: Option<&str>) -> Command {
 /// read-only, so concurrent mocks don't contend.
 #[must_use]
 pub fn pnpr_command_with_binary(bin: &Path, port: u16, public_url: Option<&str>) -> Command {
+    pnpr_command_with_home(bin, port, public_url, None)
+}
+
+/// Like [`pnpr_command_with_binary`], keeping the hosted store and its
+/// metadata database in `home` instead of the fixture build's when one is
+/// given. The fixture build's store and database carry this checkout's
+/// layout and metadata schema, which a `pnpr` built from another revision
+/// may refuse; given a home of its own, that `pnpr` creates its own there
+/// and serves everything it proxies, sharing only the proxy cache.
+#[must_use]
+pub fn pnpr_command_with_home(
+    bin: &Path,
+    port: u16,
+    public_url: Option<&str>,
+    home: Option<&Path>,
+) -> Command {
     assert!(
         bin.is_file(),
         "pnpr binary not found at {bin:?} — \
          run `cargo build -p pnpr` before invoking the mock",
     );
-    // Seed the runtime storage with the registry-mock fixtures
-    // before pnpr starts serving. Idempotent — existing
-    // files are left alone, so CI can cache the runtime path
-    // across runs and only npm-proxied entries get fetched fresh.
     let seeded = seed_runtime_storage()
         .unwrap_or_else(|err| panic!("seed registry-mock fixtures into runtime storage: {err}"));
     if seeded > 0 {
@@ -100,19 +113,74 @@ pub fn pnpr_command_with_binary(bin: &Path, port: u16, public_url: Option<&str>)
         default_public_url = port_to_url(port);
         default_public_url.trim_end_matches('/')
     };
-    let mut cmd = Command::new(bin);
-    // `pnpr` defaults to its bundled registry-mock config (the fixture
-    // namespace served from local hosted storage, everything else proxied
-    // through the pattern-less npmjs upstream), which is exactly what the
-    // mock needs — no `-c` override required. We only pin the runtime
-    // bits the bundled config can't know about.
-    cmd.arg("--storage")
-        .arg(runtime_storage())
-        .arg("--packument-ttl-secs")
+    let mut cmd = command_without_pnpr_env(bin);
+    // Front pnpr with the registry-mock config from `pnpr/.fixtures/config.yaml`
+    // (the fixture namespace served from local hosted storage, everything else
+    // proxied through the pattern-less npmjs upstream). We pin the runtime bits
+    // the config file can't know about via CLI arguments.
+    let (storage, database) = match home {
+        Some(home) => (home.join("storage"), home.join("metadata.sqlite")),
+        None => (crate::runtime_hosted_storage(), crate::runtime_metadata_path()),
+    };
+    let config = runtime_mock_config(&database)
+        .unwrap_or_else(|err| panic!("write the registry-mock config into runtime storage: {err}"));
+    cmd.arg("--config")
+        .arg(config)
+        .arg("--storage")
+        .arg(storage)
+        .arg("--cache")
+        .arg(crate::runtime_cache())
+        .arg("--packument-ttl")
         .arg("31536000")
         .arg("--listen")
         .arg(format!("127.0.0.1:{port}"))
         .arg("--public-url")
         .arg(public_url);
     cmd
+}
+
+/// A [`Command`] of `bin` without the ambient `PNPR_*` variables. pnpr binds
+/// each of its options to the variable named after it, so an ambient one — a
+/// developer's `PNPR_CONFIG`, a stray `PNPR_DISABLE_REGISTRY` — would quietly
+/// reconfigure the mock. The arguments the caller adds are the only thing
+/// allowed to.
+fn command_without_pnpr_env(bin: &Path) -> Command {
+    let mut cmd = Command::new(bin);
+    for (name, _) in env::vars_os() {
+        let key = name.to_string_lossy().to_ascii_uppercase();
+        if key.starts_with("PNPR_") {
+            cmd.env_remove(&name);
+        }
+    }
+    cmd
+}
+
+/// The registry-mock config with the metadata `database` named outright,
+/// written beside the build's hosted store. A `pnpr` from another revision, such as the one the integrated benchmark compares against, may
+/// not move its default database along with `--storage`, and every revision
+/// reads a named one. The config is named after the fixture build and its
+/// own contents, so no mock reads a config another checkout wrote for
+/// another build or another fixture config.
+fn runtime_mock_config(database: &Path) -> io::Result<PathBuf> {
+    let database = std::path::absolute(database)?;
+    let url = format!("sqlite:{}", database.display()).replace('\'', "''");
+    let yaml = format!("{}\nmetadata:\n  url: '{url}'\n", pnpr_fixtures::MOCK_CONFIG_YAML);
+    let mut hasher = DefaultHasher::new();
+    yaml.hash(&mut hasher);
+    let mut path = std::path::absolute(crate::runtime_hosted_storage())?.into_os_string();
+    path.push(format!("-{:016x}.yaml", hasher.finish()));
+    let path = PathBuf::from(path);
+    if fs::read_to_string(&path).is_ok_and(|existing| existing == yaml) {
+        return Ok(path);
+    }
+    let directory = path.parent().expect("the config has a directory");
+    fs::create_dir_all(directory)?;
+    // One temporary name per write, so concurrent first launches in one
+    // process never rename each other's file.
+    static WRITES: AtomicU64 = AtomicU64::new(0);
+    let write = WRITES.fetch_add(1, Ordering::Relaxed);
+    let temp = path.with_extension(format!("yaml.{}-{write}", std::process::id()));
+    fs::write(&temp, yaml)?;
+    fs::rename(&temp, &path)?;
+    Ok(path)
 }

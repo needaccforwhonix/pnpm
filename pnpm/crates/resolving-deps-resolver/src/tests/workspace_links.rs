@@ -39,6 +39,7 @@ async fn workspace_link_node_is_short_circuited_in_tree() {
                     "peerDependencies": { "react": "^18.0.0" },
                     "dependencies": { "lodash": "^4.0.0" },
                 }))),
+                non_deprecated_alternative: None,
             },
         },
     );
@@ -72,7 +73,7 @@ async fn workspace_link_node_is_short_circuited_in_tree() {
     );
     let pkg = tree.packages.get(link_id).expect("link package entry");
     assert!(
-        pkg.peer_dependencies.is_empty(),
+        pkg.peer_set.taken().is_empty(),
         "link node's ResolvedPackage must carry no peer_dependencies — peer matching is the linked importer's responsibility",
     );
 }

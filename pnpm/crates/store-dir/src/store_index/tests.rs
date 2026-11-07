@@ -31,7 +31,7 @@ fn immutable_uri_absolutizes_a_relative_path() {
     assert!(uri.ends_with("/relative-store/index.db?immutable=1"), "{uri}");
 }
 
-fn sample_index() -> PackageFilesIndex {
+pub(super) fn sample_index() -> PackageFilesIndex {
     let mut files = HashMap::new();
     files.insert(
         "package.json".to_string(),
@@ -54,6 +54,7 @@ fn sample_index() -> PackageFilesIndex {
         files,
         side_effects: None,
         remote_side_effects_quarantine: None,
+        tar_integrity: None,
     }
 }
 
@@ -158,6 +159,84 @@ fn set_then_get_round_trips() {
         .expect("row must exist after set");
 
     assert_eq!(loaded, original);
+}
+
+#[test]
+fn readonly_index_reads_wal_commits_and_checkpointed_growth() {
+    let dir = tempdir().unwrap();
+    let writer = StoreIndex::open(dir.path()).unwrap();
+    let initial = sample_index();
+    for i in 0..1000 {
+        writer
+            .set(&format!("pkg-{i:06}"), &initial)
+            .unwrap();
+    }
+    writer
+        .sqlite_conn()
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    let reader = StoreIndex::open_readonly(dir.path()).unwrap();
+    assert_eq!(
+        reader
+            .get("pkg-000000")
+            .unwrap()
+            .as_ref(),
+        Some(&initial),
+    );
+
+    let mut added = sample_index();
+    added.files.get_mut("index.js").unwrap().size = 4096;
+    for i in 1000..1100 {
+        writer
+            .set(&format!("pkg-{i:06}"), &added)
+            .unwrap();
+    }
+    assert_eq!(
+        reader
+            .get("pkg-001099")
+            .unwrap()
+            .as_ref(),
+        Some(&added),
+    );
+    writer
+        .sqlite_conn()
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    assert_eq!(reader.get("pkg-001099").unwrap(), Some(added));
+    assert_eq!(reader.get("pkg-000000").unwrap(), Some(initial));
+}
+
+#[test]
+fn delete_many_shrinks_index_db() {
+    let dir = tempdir().unwrap();
+    let mut idx = StoreIndex::open(dir.path()).unwrap();
+    let keys: Vec<String> = (0..2000)
+        .map(|i| format!("pkg-{i:06}"))
+        .collect();
+    idx.set_many(
+        keys.iter()
+            .map(|key| (key.clone(), sample_index())),
+    )
+    .unwrap();
+    idx.sqlite_conn()
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    let pragma = |idx: &StoreIndex, name: &str| -> i64 {
+        idx.sqlite_conn()
+            .query_row(&format!("PRAGMA {name}"), [], |row| row.get(0))
+            .unwrap()
+    };
+    let pages_before = pragma(&idx, "page_count");
+
+    idx.delete_many(&keys[1..]).unwrap();
+
+    let pages_after = pragma(&idx, "page_count");
+    assert!(pages_after < pages_before);
+    assert_eq!(pragma(&idx, "freelist_count"), 0);
+    let db_len = std::fs::metadata(dir.path().join("index.db")).unwrap().len();
+    let page_size = pragma(&idx, "page_size");
+    assert_eq!(db_len, u64::try_from(pages_after * page_size).unwrap());
+    assert_eq!(idx.keys().unwrap(), [keys[0].clone()]);
 }
 
 #[test]
@@ -280,7 +359,7 @@ fn get_decodes_msgpackr_records_rows() {
         0x65, 0x63, 0x6b, 0x65, 0x64, 0x41, 0x74, 0xa3, 0x61, 0x62, 0x63, 0xcd, 0x01, 0xa4, 0x11,
         0xcb, 0x42, 0x78, 0xbc, 0xfe, 0x56, 0x80, 0x00, 0x00,
     ];
-    idx.conn
+    idx.sqlite_conn()
         .execute(
             "INSERT INTO package_index (key, data) VALUES (?1, ?2)",
             rusqlite::params![key, msgpackr_row],
@@ -458,7 +537,7 @@ fn get_many_skips_undecodable_rows() {
     let good_key = store_index_key("sha512-good", "good@1.0.0");
     let bad_key = store_index_key("sha512-bad", "bad@1.0.0");
     idx.set(&good_key, &payload).unwrap();
-    idx.conn
+    idx.sqlite_conn()
         .execute(
             "INSERT INTO package_index (key, data) VALUES (?1, ?2)",
             rusqlite::params![&bad_key, &b"not msgpack"[..]],
@@ -550,4 +629,40 @@ fn open_immutable_reads_wal_db_on_readonly_directory() {
             "immutable open must not create the {sidecar} sidecar",
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn new_index_db_inherits_group_write_and_reopen_keeps_owner_and_mode() {
+    use std::{
+        fs,
+        os::unix::fs::{MetadataExt, PermissionsExt},
+    };
+
+    let tmp = tempdir().unwrap();
+    fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o2775)).unwrap();
+    let store = tmp.path().join("store");
+    drop(StoreIndex::open(&store).unwrap());
+
+    let db = store.join("index.db");
+    let created = fs::metadata(&db).unwrap();
+    assert_ne!(created.permissions().mode() & 0o020, 0, "new index.db must be group-writable");
+    assert_eq!(created.gid(), fs::metadata(tmp.path()).unwrap().gid());
+    assert_eq!(
+        fs::metadata(&store)
+            .unwrap()
+            .permissions()
+            .mode()
+            & (0o020 | 0o2000),
+        0o020 | 0o2000,
+    );
+
+    fs::set_permissions(&db, fs::Permissions::from_mode(0o600)).unwrap();
+    let before = fs::metadata(&db).unwrap();
+    drop(StoreIndex::open(&store).unwrap());
+    let after = fs::metadata(&db).unwrap();
+    assert_eq!(after.uid(), before.uid());
+    assert_eq!(after.gid(), before.gid());
+    assert_eq!(after.ino(), before.ino());
+    assert_eq!(after.permissions().mode() & 0o777, 0o600);
 }

@@ -26,6 +26,7 @@ pub(crate) async fn select_global_package_groups<Reporter: self::Reporter>(
         match_names: None,
         ignore_names: ignored.as_ref(),
         include_deprecated: false,
+        full_metadata: false,
     };
     let Some(matched_packages) = matching_global_packages(&global_pkg_dir, packages)? else {
         return Ok(None);
@@ -38,7 +39,7 @@ pub(crate) async fn select_global_package_groups<Reporter: self::Reporter>(
     let Some(selected_indices) = prompt.select(
         "Choose which global package groups to update (space to select, enter to confirm)",
         &rows,
-        PromptStyle::GlobalGroups,
+        (PromptStyle::GlobalGroups, &super::ChoiceNotes::new()),
     )?
     else {
         report_cancelled::<Reporter>();
@@ -89,7 +90,12 @@ async fn outdated_group_rows(
             })
             .collect::<Vec<_>>()
             .join(", ");
-        rows.push(PromptRow::Choice { short: label.clone(), label, value: pkg.hash });
+        rows.push(PromptRow::Choice {
+            short: label.clone(),
+            label,
+            value: pkg.hash,
+            notes_key: None,
+        });
     }
     Ok(rows)
 }
@@ -105,7 +111,7 @@ fn matching_global_packages(
     let global_packages = pnpm_global::scan_global_packages(global_pkg_dir)
         .map_err(|err| miette!("failed to scan global packages: {err}"))?;
     if global_packages.is_empty() {
-        println!("No global packages found");
+        pnpm_diagnostics::println!("No global packages found");
         return Ok(None);
     }
     let global_packages: Vec<_> = global_packages
@@ -113,7 +119,9 @@ fn matching_global_packages(
         .filter(|pkg| !has_pnpm_cli_dependency(pkg))
         .collect();
     if global_packages.is_empty() {
-        println!(r#"No global packages to update. Run "pnpm self-update" to update pnpm itself."#);
+        pnpm_diagnostics::println!(
+            r#"No global packages to update. Run "pnpm self-update" to update pnpm itself."#,
+        );
         return Ok(None);
     }
     if packages.is_empty() {
@@ -128,7 +136,7 @@ fn matching_global_packages(
         })
         .collect::<Vec<_>>();
     if matched.is_empty() {
-        println!("No matching global packages found");
+        pnpm_diagnostics::println!("No matching global packages found");
         return Ok(None);
     }
     Ok(Some(matched))

@@ -1,6 +1,6 @@
 use super::{
     LinkVirtualStoreBins, LinkVirtualStoreBinsError, PrefetchedBinLookup, build_has_bin_set,
-    link_direct_dep_bins, link_direct_dep_bins_prefetched,
+    link_direct_dep_bins, link_direct_dep_bins_prefetched, link_new_bins_from_locations,
 };
 use crate::{SkippedSnapshots, VirtualStoreLayout};
 use pnpm_cmd_shim::{LinkBinsOptions, is_shim_pointing_at};
@@ -57,6 +57,7 @@ fn writes_child_bins_into_slot_own_package_node_modules() {
         selected_snapshots: None,
         packages: None,
         package_manifests: &HashMap::default(),
+        package_bins: None,
         skipped: &SkippedSnapshots::default(),
         link_options: &LinkBinsOptions::default(),
     }
@@ -67,7 +68,7 @@ fn writes_child_bins_into_slot_own_package_node_modules() {
     assert!(shim_path.exists(), "expected shim at {shim_path:?}");
     let body = read_to_string(&shim_path).unwrap();
     assert!(
-        body.contains(r#""$basedir/../../../child/cli.js""#),
+        body.contains(r#""$basedir_abs"/'../../../child/cli.js'"#),
         "shim must reference the sibling child via the right number of `..`s, got:\n{body}",
     );
 }
@@ -111,6 +112,7 @@ fn skips_slot_own_package_when_walking_children() {
         selected_snapshots: None,
         packages: None,
         package_manifests: &HashMap::default(),
+        package_bins: None,
         skipped: &SkippedSnapshots::default(),
         link_options: &LinkBinsOptions::default(),
     }
@@ -141,6 +143,7 @@ fn link_virtual_store_bins_no_op_when_dir_missing() {
         selected_snapshots: None,
         packages: None,
         package_manifests: &HashMap::default(),
+        package_bins: None,
         skipped: &SkippedSnapshots::default(),
         link_options: &LinkBinsOptions::default(),
     }
@@ -184,6 +187,7 @@ fn link_virtual_store_bins_handles_scoped_slot_name() {
         selected_snapshots: None,
         packages: None,
         package_manifests: &HashMap::default(),
+        package_bins: None,
         skipped: &SkippedSnapshots::default(),
         link_options: &LinkBinsOptions::default(),
     }
@@ -239,6 +243,7 @@ fn link_virtual_store_bins_handles_peer_resolved_slot_name() {
         selected_snapshots: None,
         packages: None,
         package_manifests: &HashMap::default(),
+        package_bins: None,
         skipped: &SkippedSnapshots::default(),
         link_options: &LinkBinsOptions::default(),
     }
@@ -294,6 +299,7 @@ fn link_virtual_store_bins_handles_unscoped_name_with_plus() {
         selected_snapshots: None,
         packages: None,
         package_manifests: &HashMap::default(),
+        package_bins: None,
         skipped: &SkippedSnapshots::default(),
         link_options: &LinkBinsOptions::default(),
     }
@@ -324,6 +330,7 @@ fn link_virtual_store_bins_skips_slot_without_node_modules() {
         selected_snapshots: None,
         packages: None,
         package_manifests: &HashMap::default(),
+        package_bins: None,
         skipped: &SkippedSnapshots::default(),
         link_options: &LinkBinsOptions::default(),
     }
@@ -356,6 +363,7 @@ fn link_virtual_store_bins_skips_slot_without_own_package_dir() {
         selected_snapshots: None,
         packages: None,
         package_manifests: &HashMap::default(),
+        package_bins: None,
         skipped: &SkippedSnapshots::default(),
         link_options: &LinkBinsOptions::default(),
     }
@@ -416,6 +424,7 @@ fn lockfile_driven_linking_only_visits_selected_snapshots() {
         selected_snapshots: Some(&selected_snapshots),
         packages: Some(&packages),
         package_manifests: &HashMap::default(),
+        package_bins: None,
         skipped: &SkippedSnapshots::default(),
         link_options: &LinkBinsOptions::default(),
     }
@@ -452,7 +461,7 @@ fn link_direct_dep_bins_writes_shims_for_each_dep() {
     let shim = modules.join(".bin/foo");
     assert!(shim.exists(), "shim should be created at {shim:?}");
     let body = read_to_string(&shim).unwrap();
-    assert!(is_shim_pointing_at(&body, &foo_dir.join("cli.js")));
+    assert!(is_shim_pointing_at(&body, &shim, &foo_dir.join("cli.js")));
 }
 
 /// [`link_direct_dep_bins`] with no deps is a no-op. It must not even
@@ -510,6 +519,50 @@ fn link_direct_dep_bins_skips_dep_with_missing_manifest() {
     assert!(!modules.join(".bin").exists());
 }
 
+#[test]
+fn read_dep_bin_source_skips_missing_publish_directory() {
+    let tmp = tempdir().unwrap();
+    let project = tmp.path().join("project");
+    create_dir_all(&project).unwrap();
+    write_file(
+        project.join("package.json"),
+        json!({ "name": "foo", "bin": "cli.js", "publishConfig": { "directory": "dist" } })
+            .to_string(),
+    )
+    .unwrap();
+
+    let source = super::direct::read_dep_bin_source(
+        &tmp.path().join("node_modules"),
+        "foo",
+        &project.join("dist"),
+    );
+
+    assert!(source.is_none(), "a missing publish directory has no bins");
+}
+
+/// A publish target that cannot be inspected surfaces the error instead of
+/// being taken for a missing directory. A path through a regular file fails
+/// with `ENOTDIR` on Unix, where Windows reports it as not found.
+#[cfg(unix)]
+#[test]
+fn read_dep_bin_source_reports_publish_directory_inspection_error() {
+    let tmp = tempdir().unwrap();
+    let file = tmp.path().join("file");
+    write_file(&file, "").unwrap();
+    let target = file.join("dist");
+
+    let error =
+        super::direct::read_dep_bin_source(&tmp.path().join("node_modules"), "foo", &target)
+            .expect("an inspection error yields a result")
+            .expect_err("an inspection error is not a bin source");
+
+    dbg!(&error);
+    assert!(
+        matches!(&error, pnpm_cmd_shim::LinkBinsError::ResolvePath { path, .. } if path == &target),
+        "expected ResolvePath for {target:?}",
+    );
+}
+
 /// [`LinkVirtualStoreBins::run_with`] propagates a non-`NotFound`
 /// `read_dir` error on the virtual-store directory itself. Real fs
 /// can't trigger this portably; the fake forces the
@@ -559,7 +612,7 @@ fn link_virtual_store_bins_propagates_read_error_via_di() {
         }
     }
     impl FsEnsureExecutableBits for DenyVirtualStore {
-        fn ensure_executable_bits(_: &Path) -> io::Result<()> {
+        fn ensure_executable_bits(_: &Path, _: Option<&Path>) -> io::Result<()> {
             unreachable!()
         }
     }
@@ -583,6 +636,7 @@ fn link_virtual_store_bins_propagates_read_error_via_di() {
         selected_snapshots: None,
         packages: None,
         package_manifests: &HashMap::default(),
+        package_bins: None,
         skipped: &SkippedSnapshots::default(),
         link_options: &LinkBinsOptions::default(),
     }
@@ -624,17 +678,12 @@ fn dummy_binary_resolution() -> BinaryResolution {
     }
 }
 
-/// `build_has_bin_set` must include runtime resolutions
-/// (`Binary` / `Variations`) unconditionally, *regardless of*
-/// `meta.has_bin`. Pnpm v11 doesn't emit `hasBin: true` for
-/// runtime entries in `pnpm-lock.yaml` (the bin info lives on
-/// `resolution.bin`, not at the metadata level), so the existing
-/// `has_bin == Some(true)` filter would drop runtime slots from
-/// the bin-link dispatch and the synthesized `package.json`
-/// (from `install_package_by_snapshot::synthesize_runtime_manifest_bytes`)
-/// would go unread.
+/// Runtime resolutions must be included without `has_bin` because pnpm v11
+/// records their bin in the resolution instead of emitting `hasBin: true`.
+/// Directory resolutions need the same fallback because deploy lockfiles can
+/// omit `hasBin` for workspace packages.
 #[test]
-fn build_has_bin_set_includes_runtime_resolutions_even_when_has_bin_is_absent() {
+fn build_has_bin_set_includes_resolutions_with_implicit_bin_metadata() {
     let registry_with_bin: PackageKey = "react@18.0.0".parse().expect("parse react key");
     let registry_no_bin: PackageKey = "lodash@4.17.0".parse().expect("parse lodash key");
     let runtime_binary: PackageKey = "node@22.0.0".parse().expect("parse node key");
@@ -664,20 +713,20 @@ fn build_has_bin_set_includes_runtime_resolutions_even_when_has_bin_is_absent() 
     );
     packages.insert(
         runtime_binary.clone(),
-        // Runtime entry without `has_bin: true` (pnpm v11 does
-        // not emit it for runtimes). Must still land in the set.
         metadata_with_resolution(LockfileResolution::Binary(dummy_binary_resolution()), None),
     );
     packages.insert(
         runtime_variations.clone(),
         metadata_with_resolution(
             LockfileResolution::Variations(VariationsResolution {
+                revision: None,
                 variants: vec![PlatformAssetResolution {
                     resolution: LockfileResolution::Binary(dummy_binary_resolution()),
                     targets: vec![PlatformAssetTarget {
                         os: "linux".into(),
                         cpu: "x64".into(),
                         libc: Some("glibc".into()),
+                        ..PlatformAssetTarget::default()
                     }],
                 }],
             }),
@@ -702,7 +751,7 @@ fn build_has_bin_set_includes_runtime_resolutions_even_when_has_bin_is_absent() 
         set.contains(&runtime_variations),
         "Variations runtime must be in the set unconditionally",
     );
-    assert!(!set.contains(&directory), "directory without has_bin must be filtered out");
+    assert!(set.contains(&directory), "directory without has_bin must be probed for bins");
 }
 
 #[test]
@@ -766,7 +815,7 @@ fn prefetched_bin_pass_reads_a_may_build_dep_from_disk() {
     )
     .unwrap();
     let body = read_to_string(modules.join(".bin/foo")).expect("may-build dep read from disk");
-    assert!(is_shim_pointing_at(&body, &foo_dir.join("cli.js")));
+    assert!(is_shim_pointing_at(&body, &modules.join(".bin/foo"), &foo_dir.join("cli.js")));
 }
 
 #[test]
@@ -801,7 +850,139 @@ fn prefetched_bin_pass_links_from_the_prefetched_manifest_without_a_disk_manifes
     .unwrap();
     let shim = modules.join(".bin/foo");
     let body = read_to_string(&shim).expect("shim written from the prefetched manifest");
-    assert!(is_shim_pointing_at(&body, &foo_dir.join("cli.js")));
+    assert!(is_shim_pointing_at(&body, &shim, &foo_dir.join("cli.js")));
+}
+
+#[test]
+fn prefetched_and_virtual_store_bin_passes_use_precalculated_bins_without_disk_reads() {
+    use pnpm_cmd_shim::{
+        FsCreateDirAll, FsEnsureExecutableBits, FsReadDir, FsReadFile, FsReadHead, FsReadToString,
+        FsSetExecutable, FsWalkFiles, FsWrite, Host,
+    };
+    use std::io;
+
+    struct NoSourceReads;
+    impl FsReadDir for NoSourceReads {
+        fn read_dir(dir: &Path) -> io::Result<impl Iterator<Item = PathBuf>> {
+            Host::read_dir(dir)
+        }
+    }
+    impl FsReadFile for NoSourceReads {
+        fn read_file(path: &Path) -> io::Result<Vec<u8>> {
+            panic!("unexpected FsReadFile at {path:?}");
+        }
+    }
+    impl FsReadToString for NoSourceReads {
+        fn read_to_string(path: &Path) -> io::Result<String> {
+            Host::read_to_string(path)
+        }
+    }
+    impl FsReadHead for NoSourceReads {
+        fn read_head(path: &Path, _: u64, _: &mut [u8]) -> io::Result<usize> {
+            panic!("unexpected FsReadHead at {path:?}");
+        }
+    }
+    impl FsCreateDirAll for NoSourceReads {
+        fn create_dir_all(dir: &Path) -> io::Result<()> {
+            Host::create_dir_all(dir)
+        }
+    }
+    impl FsWalkFiles for NoSourceReads {
+        fn walk_files(dir: &Path) -> io::Result<impl Iterator<Item = PathBuf>> {
+            panic!("unexpected FsWalkFiles at {dir:?}");
+            #[expect(unreachable_code, reason = "satisfy return type")]
+            Ok(empty())
+        }
+    }
+    impl FsWrite for NoSourceReads {
+        fn write(path: &Path, data: &[u8]) -> io::Result<()> {
+            Host::write(path, data)
+        }
+    }
+    impl FsSetExecutable for NoSourceReads {
+        fn set_executable(path: &Path) -> io::Result<()> {
+            Host::set_executable(path)
+        }
+    }
+    impl FsEnsureExecutableBits for NoSourceReads {
+        fn ensure_executable_bits(path: &Path, modules_dir: Option<&Path>) -> io::Result<()> {
+            Host::ensure_executable_bits(path, modules_dir)
+        }
+    }
+
+    let tmp = tempdir().unwrap();
+    let virtual_dir = tmp.path().join(".pacquet");
+    let layout = VirtualStoreLayout::legacy(
+        virtual_dir,
+        pnpm_config::default_virtual_store_dir_max_length() as usize,
+    );
+    let key: PackageKey = "foo@1.0.0".parse().expect("parse key");
+    let pkg_dir = layout.slot_dir(&key).join("node_modules/foo");
+    create_dir_all(pkg_dir.join("bin")).unwrap();
+    // Script on disk has NO shebang, and there is NO package.json on disk.
+    write_file(pkg_dir.join("bin/cli.js"), "console.log('hi');\n").unwrap();
+
+    let packages = HashMap::from([(
+        key.clone(),
+        metadata_with_resolution(
+            LockfileResolution::Directory(DirectoryResolution { directory: "foo".into() }),
+            Some(true),
+        ),
+    )]);
+    let manifests = HashMap::from([(
+        key.clone(),
+        std::sync::Arc::new(json!({
+            "name": "foo",
+            "version": "1.0.0",
+            "directories": { "bin": "bin" }
+        })),
+    )]);
+    let bins = HashMap::from([(
+        key.clone(),
+        std::sync::Arc::new(std::collections::BTreeMap::from([(
+            "cli.js".to_string(),
+            pnpm_package_manifest::PackageBin {
+                path: "bin/cli.js".to_string(),
+                prog: Some("node".to_string()),
+                args: "--experimental-strip-types".to_string(),
+            },
+        )])),
+    )]);
+    let requires_build = HashMap::from([(key.clone(), false)]);
+    let snapshots = HashMap::from([(key.clone(), SnapshotEntry::default())]);
+
+    LinkVirtualStoreBins {
+        layout: &layout,
+        snapshots: Some(&snapshots),
+        selected_snapshots: None,
+        packages: Some(&packages),
+        package_manifests: &manifests,
+        package_bins: Some(&bins),
+        skipped: &SkippedSnapshots::default(),
+        link_options: &LinkBinsOptions::default(),
+    }
+    .run_with::<NoSourceReads>()
+    .expect("virtual store bin pass must succeed without reading package.json, walking directories.bin, or reading shebangs");
+
+    let slot_shim = pkg_dir.join("node_modules/.bin/cli.js");
+    let slot_body = read_to_string(&slot_shim).expect("slot shim written");
+    assert!(slot_body.contains("--experimental-strip-types"), "got:\n{slot_body}");
+
+    let modules = tmp.path().join("node_modules");
+    create_dir_all(&modules).unwrap();
+    pnpm_fs::symlink_dir(&pkg_dir, &modules.join("foo")).unwrap();
+    let lookup = PrefetchedBinLookup::new(Some(&packages), Some(&manifests), Some(&requires_build))
+        .with_package_bins(Some(&bins));
+    link_direct_dep_bins_prefetched(
+        &modules,
+        &[("foo".to_string(), pkg_dir, Some(key))],
+        &lookup,
+        &LinkBinsOptions::default(),
+    )
+    .unwrap();
+    let direct_shim = modules.join(".bin/cli.js");
+    let direct_body = read_to_string(&direct_shim).expect("direct shim written");
+    assert!(direct_body.contains("--experimental-strip-types"), "got:\n{direct_body}");
 }
 
 #[test]
@@ -827,5 +1008,53 @@ fn prefetched_bin_pass_reads_a_link_dep_from_disk() {
     )
     .unwrap();
     let body = read_to_string(modules.join(".bin/sibling")).expect("link: dep read from disk");
-    assert!(is_shim_pointing_at(&body, &sibling_dir.join("cli.js")));
+    assert!(is_shim_pointing_at(&body, &modules.join(".bin/sibling"), &sibling_dir.join("cli.js")));
+}
+
+/// On Windows, a command already in `.bin` keeps its entry whatever case
+/// its shim or executable extension is written in. Elsewhere `node.EXE`
+/// is a command of its own and does not hold `node`.
+#[test]
+fn link_new_bins_from_locations_keeps_commands_with_any_windows_extension() {
+    let tmp = tempdir().unwrap();
+    let modules_dir = tmp.path().join("node_modules");
+    let bins_dir = modules_dir.join(".bin");
+    create_dir_all(&bins_dir).unwrap();
+    for existing in ["node.EXE", "shared.CMD", "other.Ps1"] {
+        write_file(bins_dir.join(existing), "existing").unwrap();
+    }
+    let project = tmp.path().join("project");
+    create_dir_all(&project).unwrap();
+    write_file(project.join("cli.js"), "#!/usr/bin/env node\n").unwrap();
+    let bin: serde_json::Map<String, serde_json::Value> = ["node", "shared", "other", "own"]
+        .into_iter()
+        .map(|name| (name.to_owned(), json!("cli.js")))
+        .collect();
+    write_file(project.join("package.json"), json!({ "name": "project", "bin": bin }).to_string())
+        .unwrap();
+
+    link_new_bins_from_locations(&modules_dir, &[project], &LinkBinsOptions::default()).unwrap();
+
+    let mut linked: Vec<String> = std::fs::read_dir(&bins_dir)
+        .unwrap()
+        .map(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .into_string()
+                .unwrap()
+        })
+        .filter(|name| !["node.EXE", "shared.CMD", "other.Ps1"].contains(&name.as_str()))
+        .map(|name| {
+            name.split('.')
+                .next()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    linked.sort();
+    linked.dedup();
+    let expected: &[&str] =
+        if cfg!(windows) { &["own"] } else { &["node", "other", "own", "shared"] };
+    assert_eq!(linked, expected);
 }

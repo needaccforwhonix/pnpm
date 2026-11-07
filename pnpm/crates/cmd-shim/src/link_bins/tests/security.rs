@@ -5,6 +5,8 @@ use super::{
 #[cfg(unix)]
 use super::{is_sh_shim_hardened, is_shim_pointing_at};
 #[cfg(unix)]
+use crate::shim::generate_sh_shim;
+#[cfg(unix)]
 use std::fs::metadata;
 
 #[cfg(unix)]
@@ -92,13 +94,13 @@ fn prefer_symlinked_executables_links_bins_as_relative_symlinks() {
     let tmp = tempdir().unwrap();
     let pkg_dir = tmp.path().join("node_modules/foo");
     create_dir_all(&pkg_dir).unwrap();
+    let cli_js = pkg_dir.join("cli.js");
     write_file(
         pkg_dir.join("package.json"),
         json!({"name": "foo", "version": "1.0.0", "bin": "cli.js"}).to_string(),
     )
     .unwrap();
-    write_file(pkg_dir.join("cli.js"), "#!/usr/bin/env node\nconsole.log('hello_world')\n")
-        .unwrap();
+    write_file(&cli_js, "#!/usr/bin/env node\nconsole.log('hello_world')\n").unwrap();
 
     let bins_dir = tmp.path().join("node_modules/.bin");
     let manifest_value: Value =
@@ -106,7 +108,7 @@ fn prefer_symlinked_executables_links_bins_as_relative_symlinks() {
     let options =
         LinkBinsOptions { prefer_symlinked_executables: true, ..LinkBinsOptions::default() };
     link_bins_of_packages::<Host>(
-        &[PackageBinSource::new(pkg_dir.clone(), Arc::new(manifest_value))],
+        &[PackageBinSource::new(pkg_dir, Arc::new(manifest_value))],
         &bins_dir,
         &options,
     )
@@ -136,7 +138,7 @@ fn prefer_symlinked_executables_links_bins_as_relative_symlinks() {
     {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(
-            metadata(pkg_dir.join("cli.js"))
+            metadata(&cli_js)
                 .unwrap()
                 .permissions()
                 .mode()
@@ -199,7 +201,7 @@ fn dangling_symlink_at_shim_path_is_replaced_with_a_shim() {
     .unwrap();
 
     let body = read_to_string(bins_dir.join("foo")).expect("real shim replaces the dangling link");
-    assert!(is_shim_pointing_at(&body, &pkg.join("cli.js")));
+    assert!(is_shim_pointing_at(&body, &bins_dir.join("foo"), &pkg.join("cli.js")));
 }
 
 #[cfg(unix)]
@@ -232,7 +234,7 @@ fn stale_shim_rewrite_replaces_a_symlink_instead_of_writing_through_it() {
         "the shim is a regular file",
     );
     let body = read_to_string(bins_dir.join("foo")).unwrap();
-    assert!(is_shim_pointing_at(&body, &pkg.join("cli.js")));
+    assert!(is_shim_pointing_at(&body, &bins_dir.join("foo"), &pkg.join("cli.js")));
 }
 
 /// A shim an older pacquet wrote still points at the right target, so the warm
@@ -273,7 +275,7 @@ exec node  "$basedir/../foo/cli.js" "$@"
     );
     write_file(&shim, &outdated).unwrap();
     assert!(
-        is_shim_pointing_at(&outdated, &target),
+        is_shim_pointing_at(&outdated, &shim, &target),
         "precondition: the outdated shim carries a matching target marker, so only the \
          header tells it apart from a current one",
     );
@@ -287,9 +289,208 @@ exec node  "$basedir/../foo/cli.js" "$@"
     .unwrap();
 
     let body = read_to_string(&shim).unwrap();
-    assert!(is_shim_pointing_at(&body, &target), "the rewritten shim keeps its target");
+    assert!(is_shim_pointing_at(&body, &shim, &target), "the rewritten shim keeps its target");
     assert!(
         is_sh_shim_hardened(&body),
         "the reinstall must replace a shim that resolves its helpers on PATH, body was:\n{body}",
+    );
+}
+
+/// A shim that already looks up `readlink` with `command -p` can still pipe
+/// `$link` through `echo`. The target marker matches, so a warm reinstall
+/// has to notice the conversion line and replace the shim.
+#[cfg(unix)]
+#[test]
+fn a_reinstall_replaces_a_shim_that_pipes_the_path_through_echo() {
+    let manifest = serde_json::json!({"name": "foo", "bin": "cli.js"});
+    let tmp = tempdir().unwrap();
+    let pkg = tmp.path().join("foo");
+    create_dir_all(&pkg).unwrap();
+    write_file(pkg.join("cli.js"), "#!/usr/bin/env node\n").unwrap();
+    let target = pkg.join("cli.js");
+    let bins_dir = tmp.path().join(".bin");
+    create_dir_all(&bins_dir).unwrap();
+    let shim = bins_dir.join("foo");
+    let outdated = format!(
+        r#"#!/bin/sh
+link="$0"
+case "$link" in
+  */*|*\\*) ;;
+  *) link="./$link" ;;
+esac
+hops=0
+while [ -L "$link" ] && [ "$hops" -lt 40 ]; do
+  hops=$((hops+1))
+  target=$(command -p readlink "$link")
+  case "$target" in
+    /*) link="$target" ;;
+    *)  link="${{link%/*}}/$target" ;;
+  esac
+done
+basedir=$(echo "$link" | command -p sed -e 's,\\,/,g')
+basedir="${{basedir%/*}}"
+exec node  "$basedir/../foo/cli.js" "$@"
+# cmd-shim-target={}
+"#,
+        target.display(),
+    );
+    write_file(&shim, &outdated).unwrap();
+    assert!(
+        is_shim_pointing_at(&outdated, &shim, &target),
+        "precondition: the outdated shim carries a matching target marker",
+    );
+    assert!(
+        outdated.contains(r#"  target=$(command -p readlink "$link")"#),
+        "precondition: helpers already resolve off the system path",
+    );
+    assert!(!is_sh_shim_hardened(&outdated), "precondition: the echo conversion is not current");
+
+    link_bins_of_packages::<Host>(
+        &[PackageBinSource::new(pkg, Arc::new(manifest))],
+        &bins_dir,
+        &LinkBinsOptions::default(),
+    )
+    .unwrap();
+
+    let body = read_to_string(&shim).unwrap();
+    assert!(is_shim_pointing_at(&body, &shim, &target), "the rewritten shim keeps its target");
+    assert!(
+        is_sh_shim_hardened(&body),
+        "the reinstall must replace a shim that pipes $link through echo, body was:\n{body}",
+    );
+}
+
+/// A shim can carry the hardened `readlink` and `printf` lines and still take
+/// its Windows path conversion from the caller's `PATH`. The target marker
+/// matches, so a warm reinstall has to notice the conversion helpers and
+/// replace the shim.
+#[cfg(unix)]
+#[test]
+fn a_reinstall_replaces_a_shim_that_converts_paths_with_a_helper_from_the_callers_path() {
+    let manifest = serde_json::json!({"name": "foo", "bin": "cli.js"});
+    let tmp = tempdir().unwrap();
+    let pkg = tmp.path().join("foo");
+    create_dir_all(&pkg).unwrap();
+    write_file(pkg.join("cli.js"), "#!/usr/bin/env node\n").unwrap();
+    let target = pkg.join("cli.js");
+    let bins_dir = tmp.path().join(".bin");
+    create_dir_all(&bins_dir).unwrap();
+    let shim = bins_dir.join("foo");
+    let outdated = generate_sh_shim(&target, &shim, None, &[], None)
+        .replace("command -p cygpath", "cygpath")
+        .replace("command -p wslpath", "wslpath");
+    write_file(&shim, &outdated).unwrap();
+    assert!(
+        is_shim_pointing_at(&outdated, &shim, &target),
+        "precondition: the outdated shim carries a matching target marker",
+    );
+    assert!(
+        outdated.contains(r#"  target=$(run_helper readlink "$link")"#),
+        "precondition: the other helpers already resolve off the system path",
+    );
+    assert!(
+        !is_sh_shim_hardened(&outdated),
+        "precondition: PATH-resolved path conversion is not current",
+    );
+
+    link_bins_of_packages::<Host>(
+        &[PackageBinSource::new(pkg, Arc::new(manifest))],
+        &bins_dir,
+        &LinkBinsOptions::default(),
+    )
+    .unwrap();
+
+    let body = read_to_string(&shim).unwrap();
+    assert!(is_shim_pointing_at(&body, &shim, &target), "the rewritten shim keeps its target");
+    assert!(
+        is_sh_shim_hardened(&body),
+        "the reinstall must replace a shim that converts paths with a helper from PATH, \
+         body was:\n{body}",
+    );
+}
+
+/// A shim can resolve every helper through `command -p` and still leave the
+/// caller's `node_modules` entries on the `PATH` that `command -p` searches on
+/// Nix. The target marker matches, so a warm reinstall has to notice the missing
+/// filter and replace the shim.
+#[cfg(unix)]
+#[test]
+fn a_reinstall_replaces_a_shim_that_resolves_helpers_with_node_modules_on_path() {
+    let manifest = serde_json::json!({"name": "foo", "bin": "cli.js"});
+    let tmp = tempdir().unwrap();
+    let pkg = tmp.path().join("foo");
+    create_dir_all(&pkg).unwrap();
+    write_file(pkg.join("cli.js"), "#!/usr/bin/env node\n").unwrap();
+    let target = pkg.join("cli.js");
+    let bins_dir = tmp.path().join(".bin");
+    create_dir_all(&bins_dir).unwrap();
+    let shim = bins_dir.join("foo");
+    let outdated = generate_sh_shim(&target, &shim, None, &[], None)
+        .replace("    */node_modules/*|*/node_modules) ;;\n", "");
+    write_file(&shim, &outdated).unwrap();
+    assert!(
+        is_shim_pointing_at(&outdated, &shim, &target),
+        "precondition: the outdated shim carries a matching target marker",
+    );
+    assert!(!is_sh_shim_hardened(&outdated), "precondition: the unfiltered PATH is not current");
+
+    link_bins_of_packages::<Host>(
+        &[PackageBinSource::new(pkg, Arc::new(manifest))],
+        &bins_dir,
+        &LinkBinsOptions::default(),
+    )
+    .unwrap();
+
+    let body = read_to_string(&shim).unwrap();
+    assert!(is_shim_pointing_at(&body, &shim, &target), "the rewritten shim keeps its target");
+    assert!(
+        is_sh_shim_hardened(&body),
+        "the reinstall must replace a shim that keeps node_modules on the helpers' PATH, \
+         body was:\n{body}",
+    );
+}
+
+/// A shim can resolve every helper through `command -p` alone, which finds
+/// nothing where the default path lacks the helpers, as inside a Nix build
+/// sandbox. The target marker matches, so a warm reinstall has to notice the
+/// missing fallback and replace the shim.
+#[cfg(unix)]
+#[test]
+fn a_reinstall_replaces_a_shim_whose_helpers_have_no_path_fallback() {
+    let manifest = serde_json::json!({"name": "foo", "bin": "cli.js"});
+    let tmp = tempdir().unwrap();
+    let pkg = tmp.path().join("foo");
+    create_dir_all(&pkg).unwrap();
+    write_file(pkg.join("cli.js"), "#!/usr/bin/env node\n").unwrap();
+    let target = pkg.join("cli.js");
+    let bins_dir = tmp.path().join(".bin");
+    create_dir_all(&bins_dir).unwrap();
+    let shim = bins_dir.join("foo");
+    let outdated = generate_sh_shim(&target, &shim, None, &[], None)
+        .replace("run_helper readlink", "command -p readlink")
+        .replace("run_helper printf", "command -p printf")
+        .replace("run_helper sed", "command -p sed");
+    write_file(&shim, &outdated).unwrap();
+    assert!(
+        is_shim_pointing_at(&outdated, &shim, &target),
+        "precondition: the outdated shim carries a matching target marker",
+    );
+    assert!(
+        !is_sh_shim_hardened(&outdated),
+        "precondition: helpers without a fallback are not current",
+    );
+
+    link_bins_of_packages::<Host>(
+        &[PackageBinSource::new(pkg, Arc::new(manifest))],
+        &bins_dir,
+        &LinkBinsOptions::default(),
+    )
+    .unwrap();
+
+    let body = read_to_string(&shim).unwrap();
+    assert!(is_shim_pointing_at(&body, &shim, &target), "the rewritten shim keeps its target");
+    assert!(
+        is_sh_shim_hardened(&body),
+        "the reinstall must replace a shim whose helpers have no PATH fallback, body was:\n{body}",
     );
 }

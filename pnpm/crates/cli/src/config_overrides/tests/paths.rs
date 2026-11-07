@@ -232,7 +232,7 @@ fn store_dir_override_expands_quoted_home_path() {
         }
     }
 
-    let mut config = Config::default();
+    let mut config = Config { store_dir_placement_skipped: true, ..Config::default() };
     apply_store_dir_override::<FakeHome>(
         &mut config,
         std::path::Path::new("~/quoted-store"),
@@ -248,6 +248,7 @@ fn store_dir_override_expands_quoted_home_path() {
         config.explicit_settings.get("storeDir"),
         Some(&serde_json::Value::String("~/quoted-store".to_string())),
     );
+    assert!(!config.store_dir_placement_skipped, "a pinned store needs no placement");
 }
 
 #[test]
@@ -403,10 +404,19 @@ fn the_modules_and_virtual_store_dirs_are_anchored_at_the_workspace_root() {
     assert_eq!(remaining, argv(["pacquet", "install"]));
 
     let workspace_dir = PathBuf::from("/workspace");
-    let mut config = Config { workspace_dir: Some(workspace_dir.clone()), ..Config::default() };
-    overrides.apply(&mut config, Path::new("/workspace/pkg"));
-    assert_eq!(config.modules_dir, workspace_dir.join("custom_modules"));
-    assert_eq!(config.virtual_store_dir, workspace_dir.join("custom_store"));
+    for enable_global_virtual_store in [false, true] {
+        let mut config = Config {
+            workspace_dir: Some(workspace_dir.clone()),
+            enable_global_virtual_store,
+            ..Config::default()
+        };
+        overrides.apply(&mut config, Path::new("/workspace/pkg"));
+        assert_eq!(config.modules_dir, workspace_dir.join("custom_modules"));
+        assert_eq!(config.virtual_store_dir(), workspace_dir.join("custom_store"));
+        let internal_dir =
+            if enable_global_virtual_store { "custom_modules/.pnpm" } else { "custom_store" };
+        assert_eq!(config.install_state_dir, workspace_dir.join(internal_dir));
+    }
 }
 
 #[test]
@@ -417,7 +427,7 @@ fn the_modules_dir_alone_re_anchors_the_default_virtual_store() {
     let workspace_dir = PathBuf::from("/workspace");
     let mut config = Config { workspace_dir: Some(workspace_dir.clone()), ..Config::default() };
     overrides.apply(&mut config, Path::new("/workspace"));
-    assert_eq!(config.virtual_store_dir, workspace_dir.join("custom_modules/.pnpm"));
+    assert_eq!(config.install_state_dir, workspace_dir.join("custom_modules/.pnpm"));
 }
 
 #[test]
@@ -433,4 +443,53 @@ fn the_global_dir_override_re_derives_the_global_package_dir() {
         config.global_pkg_dir,
         Some(Path::new("/custom/global").join(pnpm_config::GLOBAL_LAYOUT_VERSION)),
     );
+}
+
+#[test]
+fn store_dir_override_matching_the_relocated_default_does_not_warn() {
+    struct FakeHome;
+
+    impl GetHomeDir for FakeHome {
+        fn home_dir() -> Option<PathBuf> {
+            unreachable!("an absolute store directory does not consult the home directory")
+        }
+    }
+
+    impl EnvVar for FakeHome {
+        fn var(_: &str) -> Option<String> {
+            unreachable!("an absolute store directory does not consult environment variables")
+        }
+    }
+
+    impl GetCurrentDir for FakeHome {
+        fn current_dir() -> std::io::Result<PathBuf> {
+            unreachable!("an absolute store directory does not consult the current directory")
+        }
+    }
+
+    impl LinkProbe for FakeHome {
+        fn can_link_between_dirs(_: &std::path::Path, _: &std::path::Path) -> bool {
+            unreachable!("an explicit store directory does not probe filesystem linkability")
+        }
+    }
+
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let home_store_dir = temp.path().join("home/store");
+    std::fs::create_dir_all(home_store_dir.join(STORE_VERSION)).expect("create home store");
+    let relocated = temp.path().join("volume/.pnpm-store");
+    let mut config = Config {
+        store_dir: relocated.clone().into(),
+        store_relocation: Some(Box::new(pnpm_config::StoreRelocation {
+            home_store_dir: home_store_dir.into(),
+            store_dir: relocated.clone().into(),
+        })),
+        ..Config::default()
+    };
+    assert!(config.bypassed_home_store_warning().is_some());
+
+    apply_store_dir_override::<FakeHome>(&mut config, &relocated, temp.path())
+        .expect("apply an absolute store directory");
+
+    assert_eq!(config.store_dir.root(), relocated.join(STORE_VERSION));
+    assert_eq!(config.bypassed_home_store_warning(), None);
 }

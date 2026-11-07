@@ -30,7 +30,7 @@ fn walker_multi_importer_emits_per_importer_direct_deps() {
     );
     let lockfile_dir = PathBuf::from("/repo");
     let opts = LockfileToHoistedDepGraphOptions {
-        lockfile_dir: lockfile_dir.clone(),
+        modules_dirs: crate::ImporterModulesDirs::node_modules(&lockfile_dir),
         ..LockfileToHoistedDepGraphOptions::default()
     };
     let result = lockfile_to_hoisted_dep_graph(&lockfile, None, &opts).expect("walker succeeds");
@@ -75,7 +75,7 @@ fn walker_multi_importer_emits_per_importer_hierarchy() {
     );
     let lockfile_dir = PathBuf::from("/repo");
     let opts = LockfileToHoistedDepGraphOptions {
-        lockfile_dir: lockfile_dir.clone(),
+        modules_dirs: crate::ImporterModulesDirs::node_modules(&lockfile_dir),
         ..LockfileToHoistedDepGraphOptions::default()
     };
     let result = lockfile_to_hoisted_dep_graph(&lockfile, None, &opts).expect("walker succeeds");
@@ -120,7 +120,7 @@ fn walker_hoist_workspace_packages_false_keeps_importer_deps() {
             hoist_workspace_packages: false,
             ..LockfileToHoistedDepGraphOptions::default().placement
         },
-        lockfile_dir: lockfile_dir.clone(),
+        modules_dirs: crate::ImporterModulesDirs::node_modules(&lockfile_dir),
 
         ..LockfileToHoistedDepGraphOptions::default()
     };
@@ -157,7 +157,7 @@ fn walker_multi_importer_version_conflict_nests_loser() {
     );
     let lockfile_dir = PathBuf::from("/repo");
     let opts = LockfileToHoistedDepGraphOptions {
-        lockfile_dir,
+        modules_dirs: crate::ImporterModulesDirs::node_modules(&lockfile_dir),
         ..LockfileToHoistedDepGraphOptions::default()
     };
     let result = lockfile_to_hoisted_dep_graph(&lockfile, None, &opts).expect("walker succeeds");
@@ -201,7 +201,7 @@ fn walker_workspace_root_version_wins_root_slot() {
     );
     let lockfile_dir = PathBuf::from("/repo");
     let opts = LockfileToHoistedDepGraphOptions {
-        lockfile_dir: lockfile_dir.clone(),
+        modules_dirs: crate::ImporterModulesDirs::node_modules(&lockfile_dir),
         ..LockfileToHoistedDepGraphOptions::default()
     };
     let result = lockfile_to_hoisted_dep_graph(&lockfile, None, &opts).expect("walker succeeds");
@@ -227,4 +227,48 @@ fn walker_workspace_root_version_wins_root_slot() {
         root_webby,
     );
     assert_eq!(result.direct_dependencies_by_importer_id["packages/app"]["webby"], nested_webby);
+}
+/// Two projects that lose the root slot with the same snapshot each get a
+/// copy under their own `node_modules`, and each project's direct dependency
+/// is its own copy.
+#[test]
+fn walker_projects_sharing_a_nested_snapshot_keep_their_own_copy() {
+    let mut root_deps = ResolvedDependencyMap::new();
+    root_deps.insert(pkg_name("webby"), resolved_dep("5.0.0"));
+
+    let mut project_deps = ResolvedDependencyMap::new();
+    project_deps.insert(pkg_name("webby"), resolved_dep("2.0.0"));
+
+    let mut packages = HashMap::new();
+    packages.insert(dep_key("webby", "5.0.0"), metadata_stub());
+    packages.insert(dep_key("webby", "2.0.0"), metadata_stub());
+
+    let mut snapshots = HashMap::new();
+    snapshots.insert(dep_key("webby", "5.0.0"), SnapshotEntry::default());
+    snapshots.insert(dep_key("webby", "2.0.0"), SnapshotEntry::default());
+
+    let lockfile = workspace_lockfile(
+        vec![
+            (Lockfile::ROOT_IMPORTER_KEY, root_deps),
+            ("packages/app", project_deps.clone()),
+            ("packages/web", project_deps),
+        ],
+        packages,
+        snapshots,
+    );
+    let lockfile_dir = PathBuf::from("/repo");
+    let opts = LockfileToHoistedDepGraphOptions {
+        modules_dirs: crate::ImporterModulesDirs::node_modules(&lockfile_dir),
+        ..LockfileToHoistedDepGraphOptions::default()
+    };
+    let result = lockfile_to_hoisted_dep_graph(&lockfile, None, &opts).expect("walker succeeds");
+
+    for project in ["packages/app", "packages/web"] {
+        let own_copy = lockfile_dir
+            .join(project)
+            .join("node_modules")
+            .join("webby");
+        assert!(result.graph.contains_key(&own_copy), "{project} holds a copy");
+        assert_eq!(result.direct_dependencies_by_importer_id[project]["webby"], own_copy);
+    }
 }

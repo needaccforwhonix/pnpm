@@ -1,7 +1,9 @@
 //! Applying fixes: overrides, ignores, and dependency updates.
 
+pub(super) mod overrides;
 pub(super) mod update;
 
+pub(crate) use overrides::{create_overrides_from_pruned, prune_subsumed_advisories};
 pub(crate) use update::{
     AuditFixObserver, VulnerabilityGuard, fix_with_update, format_fix_with_update_output,
 };
@@ -10,11 +12,11 @@ use super::{
     Arc, AuditAdvisory, AuditError, AuditReport, BTreeMap, Config, ConfigAuditLevel, DateTime,
     DependencyGroup, Deserialize, HashMap, HashSet, IntoDiagnostic, Lockfile, MultiSelect,
     PackageVersionGuard, Range, RangeSpecStyle, Reporter, ResolutionObserver, State, Update, Utc,
-    Version, blue, caret_range_for_patched, color_severity, encode_package_name, green,
-    normalize_ghsa_id, normalize_registry, parse_packument_timestamp, patched_range_for_style, red,
-    redact_url_userinfo, retry_opts_from_config, satisfies_including_prerelease, send_with_retry,
-    severity_name, severity_number,
+    Version, blue, color_severity, encode_package_name, green, normalize_ghsa_id,
+    parse_packument_timestamp, red, satisfies_including_prerelease, send_with_retry, severity_name,
+    severity_number,
 };
+use pnpm_network::{normalize_registry_url, redact_url_credentials};
 use update::advisory_choices;
 
 /// Filter `report`'s advisories down to the set both fix methods and the
@@ -81,23 +83,6 @@ pub(crate) fn prune_ignored_ghsas(
     PruneIgnoredGhsasResult { pruned, retained }
 }
 
-/// Build the `name@vulnerable_versions → patched-range` override map from the
-/// fixable advisories (those with an inferred patched range), saving each
-/// minimum patched version in the style of `range_spec_style`. Keyed by a
-/// `BTreeMap` so the output is sorted, mirroring pnpm's `sortDirectKeys`.
-pub(crate) fn create_overrides(
-    advisories: &BTreeMap<String, AuditAdvisory>,
-    range_spec_style: RangeSpecStyle,
-) -> BTreeMap<String, String> {
-    let mut overrides = BTreeMap::new();
-    for advisory in advisories.values() {
-        let Some(patched) = advisory.patched_versions.as_deref() else { continue };
-        let key = format!("{}@{}", advisory.module_name, advisory.vulnerable_versions);
-        overrides.insert(key, patched_range_for_style(patched, range_spec_style));
-    }
-    overrides
-}
-
 /// Write the override-method fixes to `pnpm-workspace.yaml` and return the
 /// user-facing summary. Mirrors the override branch of pnpm's audit handler.
 /// `publish_infos` reuses the packument data the report validation already
@@ -108,8 +93,9 @@ pub(crate) async fn fix_override(
     config: &Config,
     publish_infos: &HashMap<String, Option<PackumentPublishInfo>>,
 ) -> miette::Result<String> {
-    let overrides = create_overrides(
-        advisories,
+    let pruned_advisories = prune_subsumed_advisories(advisories);
+    let overrides = create_overrides_from_pruned(
+        &pruned_advisories,
         RangeSpecStyle::from_save_options(config.save_exact, config.save_prefix.as_deref()),
     );
     if overrides.is_empty() {
@@ -128,8 +114,11 @@ pub(crate) async fn fix_override(
         overrides.len(),
     );
     if let Some(minimum_release_age) = config.resolved_minimum_release_age() {
-        let added =
-            resolve_minimum_release_age_excludes(advisories, publish_infos, minimum_release_age)?;
+        let added = resolve_minimum_release_age_excludes(
+            &pruned_advisories,
+            publish_infos,
+            minimum_release_age,
+        )?;
         if !added.is_empty() {
             write_age_excludes(settings_dir, &added)?;
             let note = format!(
@@ -205,14 +194,14 @@ pub(crate) async fn fetch_publish_times(
         deprecated: Option<String>,
     }
 
-    let registry = normalize_registry(registry);
+    let registry = normalize_registry_url(registry);
     let url = format!("{registry}{}", encode_package_name(name));
     // The URL is user-configured and may embed credentials; keep only the
     // redacted form, like the audit request does, so retry diagnostics never
     // print them (auth travels in the header instead).
-    let url = redact_url_userinfo(&url);
+    let url = redact_url_credentials(&url);
     let authorization = config.auth_headers.for_url_with_package(&registry, Some(name));
-    let retry_opts = retry_opts_from_config(config);
+    let retry_opts = config.retry_opts();
     let (_guard, response) = send_with_retry(http_client, &url, retry_opts, |client| {
         // Full metadata: the abbreviated packument has no `time` field.
         let mut request = client.get(&url).header("accept", "application/json; q=1.0, */*");
@@ -320,8 +309,16 @@ pub(crate) fn write_age_excludes(
     })
 }
 
+/// What [`ignore_vulnerabilities`] persisted.
+pub(crate) struct IgnoredVulnerabilities {
+    /// The user-facing summary of the newly ignored GHSA ids.
+    pub summary: String,
+    /// The merged `auditConfig.ignoreGhsas` list that was written.
+    pub ignore_ghsas: Vec<String>,
+}
+
 /// Merge the requested ignores into `auditConfig.ignoreGhsas` and persist
-/// them, returning the user-facing summary. Mirrors pnpm's `ignore()`:
+/// them. Mirrors pnpm's `ignore()`:
 /// `--ignore-unfixable` adds every advisory with no inferable fix (erroring
 /// when one lacks a GHSA id); otherwise the `--ignore` GHSA ids are added.
 pub(crate) fn ignore_vulnerabilities(
@@ -330,7 +327,7 @@ pub(crate) fn ignore_vulnerabilities(
     settings_dir: &std::path::Path,
     ignore: &[String],
     ignore_unfixable: bool,
-) -> miette::Result<String> {
+) -> miette::Result<IgnoredVulnerabilities> {
     let mut ordered: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for ghsa in config.audit_config.ignore_ghsas.iter().map(|ghsa| normalize_ghsa_id(ghsa)) {
@@ -361,7 +358,7 @@ pub(crate) fn ignore_vulnerabilities(
                 .wrap_err("write auditConfig.ignoreGhsas to pnpm-workspace.yaml")
         })?;
 
-    Ok(ignored_summary(&new_ignores))
+    Ok(IgnoredVulnerabilities { summary: ignored_summary(&new_ignores), ignore_ghsas: ordered })
 }
 
 fn ignored_summary(new_ignores: &[String]) -> String {
@@ -400,8 +397,9 @@ fn unfixable_ghsa_ids(report: &AuditReport) -> miette::Result<Vec<String>> {
 /// severity-grouped table.
 pub(crate) fn interactive_select(
     advisories: BTreeMap<String, AuditAdvisory>,
+    range_spec_style: RangeSpecStyle,
 ) -> miette::Result<Option<BTreeMap<String, AuditAdvisory>>> {
-    let (keys, labels) = advisory_choices(&advisories);
+    let (keys, labels) = advisory_choices(&advisories, range_spec_style);
 
     // Nothing fixable: mirror pnpm returning the report unchanged (the fix
     // method then makes no changes).
@@ -409,10 +407,6 @@ pub(crate) fn interactive_select(
         return Ok(Some(advisories));
     }
 
-    // `interact_opt` distinguishes an explicit cancel (Esc/Ctrl-C → `Ok(None)`)
-    // from a prompt failure (`Err`). A failure must not be swallowed into a
-    // clean audit, so it propagates; a cancel or empty selection is "nothing
-    // to do".
     let selected = MultiSelect::new()
         .with_prompt("Choose which vulnerabilities to fix (space to select, enter to confirm)")
         .items(&labels)
@@ -433,10 +427,8 @@ pub(crate) fn interactive_select(
         advisories
             .into_iter()
             .filter(|(_, advisory)| {
-                chosen.contains(&format!(
-                    "{}@{}",
-                    advisory.module_name, advisory.vulnerable_versions,
-                ))
+                let key = format!("{}@{}", advisory.module_name, advisory.vulnerable_versions);
+                chosen.contains(&key)
             })
             .collect(),
     ))

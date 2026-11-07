@@ -1,6 +1,8 @@
 use crate::fast_update_compose::Drift;
 use pnpm_config::Config;
-use pnpm_lockfile::{ImporterDepVersion, Lockfile, LockfileSettings, ProjectSnapshot};
+use pnpm_lockfile::{
+    ImporterDepVersion, Lockfile, LockfileSettings, ProjectSnapshot, ResolutionSettings,
+};
 use pnpm_package_manifest::{DependencyGroup, PackageManifest};
 use std::{
     collections::{HashMap, HashSet},
@@ -15,10 +17,36 @@ pub(crate) fn lockfile_settings_from_config(config: &Config) -> LockfileSettings
         auto_install_peers: config.auto_install_peers,
         dedupe_peers: config.dedupe_peers.then_some(true),
         exclude_links_from_lockfile: config.exclude_links_from_lockfile,
+        add_missing_peer_types: config.add_missing_peer_types.then_some(true),
+        project_scoped_optional_peers: config
+            .project_scoped_optional_peers_take_effect()
+            .then_some(true),
         inject_workspace_packages: config.inject_workspace_packages,
         peers_suffix_max_length: (config.peers_suffix_max_length
             != pnpm_config::default_peers_suffix_max_length())
         .then_some(config.peers_suffix_max_length),
+        integrity_target: (config.lockfile_integrity_target
+            != pnpm_lockfile::IntegrityTarget::Resource)
+            .then_some(config.lockfile_integrity_target),
+        resolution: resolution_settings_from_config(config),
+    }
+}
+
+/// The values `lockfile.includeResolutionSettings` records, all unset when
+/// that setting is off.
+pub(crate) fn resolution_settings_from_config(config: &Config) -> ResolutionSettings {
+    if !config.lockfile_include_resolution_settings {
+        return ResolutionSettings::default();
+    }
+    ResolutionSettings {
+        auto_dedupe: Some(config.auto_dedupe),
+        dedupe_injected_deps: Some(config.dedupe_injected_deps),
+        dedupe_peer_dependents: Some(config.dedupe_peer_dependents),
+        link_workspace_packages: Some(
+            crate::install_state::settings::link_workspace_packages_to_json(
+                config.link_workspace_packages,
+            ),
+        ),
     }
 }
 
@@ -29,8 +57,12 @@ pub(crate) enum ChangedSetting {
     AutoInstallPeers,
     DedupePeers,
     ExcludeLinksFromLockfile,
+    AddMissingPeerTypes,
+    ProjectScopedOptionalPeers,
     PeersSuffixMaxLength,
     InjectWorkspacePackages,
+    IntegrityTarget,
+    ResolutionSettings,
 }
 
 /// Whether the lockfile's recorded `settings` block drifted from the
@@ -80,28 +112,61 @@ fn changed_settings(
     if pnpm_lockfile::auto_install_peers_changed(recorded, settings.auto_install_peers) {
         changed.push(ChangedSetting::AutoInstallPeers);
     }
-    if pnpm_lockfile::recorded_dedupe_peers(recorded)
-        != pnpm_lockfile::recorded_dedupe_peers(Some(settings))
-    {
-        changed.push(ChangedSetting::DedupePeers);
-    }
     if pnpm_lockfile::exclude_links_from_lockfile_changed(
         recorded,
         settings.exclude_links_from_lockfile,
     ) {
         changed.push(ChangedSetting::ExcludeLinksFromLockfile);
     }
+    changed.extend(changed_flags(recorded, settings));
     if pnpm_lockfile::recorded_peers_suffix_max_length(recorded)
         != pnpm_lockfile::recorded_peers_suffix_max_length(Some(settings))
     {
         changed.push(ChangedSetting::PeersSuffixMaxLength);
     }
-    if pnpm_lockfile::recorded_inject_workspace_packages(recorded)
-        != pnpm_lockfile::recorded_inject_workspace_packages(Some(settings))
+    if integrity_target_changed(recorded, settings) {
+        changed.push(ChangedSetting::IntegrityTarget);
+    }
+    // Unrecorded settings are dropped on write rather than compared.
+    if settings.resolution != ResolutionSettings::default()
+        && recorded.map(|recorded| &recorded.resolution) != Some(&settings.resolution)
     {
-        changed.push(ChangedSetting::InjectWorkspacePackages);
+        changed.push(ChangedSetting::ResolutionSettings);
     }
     changed
+}
+
+/// The boolean settings whose recorded value, absent counting as `false`,
+/// differs from `settings`.
+fn changed_flags<'a>(
+    recorded: Option<&'a LockfileSettings>,
+    settings: &'a LockfileSettings,
+) -> impl Iterator<Item = ChangedSetting> + 'a {
+    type RecordedFlag = fn(Option<&LockfileSettings>) -> bool;
+    let flags: [(ChangedSetting, RecordedFlag); 4] = [
+        (ChangedSetting::DedupePeers, pnpm_lockfile::recorded_dedupe_peers),
+        (ChangedSetting::AddMissingPeerTypes, pnpm_lockfile::recorded_add_missing_peer_types),
+        (
+            ChangedSetting::ProjectScopedOptionalPeers,
+            pnpm_lockfile::recorded_project_scoped_optional_peers,
+        ),
+        (
+            ChangedSetting::InjectWorkspacePackages,
+            pnpm_lockfile::recorded_inject_workspace_packages,
+        ),
+    ];
+    flags
+        .into_iter()
+        .filter(move |(_, recorded_flag)| recorded_flag(recorded) != recorded_flag(Some(settings)))
+        .map(|(setting, _)| setting)
+}
+
+fn integrity_target_changed(
+    recorded: Option<&LockfileSettings>,
+    settings: &LockfileSettings,
+) -> bool {
+    recorded.map(LockfileSettings::integrity_target).unwrap_or_default()
+        != settings.integrity_target()
 }
 
 fn setting_cannot_affect_lockfile(
@@ -113,6 +178,8 @@ fn setting_cannot_affect_lockfile(
     match setting {
         ChangedSetting::AutoInstallPeers
         | ChangedSetting::DedupePeers
+        | ChangedSetting::AddMissingPeerTypes
+        | ChangedSetting::ProjectScopedOptionalPeers
         | ChangedSetting::PeersSuffixMaxLength => has_no_peer_dependencies(lockfile, manifests),
         ChangedSetting::ExcludeLinksFromLockfile => {
             has_no_linked_dependencies(lockfile, manifests, workspace_package_names)
@@ -120,10 +187,13 @@ fn setting_cannot_affect_lockfile(
         ChangedSetting::InjectWorkspacePackages => {
             has_no_injectable_dependencies(lockfile, manifests, workspace_package_names)
         }
+        // Only a resolution under the recorded values may record them, and
+        // only a resolution rewrites every hash for another target.
+        ChangedSetting::ResolutionSettings | ChangedSetting::IntegrityTarget => false,
     }
 }
 
-/// All three peer settings only change how peer dependencies are
+/// The peer settings only change how peer dependencies are
 /// resolved, deduplicated, and hashed into depPath suffixes. None of
 /// them has anything to act on when no package or project declares a
 /// peer dependency and no depPath carries a peers suffix.

@@ -1,9 +1,23 @@
 use super::{
     API_VERSION_HEADER, Body, CHALLENGE, DOCKER_CONTENT_DIGEST, DOCKER_UPLOAD_UUID, Digest,
-    ErrorBody, ErrorCode, HeaderValue, ManifestEntry, RegistryError, Response, Serialize,
+    ErrorBody, ErrorCode, HeaderValue, ManifestEntry, Method, RegistryError, Response, Serialize,
     StatusCode, header,
 };
 use axum::response::IntoResponse;
+
+/// Whether a response carries its body. A `HEAD` reply advertises the
+/// length it would have sent and sends nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ResponseBody {
+    Sent,
+    Omitted,
+}
+
+impl ResponseBody {
+    pub(super) fn for_method(method: &Method) -> Self {
+        if method == Method::HEAD { ResponseBody::Omitted } else { ResponseBody::Sent }
+    }
+}
 
 pub(super) fn insert_header(response: &mut Response, name: &'static str, value: &str) {
     let value = HeaderValue::from_str(value).expect("generated OCI response header is valid");
@@ -42,6 +56,12 @@ pub(super) fn ranged_blob_response(
     }
 }
 
+/// A refusal on its way to becoming a response, small enough to ride in a
+/// `Result`'s error slot as the response itself is not.
+///
+/// The status is carried rather than re-derived from the code, because a
+/// `RegistryError` has already chosen one, and deriving it back from the spec
+/// code would answer `405` for every error that has no code of its own.
 pub(in super::super) struct Refusal {
     pub(super) status: StatusCode,
     pub(super) code: ErrorCode,
@@ -55,8 +75,15 @@ impl Refusal {
     }
 
     pub(in super::super) fn respond(self) -> Response {
-        let status = self.original.map_or(self.status, |err| err.into_response().status());
-        respond(status, self.code, self.message)
+        let mut response = respond(self.status, self.code, self.message);
+        if let Some(err) = self.original {
+            let original = err.into_response();
+            *response.status_mut() = original.status();
+            if let Some(retry_after) = original.headers().get(header::RETRY_AFTER) {
+                response.headers_mut().insert(header::RETRY_AFTER, retry_after.clone());
+            }
+        }
+        response
     }
 }
 
@@ -188,14 +215,16 @@ pub(super) fn created(location: &str, digest: &Digest) -> Response {
         .unwrap_or_else(|_| server_error())
 }
 
-/// HEAD advertises the manifest's full length while sending no body.
 pub(super) fn hosted_manifest_response(
     bytes: Vec<u8>,
     entry: ManifestEntry,
-    head: bool,
+    body: ResponseBody,
 ) -> Response {
     let length = bytes.len();
-    let body = if head { Body::empty() } else { Body::from(bytes) };
+    let body = match body {
+        ResponseBody::Omitted => Body::empty(),
+        ResponseBody::Sent => Body::from(bytes),
+    };
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, entry.media_type)

@@ -1,5 +1,7 @@
 pub mod build_graph;
 pub mod build_modules;
+pub mod cas;
+pub mod claimed_commands;
 pub mod create_symlink_layout;
 pub mod create_virtual_dir_by_snapshot;
 pub mod create_virtual_store;
@@ -10,6 +12,7 @@ pub mod hoist;
 pub mod hoisted_dep_graph;
 pub mod hoisting_limits;
 pub mod import_indexed_dir;
+pub mod importer_modules_dirs;
 pub mod install_context;
 pub mod install_frozen_lockfile;
 pub mod install_package_by_snapshot;
@@ -22,10 +25,12 @@ pub mod link_root_component_members;
 pub mod linking;
 pub mod materialization_plan;
 pub mod package_map;
+pub mod platform_selection;
 pub mod pnp;
 pub mod prune_direct_deps;
 pub mod prune_stale_modules;
 pub mod remove_quarantine;
+pub mod report_direct_dependency_changes;
 pub mod retry_config;
 pub mod safe_join_modules_dir;
 pub mod store_init;
@@ -34,32 +39,37 @@ pub mod symlink_package;
 pub mod validate_lockfile_paths;
 pub mod version_policy;
 pub mod virtual_store_layout;
+
+pub(crate) use pnpm_process as process;
+
 pub use build_graph::*;
 pub use build_modules::*;
 pub use build_options::{
     BuildCacheContext, BuildGraphInputs, BuildLayout, BuildProgress, BuildScriptOptions,
-    BuildSnapshotInputs,
+    BuildSnapshotInputs, CachedSideEffects, PatchedEngineCheck, ScriptPath,
 };
+pub use claimed_commands::ClaimedCommands;
 pub use create_symlink_layout::*;
 pub use create_virtual_dir_by_snapshot::*;
 pub use create_virtual_store::*;
 pub use current_lockfile::*;
-pub use custom_fetcher::CustomFetcherSession;
+pub use custom_fetcher::{CustomFetcherSession, ResolvedTarballMetadata};
 pub use deps_graph::*;
 pub use dir_clone_cache::*;
 pub use frozen_install_options::{
     FrozenInstallDrivers, FrozenInstallSeed, FrozenLockfileInputs, FrozenPlatformOptions,
-    FrozenProjectInputs, PriorMaterialization,
+    FrozenProjectInputs, PriorMaterialization, SharedFetchCaches,
 };
 pub use hoist::*;
 pub use hoisted_dep_graph::*;
 pub use hoisting_limits::*;
 pub use import_indexed_dir::*;
+pub use importer_modules_dirs::ImporterModulesDirs;
 pub use install_context::*;
 pub use install_frozen_lockfile::*;
 pub use install_options::{
-    DirectLinkPolicy, ImporterDependencyGraph, ImporterLinkContext, SkipSetClosure,
-    SnapshotSelection, VirtualStoreFetchInputs,
+    DirectLinkPolicy, ImporterDependencyGraph, ImporterLinkContext, PlatformLockfile,
+    SkipSetClosure, SnapshotSelection, VirtualStoreFetchInputs,
 };
 pub use install_package_by_snapshot::*;
 pub use install_package_from_registry::*;
@@ -73,11 +83,12 @@ pub use materialization_options::{
     ModuleLinkerContext, PackageImportOptions, RegistryFetchContext, SlotImportSource,
     SnapshotDependencyLinks, SnapshotFetchContext, VirtualStoreLinkOptions,
 };
+pub use modules_swap_lock::ModulesSwapLock;
 pub use package_map::*;
 pub use phase_options::{
     BuildPhaseCache, BuildPhaseDirectories, BuildPhaseGraph, BuildPhasePolicy, HoistedLinkGraph,
     HoistedProjects, LinkLockfiles, LinkPackageData, LinkProjects, PriorHoistedState,
-    PriorLinkState,
+    PriorLinkState, PruneTreeOptions,
 };
 pub use pnp::*;
 pub use pnpm_workspace_task_scheduler::{GraphSequencerResult, PathNode, graph_sequencer};
@@ -91,10 +102,19 @@ pub use version_policy::*;
 pub use virtual_store_layout::*;
 
 mod custom_fetcher;
+mod gvs_slot_lock;
 mod installed_hoisted_state;
+mod link_pool;
+mod prune_extraneous_deps;
 mod shared_side_effects;
 
 pub const NEEDS_BUILD_MARKER: &str = ".pnpm-needs-build";
+
+/// Cargo's checksum manifest of a vendored package directory. The Cargo
+/// installer imports it with the package's files, and
+/// [`import_indexed_dir()`] places it last, as the import's completion
+/// marker.
+pub const CARGO_CHECKSUM_FILE: &str = ".cargo-checksum.json";
 
 pub fn store_index_key_for_resolution(
     resolution: &pnpm_lockfile::LockfileResolution,
@@ -129,25 +149,21 @@ pub fn snapshot_has_patch(snapshot_key: &pnpm_lockfile::PackageKey) -> bool {
         .is_some()
 }
 
-/// Returns the package identity used to match a lockfile snapshot against
-/// `patchedDependencies`.
-///
-/// Non-registry package keys carry their resolution in the version slot, so
-/// the manifest version recorded in `packages:` takes precedence when present.
+/// Whether the calling thread is inside a multi-thread tokio runtime, the
+/// only one on which `block_in_place` works. The `current_thread` runtime
+/// that `#[tokio::test]` defaults to panics on it.
 #[must_use]
-pub fn name_version_from_package_key(
-    key: &pnpm_lockfile::PackageKey,
-    packages: Option<
-        &std::collections::HashMap<pnpm_lockfile::PackageKey, pnpm_lockfile::PackageMetadata>,
-    >,
-) -> (String, String) {
-    let metadata_key = key.without_peer();
-    let name = metadata_key.name.to_string();
-    let version = packages
-        .and_then(|packages| packages.get(&metadata_key))
-        .and_then(|metadata| metadata.version.clone())
-        .unwrap_or_else(|| metadata_key.suffix.version().to_string());
-    (name, version)
+pub fn on_multi_thread_runtime() -> bool {
+    tokio::runtime::Handle::try_current()
+        .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+}
+
+/// Run `work`, which blocks its thread, from inside an `async fn`. On the
+/// multi-thread runtime, `block_in_place` moves the worker's other futures
+/// to another worker so async progress continues. Elsewhere `work` runs
+/// as a plain call.
+pub fn block_in_place_if_multi_thread<Output>(work: impl FnOnce() -> Output) -> Output {
+    if on_multi_thread_runtime() { tokio::task::block_in_place(work) } else { work() }
 }
 
 const MAX_SCRIPT_THREADS: usize = 256;
@@ -163,10 +179,6 @@ pub fn script_thread_count(child_concurrency: u32, max_work_items: usize) -> usi
 
 /// Whether this install writes `node_modules/.package-map.json`.
 ///
-/// Nothing reads the map unless `nodeExperimentalPackageMap` is set:
-/// `package_map_path_for_execution` returns `None` without it, so
-/// `pnpm run` and `pnpm exec` never hand the file to Node.
-///
 /// Hoisted installs answer the same question through
 /// [`should_write_hoisted_package_map`], because they write the map
 /// from their own linker.
@@ -175,7 +187,7 @@ pub fn should_write_package_map(
     config: &pnpm_config::Config,
     node_linker: pnpm_config::NodeLinker,
 ) -> bool {
-    config.node_experimental_package_map
+    config.node_package_map_mode.writes()
         && node_linker == pnpm_config::NodeLinker::Isolated
         && !config.virtual_store_only
 }
@@ -185,12 +197,14 @@ pub fn should_write_package_map(
 /// store and so has a writer of its own.
 #[must_use]
 pub fn should_write_hoisted_package_map(config: &pnpm_config::Config) -> bool {
-    config.node_experimental_package_map && !config.virtual_store_only
+    config.node_package_map_mode.writes() && !config.virtual_store_only
 }
 
 mod build_options;
+mod build_scope;
 
 mod materialization_options;
+mod modules_swap_lock;
 
 mod frozen_install_options;
 

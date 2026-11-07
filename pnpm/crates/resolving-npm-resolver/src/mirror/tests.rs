@@ -8,8 +8,9 @@ use pnpm_network::MetadataCacheScope;
 
 use super::{
     ABBREVIATED_META_DIR, FULL_FILTERED_META_DIR, FULL_META_DIR, decode_registry_name,
-    encode_pkg_name, get_pkg_mirror_path, get_registry_name, load_meta, load_meta_headers,
-    load_meta_with_hold_cap, save_meta_indexed, scoped_meta_dir,
+    encode_pkg_name, get_legacy_pkg_mirror_paths, get_legacy_registry_name, get_pkg_mirror_path,
+    get_registry_name, load_meta, load_meta_headers, load_meta_with_hold_cap, save_meta_indexed,
+    scoped_meta_dir,
 };
 
 #[test]
@@ -26,12 +27,12 @@ fn scoped_meta_dir_private_namespaces_by_descriptor() {
     let scope = MetadataCacheScope::Private { descriptor_id: "abc123".to_string() };
     assert_eq!(
         scoped_meta_dir(&scope, ABBREVIATED_META_DIR),
-        "v11/metadata-private/abc123/metadata",
+        "v12/metadata-private/abc123/metadata",
     );
-    assert_eq!(scoped_meta_dir(&scope, FULL_META_DIR), "v11/metadata-private/abc123/metadata-full");
+    assert_eq!(scoped_meta_dir(&scope, FULL_META_DIR), "v12/metadata-private/abc123/metadata-full");
     assert_eq!(
         scoped_meta_dir(&scope, FULL_FILTERED_META_DIR),
-        "v11/metadata-private/abc123/metadata-full-filtered",
+        "v12/metadata-private/abc123/metadata-full-filtered",
     );
     // Distinct descriptors never share a directory.
     let other = MetadataCacheScope::Private { descriptor_id: "def456".to_string() };
@@ -156,8 +157,54 @@ fn get_registry_name_cannot_collide_with_an_earlier_pnpm_version() {
     assert_eq!(get_registry_name("https://nexus/npm/").expect("encode"), "https%3A+nexus%2Fnpm");
 }
 
-/// `http` metadata can be rewritten in transit and must never be handed to
-/// a resolution configured for `https`.
+/// [`get_legacy_registry_name`] reproduces `encode-registry`: the URL's host, with `:`
+/// replaced by `+` for a non-default port, and no scheme, path, or hash suffix.
+#[test]
+fn get_legacy_registry_name_matches_the_pre_rename_encoding() {
+    assert_eq!(
+        get_legacy_registry_name("https://registry.npmjs.org/").expect("legacy encode"),
+        "registry.npmjs.org",
+    );
+    assert_eq!(
+        get_legacy_registry_name("https://npm.example:8443/").expect("legacy encode"),
+        "npm.example+8443",
+    );
+    assert_eq!(
+        get_legacy_registry_name("https://npm.example:443/").expect("legacy encode"),
+        "npm.example",
+    );
+    assert_eq!(
+        get_legacy_registry_name("http://localhost:4873/").expect("legacy encode"),
+        "localhost+4873",
+    );
+}
+
+#[test]
+fn get_legacy_registry_name_none_for_a_hostless_url() {
+    assert_eq!(get_legacy_registry_name("not a url"), None);
+}
+
+#[test]
+fn get_legacy_pkg_mirror_paths_cover_both_registry_keys_of_the_legacy_layout() {
+    let cache_dir = TempDir::new().expect("tempdir");
+    let registry = "https://registry.npmjs.org/";
+    let current = get_pkg_mirror_path(cache_dir.path(), ABBREVIATED_META_DIR, registry, "acme")
+        .expect("current path");
+    let legacy =
+        get_legacy_pkg_mirror_paths(cache_dir.path(), ABBREVIATED_META_DIR, registry, "acme");
+    let legacy_root = cache_dir.path().join("v11/metadata");
+    assert_eq!(
+        legacy,
+        [
+            legacy_root
+                .join(get_registry_name(registry).expect("registry key"))
+                .join("acme.jsonl"),
+            legacy_root.join("registry.npmjs.org").join("acme.jsonl"),
+        ],
+    );
+    assert!(!legacy.contains(&current), "legacy and current mirrors never collide");
+}
+
 #[test]
 fn get_registry_name_separates_schemes() {
     assert_ne!(
@@ -317,6 +364,62 @@ fn decode_registry_name_passes_through_an_undecodable_key() {
     assert_eq!(decode_registry_name("%not-a-key+8443"), "%not-a-key+8443");
 }
 
+#[test]
+fn is_unreadable_registry_key_reports_names_written_before_the_scheme_joined_the_key() {
+    assert!(super::is_unreadable_registry_key("registry.npmjs.org"));
+    assert!(super::is_unreadable_registry_key("localhost+4873"));
+    assert!(super::is_unreadable_registry_key("registry.yarnpkg.com"));
+}
+
+/// Whatever the current encoder spells must survive a prune, so this walks the
+/// same registries the round-trip test does.
+#[test]
+fn is_unreadable_registry_key_spares_every_key_the_encoder_can_write() {
+    for registry in [
+        "https://registry.npmjs.org/",
+        "http://localhost:4873/",
+        "http://[::1]:8080/",
+        "https://npm.example:8443/registry/a/",
+        "https://releases.jfrog.io/artifactory/api/npm/team-a/",
+        "https://npm.example/team+a/",
+        "https://npm.example//",
+        "https://nexus_npm/",
+    ] {
+        let key = get_registry_name(registry).expect("encode");
+        assert!(!super::is_unreadable_registry_key(&key), "key: {key}");
+    }
+}
+
+/// An over-long registry collapses to a bare sha256, which carries no scheme
+/// separator. Reporting it would delete a mirror that is still in use.
+#[test]
+fn is_unreadable_registry_key_spares_the_hash_an_over_long_registry_collapses_to() {
+    let long_path = "a".repeat(300);
+    let key = get_registry_name(&format!("https://npm.example/{long_path}/")).expect("encode");
+    assert_eq!(key.len(), 64, "key: {key}");
+    assert!(!super::is_unreadable_registry_key(&key), "key: {key}");
+}
+
+/// No resolvable DNS name is a single 64-octet label, but through a proxy the
+/// host is never resolved locally, so pnpm could have cached one.
+#[test]
+fn is_unreadable_registry_key_spares_a_legacy_host_shaped_like_the_hash() {
+    let host = reqwest::Url::parse(&format!("http://{}/", "ab".repeat(32))).expect("parse");
+    let host = host.host_str().expect("host");
+    assert_eq!(host.len(), 64, "host: {host}");
+    assert!(!super::is_unreadable_registry_key(host), "host: {host}");
+}
+
+/// The sha256 spared above is 64 lowercase hex characters. A legacy host that
+/// merely looks hash-like in length or alphabet is still legacy.
+#[test]
+fn is_unreadable_registry_key_reports_a_name_that_only_resembles_the_hash() {
+    assert!(super::is_unreadable_registry_key(&"a".repeat(63)));
+    assert!(super::is_unreadable_registry_key(&"a".repeat(65)));
+    assert!(super::is_unreadable_registry_key(&"A".repeat(64)));
+    assert!(super::is_unreadable_registry_key(&"z".repeat(64)));
+}
+
 /// Callers (notably the cached fetcher) downgrade to a cache-less
 /// fetch on this error instead of failing the install.
 #[test]
@@ -346,7 +449,7 @@ fn get_pkg_mirror_path_composes_full_path() {
         .expect("compose");
     assert_eq!(
         got,
-        PathBuf::from("/cache/v11/metadata-full/https%3A+registry.npmjs.org/lodash.jsonl"),
+        PathBuf::from("/cache/v12/metadata-full/https%3A+registry.npmjs.org/lodash.jsonl"),
     );
 }
 
@@ -354,9 +457,9 @@ fn get_pkg_mirror_path_composes_full_path() {
 /// Any drift would silently fork the cache layout from pnpm's.
 #[test]
 fn constants_match_upstream() {
-    assert_eq!(FULL_META_DIR, "v11/metadata-full");
-    assert_eq!(FULL_FILTERED_META_DIR, "v11/metadata-full-filtered");
-    assert_eq!(ABBREVIATED_META_DIR, "v11/metadata");
+    assert_eq!(FULL_META_DIR, "v12/metadata-full");
+    assert_eq!(FULL_FILTERED_META_DIR, "v12/metadata-full-filtered");
+    assert_eq!(ABBREVIATED_META_DIR, "v12/metadata");
 }
 
 /// Build a minimal `Package` fixture for the round-trip tests.
@@ -389,7 +492,7 @@ fn load_meta_headers_round_trip() {
         .join("nested")
         .join("lodash.jsonl");
     let pkg = fixture_package();
-    save_meta_indexed(&mirror, &pkg, Some(r#"W/"abc""#)).expect("save");
+    save_meta_indexed(&mirror, &pkg, Some(r#"W/"abc""#), false).expect("save");
     let headers = load_meta_headers(&mirror).expect("read headers back");
     assert_eq!(headers.etag.as_deref(), Some(r#"W/"abc""#));
     assert_eq!(headers.modified.as_deref(), Some("2025-01-15T12:00:00.000Z"));
@@ -400,7 +503,7 @@ fn load_meta_round_trip_hydrates_versions_from_spans() {
     let dir = TempDir::new().expect("tmp dir");
     let mirror = dir.path().join("acme.jsonl");
     let pkg = fixture_package();
-    save_meta_indexed(&mirror, &pkg, Some(r#"W/"abc""#)).expect("save");
+    save_meta_indexed(&mirror, &pkg, Some(r#"W/"abc""#), false).expect("save");
     let loaded = load_meta(&mirror).expect("read full back");
     assert_eq!(loaded.name, "acme");
     assert_eq!(loaded.etag.as_deref(), Some(r#"W/"abc""#));
@@ -415,7 +518,7 @@ fn load_meta_survives_mirror_rewrite() {
     let dir = TempDir::new().expect("tmp dir");
     let mirror = dir.path().join("acme.jsonl");
     let pkg = fixture_package();
-    save_meta_indexed(&mirror, &pkg, None).expect("save");
+    save_meta_indexed(&mirror, &pkg, None, false).expect("save");
     let loaded = load_meta(&mirror).expect("read full back");
     // The fatter `0.9.0` fragment shifts `1.0.0`'s offset, so a loader
     // that re-read the path instead of the pinned inode parses garbage.
@@ -445,7 +548,7 @@ fn load_meta_survives_mirror_rewrite() {
         }
     }))
     .expect("deserialize rewritten Package");
-    save_meta_indexed(&mirror, &newer, None).expect("overwrite");
+    save_meta_indexed(&mirror, &newer, None, false).expect("overwrite");
     let manifest = loaded.versions.get("1.0.0").expect("hydrate after rewrite");
     assert_eq!(manifest.dist.tarball, "https://registry/acme-1.0.0.tgz");
 }
@@ -455,7 +558,7 @@ fn load_meta_past_the_hold_cap_buffers_fragments_instead_of_missing() {
     let dir = TempDir::new().expect("tmp dir");
     let mirror = dir.path().join("acme.jsonl");
     let pkg = fixture_package();
-    save_meta_indexed(&mirror, &pkg, Some(r#"W/"abc""#)).expect("save");
+    save_meta_indexed(&mirror, &pkg, Some(r#"W/"abc""#), false).expect("save");
     let loaded = load_meta_with_hold_cap(&mirror, 0).expect("read full back without a handle");
     let manifest = loaded.versions.get("1.0.0").expect("hydrate from buffered fragment");
     assert_eq!(manifest.dist.tarball, "https://registry/acme-1.0.0.tgz");
@@ -466,7 +569,7 @@ fn load_meta_past_the_hold_cap_buffers_fragments_instead_of_missing() {
 fn load_meta_rejects_oversized_declared_record_lengths() {
     let dir = TempDir::new().expect("tmp dir");
     let mirror = dir.path().join("acme.jsonl");
-    std::fs::write(&mirror, "pacquet-meta-v1 128 999999999999\n{}{}").expect("write");
+    std::fs::write(&mirror, "pnpm-meta-v1 128 999999999999\n{}{}").expect("write");
     assert!(load_meta(&mirror).is_none());
 }
 
@@ -475,7 +578,7 @@ fn load_meta_past_the_hold_cap_ignores_a_sparse_tail() {
     let dir = TempDir::new().expect("tmp dir");
     let mirror = dir.path().join("acme.jsonl");
     let pkg = fixture_package();
-    save_meta_indexed(&mirror, &pkg, None).expect("save");
+    save_meta_indexed(&mirror, &pkg, None, false).expect("save");
     let file = std::fs::OpenOptions::new()
         .write(true)
         .open(&mirror)
@@ -500,7 +603,7 @@ fn load_meta_past_the_hold_cap_skips_a_sparse_gap_between_spans() {
         fragment.len(),
     );
     let contents =
-        format!("pacquet-meta-v1 {} {}\n{headers}{index}{fragment}", headers.len(), index.len());
+        format!("pnpm-meta-v1 {} {}\n{headers}{index}{fragment}", headers.len(), index.len());
     std::fs::write(&mirror, &contents).expect("write");
     let file = std::fs::OpenOptions::new()
         .write(true)
@@ -508,12 +611,27 @@ fn load_meta_past_the_hold_cap_skips_a_sparse_gap_between_spans() {
         .expect("open");
     file.set_len(contents.len() as u64 + far_offset + 16)
         .expect("extend sparsely");
-    let loaded = load_meta_with_hold_cap(&mirror, 0).expect("read full back without a handle");
-    let manifest = loaded.versions.get("1.0.0").expect("hydrate the near fragment");
-    assert_eq!(manifest.dist.tarball, "https://registry/acme-1.0.0.tgz");
-    // The far span reads zeroes out of the sparse hole — not JSON, so
-    // the version is absent; the gap itself must never be buffered.
-    assert!(loaded.versions.get("2.0.0").is_none());
+    // The far span reads zeroes out of the sparse hole, which are not JSON,
+    // so the mirror is a miss. The gap itself must never be buffered.
+    assert!(load_meta_with_hold_cap(&mirror, 0).is_none());
+}
+
+#[test]
+fn load_meta_past_the_hold_cap_keeps_a_wrong_shape_fragment_absent_not_damaged() {
+    let dir = TempDir::new().expect("tmp dir");
+    let mirror = dir.path().join("acme.jsonl");
+    let headers = "{}";
+    let fragment = r#"{"name":1}"#;
+    let index = format!(
+        r#"{{"name":"acme","distTags":{{}},"versions":[["1.0.0",0,{}]]}}"#,
+        fragment.len(),
+    );
+    let contents =
+        format!("pnpm-meta-v1 {} {}\n{headers}{index}{fragment}", headers.len(), index.len());
+    std::fs::write(&mirror, &contents).expect("write");
+    let loaded = load_meta_with_hold_cap(&mirror, 0).expect("read back without a handle");
+    assert!(loaded.versions.get("1.0.0").is_none());
+    assert!(!loaded.versions.corrupt_mirror_fragment_found());
 }
 
 #[test]
@@ -529,7 +647,7 @@ fn load_meta_treats_an_oversized_fragment_span_as_absent() {
         32 * 1024 * 1024,
     );
     let contents =
-        format!("pacquet-meta-v1 {} {}\n{headers}{index}{fragment}", headers.len(), index.len());
+        format!("pnpm-meta-v1 {} {}\n{headers}{index}{fragment}", headers.len(), index.len());
     std::fs::write(&mirror, &contents).expect("write");
     // A sparse tail makes the file size cover the declared span
     // without paying for the bytes, like a corrupt mirror would.
@@ -550,7 +668,7 @@ fn load_meta_rejects_truncated_fragments() {
     let dir = TempDir::new().expect("tmp dir");
     let mirror = dir.path().join("acme.jsonl");
     let pkg = fixture_package();
-    save_meta_indexed(&mirror, &pkg, None).expect("save");
+    save_meta_indexed(&mirror, &pkg, None, false).expect("save");
     let full = std::fs::read(&mirror).expect("read mirror");
     std::fs::write(&mirror, &full[..full.len() - 10]).expect("truncate");
     assert!(load_meta(&mirror).is_none());
@@ -602,8 +720,8 @@ fn save_meta_overwrites_existing_mirror() {
     let mirror = dir.path().join("acme.jsonl");
     let pkg = fixture_package();
 
-    save_meta_indexed(&mirror, &pkg, Some(r#"W/"old""#)).expect("first save");
-    save_meta_indexed(&mirror, &pkg, Some(r#"W/"new""#)).expect("second save");
+    save_meta_indexed(&mirror, &pkg, Some(r#"W/"old""#), false).expect("first save");
+    save_meta_indexed(&mirror, &pkg, Some(r#"W/"new""#), false).expect("second save");
 
     let headers = load_meta_headers(&mirror).expect("read headers");
     assert_eq!(headers.etag.as_deref(), Some(r#"W/"new""#));

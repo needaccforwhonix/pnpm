@@ -1,6 +1,6 @@
 use super::{
-    Config, ConfigOverrides, OsString, PackageImportMethod, Path, PmOnFail, RuntimeOnFail,
-    TrustPolicy, argv, assert_eq,
+    Config, ConfigOverrides, NodePackageMapMode, OsString, PackageImportMethod, Path, PmOnFail,
+    RuntimeOnFail, TrustPolicy, argv, assert_eq, config_with_cli_registries,
 };
 
 #[test]
@@ -16,6 +16,22 @@ fn extract_accepts_the_on_fail_settings_as_bare_flags() {
     overrides.apply(&mut config, Path::new("/workspace"));
     assert_eq!(config.pm_on_fail, Some(PmOnFail::Ignore));
     assert_eq!(config.runtime_on_fail, Some(RuntimeOnFail::Warn));
+}
+
+#[test]
+fn extract_accepts_cache_dir_as_a_bare_flag() {
+    let (overrides, remaining) =
+        ConfigOverrides::extract(argv(["pacquet", "install", "--cache-dir", "/tmp/pnpm-cache"]));
+
+    assert_eq!(remaining, argv(["pacquet", "install"]));
+    assert_eq!(
+        overrides
+            .cli_layer(None)
+            .setting_values
+            .get("cache-dir")
+            .map(String::as_str),
+        Some("/tmp/pnpm-cache"),
+    );
 }
 
 #[test]
@@ -57,22 +73,22 @@ fn extract_accepts_the_install_settings_as_bare_flags() {
     assert!(!config.lockfile);
 }
 
-/// `install` declares `--trust-lockfile` itself; every other command
+/// `install` and `remove` declare `--trust-lockfile` themselves; every other command
 /// takes the spelling from the table, so it lands on [`Config`] before
 /// the command reads `config.trust_lockfile`.
 #[test]
 fn trust_lockfile_is_a_bare_flag_where_no_command_declares_it() {
     let (overrides, remaining) =
-        ConfigOverrides::extract(argv(["pacquet", "remove", "foo", "--trust-lockfile"]));
-    assert_eq!(remaining, argv(["pacquet", "remove", "foo"]));
+        ConfigOverrides::extract(argv(["pacquet", "update", "foo", "--trust-lockfile"]));
+    assert_eq!(remaining, argv(["pacquet", "update", "foo"]));
     let mut config = Config::default();
     overrides.apply(&mut config, Path::new("/workspace"));
     assert!(config.trust_lockfile);
     assert_eq!(config.explicit_settings.get("trustLockfile"), Some(&serde_json::Value::Bool(true)));
 
     let (overrides, remaining) =
-        ConfigOverrides::extract(argv(["pacquet", "remove", "foo", "--no-trust-lockfile"]));
-    assert_eq!(remaining, argv(["pacquet", "remove", "foo"]));
+        ConfigOverrides::extract(argv(["pacquet", "update", "foo", "--no-trust-lockfile"]));
+    assert_eq!(remaining, argv(["pacquet", "update", "foo"]));
     let mut config = Config { trust_lockfile: true, ..Config::default() };
     overrides.apply(&mut config, Path::new("/workspace"));
     assert!(!config.trust_lockfile);
@@ -150,7 +166,7 @@ fn the_boolean_settings_are_bare_flags_where_no_command_declares_them() {
     assert!(config.frozen_store);
     assert!(config.lockfile_include_tarball_url);
     assert!(config.merge_git_branch_lockfiles);
-    assert!(config.node_experimental_package_map);
+    assert_eq!(config.node_package_map_mode, NodePackageMapMode::Load);
     assert!(config.offline);
     assert!(config.prefer_frozen_lockfile);
     assert!(config.prefer_offline);
@@ -291,8 +307,10 @@ fn a_boolean_settings_explicit_value_does_not_move_the_command_boundary() {
     ]));
     assert_eq!(remaining, argv(["pacquet", "install"]));
 
-    let mut config = Config { strict_peer_dependencies: true, ..Config::default() };
-    overrides.apply(&mut config, Path::new("/workspace"));
+    let config = config_with_cli_registries(
+        &overrides,
+        Config { strict_peer_dependencies: true, ..Config::default() },
+    );
     assert!(!config.strict_peer_dependencies);
     assert_eq!(config.registry, "https://example.test/");
 }
@@ -311,8 +329,8 @@ fn a_boolean_settings_value_is_claimed_even_when_a_command_declares_the_name() {
     ]));
     assert_eq!(remaining, argv(["pacquet", "install"]));
 
-    let mut config = Config { lockfile: false, ..Config::default() };
-    overrides.apply(&mut config, Path::new("/workspace"));
+    let config =
+        config_with_cli_registries(&overrides, Config { lockfile: false, ..Config::default() });
     assert!(config.lockfile);
     assert_eq!(config.registry, "https://example.test/");
 }
@@ -364,4 +382,20 @@ fn a_numeric_setting_claims_a_negative_value() {
             "{tokens:?}",
         );
     }
+}
+
+/// The deprecated `--node-experimental-package-map` flag yields to the mode
+/// the same command line sets, which config loading has already applied.
+#[test]
+fn the_node_package_map_mode_wins_over_the_deprecated_flag() {
+    let (overrides, _) = ConfigOverrides::extract(argv([
+        "pacquet",
+        "install",
+        "--node-experimental-package-map",
+        "--config.node-package-map-mode=write-only",
+    ]));
+    let mut config =
+        Config { node_package_map_mode: NodePackageMapMode::WriteOnly, ..Config::default() };
+    overrides.apply(&mut config, Path::new("/workspace"));
+    assert_eq!(config.node_package_map_mode, NodePackageMapMode::WriteOnly);
 }

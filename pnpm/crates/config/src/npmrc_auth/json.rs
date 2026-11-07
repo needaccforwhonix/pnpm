@@ -1,7 +1,8 @@
 use super::{
-    BTreeSet, Config, DEFAULT_REGISTRY_SCOPE, EnvVar, IndexMap, NpmrcAuth, apply_creds_field,
-    is_package_scope, nerf_dart, normalize_registry_url, split_creds_key,
+    BTreeSet, Config, DEFAULT_REGISTRY_SCOPE, EnvVar, IndexMap, NpmrcAuth, env_replace_lossy,
+    is_package_scope, nerf_dart, split_creds_key,
 };
+use pnpm_network::{canonicalize_npm_registry_url, normalize_registry_url};
 
 /// What the config files — the `.npmrc` files as much as the yamls —
 /// declared about registry routing, as opposed to what the cascade merely
@@ -38,17 +39,51 @@ enum JsonAuthOrigin {
 }
 
 /// The parsed `_auth` setting: registry URL → scope → credentials.
-/// Deserialization is strict — any malformed entry (bad JSON, wrong shape,
-/// invalid URL/scope, unsupported credential field) is an error, never a
-/// silent skip. See [`NpmrcAuth::from_json_sources`].
+/// See [`NpmrcAuth::from_json_sources`].
 ///
 /// [`IndexMap`] preserves source order so a later entry wins for a
 /// duplicate inferred route (`"@"` / `@scope` across different hosts) —
 /// a `BTreeMap` would re-sort and could pick a different host.
 #[derive(Debug, serde::Deserialize)]
-struct JsonAuth(IndexMap<JsonAuthRegistry, IndexMap<JsonAuthScope, JsonAuthCreds>>);
+struct JsonAuth(IndexMap<JsonAuthRegistry, JsonAuthEntries>);
 
-/// A registry URL `_auth` key. Validated to be an http(s) URL with no
+/// The entries under one registry URL. A key that starts with `@` is a scope
+/// and is held to its full shape, and so is one shaped like a scope entry:
+/// a mistyped scope would otherwise drop its route, and its packages would
+/// resolve from another registry. Any other key is a field a later pnpm may
+/// define, and is skipped with a warning: the global config is shared by
+/// every pnpm version on the machine, and one an older version does not know
+/// must not stop it.
+#[derive(Debug)]
+struct JsonAuthEntries {
+    scopes: IndexMap<JsonAuthScope, JsonAuthCreds>,
+    unknown_fields: Vec<String>,
+}
+
+impl<'de> serde::Deserialize<'de> for JsonAuthEntries {
+    fn deserialize<De: serde::Deserializer<'de>>(deserializer: De) -> Result<Self, De::Error> {
+        use serde::de::Error as _;
+        let raw = IndexMap::<String, serde_json::Value>::deserialize(deserializer)?;
+        let mut entries = JsonAuthEntries { scopes: IndexMap::new(), unknown_fields: Vec::new() };
+        for (key, value) in raw {
+            if !key.starts_with('@') {
+                if value.get("authToken").is_some() {
+                    return Err(De::Error::custom(format!(
+                        r#"scope "{key}" must be "@" or a package scope like "@org" (did you mean "@{key}"?)"#,
+                    )));
+                }
+                entries.unknown_fields.push(key);
+                continue;
+            }
+            let scope = JsonAuthScope::try_from(key).map_err(De::Error::custom)?;
+            let creds = serde_json::from_value(value).map_err(De::Error::custom)?;
+            entries.scopes.insert(scope, creds);
+        }
+        Ok(entries)
+    }
+}
+
+/// A registry URL `_auth` key. Validated to be an HTTP or HTTPS URL with no
 /// userinfo, query, or fragment (those can carry secrets), then stored
 /// normalized (trailing slash) and nerf-darted for the credential key.
 /// Parsed with the `url` crate.
@@ -96,7 +131,7 @@ pub fn validate_json_auth_registry(value: &str) -> Result<String, String> {
     if nerf_dart(&normalized).is_empty() {
         return Err(format!("registry URL {label} is not a valid registry URL"));
     }
-    Ok(normalized)
+    Ok(normalized.into_owned())
 }
 
 /// Whether `scope` is a key `_auth` accepts: the bare `@` standing for the
@@ -112,7 +147,11 @@ impl TryFrom<String> for JsonAuthRegistry {
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
         let normalized = validate_json_auth_registry(&value)?;
-        let nerfed = nerf_dart(&normalized);
+        let nerfed = if canonicalize_npm_registry_url(&value) == value {
+            nerf_dart(&normalized)
+        } else {
+            nerf_dart(&value)
+        };
         Ok(JsonAuthRegistry { normalized, nerfed })
     }
 }
@@ -164,8 +203,8 @@ impl NpmrcAuth {
     /// The env var exists because GitHub Actions / bash / zsh drop env var
     /// names containing `/`, `:`, or `.`, breaking the
     /// `pnpm_config_//host/:_authToken=…` form on CI (pnpm/pnpm#12314).
-    /// Values are used as-is — no `${VAR}` re-expansion, which would let
-    /// repo-controlled env vars leak into them.
+    /// Only credential values expand environment placeholders; registry and
+    /// scope keys keep their validated routing semantics.
     pub fn from_json_sources<Sys: EnvVar>(
         global_value: Option<&serde_json::Value>,
     ) -> Result<Self, serde_json::Error> {
@@ -184,7 +223,26 @@ impl NpmrcAuth {
         if let Some(value) = env_value {
             auth.apply_json_auth(serde_json::from_str(&value)?, JsonAuthOrigin::Env);
         }
+        auth.expand_json_auth_tokens::<Sys>();
         Ok(auth)
+    }
+
+    fn expand_json_auth_tokens<Sys: EnvVar>(&mut self) {
+        for creds in self.creds_by_scope_by_uri.values_mut().flat_map(|scopes| scopes.values_mut())
+        {
+            let Some(token) = creds.auth_token.as_mut() else {
+                continue;
+            };
+            let (expanded, unresolved) = env_replace_lossy::<Sys>(token);
+            *token = expanded;
+            self.warnings.extend(
+                unresolved
+                    .into_iter()
+                    .map(|placeholder| {
+                        format!("Failed to replace env in config: {placeholder} in _auth.authToken")
+                    }),
+            );
+        }
     }
 
     /// Fold a parsed [`JsonAuth`] into `self` (last-write-wins, so the env
@@ -192,9 +250,19 @@ impl NpmrcAuth {
     /// entry becomes a `//host/:_authToken` credential and an inferred
     /// registry route (see [`crate::npmrc_auth::NpmrcRoutes::json_env`]).
     fn apply_json_auth(&mut self, parsed: JsonAuth, origin: JsonAuthOrigin) {
-        for (registry, scopes) in parsed.0 {
-            for (scope, creds) in scopes {
-                self.apply_json_entry(&registry, scope, creds.auth_token, origin);
+        for (registry, entries) in parsed.0 {
+            self.warnings.extend(
+                entries.unknown_fields
+                    .iter()
+                    .map(|field| {
+                        format!(
+                            "Ignoring the unknown field {field:?} under {} in _auth",
+                            registry.normalized,
+                        )
+                    }),
+            );
+            for (scope, creds) in entries.scopes {
+                self.apply_json_entry(&registry, scope, &creds.auth_token, origin);
             }
         }
     }
@@ -204,26 +272,32 @@ impl NpmrcAuth {
         &mut self,
         registry: &JsonAuthRegistry,
         scope: JsonAuthScope,
-        auth_token: String,
+        auth_token: &str,
         origin: JsonAuthOrigin,
     ) {
+        let is_default = matches!(scope, JsonAuthScope::Default);
         let key = match &scope {
             JsonAuthScope::Default => format!("{}:_authToken", registry.nerfed),
             JsonAuthScope::Package(scope) => format!("{}:{scope}:_authToken", registry.nerfed),
         };
         if let Some((uri, suffix)) = split_creds_key(&key) {
-            let entry = self.creds_entry_mut(uri);
-            apply_creds_field(entry, suffix, auth_token);
+            self.apply_uri_creds_field(uri, suffix, auth_token);
         }
         let route_key = match scope {
             JsonAuthScope::Default => "default".to_string(),
             JsonAuthScope::Package(scope) => scope,
         };
-        let routes = match origin {
-            JsonAuthOrigin::Env => &mut self.routes.json_env,
-            JsonAuthOrigin::File => &mut self.routes.json_file,
-        };
-        routes.insert(route_key, registry.normalized.clone());
+        match origin {
+            JsonAuthOrigin::Env => {
+                if is_default {
+                    self.routes.json_env_default_candidates.push(registry.normalized.clone());
+                }
+                self.routes.json_env.insert(route_key, registry.normalized.clone());
+            }
+            JsonAuthOrigin::File => {
+                self.routes.json_file.insert(route_key, registry.normalized.clone());
+            }
+        }
     }
 
     /// Apply the [`crate::npmrc_auth::NpmrcRoutes::json_env`] routes. Unlike
@@ -241,22 +315,87 @@ impl NpmrcAuth {
         config: &mut Config,
         declared: &DeclaredRegistries,
     ) {
+        let scoped_urls = declared_scope_registry_urls(config, &self.routes.json_env);
+        self.apply_file_routes(config, declared, &scoped_urls);
+        self.apply_env_routes(config, declared, &scoped_urls);
+    }
+
+    fn apply_file_routes(
+        &mut self,
+        config: &mut Config,
+        declared: &DeclaredRegistries,
+        scoped_urls: &BTreeSet<String>,
+    ) {
         let file_routes = std::mem::take(&mut self.routes.json_file);
         for (scope, url) in file_routes
             .into_iter()
             .filter(|(scope, _)| !declared.covers(scope))
         {
             if scope == "default" {
-                config.registry.clone_from(&url);
-                continue;
+                if !scoped_urls.contains(normalize_registry_url(&url).as_ref()) {
+                    config.registry.clone_from(&url);
+                }
+            } else {
+                config.registries_by_scope.insert(scope, url);
             }
-            config.registries_by_scope.insert(scope, url);
         }
+    }
+
+    fn apply_env_routes(
+        &mut self,
+        config: &mut Config,
+        declared: &DeclaredRegistries,
+        scoped_urls: &BTreeSet<String>,
+    ) {
         for (scope, url) in std::mem::take(&mut self.routes.json_env) {
-            if scope == "default" {
-                config.registry.clone_from(&url);
+            if scope != "default" {
+                config.registries_by_scope.insert(scope, url);
             }
-            config.registries_by_scope.insert(scope, url);
         }
+
+        let candidates: Vec<String> = std::mem::take(&mut self.routes.json_env_default_candidates)
+            .into_iter()
+            .filter(|url| !scoped_urls.contains(normalize_registry_url(url).as_ref()))
+            .collect();
+
+        if let Some(url) =
+            select_default_candidate(&candidates, &config.registry, declared.registry)
+        {
+            config.registry.clone_from(&url);
+            config.registries_by_scope.insert("default".to_string(), url);
+        }
+    }
+}
+
+/// The URLs of the scope registries a config file declared and the `_auth`
+/// env var does not re-route. An `@` credential in `_auth` for one of them
+/// authenticates that registry; it does not make it the default.
+fn declared_scope_registry_urls(
+    config: &Config,
+    json_env: &std::collections::BTreeMap<String, String>,
+) -> BTreeSet<String> {
+    config.registries_by_scope
+        .iter()
+        .filter(|(scope, _)| scope.as_str() != "default" && !json_env.contains_key(*scope))
+        .map(|(_, url)| normalize_registry_url(url).into_owned())
+        .collect()
+}
+
+fn select_default_candidate(
+    candidates: &[String],
+    current_default: &str,
+    has_declared_registry: bool,
+) -> Option<String> {
+    if candidates.is_empty() {
+        return None;
+    }
+    if has_declared_registry && candidates.len() > 1 {
+        let current_normalized = normalize_registry_url(current_default);
+        candidates
+            .iter()
+            .find(|url| normalize_registry_url(url) == current_normalized)
+            .cloned()
+    } else {
+        candidates.last().cloned()
     }
 }

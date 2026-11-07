@@ -274,7 +274,7 @@ fn recursive_update_prod_dependencies_only() {
     anchor.set_dist_tag(FOO, "100.1.0", "latest");
     anchor.set_dist_tag(BAR, "100.1.0", "latest");
 
-    pacquet(&workspace, ["-r", "update", "--prod", "--no-optional"]).assert().success();
+    pacquet(&workspace, ["-r", "update", "--prod"]).assert().success();
 
     assert_eq!(
         lockfile_package_keys(&workspace),
@@ -493,7 +493,7 @@ fn recursive_update_with_pattern_and_name_in_project() {
     assert!(!output.status.success(), "updating an undeclared package should fail");
     assert!(stderr.contains("ERR_PNPM_NO_PACKAGE_IN_DEPENDENCIES"), "{stderr}");
 
-    // Without `--depth 0` the same selector is simply a no-op.
+    // Without `--depth 0` the same selector is a no-op.
     pacquet(&workspace, ["-r", "update", "--latest", "@pnpm.e2e/this-does-not-exist"])
         .assert()
         .success();

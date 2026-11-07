@@ -2,18 +2,23 @@ use super::{
     super::{host_platform_selector, runtime_platform_selector},
     build_runtime_tarball_fixture, leaked_offline_config,
 };
-use crate::install_package_by_snapshot::runtime::synthesize_runtime_manifest_bytes;
-use pnpm_lockfile::{BinaryArchive, BinaryResolution, BinarySpec, LockfileResolution, PackageKey};
-use pnpm_package_is_installable::SupportedArchitectures;
+use crate::{
+    install_package_by_snapshot::runtime::synthesize_runtime_manifest_bytes,
+    platform_selection::runtime_platform_of,
+};
+use pnpm_lockfile::{
+    BinaryArchive, BinaryResolution, BinarySpec, LockfileResolution, PackageKey, PlatformSelector,
+};
+use pnpm_package_is_installable::{ArchitectureAxes, SupportedArchitectures};
 use pretty_assertions::assert_eq;
 
 #[test]
 fn runtime_platform_selector_falls_back_to_the_first_configured_target_the_host_is_absent_from() {
-    let supported = SupportedArchitectures {
+    let supported = SupportedArchitectures::Axes(ArchitectureAxes {
         os: Some(vec!["freebsd".to_string(), "openbsd".to_string()]),
         cpu: Some(vec!["ppc64".to_string(), "s390x".to_string()]),
         libc: Some(vec!["current".to_string(), "musl".to_string()]),
-    };
+    });
 
     let selector = runtime_platform_selector(Some(&supported));
 
@@ -24,11 +29,11 @@ fn runtime_platform_selector_falls_back_to_the_first_configured_target_the_host_
 #[test]
 fn runtime_platform_selector_prefers_the_host_over_the_other_configured_targets() {
     let host = host_platform_selector();
-    let supported = SupportedArchitectures {
+    let supported = SupportedArchitectures::Axes(ArchitectureAxes {
         os: Some(vec!["freebsd".to_string(), host.os.clone()]),
         cpu: Some(vec!["ppc64".to_string(), host.cpu.clone()]),
         libc: None,
-    };
+    });
 
     let selector = runtime_platform_selector(Some(&supported));
 
@@ -36,16 +41,90 @@ fn runtime_platform_selector_prefers_the_host_over_the_other_configured_targets(
 }
 #[test]
 fn runtime_platform_selector_expands_current_to_the_host() {
-    let supported = SupportedArchitectures {
+    let supported = SupportedArchitectures::Axes(ArchitectureAxes {
         os: Some(vec!["freebsd".to_string(), "current".to_string()]),
         cpu: Some(vec!["current".to_string()]),
         libc: Some(vec!["current".to_string()]),
-    };
+    });
 
     let selector = runtime_platform_selector(Some(&supported));
 
     assert_eq!(selector, host_platform_selector());
 }
+/// An archive is built for a whole platform, so a list picks one of the
+/// platforms it names where the axes above pick a value of each axis.
+#[test]
+fn runtime_platform_selector_takes_the_first_platform_the_list_names() {
+    let supported = SupportedArchitectures::Platforms(vec!["linux-ppc64le-musl".parse().unwrap()]);
+
+    let selector = runtime_platform_selector(Some(&supported));
+
+    assert_eq!(selector.os, "linux");
+    assert_eq!(selector.cpu, "ppc64");
+    assert_eq!(selector.libc.as_deref(), Some("musl"));
+}
+
+/// An archive built for another platform cannot run here, so a list that
+/// names this machine asks for this machine's own.
+#[test]
+fn runtime_platform_selector_prefers_the_host_among_the_platforms_a_list_names() {
+    let host = host_platform_selector();
+    let listed = format!(
+        "{}-{}{}",
+        host.os,
+        host.cpu,
+        host.libc
+            .as_deref()
+            .map_or(String::new(), |libc| format!("-{libc}")),
+    );
+    let supported = SupportedArchitectures::Platforms(vec![
+        "linux-ppc64le-musl".parse().unwrap(),
+        listed
+            .parse()
+            .unwrap_or_else(|error| panic!("{listed}: {error}")),
+    ]);
+
+    let selector = runtime_platform_selector(Some(&supported));
+
+    assert_eq!(selector, host);
+}
+
+/// A host whose C library could not be read is not a reason to install
+/// an archive for a platform nobody named.
+#[test]
+fn runtime_platform_selector_stays_among_the_platforms_named() {
+    let host = PlatformSelector {
+        os: "linux".to_string(),
+        cpu: "x64".to_string(),
+        libc: None,
+        floors: None,
+    };
+    let platforms = vec!["linux-x64-musl".parse().unwrap()];
+
+    assert_eq!(
+        runtime_platform_of(&platforms, host),
+        PlatformSelector {
+            os: "linux".to_string(),
+            cpu: "x64".to_string(),
+            libc: Some("musl".to_string()),
+            floors: Some(pnpm_lockfile::HostFloors::default()),
+        },
+    );
+}
+
+/// `current` is this machine whichever platform it is listed beside.
+#[test]
+fn runtime_platform_selector_reads_current_in_a_list_as_the_host() {
+    let supported = SupportedArchitectures::Platforms(vec![
+        "linux-ppc64le-musl".parse().unwrap(),
+        "current".parse().unwrap(),
+    ]);
+
+    let selector = runtime_platform_selector(Some(&supported));
+
+    assert_eq!(selector, host_platform_selector());
+}
+
 #[test]
 fn synthesize_runtime_manifest_emits_name_version_and_bin_single() {
     let key: PackageKey = "node@22.0.0".parse().expect("parse node key");
@@ -196,6 +275,14 @@ async fn installing_a_runtime_persists_the_synthesized_manifest_into_the_store_i
             custom_fetcher_session: None,
         },
         ctx: &crate::InstallContext {
+            caches: crate::InstallCaches {
+                logged_methods: &logged_methods,
+                swap_lock: None,
+                git_source_cache: &pnpm_git_fetcher::GitSourceCache::default(),
+                materialized_graph: std::sync::Arc::default(),
+                dir_clone_cache: None,
+            },
+
             linker: crate::ModuleLinkerContext {
                 layout: &layout,
                 kind: pnpm_config::NodeLinker::Hoisted,
@@ -206,14 +293,11 @@ async fn installing_a_runtime_persists_the_synthesized_manifest_into_the_store_i
             requester: "/project",
 
             allow_build_policy: &allow_build_policy,
-
-            logged_methods: &logged_methods,
-            git_source_cache: &pnpm_git_fetcher::GitSourceCache::default(),
         },
 
         skipped: &skipped,
         include_optional_dependencies: true,
-        runtime_platform_selector: &host_platform_selector(),
+        variant_platforms: &crate::platform_selection::VariantPlatforms::host(),
 
         defer_link: false,
         link_concurrency_probe: None,
@@ -276,6 +360,14 @@ async fn installing_a_runtime_persists_the_synthesized_manifest_into_the_store_i
             custom_fetcher_session: None,
         },
         ctx: &crate::InstallContext {
+            caches: crate::InstallCaches {
+                logged_methods: &warm_logged,
+                swap_lock: None,
+                git_source_cache: &pnpm_git_fetcher::GitSourceCache::default(),
+                materialized_graph: std::sync::Arc::default(),
+                dir_clone_cache: None,
+            },
+
             linker: crate::ModuleLinkerContext {
                 layout: &layout,
                 kind: pnpm_config::NodeLinker::Hoisted,
@@ -286,17 +378,14 @@ async fn installing_a_runtime_persists_the_synthesized_manifest_into_the_store_i
             requester: "/project",
 
             allow_build_policy: &allow_build_policy,
-
             // Deliberately not the cold run's counter: the assertion
             // below is that the warm path logs its import method on its
             // own.
-            logged_methods: &warm_logged,
-            git_source_cache: &pnpm_git_fetcher::GitSourceCache::default(),
         },
 
         skipped: &skipped,
         include_optional_dependencies: true,
-        runtime_platform_selector: &host_platform_selector(),
+        variant_platforms: &crate::platform_selection::VariantPlatforms::host(),
 
         defer_link: false,
         link_concurrency_probe: None,

@@ -1,11 +1,11 @@
-use crate::{AllowBuildPolicy, CasPathsByPkgId, PackageManifests, VirtualStoreLayout};
+use crate::{AllowBuildPolicy, CasPathsByPkgId, PackageBins, PackageManifests, VirtualStoreLayout};
 use pnpm_cmd_shim::LinkBinsOptions;
 use pnpm_config::Config;
 use pnpm_lockfile::{Lockfile, PackageKey, PackageMetadata, ProjectSnapshot, SnapshotEntry};
 use pnpm_package_manifest::{DependencyGroup, PackageManifest};
 use pnpm_store_dir::StoreIndexWriter;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, atomic::AtomicU8},
 };
@@ -16,7 +16,7 @@ pub struct LinkProjects<'a> {
     pub package_map_manifests: &'a [(PathBuf, &'a PackageManifest)],
     pub dependency_groups: &'a [DependencyGroup],
     /// Anchor for each importer's `node_modules`. The frozen path uses
-    /// `workspace_root`; the fresh path uses `modules_dir.parent()`,
+    /// `workspace_root`; the fresh path uses `Config::modules_dir_anchor`,
     /// because its tests relocate `modules_dir` away from the manifest.
     pub symlink_root: &'a Path,
     /// Importer ids allowed to live outside the lockfile dir (Bit's
@@ -44,6 +44,7 @@ pub struct LinkLockfiles<'a> {
 
 pub struct LinkPackageData<'a> {
     pub package_manifests: &'a PackageManifests,
+    pub package_bins: Option<&'a PackageBins>,
     /// Per-snapshot `requiresBuild` flags from the store-index prefetch,
     /// gating the importer bin pass's use of `package_manifests` — see
     /// [`crate::link_direct_dep_bins_prefetched`]. `None` when the
@@ -52,9 +53,16 @@ pub struct LinkPackageData<'a> {
     pub cas_paths_by_pkg_id: Option<CasPathsByPkgId>,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PruneTreeOptions<'a> {
+    pub orphans: bool,
+    pub direct_dependencies: bool,
+    pub importer_ids: Option<&'a std::collections::HashSet<String>>,
+}
+
 #[derive(Clone, Copy)]
 pub struct PriorLinkState<'a> {
-    pub prune_orphans: bool,
+    pub prune: PruneTreeOptions<'a>,
     pub hoisted_dependencies: Option<&'a crate::HoistedDependencies>,
     /// `hoistedLocations` recorded by the previous install's
     /// `.modules.yaml`; lets the hoisted linker leave packages that are
@@ -64,6 +72,25 @@ pub struct PriorLinkState<'a> {
     pub build_present_packages: bool,
     /// See [`crate::PriorHoistedState::unbuilt_builds`].
     pub unbuilt_builds: &'a crate::UnbuiltBuilds,
+    /// The snapshots the previous install's `.modules.yaml` recorded as
+    /// skipped. A lockfile entry says what an install resolved rather than
+    /// what it put on disk, so telling the two apart for the previous
+    /// install takes this set (pnpm/pnpm#15161).
+    pub previously_skipped: &'a crate::SkippedSnapshots,
+}
+
+impl<'a> PriorLinkState<'a> {
+    #[must_use]
+    pub fn hoisted_state(self, current_lockfile: Option<&'a Lockfile>) -> PriorHoistedState<'a> {
+        PriorHoistedState {
+            current_lockfile,
+            hoisted_dependencies: self.hoisted_dependencies,
+            current_hoisted_locations: self.hoisted_locations,
+            previously_skipped: self.previously_skipped,
+            unbuilt_builds: self.unbuilt_builds,
+            build_present_packages: self.build_present_packages,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -75,13 +102,14 @@ pub struct HoistedProjects<'a> {
     pub manifests: &'a [(PathBuf, &'a pnpm_package_manifest::PackageManifest)],
     /// Every real importer manifest represented in the full hoisted graph.
     /// The shared package map needs all project names for self-reference
-    /// entries even though direct links are limited to selected anchors.
+    /// entries, and the root links of workspace projects need every
+    /// project, even though direct links are limited to selected anchors.
     pub package_map_manifests: &'a [(PathBuf, &'a pnpm_package_manifest::PackageManifest)],
     /// Lockfile root the walker resolves hoisted directories against.
     pub walker_lockfile_dir: &'a Path,
     /// Anchor for [`crate::SymlinkDirectDependencies`]'s per-importer
     /// `node_modules` lookup. Equals `walker_lockfile_dir` on the
-    /// frozen path; the fresh path passes `config.modules_dir.parent()`
+    /// frozen path; the fresh path passes `Config::modules_dir_anchor`
     /// so relocated `modules_dir` test configs land symlinks where the
     /// rest of the install writes.
     pub symlink_workspace_root: &'a Path,
@@ -89,15 +117,20 @@ pub struct HoistedProjects<'a> {
 
 #[derive(Clone, Copy)]
 pub struct PriorHoistedState<'a> {
-    /// Previous install's `<virtual_store_dir>/lock.yaml`. The walker
+    /// Previous install's `<install_state_dir>/lock.yaml`. The walker
     /// diffs orphans against it and compares the resolution it records
     /// for a directory against the wanted one. Both install paths pass
     /// it; `None` when the file is absent, which is a first install.
     pub current_lockfile: Option<&'a Lockfile>,
+    /// `hoistedDependencies` from the previous install's `.modules.yaml`:
+    /// the workspace projects it linked into the root `node_modules`.
+    pub hoisted_dependencies: Option<&'a crate::HoistedDependencies>,
     /// `hoistedLocations` from the previous install's `.modules.yaml`,
     /// so the walker can mark packages that are already on disk. `None`
     /// on a first install.
     pub current_hoisted_locations: Option<&'a crate::HoistedLocations>,
+    /// See [`crate::PriorLinkState::previously_skipped`].
+    pub previously_skipped: &'a crate::SkippedSnapshots,
     /// Packages the previous install's `.modules.yaml` recorded as not
     /// built. A present one among them still reaches the build phase.
     pub unbuilt_builds: &'a crate::UnbuiltBuilds,
@@ -124,6 +157,8 @@ pub struct HoistedLinkGraph<'a> {
 
 #[derive(Clone, Copy)]
 pub struct BuildPhaseGraph<'a> {
+    pub trusted_importer_ids: &'a std::collections::HashSet<String>,
+    pub loaded_snapshots: Option<&'a HashMap<PackageKey, SnapshotEntry>>,
     pub snapshots: Option<&'a HashMap<PackageKey, SnapshotEntry>>,
     pub packages: Option<&'a HashMap<PackageKey, PackageMetadata>>,
     pub importers: &'a HashMap<String, ProjectSnapshot>,
@@ -132,6 +167,8 @@ pub struct BuildPhaseGraph<'a> {
     /// `ignoreScripts`, only these can add new `pendingBuilds`; the
     /// install orchestrator separately carries forward existing entries.
     pub materialized_snapshots: &'a [PackageKey],
+    /// See [`crate::BuildGraphInputs::build_scope`].
+    pub build_scope: Option<&'a HashSet<PackageKey>>,
 }
 
 #[derive(Clone, Copy)]
@@ -151,9 +188,19 @@ pub struct BuildPhasePolicy<'a> {
 #[derive(Clone, Copy)]
 pub struct BuildPhaseCache<'a> {
     pub maps_by_snapshot: &'a crate::SideEffectsMapsBySnapshot,
+    pub diffs_by_snapshot: &'a crate::SideEffectsBySnapshot,
     pub requires_build_by_snapshot: &'a crate::RequiresBuildBySnapshot,
     pub engine_name: Option<&'a str>,
     pub store_index_writer: &'a Arc<StoreIndexWriter>,
+}
+
+impl<'a> BuildPhaseCache<'a> {
+    pub(crate) fn side_effects(&self) -> crate::CachedSideEffects<'a> {
+        crate::CachedSideEffects {
+            overlays: Some(self.maps_by_snapshot),
+            rows: Some(self.diffs_by_snapshot),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -165,7 +212,7 @@ pub struct BuildPhaseDirectories<'a> {
     /// Directory each importer's `node_modules/.bin` is anchored under
     /// in the post-build top-level bin pass. Equals `workspace_root`
     /// in production (and on the frozen path); the fresh path passes
-    /// its `symlink_root` (`config.modules_dir.parent()`), which can
+    /// its `symlink_root` (`Config::modules_dir_anchor`), which can
     /// differ when a test relocates `modules_dir`.
     pub top_level_bin_root: &'a Path,
     pub layout: &'a VirtualStoreLayout,

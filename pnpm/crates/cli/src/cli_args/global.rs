@@ -6,22 +6,27 @@
 //! installs into a fresh directory under the global packages dir, then a
 //! hash symlink and the global bins are pointed at it.
 
+pub mod rust;
+
 pub use builds::approve_global_builds;
-pub use remove::handle_global_remove;
+pub use legacy::migrate_legacy_global_packages;
+pub use remove::{handle_global_remove, remove_global_groups};
 pub use selectors::{has_pnpm_cli_dependency, selects_pnpm_cli};
 
 mod activation;
 
 use self::activation::{
-    ArtifactCleanupError, FsRename, activate_global_install_with_extra_bin_names,
-    get_actual_bin_names, hash_linked_packages, replace_global_bin_slots,
+    ActivationBinSets, ArtifactCleanupError, FsRename,
+    activate_global_install_with_extra_bin_names, get_actual_bin_names, hash_linked_packages,
+    replace_global_bin_slots,
 };
 use crate::{
     State,
     cli_args::{
-        add::{add_packages, apply_allow_build},
+        add::{AddGroups, AddRequest, add_packages, apply_allow_build},
         approve_builds::{
-            ApproveBuildsArgs, clear_decided_ignored_builds, write_approval_settings,
+            ApproveBuildsArgs, clear_decided_ignored_builds, prompt_approve_install_builds,
+            write_approval_settings,
         },
         global_bin_lock::acquire_global_bin_lock,
         ignored_builds::{IgnoredBuildsScan, get_automatically_ignored_builds},
@@ -31,11 +36,10 @@ use crate::{
             virtual_shim_restoration_owners,
         },
     },
-    engine_pm::selector::tool_install_selector,
+    engine_pm::selector::{rust_toolchain_request, tool_install_selector},
     shim_dispatch::{ShimTarget, install_native_shim, migrate_legacy_shims, remove_native_shim},
 };
 
-use builds::prompt_approve_global_builds;
 use cleanup::discard_install_dir_on_error;
 use derive_more::{Display, Error};
 use install::{
@@ -48,22 +52,21 @@ use pnpm_cmd_shim::{
     Host as CmdShimHost, LinkBinsOptions, PackageBinSource, choose_bins,
     link_bins_of_packages_with_excludes, remove_bin as remove_cmd_shim,
 };
-use pnpm_config::{
-    CatalogMode, Config, GlobalShims, WorkspaceSettings, check_global_bin_dir, decided_allow_builds,
-};
+use pnpm_config::{CatalogMode, Config, GlobalShims, WorkspaceSettings, check_global_bin_dir};
 use pnpm_fs::{is_subdir, lexical_normalize, remove_symlink_dir, symlink_dir};
 use pnpm_global::{
     GlobalPackageInfo, check_global_bin_conflicts, clean_orphaned_install_dirs,
     create_global_cache_key, create_install_dir, find_global_package, get_hash_link,
-    get_installed_bin_names, installed_versions, read_direct_dependencies, read_installed_packages,
-    scan_global_packages,
+    get_installed_bin_names, installed_versions, is_global_install_subdir,
+    read_direct_dependencies, read_installed_packages, scan_global_packages,
 };
 use pnpm_lockfile::{ImporterDepVersion, Lockfile};
 use pnpm_package_is_installable::SupportedArchitectures;
 use pnpm_package_manifest::{DependencyGroup, safe_read_package_json_from_dir};
 use pnpm_package_name::is_valid_old_npm_package_name;
 use pnpm_registry::RangeSpecStyle;
-use pnpm_reporter::{GlobalLog, LogEvent, LogLevel, Reporter};
+use pnpm_reporter::{GlobalLog, LogEvent, LogLevel, PnpmLog, Reporter, SummaryLog};
+use pnpm_resolving_local_resolver::local_file_path;
 use pnpm_resolving_parse_wanted_dependency::parse_wanted_dependency;
 
 use remove::{
@@ -71,8 +74,9 @@ use remove::{
     collect_existing_global_installs, snapshot_global_package,
 };
 use selectors::{
-    groups_matching_params, infer_local_package_alias, replacement_aliases,
-    should_replace_existing_package, split_into_groups, tool_install_selectors, update_selectors,
+    SelectorGroup, groups_matching_params, infer_local_package_alias, missing_file_source_warning,
+    replacement_aliases, should_replace_existing_package, split_into_groups, take_rust_toolchains,
+    tool_install_selectors, update_selectors,
 };
 
 use shims::{
@@ -129,7 +133,7 @@ pub enum GlobalError {
 
 /// Resolve the global packages and global bin directories, erroring with
 /// `NO_GLOBAL_BIN_DIR` when the pnpm home can't be determined.
-fn global_dirs(config: &Config) -> Result<(PathBuf, PathBuf), GlobalError> {
+pub(crate) fn global_dirs(config: &Config) -> Result<(PathBuf, PathBuf), GlobalError> {
     let bin = config.global_bin.clone().ok_or(GlobalError::NoGlobalBinDir)?;
     let pkg_dir = config.global_pkg_dir.clone().ok_or(GlobalError::NoGlobalBinDir)?;
     Ok((pkg_dir, bin))
@@ -153,7 +157,7 @@ fn check_bin_dir(global_bin_dir: &Path) -> miette::Result<()> {
 /// directory, and records a cache-keyed hash symlink.
 pub async fn handle_global_add<Reporter: self::Reporter + 'static>(
     base_config: &'static Config,
-    params: &[String],
+    params: &[AddRequest],
     range_spec_style: RangeSpecStyle,
     supported_architectures: Option<SupportedArchitectures>,
     allow_build: &[String],
@@ -165,13 +169,20 @@ pub async fn handle_global_add<Reporter: self::Reporter + 'static>(
     let groups = split_into_groups(params, cwd);
     // Each selector is read as its package name, so versioned forms like
     // `pnpm@9` or `@pnpm/exe@1` can't bypass the self-install guard.
-    if selects_pnpm_cli(groups.iter().flatten()) {
+    if selects_pnpm_cli(groups.iter().flat_map(SelectorGroup::tokens)) {
         return Err(GlobalError::GlobalPnpmInstall.into());
     }
+    let (rust_channels, groups) = take_rust_toolchains(groups)?;
     let groups = tool_install_selectors(groups);
 
     let (global_pkg_dir, global_bin_dir) = global_dirs(base_config)?;
     check_bin_dir(&global_bin_dir)?;
+    for channel in rust_channels {
+        rust::add_global_rust::<Reporter>(base_config, &global_bin_dir, channel).await?;
+    }
+    if groups.is_empty() {
+        return Ok(());
+    }
     fs::create_dir_all(&global_pkg_dir)
         .into_diagnostic()
         .wrap_err("create the global packages directory")?;
@@ -208,24 +219,15 @@ pub async fn handle_global_update<Reporter: self::Reporter + 'static>(
     check_bin_dir(&global_bin_dir)?;
     clean_orphaned_install_dirs(&global_pkg_dir);
 
-    let scanned =
-        scan_global_packages(&global_pkg_dir).into_diagnostic().wrap_err("scan global packages")?;
-    if scanned.is_empty() {
-        println!("No global packages found");
+    let (rust_updated, params) =
+        rust::update_from_params::<Reporter>(&global_bin_dir, params, selected_hashes.is_some())
+            .await?;
+    let Some(params) = params else { return Ok(()) };
+    let params = params.as_slice();
+
+    let Some(all) = updatable_global_packages(&global_pkg_dir, rust_updated)? else {
         return Ok(());
-    }
-    // `pnpm self-update` owns the pnpm CLI's global install: it is what points
-    // the pnpm home's bins at a release. Reinstalling that group here would
-    // resolve pnpm from the `latest` dist-tag and relink the bins, silently
-    // rolling the running pnpm back to whatever `latest` points at.
-    let all: Vec<GlobalPackageInfo> = scanned
-        .into_iter()
-        .filter(|pkg| !has_pnpm_cli_dependency(pkg))
-        .collect();
-    if all.is_empty() {
-        println!(r#"No global packages to update. Run "pnpm self-update" to update pnpm itself."#);
-        return Ok(());
-    }
+    };
     let Some(mut to_update) = groups_matching_params(all, params) else {
         return Ok(());
     };
@@ -238,16 +240,68 @@ pub async fn handle_global_update<Reporter: self::Reporter + 'static>(
         global_pkg_dir: &global_pkg_dir,
         global_bin_dir: &global_bin_dir,
     };
-    for pkg in &to_update {
-        target.update_group::<Reporter>(
-            pkg,
-            latest,
-            range_spec_style,
-            supported_architectures.clone(),
-        )
-        .await?;
-    }
+    let up_to_date = target.update_groups::<Reporter>(
+        &to_update,
+        latest,
+        range_spec_style,
+        supported_architectures,
+    )
+    .await?;
+    emit_global_update_result::<Reporter>(&global_pkg_dir, up_to_date);
     Ok(())
+}
+
+/// The global groups `pnpm update -g` may reinstall, or `None` after saying
+/// there are none. Saying nothing is left to a run that updated the Rust
+/// toolchain.
+fn updatable_global_packages(
+    global_pkg_dir: &Path,
+    rust_updated: bool,
+) -> miette::Result<Option<Vec<GlobalPackageInfo>>> {
+    let scanned =
+        scan_global_packages(global_pkg_dir).into_diagnostic().wrap_err("scan global packages")?;
+    if scanned.is_empty() {
+        if !rust_updated {
+            pnpm_diagnostics::println!("No global packages found");
+        }
+        return Ok(None);
+    }
+    // `pnpm self-update` owns the pnpm CLI's global install: it is what points
+    // the pnpm home's bins at a release. Reinstalling that group here would
+    // resolve pnpm from the `latest` dist-tag and relink the bins, silently
+    // rolling the running pnpm back to whatever `latest` points at.
+    let all: Vec<GlobalPackageInfo> = scanned
+        .into_iter()
+        .filter(|pkg| !has_pnpm_cli_dependency(pkg))
+        .collect();
+    if all.is_empty() {
+        pnpm_diagnostics::println!(
+            r#"No global packages to update. Run "pnpm self-update" to update pnpm itself."#,
+        );
+        return Ok(None);
+    }
+    Ok(Some(all))
+}
+
+/// Whether `params` name the Rust toolchain, and the params left for the
+/// npm groups.
+fn split_rust_param(params: &[String]) -> (bool, Vec<String>) {
+    let (rust, others): (Vec<&String>, Vec<&String>) = params
+        .iter()
+        .partition(|param| *param == rust::RUST_PARAM);
+    (!rust.is_empty(), others.into_iter().cloned().collect())
+}
+
+fn emit_global_update_result<Reporter: self::Reporter>(global_pkg_dir: &Path, up_to_date: bool) {
+    if up_to_date {
+        Reporter::emit(&LogEvent::Pnpm(PnpmLog {
+            level: LogLevel::Info,
+            message: "Already up to date".to_string(),
+            prefix: String::new(),
+        }));
+    }
+    let prefix = global_pkg_dir.to_string_lossy().into_owned();
+    Reporter::emit(&LogEvent::Summary(SummaryLog { level: LogLevel::Debug, prefix }));
 }
 
 /// Surface a non-fatal problem on the `pnpm:global` channel, matching
@@ -287,3 +341,5 @@ mod builds;
 mod cleanup;
 
 mod groups;
+
+mod legacy;

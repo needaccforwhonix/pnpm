@@ -1,6 +1,8 @@
 use super::{
     super::{
-        Install, ProjectMutation, load_workspace_projects, project_requires_lifecycle_scripts,
+        Install, PROJECT_LIFECYCLE_STAGES, PROJECT_POST_UNINSTALL_STAGES,
+        PROJECT_PRE_UNINSTALL_STAGES, ProjectMutation, configured_or_discovered_workspace_dir,
+        load_workspace_projects, project_requires_lifecycle_scripts,
     },
     InstallDirs, empty_test_lockfile, install_with_pnpmfile,
     install_workspace_member_with_pnpmfile,
@@ -27,17 +29,59 @@ fn project_lifecycle_detection_includes_scripts_and_binding_gyp_fallback() {
         project_dir.join("package.json"),
         serde_json::json!({ "name": "project" }),
     );
-    assert!(!project_requires_lifecycle_scripts(project_dir, &scriptless));
+    assert!(!project_requires_lifecycle_scripts(
+        project_dir,
+        &scriptless,
+        &PROJECT_LIFECYCLE_STAGES
+    ));
 
     fs::write(project_dir.join("binding.gyp"), "{}").unwrap();
-    assert!(project_requires_lifecycle_scripts(project_dir, &scriptless));
+    assert!(project_requires_lifecycle_scripts(
+        project_dir,
+        &scriptless,
+        &PROJECT_LIFECYCLE_STAGES
+    ));
+    assert!(!project_requires_lifecycle_scripts(
+        project_dir,
+        &scriptless,
+        &PROJECT_PRE_UNINSTALL_STAGES
+    ));
 
     fs::remove_file(project_dir.join("binding.gyp")).unwrap();
     let with_prepare = PackageManifest::from_value(
         project_dir.join("package.json"),
         serde_json::json!({ "scripts": { "prepare": "node prepare.js" } }),
     );
-    assert!(project_requires_lifecycle_scripts(project_dir, &with_prepare));
+    assert!(project_requires_lifecycle_scripts(
+        project_dir,
+        &with_prepare,
+        &PROJECT_LIFECYCLE_STAGES
+    ));
+    assert!(!project_requires_lifecycle_scripts(
+        project_dir,
+        &with_prepare,
+        &PROJECT_POST_UNINSTALL_STAGES
+    ));
+}
+/// [`Config::workspace_search_skipped`] alone suppresses the ancestor walk,
+/// never [`Config::ignore_workspace`]. No CLI run reaches the state where
+/// the two disagree, so only a direct call holds them apart.
+#[test]
+fn only_a_skipped_search_suppresses_the_ancestor_walk() {
+    let dir = tempdir().unwrap();
+    let workspace = dir.path();
+    fs::write(workspace.join("pnpm-workspace.yaml"), "packages:\n  - packages/*\n").unwrap();
+    let project = workspace.join("packages/alfa");
+    fs::create_dir_all(&project).unwrap();
+
+    let configured = Config { ignore_workspace: true, ..Config::default() };
+    assert_eq!(
+        configured_or_discovered_workspace_dir(&configured, &project).unwrap(),
+        Some(workspace.to_path_buf()),
+    );
+
+    let flagged = Config { workspace_search_skipped: true, ..Config::default() };
+    assert_eq!(configured_or_discovered_workspace_dir(&flagged, &project).unwrap(), None);
 }
 #[test]
 fn workspace_without_packages_field_enumerates_root_only() {
@@ -61,7 +105,7 @@ fn workspace_without_packages_field_enumerates_root_only() {
         .expect("read workspace manifest")
         .expect("workspace manifest present");
 
-    let projects = load_workspace_projects(dir.path(), Some(&manifest))
+    let projects = load_workspace_projects(dir.path(), Some(&manifest), &[])
         .expect("load workspace projects")
         .expect("workspace projects");
     let names: Vec<&str> = projects
@@ -93,8 +137,8 @@ async fn fresh_install_persists_loose_minimum_release_age_picks_to_workspace_man
     let mut config = Config::new();
     config.store_dir = dir.path().join("store").into();
     config.modules_dir = modules_dir.clone();
-    config.virtual_store_dir = virtual_store_dir;
-    config.registry = mock_instance.url();
+    config.install_state_dir = virtual_store_dir;
+    config.registry = mock_instance.url().to_string();
     config.minimum_release_age = Some(60 * 24 * 365 * 100);
     let config = config.leak();
 
@@ -143,6 +187,8 @@ async fn fresh_install_persists_loose_minimum_release_age_picks_to_workspace_man
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run_with_prompt_eligibility::<SilentReporter>(false)
@@ -184,7 +230,7 @@ async fn install_writes_workspace_state() {
     config.lockfile = false;
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
     let config = config.leak();
 
     let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
@@ -245,6 +291,8 @@ async fn install_writes_workspace_state() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -260,13 +308,10 @@ async fn install_writes_workspace_state() {
         "lastValidatedTimestamp should be populated, got {}",
         state.last_validated_timestamp,
     );
-    let manifest_mtime = crate::optimistic_repeat_install::file_mtime(manifest.path())
-        .expect("manifest should have an mtime");
+    let manifest_mtime =
+        crate::install_state::file_mtime(manifest.path()).expect("manifest should have an mtime");
     assert!(
-        !crate::optimistic_repeat_install::modified_at_or_after(
-            manifest_mtime,
-            state.last_validated_timestamp,
-        ),
+        !crate::install_state::modified_at_or_after(manifest_mtime, state.last_validated_timestamp,),
         "fresh install state should cover the validated manifest mtime",
     );
 
@@ -298,6 +343,7 @@ async fn install_writes_workspace_state() {
                     .to_string()
             ),
             version: Some("1.0.0".to_string()),
+            has_modules_dir: false,
         },
     );
 
@@ -494,9 +540,7 @@ fn filtered_modules_metadata_keeps_empty_optional_maps_omitted() {
 ///    every install-setup event (`pnpm:context`, `pnpm:stage`,
 ///    `pnpm:lockfile-verification`).
 ///
-/// Proves the single-project lockfile gate added in this commit
-/// doesn't break the warm-reinstall fast path it's intended to
-/// preserve. Companion to
+/// Companion to
 /// [`optimistic_repeat_install_does_not_short_circuit_when_lockfile_missing`]
 /// (which covers the negative direction).
 #[tokio::test]
@@ -516,8 +560,8 @@ async fn optimistic_repeat_install_round_trips_on_single_project_install() {
     let mut config = Config::new();
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
-    config.registry = mock_instance.url();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
+    config.registry = mock_instance.url().to_string();
     let config = config.leak();
 
     // First install: fresh-resolve path. Writes `pnpm-lock.yaml` next
@@ -569,6 +613,8 @@ async fn optimistic_repeat_install_round_trips_on_single_project_install() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -651,6 +697,8 @@ async fn optimistic_repeat_install_round_trips_on_single_project_install() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<RecordingReporter>()
@@ -810,4 +858,176 @@ fn workspace_packages_map_prefers_the_dependency_manifest() {
         package.manifest.get("dependencies"),
         Some(&serde_json::json!({ "sibling": "workspace:*" })),
     );
+}
+
+/// A dedicated install reuses the command's workspace-package index only
+/// for the very project list it was built from, never for a selection's or
+/// an embedder's projects that merely look the same.
+#[test]
+fn discovered_workspace_index_serves_only_its_own_projects() {
+    let project = |name: &str| pnpm_workspace::Project {
+        root_dir: std::path::PathBuf::from("ws").join(name),
+        manifest: PackageManifest::from_value(
+            std::path::PathBuf::from("ws").join(name).join("package.json"),
+            serde_json::json!({ "name": name, "version": "1.0.0" }),
+        ),
+        dependency_manifest: None,
+    };
+    let workspace = crate::DiscoveredWorkspace::new(vec![project("lib")]);
+
+    let index = workspace
+        .packages_of(Some(&workspace.projects))
+        .expect("index of its own projects");
+    assert!(
+        index
+            .get("lib")
+            .is_some_and(|by_version| by_version.contains_key("1.0.0")),
+    );
+    assert!(
+        workspace
+            .packages_of(Some(&[project("lib")]))
+            .is_none(),
+    );
+    assert!(workspace.packages_of(None).is_none());
+}
+
+#[cfg(unix)]
+fn setup_symlinked_workspace(dir: &std::path::Path, outside: &std::path::Path) {
+    let target_dir = outside.join("target-pkg");
+    fs::create_dir_all(&target_dir).unwrap();
+    fs::write(
+        target_dir.join("package.json"),
+        serde_json::json!({
+            "name": "target-pkg",
+            "version": "1.0.0",
+            "dependencies": {
+                "@pnpm.e2e/pkg-with-1-dep": "100.0.0",
+            },
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    fs::write(
+        dir.join("package.json"),
+        serde_json::json!({ "name": "root", "version": "0.0.0", "private": true }).to_string(),
+    )
+    .unwrap();
+    fs::write(dir.join("pnpm-workspace.yaml"), "packages:\n  - 'packages/*'\n").unwrap();
+    let packages_dir = dir.join("packages");
+    fs::create_dir_all(&packages_dir).unwrap();
+    pnpm_fs::symlink_dir(&target_dir, &packages_dir.join("linked-pkg")).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn load_workspace_projects_discovers_symlinked_packages() {
+    let dir = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    setup_symlinked_workspace(dir.path(), outside.path());
+
+    let manifest = pnpm_workspace::read_workspace_manifest(dir.path())
+        .expect("read workspace manifest")
+        .expect("workspace manifest present");
+
+    let projects = load_workspace_projects(dir.path(), Some(&manifest), &[])
+        .expect("load workspace projects")
+        .expect("workspace projects");
+
+    let names: Vec<&str> = projects
+        .iter()
+        .filter_map(|project| {
+            project.manifest
+                .value()
+                .get("name")
+                .and_then(|value| value.as_str())
+        })
+        .collect();
+
+    assert_eq!(names, vec!["root", "target-pkg"]);
+}
+
+#[tokio::test]
+async fn install_succeeds_even_when_workspace_state_write_fails() {
+    let mock_instance = TestRegistry::start();
+
+    let dirs = InstallDirs::new();
+
+    std::fs::create_dir_all(&dirs.project_root).expect("create project root");
+    let manifest_path = dirs.project_root.join("package.json");
+    let mut manifest = PackageManifest::create_if_needed(manifest_path).unwrap();
+    manifest
+        .add_dependency("@pnpm.e2e/hello-world-js-bin", "1.0.0", DependencyGroup::Prod)
+        .unwrap();
+    manifest.save().unwrap();
+
+    let mut config = Config::new();
+    config.store_dir = dirs.store_dir.clone().into();
+    config.modules_dir = dirs.modules_dir.clone();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
+    config.registry = mock_instance.url().to_string();
+    let config = config.leak();
+
+    // Create a directory at node_modules/.pnpm-workspace-state-v1.json so that
+    // update_workspace_state fails to rename into place.
+    let state_file_path = workspace_state::get_file_path(&dirs.project_root);
+    std::fs::create_dir_all(&state_file_path).expect("seed directory at state file path");
+
+    let result = Install {
+        lockfile_policy: crate::InstallLockfilePolicy {
+            frozen: false,
+            prefer_frozen: None,
+            ignore_manifest_check: false,
+            trust: false,
+            update_checksums: false,
+            excludes: PolicyExcludes::Persist,
+            disable_optimistic_repeat: false,
+        },
+        execution: crate::InstallExecution {
+            skip_runtimes: false,
+            mutation: ProjectMutation::InstallWorkspace,
+            installs_only: true,
+            node_linker: pnpm_config::NodeLinker::default(),
+            lockfile_only: false,
+            dry_run: false,
+        },
+        resolution: crate::ResolutionInputs {
+            update_seed_policy: crate::UpdateSeedPolicy::KeepAll,
+            preferred_versions_override: None,
+            auth_override: None,
+            observer: None,
+            peer_issues_sink: None,
+            deps_requiring_build_sink: None,
+        },
+        context: crate::InstallInvocation {
+            http_client: &Default::default(),
+            config,
+            manifest: &manifest,
+            emit_initial_manifest: true,
+            lockfile: MaybeLazyLockfile::Loaded(None),
+            lockfile_path: None,
+        },
+        fetching: crate::InstallFetching {
+            tarball_mem_cache: Default::default(),
+            http_client_arc: std::sync::Arc::new(Default::default()),
+            resolved_packages: &Default::default(),
+        },
+        projects: crate::InstallProjects {
+            dependency_groups: [DependencyGroup::Prod],
+            supported_architectures: None,
+            catalogs_override: None,
+            pnpmfile_hook_override: None,
+            workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
+        },
+    }
+    .run::<SilentReporter>()
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "install must succeed even if workspace state cannot be written: {result:?}",
+    );
+    assert!(dirs.project_root.join("pnpm-lock.yaml").exists(), "install must write lockfile");
 }

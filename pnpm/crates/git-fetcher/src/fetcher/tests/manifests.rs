@@ -1,8 +1,7 @@
 use super::{
-    AllowBuildRef, GitFetcher, GitFetcherError, GitManifestQuery, ScriptsPrependNodePath,
-    SilentReporter, StoreDir, Value, deny_all_builds, make_bare_repo,
-    make_bare_repo_with_prepare_script, make_bare_repo_with_sub_package,
-    make_bare_repo_without_manifest, read_git_manifest, tempdir,
+    AllowBuildRef, GitFetcher, GitFetcherError, GitManifestQuery, SilentReporter, StoreDir, Value,
+    deny_all_builds, make_bare_repo, make_bare_repo_with_prepare_script,
+    make_bare_repo_with_sub_package, make_bare_repo_without_manifest, read_git_manifest, tempdir,
 };
 
 #[tokio::test(flavor = "multi_thread")]
@@ -18,11 +17,10 @@ async fn fetcher_handles_repo_without_package_json() {
             ignore: false,
             unsafe_perm: true,
             user_agent: None,
-            prepend_node_path: ScriptsPrependNodePath::Never,
             shell: None,
             node_execpath: None,
             npm_execpath: None,
-            pnpm_execpath: None,
+            running_pnpm: crate::RunningPnpm::default(),
         },
         source: crate::GitSource {
             cache: &crate::GitSourceCache::default(),
@@ -63,18 +61,18 @@ async fn fetcher_rejects_untrusted_manifest_identity() {
     let store_root = tempdir().unwrap();
     let store_dir = StoreDir::from(store_root.path().to_path_buf());
     let repo_url = format!("file://{}", bare.display());
-    let allow_registry_artifacts_only: AllowBuildRef<'_> = &|dep_path| !dep_path.contains("://");
+    let allow_registry_artifacts_only: AllowBuildRef<'_> =
+        &|dep_path| (!dep_path.contains("://")).then_some(true);
 
     let err = GitFetcher {
         scripts: crate::PrepareScriptOptions {
             ignore: false,
             unsafe_perm: true,
             user_agent: None,
-            prepend_node_path: ScriptsPrependNodePath::Never,
             shell: None,
             node_execpath: None,
             npm_execpath: None,
-            pnpm_execpath: None,
+            running_pnpm: crate::RunningPnpm::default(),
         },
         source: crate::GitSource {
             cache: &crate::GitSourceCache::default(),
@@ -125,18 +123,17 @@ async fn fetcher_allows_untrusted_manifest_identity_by_dep_path() {
     let repo_url = format!("file://{}", bare.display());
     let package_id = "git+file:///tmp/repo.git#abc123";
     let allow_dep_path: AllowBuildRef<'_> =
-        &|dep_path| dep_path == "x@git+file:///tmp/repo.git#abc123";
+        &|dep_path| (dep_path == "x@git+file:///tmp/repo.git#abc123").then_some(true);
 
     let received = GitFetcher {
         scripts: crate::PrepareScriptOptions {
             ignore: false,
             unsafe_perm: true,
             user_agent: None,
-            prepend_node_path: ScriptsPrependNodePath::Never,
             shell: None,
             node_execpath: None,
             npm_execpath: None,
-            pnpm_execpath: None,
+            running_pnpm: crate::RunningPnpm::default(),
         },
         source: crate::GitSource {
             cache: &crate::GitSourceCache::default(),
@@ -181,6 +178,7 @@ async fn read_git_manifest_reads_the_name_from_the_checkout() {
         path: None,
         git_shallow_hosts: &[],
         git_bin: None,
+        git_config: &[],
     })
     .await
     .expect("checkout should be readable");
@@ -205,6 +203,7 @@ async fn read_git_manifest_reads_a_repo_rooted_sub_directory() {
         path: Some("/packages/foo"),
         git_shallow_hosts: &[],
         git_bin: None,
+        git_config: &[],
     })
     .await
     .expect("checkout should be readable");
@@ -228,6 +227,7 @@ async fn read_git_manifest_returns_none_for_a_directory_without_a_manifest() {
         path: Some("/packages/no-manifest"),
         git_shallow_hosts: &[],
         git_bin: None,
+        git_config: &[],
     })
     .await
     .expect("a manifest-less directory is not a failure");
@@ -250,6 +250,7 @@ async fn read_git_manifest_rejects_a_non_sha_commit() {
         path: None,
         git_shallow_hosts: &[],
         git_bin: None,
+        git_config: &[],
     })
     .await
     .expect_err("a non-SHA commit must be rejected before it reaches git");
@@ -276,6 +277,7 @@ async fn read_git_manifest_rejects_an_option_shaped_repo() {
         path: None,
         git_shallow_hosts: &[],
         git_bin: None,
+        git_config: &[],
     })
     .await
     .expect_err("an option-shaped repo must be rejected before it reaches git");

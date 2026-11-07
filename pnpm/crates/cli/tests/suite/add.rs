@@ -1,8 +1,8 @@
 use crate::_utils;
 
 use _utils::{
-    bravo_dep_mature_up_to_1_0_1_minimum_release_age, read_current_lockfile,
-    set_minimum_release_age,
+    append_workspace_yaml_key, bravo_dep_mature_up_to_1_0_1_minimum_release_age,
+    read_current_lockfile, set_minimum_release_age,
 };
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
@@ -44,13 +44,22 @@ where
 }
 
 fn cache_foo_index(cache_dir: &Path) {
+    cache_foo_index_versions(cache_dir, &["1.0.0"]);
+}
+
+fn cache_foo_index_versions(cache_dir: &Path, versions: &[&str]) {
     let index_dir = cache_dir.join("v11/cargo-index/crates-io/3/f");
     std::fs::create_dir_all(&index_dir).expect("create sparse-index cache");
-    std::fs::write(
-        index_dir.join("foo"),
-        r#"{"name":"foo","vers":"1.0.0","deps":[],"cksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","features":{},"yanked":false}"#,
-    )
-    .expect("cache sparse-index entry");
+    let entry = versions
+        .iter()
+        .map(|version| {
+            format!(
+                r#"{{"name":"foo","vers":"{version}","deps":[],"cksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","features":{{}},"yanked":false}}"#,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(index_dir.join("foo"), entry).expect("cache sparse-index entry");
 }
 
 fn cargo_add_project() -> (TempDir, PathBuf) {
@@ -116,6 +125,24 @@ fn add_accepts_dir_allow_build_and_registry_after_the_subcommand() {
     );
 
     drop((root, mock_instance));
+}
+
+#[test]
+fn add_short_t_reports_the_long_spellings() {
+    let CommandTempCwd { pacquet, root, .. } = CommandTempCwd::init();
+
+    let output = pacquet
+        .with_args(["add", "foo", "-T"])
+        .output()
+        .expect("run `pacquet add foo -T`");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "`add -T` must fail, stderr:\n{stderr}");
+    assert!(stderr.contains("-T"), "{stderr}");
+    assert!(stderr.contains("--save-types"), "{stderr}");
+    assert!(stderr.contains("--tilde"), "{stderr}");
+
+    drop(root);
 }
 
 /// `--allow-build=!<pkg>` denies the package's build: `allowBuilds` records
@@ -249,6 +276,34 @@ fn should_add_to_package_json() {
     drop((root, anchor)); // cleanup
 }
 
+/// An empty `peerDependencies` the user wrote survives an add
+/// (pnpm/pnpm#5096).
+#[test]
+fn add_keeps_an_empty_peer_dependencies_field() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    std::fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({ "name": "fixture", "peerDependencies": {} }).to_string(),
+    )
+    .expect("write package.json");
+    pacquet
+        .with_args(["add", "@pnpm.e2e/hello-world-js-bin"])
+        .assert()
+        .success();
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(workspace.join("package.json")).unwrap())
+            .unwrap();
+    assert_eq!(manifest.get("peerDependencies"), Some(&serde_json::json!({})));
+    assert!(manifest["dependencies"].get("@pnpm.e2e/hello-world-js-bin").is_some());
+    drop((root, npmrc_info));
+}
+
 /// A one-member workspace whose `fixtures/` packages let a `-w` add use
 /// `file:` specs instead of reaching the registry. Returns the member's
 /// directory.
@@ -306,6 +361,98 @@ fn add_runs_with_ndjson_and_silent_reporters() {
 
         drop((root, npmrc_info)); // cleanup
     }
+}
+
+#[test]
+fn add_can_disable_progress_output() {
+    for (name, args, env, workspace_config) in [
+        (
+            "--no-progress",
+            ["--reporter=append-only", "add", "@pnpm.e2e/hello-world-js-bin", "--no-progress"]
+                .as_slice(),
+            None,
+            false,
+        ),
+        (
+            "PNPM_CONFIG_PROGRESS=false",
+            ["--reporter=append-only", "add", "@pnpm.e2e/hello-world-js-bin"].as_slice(),
+            Some(("PNPM_CONFIG_PROGRESS", "false")),
+            false,
+        ),
+        (
+            "--config.progress=false",
+            [
+                "--reporter=append-only",
+                "add",
+                "@pnpm.e2e/hello-world-js-bin",
+                "--config.progress=false",
+            ]
+            .as_slice(),
+            None,
+            false,
+        ),
+        (
+            "progress: false",
+            ["--reporter=append-only", "add", "@pnpm.e2e/hello-world-js-bin"].as_slice(),
+            None,
+            true,
+        ),
+    ] {
+        let CommandTempCwd {
+            mut pacquet,
+            root,
+            workspace,
+            npmrc_info,
+            ..
+        } = CommandTempCwd::init().add_mocked_registry();
+        if let Some((key, value)) = env {
+            pacquet.env(key, value);
+        }
+        if workspace_config {
+            append_workspace_yaml_key(&workspace, "progress", false);
+        }
+
+        let output = pacquet
+            .with_args(args)
+            .output()
+            .expect("run pacquet add");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{name} failed\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        assert!(!stdout.contains("Progress:"), "{name} printed progress:\n{stdout}");
+        assert!(
+            stdout.contains("dependencies:\n+ @pnpm.e2e/hello-world-js-bin"),
+            "{name} should preserve non-progress output:\n{stdout}",
+        );
+
+        drop((root, npmrc_info));
+    }
+}
+
+#[test]
+fn add_progress_flag_overrides_the_disabled_setting() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    append_workspace_yaml_key(&workspace, "progress", false);
+
+    let output = pacquet
+        .with_args(["--reporter=append-only", "add", "@pnpm.e2e/hello-world-js-bin", "--progress"])
+        .output()
+        .expect("run pacquet add");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "add failed\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains("Progress:"),
+        "--progress should win over `progress: false`:\n{stdout}",
+    );
+
+    drop((root, npmrc_info));
 }
 
 fn prod_spec(dir: &std::path::Path, name: &str) -> String {
@@ -406,7 +553,7 @@ fn add_aliasing_a_package_manager_name_installs_the_aliased_package() {
         "yarn@npm:@pnpm.e2e/dep-of-pkg-with-1-dep@^100.0.0",
         "--lockfile-only",
     ]);
-    assert_eq!(prod_spec(&dir, "yarn"), "npm:@pnpm.e2e/dep-of-pkg-with-1-dep@^100.0.0");
+    assert_eq!(prod_spec(&dir, "yarn"), "npm:@pnpm.e2e/dep-of-pkg-with-1-dep@^100.1.0");
     let manifest: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(dir.join("package.json")).unwrap()).unwrap();
     assert_eq!(manifest.get("devEngines"), None, "{manifest}");
@@ -589,6 +736,69 @@ fn add_moves_dependency_to_new_group_and_keeps_other_groups() {
     drop((root, npmrc_info)); // cleanup
 }
 
+#[test]
+fn add_accepts_lowercase_save_aliases() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+
+    let run_add = |args: &[&str]| {
+        Command::cargo_bin("pnpm")
+            .expect("find the pnpm binary")
+            .with_current_dir(&workspace)
+            .with_arg("add")
+            .with_args(args)
+            .assert()
+            .success();
+    };
+    pacquet
+        .with_args(["add", "-d", "-e", "@pnpm.e2e/foo"])
+        .assert()
+        .success();
+    run_add(&["-o", "@pnpm.e2e/qar@^100.0.0"]);
+
+    let group_specs = |group: DependencyGroup| -> Vec<(String, String)> {
+        let manifest =
+            PackageManifest::from_path(workspace.join("package.json")).expect("read package.json");
+        manifest
+            .dependencies([group])
+            .map(|(name, spec)| (name.to_string(), spec.to_string()))
+            .collect()
+    };
+    let group_members = |group: DependencyGroup| -> Vec<String> {
+        group_specs(group)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    };
+    let dev = group_specs(DependencyGroup::Dev);
+    dbg!(&dev);
+    assert!(
+        matches!(dev.as_slice(), [(name, spec)] if name == "@pnpm.e2e/foo"
+            && spec.chars().all(|char| char.is_ascii_digit() || char == '.')),
+        "-d saves to devDependencies and -e saves an exact version",
+    );
+    assert_eq!(group_members(DependencyGroup::Optional), ["@pnpm.e2e/qar"]);
+
+    run_add(&["-p", "@pnpm.e2e/foo@^100.0.0"]);
+    assert_eq!(group_members(DependencyGroup::Prod), ["@pnpm.e2e/foo"]);
+    assert_eq!(group_members(DependencyGroup::Dev), Vec::<String>::new());
+
+    Command::cargo_bin("pnpm")
+        .expect("find the pnpm binary")
+        .with_current_dir(&workspace)
+        .with_args(["install", "-d", "@pnpm.e2e/bar@^100.0.0"])
+        .assert()
+        .success();
+    assert_eq!(group_members(DependencyGroup::Dev), ["@pnpm.e2e/bar"]);
+
+    drop((root, npmrc_info)); // cleanup
+}
+
 /// `add` into one dependency group must leave the other groups' entries in
 /// the wanted lockfile and `node_modules`: a prod `add` must not erase the
 /// project's devDependencies from either.
@@ -642,7 +852,7 @@ fn add_updates_dependency_in_the_group_it_already_occupies() {
     .expect("write package.json");
 
     pacquet
-        .with_args(["add", "@pnpm.e2e/foo@100.1.0", "@pnpm.e2e/bar@100.1.0", "--lockfile-only"])
+        .with_args(["add", "@pnpm.e2e/foo@latest", "@pnpm.e2e/bar@latest", "--lockfile-only"])
         .assert()
         .success();
 
@@ -787,6 +997,128 @@ mod workspace_flag;
 
 mod cargo;
 
+mod purl;
+
 mod version_specifiers;
 
 mod workspace;
+
+/// `pnpm install <pkg>` is a spelling of `pnpm add <pkg>`, so the
+/// `--prod` / `--dev` filter `install` takes has to survive the rewrite
+/// into `add`'s grammar (pnpm/pnpm#14868).
+#[test]
+fn install_with_a_package_keeps_dev_dependencies_when_prod_is_false() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    std::fs::write(
+        workspace.join("package.json"),
+        r#"{ "name": "p", "version": "1.0.0", "devDependencies": { "@pnpm.e2e/foo": "100.0.0" } }"#,
+    )
+    .unwrap();
+
+    pacquet
+        .with_args(["install", "--prod=false", "@pnpm.e2e/bar@100.0.0"])
+        .assert()
+        .success();
+
+    let installed = get_filenames_in_folder(&workspace.join("node_modules/@pnpm.e2e"));
+    assert_eq!(installed, ["bar", "foo"]);
+    drop((root, npmrc_info)); // cleanup
+}
+
+#[test]
+fn install_with_a_package_skips_dev_dependencies_when_prod_is_set() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    std::fs::write(
+        workspace.join("package.json"),
+        r#"{ "name": "p", "version": "1.0.0", "devDependencies": { "@pnpm.e2e/foo": "100.0.0" } }"#,
+    )
+    .unwrap();
+
+    pacquet
+        .with_args(["install", "--prod", "@pnpm.e2e/bar@100.0.0"])
+        .assert()
+        .success();
+
+    let installed = get_filenames_in_folder(&workspace.join("node_modules/@pnpm.e2e"));
+    assert_eq!(installed, ["bar"]);
+    drop((root, npmrc_info)); // cleanup
+}
+
+/// `--dev` filters what the install materializes and `-D` picks the
+/// manifest group the package is saved into, so one command line can
+/// carry both.
+#[test]
+fn install_with_a_package_skips_dependencies_when_dev_is_set() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    std::fs::write(
+        workspace.join("package.json"),
+        r#"{ "name": "p", "version": "1.0.0", "dependencies": { "@pnpm.e2e/foo": "100.0.0" }, "devDependencies": { "@pnpm.e2e/bar": "100.0.0" } }"#,
+    )
+    .unwrap();
+
+    pacquet
+        .with_args(["install", "--dev", "-D", "@pnpm.e2e/qar@100.0.0"])
+        .assert()
+        .success();
+
+    let installed = get_filenames_in_folder(&workspace.join("node_modules/@pnpm.e2e"));
+    assert_eq!(installed, ["bar", "qar"]);
+
+    let manifest = PackageManifest::from_path(workspace.join("package.json")).unwrap();
+    let group_spec = |group| {
+        manifest
+            .dependencies([group])
+            .find(|(key, _)| *key == "@pnpm.e2e/qar")
+            .map(|(_, spec)| spec.to_string())
+    };
+    assert_eq!(group_spec(DependencyGroup::Dev).as_deref(), Some("100.0.0"));
+    assert_eq!(group_spec(DependencyGroup::Prod), None);
+    drop((root, npmrc_info)); // cleanup
+}
+
+#[test]
+fn add_exact_version_honors_exact_when_range_already_exists() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    std::fs::write(
+        workspace.join("package.json"),
+        r#"{ "name": "p", "version": "1.0.0", "dependencies": { "is-positive": "^0.5.0" } }"#,
+    )
+    .unwrap();
+
+    pacquet
+        .with_args(["add", "is-positive@1.0.0"])
+        .assert()
+        .success();
+
+    let manifest = PackageManifest::from_path(workspace.join("package.json")).unwrap();
+    let spec = manifest
+        .dependencies([DependencyGroup::Prod])
+        .find(|(key, _)| *key == "is-positive")
+        .map(|(_, spec)| spec.to_string());
+    assert_eq!(spec.as_deref(), Some("1.0.0"));
+    drop((root, npmrc_info));
+}

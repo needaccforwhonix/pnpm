@@ -12,22 +12,27 @@ import { loadJsonFileSync } from 'load-json-file'
 import normalizePath from 'normalize-path'
 import { writeJsonFile } from 'write-json-file'
 
+import { NPM_SIGNING_KEYS_FILE, type NpmSigningKey, renderNpmSigningKeysModule, replaceRustNpmSigningKeys } from './npmSigningKeys.js'
+
 const CLI_PKG_NAME = 'pnpm'
 
-// The Rust products' npm wrapper packages. Their manifests are release
-// artifacts owned by the respective generate-packages.mjs scripts and are
-// versioned independently of the TypeScript packages, so none of the
-// normalizations below may touch them.
-const RUST_WRAPPER_PKGS = new Set([
+// These packages have their own release metadata and build pipelines;
+// the TypeScript package entry points, engine range, and Jest scripts do not apply.
+const NON_TYPESCRIPT_PKGS = new Set([
+  // A TypeScript package, but released on its own and built with its own
+  // tsconfig rather than the pnpm v11 conventions.
+  'get-pnpm',
   'pacquet',
   '@pnpm/napi',
   '@pnpm/pnpr',
+  '@pnpm/pnpr-ui',
+  '@pnpm/esm-loader',
 ])
 
 // Files that must be packed with mode 0755 in both `pnpm` and `@pnpm/exe`.
 // `@pnpm/exe` ships the same `dist/` tree as `pnpm`, so the two manifests'
 // `publishConfig.executableFiles` lists must stay identical — otherwise the
-// shims end up packed at 0644 in one of the tarballs (see #11483).
+// shims end up packed at 0644 in one of the tarballs (see pnpm/pnpm#11483).
 const PUBLISH_EXECUTABLE_FILES = [
   './dist/node-gyp-bin/node-gyp',
   './dist/node-gyp-bin/node-gyp.cmd',
@@ -60,6 +65,7 @@ export default async (workspaceDir: string) => { // eslint-disable-line
   // it can reach the release workflow.
   const rustCliVersion = loadJsonFileSync<ProjectManifest>(path.join(workspaceDir, 'pnpm/npm/pnpm/package.json'))!.version!
   const pnprVersion = loadJsonFileSync<ProjectManifest>(path.join(workspaceDir, 'pnpr/npm/pnpr/package.json'))!.version!
+  const npmSigningKeys = loadJsonFileSync<NpmSigningKey[]>(path.join(workspaceDir, NPM_SIGNING_KEYS_FILE))
   const pnpmMajorNumber = pnpmVersion.split('.')[0]
   const pnpmMajorKeyword = `pnpm${pnpmMajorNumber}`
   const nextTag = `next-${pnpmMajorNumber}`
@@ -72,13 +78,13 @@ export default async (workspaceDir: string) => { // eslint-disable-line
   const workspacePackageNames = new Set(workspacePackages.map(pkg => pkg.manifest.name).filter(Boolean))
   const nodeRuntimeVersion = readNodeRuntimeVersion(workspaceDir)
   return createUpdateOptions({
-    formats: { '.yml': textFormat, '.rs': textFormat, '.toml': textFormat, '.lock': textFormat },
+    formats: { '.yml': textFormat, '.rs': textFormat, '.toml': textFormat, '.lock': textFormat, '.ts': textFormat },
     files: {
       'package.json': (manifest: ProjectManifest & { keywords?: string[] } | null, { dir }: { dir: string }) => {
         if (!manifest) {
           return manifest
         }
-        if (manifest.name && RUST_WRAPPER_PKGS.has(manifest.name)) {
+        if (manifest.name && NON_TYPESCRIPT_PKGS.has(manifest.name)) {
           return manifest
         }
         if (manifest.name === 'monorepo-root') {
@@ -151,7 +157,6 @@ export default async (workspaceDir: string) => { // eslint-disable-line
             for (const depName of [
               '@pnpm/linux-arm64',
               '@pnpm/linux-x64',
-              '@pnpm/linuxstatic-arm64',
               '@pnpm/linuxstatic-x64',
               '@pnpm/macos-arm64',
               '@pnpm/win-arm64',
@@ -196,6 +201,15 @@ export default async (workspaceDir: string) => { // eslint-disable-line
         replaceRustVersion(content, /^(version\s*=\s*)"[^"]*"/m, `$1"${pnprVersion}"`),
       'Cargo.lock': (content: string | null) =>
         replaceRustVersion(content, /(\[\[package\]\]\nname = "pnpr"\nversion = )"[^"]*"/, `$1"${pnprVersion}"`),
+      // The npm signing keys each product pins, from the one committed list.
+      // pnpm keeps trusting the keys npm withdrew; get-pnpm, an installer of
+      // current releases only, does not.
+      'pnpm11/deps/security/signatures/src/npmSigningKeys.ts': (content: string | null) =>
+        content == null ? content : renderNpmSigningKeysModule(npmSigningKeys, { currentOnly: false }),
+      'pnpm/npm/get-pnpm/src/npmSigningKeys.ts': (content: string | null) =>
+        content == null ? content : renderNpmSigningKeysModule(npmSigningKeys, { currentOnly: true }),
+      'pnpm/crates/cli/src/cli_args/self_update/verify_engine/signatures.rs': (content: string | null) =>
+        replaceRustNpmSigningKeys(content, npmSigningKeys),
     },
   })
 }
@@ -214,6 +228,7 @@ async function updateTSConfig (
   if (tsConfig == null) return tsConfig
   if (manifest.name === '@pnpm/tsconfig') return tsConfig
   if (manifest.name === '@pnpm-private/typecheck') return tsConfig
+  if (manifest.name != null && NON_TYPESCRIPT_PKGS.has(manifest.name)) return tsConfig
   const relative = normalizePath(path.relative(context.workspaceDir, dir)) as ProjectId
   const importer = context.lockfile.importers[relative]
   if (!importer) return tsConfig
@@ -265,8 +280,8 @@ async function updateTSConfig (
         // If composite is explicitly set to false, we can't add the main
         // tsconfig.json as a project reference. Only composite enabled projects
         // can be referenced by definition. Instead, we have to add all the
-        // project references directly. Note that this check is approximate. The
-        // main tsconfig.json could inherit another conifg that sets composite
+        // project references directly. This check is approximate. The
+        // main tsconfig.json could inherit another config that sets composite
         // to be false.
         //
         // The link values are relative to the current packages root. We'll need
@@ -280,7 +295,7 @@ async function updateTSConfig (
         }))
 
         // If the main project is composite (the more common case), we can
-        // simply reference that. The main project will have more project
+        // reference that. The main project will have more project
         // references that will apply to the tests too.
         //
         // The project reference allows editor features like Go to Definition
@@ -370,6 +385,7 @@ async function updateManifest (workspaceDir: string, manifest: ProjectManifest, 
   let scripts: Record<string, string>
   let preset = '@pnpm/jest-config'
   switch (manifest.name) {
+    case '@pnpm/bins.cmd-shim':
     case '@pnpm/lockfile.types':
       scripts = { ...manifest.scripts }
       break
@@ -486,7 +502,7 @@ async function updateManifest (workspaceDir: string, manifest: ProjectManifest, 
     repository = `https://github.com/pnpm/pnpm/tree/main/${relative}`
   }
   if (scripts.lint) {
-    if (fs.existsSync(path.join(dir, 'test'))) {
+    if (fs.existsSync(path.join(dir, 'test')) && manifest.name !== '@pnpm/bins.cmd-shim') {
       scripts.lint = 'eslint "src/**/*.ts" "test/**/*.ts"'
     } else {
       scripts.lint = 'eslint "src/**/*.ts"'
@@ -504,6 +520,10 @@ async function updateManifest (workspaceDir: string, manifest: ProjectManifest, 
     if (manifest.bin) {
       files.push('bin')
     }
+    if (manifest.name === '@pnpm/exec.npm-lifecycle') {
+      // The node-gyp wrappers the runner puts on a script's PATH.
+      files.push('node-gyp-bin')
+    }
   }
   if (manifest.dependencies?.['@types/ramda']) {
     // We should never release @types/ramda as a prod dependency as it breaks the bit repository.
@@ -513,7 +533,7 @@ async function updateManifest (workspaceDir: string, manifest: ProjectManifest, 
     }
     delete manifest.dependencies['@types/ramda']
   }
-  if (scripts.test) {
+  if (scripts.test && manifest.name !== '@pnpm/bins.cmd-shim') {
     Object.assign(manifest, {
       jest: {
         ...(manifest as any).jest, // eslint-disable-line
@@ -531,7 +551,7 @@ async function updateManifest (workspaceDir: string, manifest: ProjectManifest, 
     files,
     funding: 'https://opencollective.com/pnpm',
     homepage,
-    license: 'MIT',
+    license: manifest.license ?? 'MIT',
     repository,
     scripts,
     exports: {

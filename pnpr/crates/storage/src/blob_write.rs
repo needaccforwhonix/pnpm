@@ -11,32 +11,37 @@ pub struct BlobWrite {
     pub(super) final_path: PathBuf,
 }
 
-/// A reserved slot for a hosted-blob write. The publish flow writes
+/// A reserved slot for a hosted-archive write. The publish flow writes
 /// the decoded + verified bytes to `tmp_path` (a local file) inside a
-/// blocking task, then promotes it to its final home — a rename on the
-/// fs backend, an upload on the S3 backend — via
-/// [`crate::Storage::finalize_blob_slot`], which recomputes the
-/// destination from `name`/`filename`.
+/// blocking task, then promotes it under the identity of those bytes — a
+/// rename on the fs backend, an upload on the S3 backend — via
+/// [`crate::Storage::promote_blob_slot`].
 #[derive(Debug)]
 pub struct BlobSlot {
     pub tmp_path: PathBuf,
     pub(super) name: CanonicalPackageName,
+    /// The public file name the archive is published as.
     pub(super) filename: String,
+    /// The version the file belongs to, empty when none.
+    pub(super) version: String,
 }
 
 impl BlobSlot {
-    /// Rebuild a slot from its journaled parts so startup recovery can
-    /// re-run [`crate::Storage::finalize_blob_slot`] on it.
-    pub(crate) fn from_parts(
-        tmp_path: PathBuf,
-        name: CanonicalPackageName,
-        filename: String,
-    ) -> Self {
-        Self { tmp_path, name, filename }
+    /// The public file name the archive is published as.
+    #[must_use]
+    pub fn filename(&self) -> &str {
+        &self.filename
     }
 
-    pub(crate) fn filename(&self) -> &str {
-        &self.filename
+    #[must_use]
+    pub fn name(&self) -> &CanonicalPackageName {
+        &self.name
+    }
+
+    /// The slot of a file of `version`, whose mapping goes with the version.
+    #[must_use]
+    pub fn for_version(self, version: &str) -> Self {
+        Self { version: version.to_string(), ..self }
     }
 }
 
@@ -48,22 +53,49 @@ impl BlobWrite {
         }
     }
 
+    /// Read back what was written through `check` on a blocking thread and
+    /// return its verdict. The handle stays open, so the bytes checked are the
+    /// bytes later promoted or streamed.
+    pub async fn check(
+        &mut self,
+        check: impl FnOnce(&mut std::fs::File) -> bool + Send + 'static,
+    ) -> std::io::Result<bool> {
+        let Some(mut file) = self.file.take() else {
+            return Err(std::io::Error::other("blob cache writer is closed"));
+        };
+        file.flush().await?;
+        file.seek(SeekFrom::Start(0)).await?;
+        let mut std_file = file.into_std().await;
+        let (std_file, verdict) = tokio::task::spawn_blocking(move || {
+            let verdict = check(&mut std_file);
+            (std_file, verdict)
+        })
+        .await
+        .map_err(std::io::Error::other)?;
+        let mut file = fs::File::from_std(std_file);
+        file.seek(SeekFrom::End(0)).await?;
+        self.file = Some(file);
+        Ok(verdict)
+    }
+
     /// Sync the file to disk and rename it to its final cache path.
-    pub async fn finalize(mut self) -> std::io::Result<()> {
-        match self.file.as_mut() {
+    pub async fn finalize(self) -> std::io::Result<()> {
+        self.seal().await?.promote().await
+    }
+
+    /// The cache path [`Self::finalize`] promotes this write to.
+    #[must_use]
+    pub fn final_path(&self) -> &super::Path {
+        &self.final_path
+    }
+
+    /// Sync the file to disk and close it, leaving it unpromoted.
+    pub async fn seal(mut self) -> std::io::Result<SealedBlob> {
+        match self.file.take() {
             Some(file) => file.sync_all().await?,
             None => return Err(std::io::Error::other("blob cache writer is closed")),
         }
-        drop(self.file.take());
-        if let Some(parent) = self.final_path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-        let tmp_path = self.tmp_path
-            .as_ref()
-            .ok_or_else(|| std::io::Error::other("blob cache temp path is missing"))?;
-        fs::rename(tmp_path, &self.final_path).await?;
-        self.tmp_path = None;
-        Ok(())
+        Ok(SealedBlob { write: self })
     }
 
     /// Rewind the verified write handle so the caller streams the exact
@@ -92,6 +124,32 @@ impl BlobWrite {
             Err(err) if err.kind() == ErrorKind::NotFound => self.tmp_path = None,
             Err(_) => {}
         }
+    }
+}
+
+/// A [`BlobWrite`] whose bytes are on disk and whose file is closed, so it
+/// holds no descriptor while it waits. [`Self::promote`] renames it to its
+/// final cache path; dropping it removes the temp file.
+pub struct SealedBlob {
+    write: BlobWrite,
+}
+
+impl SealedBlob {
+    pub async fn promote(mut self) -> std::io::Result<()> {
+        let write = &mut self.write;
+        if let Some(parent) = write.final_path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        let tmp_path = write.tmp_path
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("blob cache temp path is missing"))?;
+        fs::rename(tmp_path, &write.final_path).await?;
+        write.tmp_path = None;
+        Ok(())
+    }
+
+    pub async fn abandon(self) {
+        self.write.abandon().await;
     }
 }
 

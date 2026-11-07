@@ -3,6 +3,9 @@ pub mod custom_resolver_adapter;
 pub mod finder;
 pub mod node_runtime;
 pub mod worker;
+
+pub(crate) use pnpm_process as process;
+pub(crate) use pnpm_process::asynchronous as async_process;
 pub use worker::LogFn;
 
 use async_trait::async_trait;
@@ -10,6 +13,42 @@ use derive_more::Display;
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
+
+/// The `loadPnpmfile(path)` helper the worker script starts with.
+pub(crate) const LOAD_PNPMFILE: &str = include_str!("load_pnpmfile.cjs");
+
+/// A pnpmfile hook that pnpm accepts in a pnpmfile but never runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IgnoredHook {
+    FilterLog,
+    ImportPackage,
+}
+
+impl IgnoredHook {
+    pub const ALL: [IgnoredHook; 2] = [IgnoredHook::FilterLog, IgnoredHook::ImportPackage];
+
+    /// The hook's key in the pnpmfile's `hooks` export.
+    #[must_use]
+    pub fn export_name(self) -> &'static str {
+        match self {
+            IgnoredHook::FilterLog => "filterLog",
+            IgnoredHook::ImportPackage => "importPackage",
+        }
+    }
+
+    /// The hooks among [`IgnoredHook::ALL`] whose export name is in `names`.
+    pub(crate) fn named_in(names: &[Value]) -> Vec<IgnoredHook> {
+        let is_named = |hook: &IgnoredHook| {
+            names
+                .iter()
+                .any(|name| *name == hook.export_name())
+        };
+        IgnoredHook::ALL
+            .into_iter()
+            .filter(is_named)
+            .collect()
+    }
+}
 
 /// A native operation requested by a JavaScript custom fetcher.
 pub struct FetcherCallback {
@@ -19,13 +58,17 @@ pub struct FetcherCallback {
     pub response: oneshot::Sender<Result<Value, Value>>,
 }
 
-#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum FetcherMethod {
     CafsInfo,
     TempDir,
     LocalTarball,
     RemoteTarball,
+    Directory,
+    GitHostedTarball,
+    Git,
+    Binary,
 }
 
 pub type FetcherCallbackSender = mpsc::UnboundedSender<FetcherCallback>;
@@ -44,7 +87,14 @@ pub enum HookError {
     Timeout(String, u64),
 
     #[display("Error during pnpmfile execution. pnpmfile: \"{pnpmfile}\". Error: \"{message}\".")]
-    Execution { pnpmfile: String, message: String },
+    Execution {
+        pnpmfile: String,
+        message: String,
+    },
+
+    BadReadPackageResult {
+        message: String,
+    },
 }
 
 /// Context provided to pnpmfile hooks.
@@ -71,8 +121,9 @@ pub struct PreResolutionHookLogger {
     pub warn: Arc<dyn Fn(String) + Send + Sync>,
 }
 
-/// Context provided to preResolution hooks.
-#[derive(Clone)]
+/// Context provided to preResolution hooks. `wanted_lockfile` and
+/// `current_lockfile` are `{}` when the lockfile does not exist.
+#[derive(Debug, Clone)]
 pub struct PreResolutionHookContext {
     pub wanted_lockfile: Value,
     pub current_lockfile: Value,
@@ -144,15 +195,47 @@ pub trait PnpmfileHooks: Send + Sync {
         Ok(manifest)
     }
 
-    /// `preResolution` hook: side-effect hook called before resolution (e.g., logging, validation).
-    async fn pre_resolution(&self, ctx: PreResolutionHookContext, logger: PreResolutionHookLogger);
+    /// `preResolution` hook: called before resolution with the lockfiles the
+    /// install read.
+    ///
+    /// Returns `ctx` with `wanted_lockfile` and `current_lockfile` as the
+    /// hook left them. Only changes the hook makes to those two objects in
+    /// place count: reassigning a context field or returning a value does
+    /// not, matching pnpm. A throwing hook yields a [`HookError`] and aborts
+    /// the install.
+    async fn pre_resolution(
+        &self,
+        ctx: PreResolutionHookContext,
+        logger: PreResolutionHookLogger,
+    ) -> Result<PreResolutionHookContext, HookError>;
 
     /// `filterLog` hook: determines if a log message should be emitted.
     async fn filter_log(&self, log: Value, ctx: HookContext) -> bool;
 
-    /// Whether this pnpmfile exports a callable `filterLog` hook.
-    async fn has_filter_log(&self) -> bool {
-        false
+    /// The [`IgnoredHook`]s this pnpmfile exports as callables.
+    async fn ignored_hooks(&self) -> Vec<IgnoredHook> {
+        Vec::new()
+    }
+
+    /// Whether this pnpmfile exports a callable `readPackage` hook.
+    async fn has_read_package(&self) -> Result<bool, HookError> {
+        Ok(false)
+    }
+
+    /// Whether this pnpmfile exports a callable `afterAllResolved` hook.
+    async fn has_after_all_resolved(&self) -> Result<bool, HookError> {
+        Ok(false)
+    }
+
+    /// Whether this pnpmfile exports a callable `preResolution` hook.
+    async fn has_pre_resolution(&self) -> Result<bool, HookError> {
+        Ok(false)
+    }
+
+    /// The `readPackage` capability of a checksum-excluded hook source.
+    /// `None` means this hook set has no such source.
+    async fn untracked_read_package_hook(&self) -> Result<Option<bool>, HookError> {
+        Ok(None)
     }
 
     /// Compute the `pnpmfileChecksum` recorded in `pnpm-lock.yaml`, or
@@ -326,6 +409,16 @@ pub async fn current_pnpmfile_checksum(
     hooks.calculate_pnpmfile_checksum().await
 }
 
+/// The `readPackage` capability of a checksum-excluded hook source.
+pub async fn untracked_read_package_hook(
+    hooks: Option<&Arc<dyn PnpmfileHooks>>,
+) -> Result<Option<bool>, HookError> {
+    match hooks {
+        Some(hooks) => hooks.untracked_read_package_hook().await,
+        None => Ok(None),
+    }
+}
+
 /// A no-op implementation of [`PnpmfileHooks`].
 pub struct NoopHooks;
 
@@ -341,7 +434,13 @@ impl PnpmfileHooks for NoopHooks {
     async fn after_all_resolved(&self, _: Value, _: HookContext) -> Result<Value, HookError> {
         Ok(Value::Null)
     }
-    async fn pre_resolution(&self, _: PreResolutionHookContext, _: PreResolutionHookLogger) {}
+    async fn pre_resolution(
+        &self,
+        ctx: PreResolutionHookContext,
+        _: PreResolutionHookLogger,
+    ) -> Result<PreResolutionHookContext, HookError> {
+        Ok(ctx)
+    }
     async fn filter_log(&self, _: Value, _: HookContext) -> bool {
         true
     }
@@ -394,16 +493,36 @@ impl PnpmfileHooks for ChecksumFreeHooks {
         self.0.before_packing(manifest, dir, ctx).await
     }
 
-    async fn pre_resolution(&self, ctx: PreResolutionHookContext, logger: PreResolutionHookLogger) {
-        self.0.pre_resolution(ctx, logger).await;
+    async fn pre_resolution(
+        &self,
+        ctx: PreResolutionHookContext,
+        logger: PreResolutionHookLogger,
+    ) -> Result<PreResolutionHookContext, HookError> {
+        self.0.pre_resolution(ctx, logger).await
     }
 
     async fn filter_log(&self, log: Value, ctx: HookContext) -> bool {
         self.0.filter_log(log, ctx).await
     }
 
-    async fn has_filter_log(&self) -> bool {
-        self.0.has_filter_log().await
+    async fn ignored_hooks(&self) -> Vec<IgnoredHook> {
+        self.0.ignored_hooks().await
+    }
+
+    async fn has_read_package(&self) -> Result<bool, HookError> {
+        self.0.has_read_package().await
+    }
+
+    async fn has_after_all_resolved(&self) -> Result<bool, HookError> {
+        self.0.has_after_all_resolved().await
+    }
+
+    async fn has_pre_resolution(&self) -> Result<bool, HookError> {
+        self.0.has_pre_resolution().await
+    }
+
+    async fn untracked_read_package_hook(&self) -> Result<Option<bool>, HookError> {
+        self.0.untracked_read_package_hook().await
     }
 
     async fn calculate_pnpmfile_checksum(&self) -> Option<String> {

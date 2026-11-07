@@ -2,7 +2,7 @@ use std::{
     env,
     ffi::OsString,
     fmt::Write as _,
-    io,
+    fs, io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -16,8 +16,7 @@ use tracing_subscriber::{Layer, layer::SubscriberExt};
 
 use super::{
     Config, EnvVar, EnvVarOs, GetCurrentDir, GetHomeDir, Host, LinkProbe, LoadWorkspaceYamlError,
-    NodeLinker, NodePackageMapType, PackageImportMethod, TrustPolicy, WorkspaceSettings, fs,
-    settings::default_ci,
+    NodeLinker, NodePackageMapMode, NodePackageMapType, PackageImportMethod, TrustPolicy,
 };
 use crate::defaults::{GLOBAL_LAYOUT_VERSION, default_state_dir, default_store_dir};
 
@@ -86,8 +85,7 @@ pub(crate) fn capture_warnings<Func: FnOnce()>(f: Func) -> Vec<String> {
 /// module pin specific config-cascade behaviours, none of which
 /// turn on cross-volume detection, so the test fakes return
 /// `false` for every probe. The probe failing collapses to the
-/// pre-existing `SmartDefault` `store_dir` value, which is what the
-/// pre-port assertions already assume.
+/// pre-existing `SmartDefault` `store_dir` value.
 ///
 /// `inert_link_probe!(Name)` wires the impl onto a local test
 /// fake without polluting each test fn with the boilerplate.
@@ -382,6 +380,12 @@ mod workspace_settings_json_env_env_default;
 
 mod workspace_settings_materialization_env_vars_override;
 
+mod dedicated_project_layout;
+
+mod modules_dir_name;
+
+mod place_skipped_store_dir;
+
 mod files;
 
 mod security;
@@ -391,3 +395,11 @@ mod reporting;
 mod dependencies;
 
 mod integrity;
+
+mod json_env_multiple_registries;
+
+mod cli_setting_values;
+
+mod includes;
+
+mod tls_settings;

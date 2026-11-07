@@ -12,7 +12,7 @@ use pnpm_deps_restorer::{PathNode, graph_sequencer};
 use pnpm_reporter::{LogEvent, LogLevel, PnpmLog, Reporter};
 use pnpm_workspace::{GraphPkg, Project};
 use pnpm_workspace_projects_graph::{
-    CreateProjectsGraphOptions, ProjectGraph, create_projects_graph,
+    CreateProjectsGraphOptions, ProjectGraph, WorkspaceCatalogs, create_projects_graph,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -25,7 +25,7 @@ use std::{
 /// Edges are read from `graph` alone: an edge leaving it — a selected
 /// project depending on an unselected one — is dropped rather than
 /// followed, so two selected projects joined only through a third are
-/// not a cycle. pnpm sequences its selected graph the same way. The
+/// not a cycle. pnpm sequences its selected graph the same way.
 /// Self-references are reported by the sequencer but do not make a workspace
 /// unorderable, so only cycles with more than one project are returned.
 #[must_use]
@@ -66,14 +66,13 @@ pub fn workspace_cycles<Pkg>(graph: &ProjectGraph<Pkg>) -> Option<Vec<Vec<PathBu
 /// narrows `projects` to a `--filter`ed or `-r` selection, `None` covers
 /// the whole workspace.
 ///
-/// A selected project keeps the dependency list it has in the full
-/// graph; [`workspace_cycles`] then drops the edges that leave the
-/// selection, which is how pnpm sequences its selected graph.
+/// A selected project keeps the dependency list it has in the full graph.
 #[must_use]
 pub fn install_scope_cycles(
     config: &Config,
     projects: &[Project],
     selected_dirs: Option<&HashSet<PathBuf>>,
+    catalogs: Option<WorkspaceCatalogs<'_>>,
 ) -> Option<Vec<Vec<PathBuf>>> {
     if projects.len() < 2 {
         return None;
@@ -87,6 +86,7 @@ pub fn install_scope_cycles(
             link_workspace_packages: Some(
                 config.link_workspace_packages != LinkWorkspacePackages::Off,
             ),
+            catalogs,
             ..CreateProjectsGraphOptions::default()
         },
     )

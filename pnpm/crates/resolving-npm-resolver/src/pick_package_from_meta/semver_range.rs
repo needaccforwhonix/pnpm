@@ -84,40 +84,74 @@ pub(super) fn is_digits(value: &str) -> bool {
 /// A parse failure on either input is treated as "doesn't satisfy"
 /// so the picker can fall through to the next candidate instead of
 /// crashing.
-pub(super) fn semver_satisfies_loose(version: &str, range: &str) -> bool {
+pub(crate) fn semver_satisfies_loose(version: &str, range: &str) -> bool {
     let Ok(parsed_version) = Version::parse(version) else { return false };
     let Some(parsed_range) = cached_range(range) else { return false };
     parsed_version.satisfies(&parsed_range)
 }
 
-pub(super) fn max_satisfying<Raw: AsRef<str>>(versions: &[Raw], range: &str) -> Option<String> {
-    let parsed_range = cached_range(range)?;
-    let mut best: Option<(Version, String)> = None;
+/// The highest version in `versions` by semver order, without a range
+/// check. The `*` pick admits a prerelease `latest` that a plain `*`
+/// range would reject, so its deprecation retry ranks candidates
+/// directly instead of re-running the range.
+pub(super) fn max_version<Raw: AsRef<str>>(versions: &[Raw]) -> Option<String> {
+    let mut best: Option<(Version, &str)> = None;
     for version in versions {
         let Ok(parsed) = Version::parse(version.as_ref()) else { continue };
+        match &best {
+            Some((current, _)) if current >= &parsed => {}
+            _ => best = Some((parsed, version.as_ref())),
+        }
+    }
+    best.map(|(_, raw)| raw.to_string())
+}
+
+pub(super) fn min_version<'a>(versions: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let mut best: Option<(Version, &'a str)> = None;
+    for version in versions {
+        let Ok(parsed) = Version::parse(version) else { continue };
+        match &best {
+            Some((current, _)) if current <= &parsed => {}
+            _ => best = Some((parsed, version)),
+        }
+    }
+    best.map(|(_, raw)| raw.to_string())
+}
+
+pub(super) fn max_satisfying<'a>(
+    versions: impl IntoIterator<Item = &'a str>,
+    range: &str,
+) -> Option<String> {
+    let parsed_range = cached_range(range)?;
+    let mut best: Option<(Version, &'a str)> = None;
+    for version in versions {
+        let Ok(parsed) = Version::parse(version) else { continue };
         if !parsed.satisfies(&parsed_range) {
             continue;
         }
         match &best {
             Some((current, _)) if current >= &parsed => {}
-            _ => best = Some((parsed, version.as_ref().to_string())),
+            _ => best = Some((parsed, version)),
         }
     }
-    best.map(|(_, raw)| raw)
+    best.map(|(_, raw)| raw.to_string())
 }
 
-pub(super) fn min_satisfying<Raw: AsRef<str>>(versions: &[Raw], range: &str) -> Option<String> {
+pub(super) fn min_satisfying<'a>(
+    versions: impl IntoIterator<Item = &'a str>,
+    range: &str,
+) -> Option<String> {
     let parsed_range = cached_range(range)?;
-    let mut best: Option<(Version, String)> = None;
+    let mut best: Option<(Version, &'a str)> = None;
     for version in versions {
-        let Ok(parsed) = Version::parse(version.as_ref()) else { continue };
+        let Ok(parsed) = Version::parse(version) else { continue };
         if !parsed.satisfies(&parsed_range) {
             continue;
         }
         match &best {
             Some((current, _)) if current <= &parsed => {}
-            _ => best = Some((parsed, version.as_ref().to_string())),
+            _ => best = Some((parsed, version)),
         }
     }
-    best.map(|(_, raw)| raw)
+    best.map(|(_, raw)| raw.to_string())
 }

@@ -1,16 +1,18 @@
 use super::{
-    AccessArgs, AddArgs, ApproveBuildsArgs, AuditArgs, BinArgs, BugsArgs, CacheCommand,
-    CatFileArgs, CatIndexArgs, ChangeArgs, CiArgs, CleanArgs, CompletionArgs, CompletionServerArgs,
-    ConfigArgs, ConfigGetAliasArgs, ConfigSetAliasArgs, CreateArgs, DedupeArgs, DeployArgs,
-    DeprecateArgs, DistTagArgs, DlxArgs, DocsArgs, DoctorArgs, EnvArgs, ExecArgs, FetchArgs,
-    FindHashArgs, IgnoredBuildsArgs, ImportArgs, InitArgs, InstallArgs, InstallTestArgs, LaneArgs,
-    LicensesArgs, LinkArgs, ListArgs, LoginArgs, LogoutArgs, NotImplementedArgs, OutdatedArgs,
-    OwnerArgs, PackAppArgs, PackArgs, PatchArgs, PatchCommitArgs, PatchRemoveArgs, PeersArgs,
-    PingArgs, PipelineArgs, PkgArgs, PrefixArgs, PruneArgs, PublishArgs, RebuildArgs, RemoveArgs,
-    RepoArgs, RestartArgs, RootArgs, RunArgs, RuntimeArgs, SbomArgs, ScriptShortcutArgs,
-    SearchArgs, SelfUpdateArgs, SetScriptArgs, SetupArgs, ShimArgs, StageArgs, StarArgs, StarsArgs,
-    StoreCommand, Subcommand, SummaryScope, TeamArgs, UndeprecateArgs, UnlinkArgs, UnpublishArgs,
-    UnstarArgs, UpdateArgs, VersionArgs, ViewArgs, WhyArgs, WithArgs,
+    AccessArgs, AddArgs, ApproveArgs, ApproveBuildsArgs, AuditArgs, BinArgs, BugsArgs,
+    CacheCommand, CatFileArgs, CatIndexArgs, ChangeArgs, CiArgs, CleanArgs, CompletionArgs,
+    CompletionServerArgs, ConfigArgs, ConfigGetAliasArgs, ConfigSetAliasArgs, CreateArgs,
+    DedupeArgs, DeployArgs, DeprecateArgs, DistTagArgs, DlxArgs, DocsArgs, DoctorArgs, EnvArgs,
+    ExecArgs, FetchArgs, FindHashArgs, FundArgs, IgnoredBuildsArgs, ImportArgs, InitArgs,
+    InstallArgs, InstallTestArgs, LaneArgs, LicensesArgs, LinkArgs, ListArgs, LoginArgs,
+    LogoutArgs, NotImplementedArgs, OutdatedArgs, OwnerArgs, PackAppArgs, PackArgs, PatchArgs,
+    PatchCommitArgs, PatchRemoveArgs, PeersArgs, PermissionsArgs, PingArgs, PipelineArgs, PkgArgs,
+    PrefixArgs, ProfileArgs, PruneArgs, PublishArgs, RebuildArgs, RemoveArgs, RepoArgs,
+    RestartArgs, RootArgs, RunArgs, RuntimeArgs, SbomArgs, ScriptShortcutArgs, SearchArgs,
+    SelfUpdateArgs, SetScriptArgs, SetupArgs, ShimArgs, StageArgs, StarArgs, StarsArgs,
+    StoreCommand, Subcommand, SummaryScope, TasksArgs, TeamArgs, TokenArgs, UndeprecateArgs,
+    UnlinkArgs, UnpublishArgs, UnstarArgs, UpdateArgs, VersionArgs, ViewArgs, WhoamiArgs, WhyArgs,
+    WithArgs,
 };
 
 #[derive(Debug, strum::IntoStaticStr, Subcommand)]
@@ -28,7 +30,7 @@ pub enum CliCommand {
     /// Install packages
     #[clap(visible_alias = "i")]
     Install(InstallArgs),
-    /// Runs a `pnpm install` followed immediately by a `pnpm test`. It takes exactly the same arguments as `pnpm install`.
+    /// Runs a `pnpm install` followed immediately by a `pnpm test`. Accepts the same arguments as `pnpm install`, plus `--no-bail` to continue running workspace tests after a failure.
     #[clap(name = "install-test", visible_alias = "it")]
     InstallTest(InstallTestArgs),
     /// Update packages to their newest version based on the specified range
@@ -57,6 +59,8 @@ pub enum CliCommand {
     /// Check the licenses of the installed packages.
     #[clap(visible_aliases = ["licences"])]
     Licenses(LicensesArgs),
+    /// Retrieve the funding information of the installed packages.
+    Fund(FundArgs),
     /// Shows the packages that depend on `pkg`
     Why(WhyArgs),
     /// View registry information about a package.
@@ -65,7 +69,7 @@ pub enum CliCommand {
     /// Generate a Software Bill of Materials (SBOM).
     Sbom(SbomArgs),
     /// Displays your pnpm username.
-    Whoami,
+    Whoami(WhoamiArgs),
     /// Deprecates a version of a package in the registry.
     Deprecate(DeprecateArgs),
     /// Removes deprecation from a version of a package in the registry. Only works on already deprecated versions.
@@ -89,9 +93,21 @@ pub enum CliCommand {
     #[clap(visible_aliases = ["s", "se", "find"])]
     Search(SearchArgs),
     /// Rebuild a package.
-    #[clap(visible_alias = "rb")]
     Rebuild(RebuildArgs),
-    /// Create a tarball from a package
+    // A variant of its own rather than a `visible_alias` of `rebuild`,
+    // because the script that overrides a built-in command is looked up
+    // under the name that was typed.
+    /// Rebuild a package.
+    ///
+    /// An `rb` script in `package.json` replaces this command, the way a
+    /// `rebuild` script replaces `pnpm rebuild`. Run `pnpm pm rb` for the
+    /// built-in command regardless.
+    #[clap(name = "rb")]
+    Rb(RebuildArgs),
+    /// Create a tarball from a package.
+    ///
+    /// Use --silent to suppress the tarball contents and summary.
+    /// With --json, lifecycle output and the final JSON result remain visible.
     Pack(PackArgs),
     /// Publish a package to the registry
     Publish(PublishArgs),
@@ -121,7 +137,11 @@ pub enum CliCommand {
     #[clap(visible_aliases = ["t", "tst"])]
     Test(ScriptShortcutArgs),
     /// Runs a defined package script.
+    #[clap(visible_alias = "run-script")]
     Run(RunArgs),
+    /// Inspect tasks in concurrency groups.
+    /// A same-named script takes precedence. Use `pnpm pm tasks` to force the built-in.
+    Tasks(TasksArgs),
     /// Runs a named pipeline of workspace tasks the way a CI run would:
     /// a frozen install, affected-since-base selection, the task graph in
     /// dependency order without bailing, and cached task results restored
@@ -130,6 +150,7 @@ pub enum CliCommand {
     /// Run a shell command in the context of a project.
     Exec(ExecArgs),
     /// Run a package in a temporary environment.
+    #[clap(version = pnpm_config::PNPM_VERSION, disable_version_flag = true)]
     Dlx(DlxArgs),
     /// Creates a project from a `create-*` starter kit.
     Create(CreateArgs),
@@ -142,8 +163,8 @@ pub enum CliCommand {
     Start(ScriptShortcutArgs),
     /// Runs a package's "stop" script, if one was provided.
     Stop(ScriptShortcutArgs),
-    /// Restarts a package. Runs "stop", "restart", and "start" scripts,
-    /// and associated pre- and post- scripts.
+    /// Restarts a package. Runs "stop", "restart" (if present), and "start"
+    /// scripts, and associated pre- and post- scripts.
     Restart(RestartArgs),
     /// Lists the packages that include the file with the specified hash.
     FindHash(FindHashArgs),
@@ -201,6 +222,12 @@ pub enum CliCommand {
     IgnoredBuilds(IgnoredBuildsArgs),
     /// Approve dependencies for running scripts during installation.
     ApproveBuilds(ApproveBuildsArgs),
+    /// Review what dependencies may do: run build scripts and provide agent
+    /// skills.
+    Permissions(PermissionsArgs),
+    /// Approve or deny what dependencies may do. Same as `pnpm permissions
+    /// approve`.
+    Approve(ApproveArgs),
     /// Links a local package as a dependency
     #[clap(visible_aliases = ["ln"])]
     Link(LinkArgs),
@@ -244,10 +271,10 @@ pub enum CliCommand {
     // Registered rather than left to the external-subcommand fallback so
     // it names npm instead of failing as a missing package script.
     Edit(NotImplementedArgs),
-    /// Not implemented in pnpm. Use the npm CLI directly.
-    Profile(NotImplementedArgs),
-    /// Not implemented in pnpm. Use the npm CLI directly.
-    Token(NotImplementedArgs),
+    /// Change settings on your registry profile.
+    Profile(ProfileArgs),
+    /// Manage authentication tokens on the registry.
+    Token(TokenArgs),
     /// Not implemented in pnpm. Use the npm CLI directly.
     Xmas(NotImplementedArgs),
     #[clap(external_subcommand)]
@@ -255,19 +282,50 @@ pub enum CliCommand {
 }
 
 impl CliCommand {
+    /// The name npm reports for the running command in the `npm_command`
+    /// environment variable. Running a script — `pnpm run`, the `test`,
+    /// `start` and `stop` shortcuts, and a bare `pnpm <script>` — reports
+    /// `run-script`; everything else reports the command's own name, with the
+    /// variants that spell an alias reporting the name the command is
+    /// registered under.
+    pub(crate) fn npm_command_name(&self) -> &'static str {
+        match self {
+            CliCommand::Run(_)
+            | CliCommand::Test(_)
+            | CliCommand::Start(_)
+            | CliCommand::Stop(_)
+            | CliCommand::External(_) => "run-script",
+            CliCommand::Ll(_) => "list",
+            CliCommand::Rb(_) => "rebuild",
+            CliCommand::Purge(_) => "clean",
+            command => command.into(),
+        }
+    }
+
+    /// Whether this is a `config get` / `config list` scoped to the global
+    /// config, in any of its spellings.
+    pub(super) fn reads_global_config(&self) -> bool {
+        match self {
+            CliCommand::Config(args) => args.reads_global_config(),
+            CliCommand::Get(args) => args.flags.is_global(),
+            _ => false,
+        }
+    }
+
     /// Whether `--global` was passed. pnpm parses it as one CLI-wide
     /// option; pacquet declares it per subcommand.
-    pub(super) fn is_global(&self) -> bool {
+    pub(crate) fn is_global(&self) -> bool {
         match self {
             CliCommand::Add(args) => args.target.global,
             CliCommand::ApproveBuilds(args) => args.global,
             CliCommand::Bin(args) => args.global,
-            CliCommand::Config(args) => args.is_global(),
+            CliCommand::Config(args) => args.flags.is_global(),
             CliCommand::Env(args) => args.global,
-            CliCommand::Get(args) => args.flags.global,
-            CliCommand::Set(args) => args.flags.global,
+            CliCommand::Get(args) => args.flags.is_global(),
+            CliCommand::Set(args) => args.flags.is_global(),
             CliCommand::List(args) | CliCommand::Ll(args) => args.global,
             CliCommand::Outdated(args) => args.global,
+            CliCommand::Peers(args) => args.global,
             CliCommand::Prefix(args) => args.global,
             CliCommand::Remove(args) => args.global,
             CliCommand::Root(args) => args.global,
@@ -295,6 +353,7 @@ impl CliCommand {
                 | CliCommand::Clean(_)
                 | CliCommand::Exec(_)
                 | CliCommand::External(_)
+                | CliCommand::Fund(_)
                 | CliCommand::Pkg(_)
                 | CliCommand::Purge(_)
                 | CliCommand::Restart(_)
@@ -303,6 +362,7 @@ impl CliCommand {
                 | CliCommand::SetScript(_)
                 | CliCommand::Start(_)
                 | CliCommand::Stop(_)
+                | CliCommand::Tasks(_)
                 | CliCommand::Test(_),
         )
     }
@@ -312,6 +372,7 @@ impl CliCommand {
             self,
             CliCommand::Install(_)
                 | CliCommand::Dedupe(_)
+                | CliCommand::Prune(_)
                 | CliCommand::InstallTest(_)
                 | CliCommand::Import(_)
                 | CliCommand::List(_)
@@ -334,6 +395,7 @@ impl CliCommand {
                 | CliCommand::Link(_)
                 | CliCommand::Prune(_)
                 | CliCommand::Rebuild(_)
+                | CliCommand::Rb(_)
                 | CliCommand::Remove(_)
                 | CliCommand::Unlink(_)
                 | CliCommand::Update(_)
@@ -362,7 +424,13 @@ impl CliCommand {
                 | CliCommand::Prefix(_)
                 | CliCommand::Root(_)
                 | CliCommand::Bin(_),
-        )
+        ) || self.prints_upload_values()
+    }
+
+    /// `publish --upload-variant` prints the values a later publish takes,
+    /// which a CI job captures from stdout.
+    fn prints_upload_values(&self) -> bool {
+        matches!(self, CliCommand::Publish(args) if !args.flags.variants.upload_variant.is_empty())
     }
 
     pub(crate) fn default_reporter_summary_scope(&self) -> SummaryScope {

@@ -50,14 +50,14 @@ fn load_at_buckets_the_problem_keys() {
         .expect("load pnpm-workspace.yaml")
         .expect("pnpm-workspace.yaml is present");
 
-    assert_eq!(settings.key_issues.refused, ["configDir"]);
+    assert_eq!(settings.key_issues.refused, ["configDir", "globalShims"]);
     assert_eq!(settings.key_issues.unrecognized, ["minimumReleaseAg"]);
     assert_eq!(settings.key_issues.non_camel_case, ["store-dir"]);
 }
 
 #[test]
 fn parses_and_applies_scope_from_yaml() {
-    let settings: WorkspaceSettings = serde_saphyr::from_str("scope: '@my-org'\n").unwrap();
+    let settings: crate::MachineSettings = serde_saphyr::from_str("scope: '@my-org'\n").unwrap();
     assert_eq!(settings.scope.as_deref(), Some("@my-org"));
 
     let mut config = Config::new();
@@ -68,7 +68,7 @@ fn parses_and_applies_scope_from_yaml() {
 
 #[test]
 fn apply_scope_overrides_an_earlier_layer() {
-    let settings: WorkspaceSettings =
+    let settings: crate::MachineSettings =
         serde_saphyr::from_str("scope: '@from-later-layer'\n").unwrap();
     let mut config = Config::new();
     config.scope = Some("@from-global-config".to_owned());
@@ -145,9 +145,7 @@ registries:
 }
 
 /// `strictStorePkgContentCheck` decides whether a store row that holds
-/// another package fails the install. Same camelCase rename +
-/// `apply_to` wiring as `verifyStoreIntegrity`, and the same
-/// default-true polarity.
+/// another package fails the install.
 #[test]
 fn parses_strict_store_pkg_content_check_from_yaml_and_applies() {
     let yaml = "strictStorePkgContentCheck: false\n";
@@ -161,10 +159,7 @@ fn parses_strict_store_pkg_content_check_from_yaml_and_applies() {
 }
 
 /// `sideEffectsCache` is the side-effects cache READ-path knob from
-/// pnpm-workspace.yaml. Same shape as `verifyStoreIntegrity`:
-/// camelCase rename + `apply_to` wiring. Parsing a yaml that flips
-/// the default-true setting to false must end up at
-/// `config.side_effects_cache == false`.
+/// pnpm-workspace.yaml.
 #[test]
 fn parses_side_effects_cache_from_yaml_and_applies() {
     let yaml = "sideEffectsCache: false\n";
@@ -178,9 +173,7 @@ fn parses_side_effects_cache_from_yaml_and_applies() {
 }
 
 /// `sideEffectsCacheReadonly` is pnpm's read-only flag for the
-/// side-effects cache. Same camelCase + `apply_to` wiring as
-/// `sideEffectsCache`. Default is `false`, so flipping it on via
-/// yaml must end at `config.side_effects_cache_readonly == true`.
+/// side-effects cache.
 #[test]
 fn parses_side_effects_cache_readonly_from_yaml_and_applies() {
     let yaml = "sideEffectsCacheReadonly: true\n";
@@ -666,7 +659,7 @@ supportedArchitectures:
   libc: [glibc]
 ";
     let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
-    let raw = settings.supported_architectures.clone().expect("field present");
+    let raw = axes(settings.supported_architectures.clone().expect("field present"));
     assert_eq!(raw.os.as_deref(), Some(&["darwin".to_string(), "linux".to_string()][..]));
     assert_eq!(raw.cpu.as_deref(), Some(&["arm64".to_string(), "x64".to_string()][..]));
     assert_eq!(raw.libc.as_deref(), Some(&["glibc".to_string()][..]));
@@ -674,10 +667,62 @@ supportedArchitectures:
     let mut config = Config::new();
     assert!(config.supported_architectures.is_none(), "default is None");
     settings.apply_to(&mut config, Path::new("/irrelevant"));
-    let applied = config.supported_architectures.expect("set after apply_to");
+    let applied = axes(config.supported_architectures.expect("set after apply_to"));
     assert_eq!(applied.os.as_deref(), Some(&["darwin".to_string(), "linux".to_string()][..]));
     assert_eq!(applied.cpu.as_deref(), Some(&["arm64".to_string(), "x64".to_string()][..]));
     assert_eq!(applied.libc.as_deref(), Some(&["glibc".to_string()][..]));
+}
+
+/// The three axes of a `supportedArchitectures` written as a mapping.
+fn axes(
+    supported: pnpm_package_is_installable::SupportedArchitectures,
+) -> pnpm_package_is_installable::ArchitectureAxes {
+    match supported {
+        pnpm_package_is_installable::SupportedArchitectures::Axes(axes) => axes,
+        pnpm_package_is_installable::SupportedArchitectures::Platforms(platforms) => {
+            panic!("{platforms:?} was written as a mapping")
+        }
+    }
+}
+
+#[test]
+fn parses_supported_architectures_written_as_a_platform_list() {
+    let yaml = r"
+supportedArchitectures:
+  - linux-x64-manylinux_2_28
+  - aarch64-apple-darwin
+  - win32-x64
+";
+    let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
+    let mut config = Config::new();
+    settings.apply_to(&mut config, Path::new("/irrelevant"));
+    let applied = config.supported_architectures.expect("set after apply_to");
+    assert_eq!(
+        applied
+            .platforms("linux", "x64", "glibc")
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["linux-x64-manylinux_2_28", "darwin-arm64", "win32-x64"],
+    );
+}
+
+/// Refused rather than read as unset: a list that names no platform
+/// prepares for nothing.
+#[test]
+fn refuses_a_platform_list_that_names_no_platform() {
+    serde_saphyr::from_str::<WorkspaceSettings>("supportedArchitectures: []\n")
+        .expect_err("an empty list names no platform");
+}
+
+/// A platform pnpm does not know is a typo, not a name to leave out
+/// the way an axis value it cannot read is.
+#[test]
+fn refuses_a_platform_it_does_not_know() {
+    let error =
+        serde_saphyr::from_str::<WorkspaceSettings>("supportedArchitectures:\n  - x86_64-linux\n")
+            .expect_err("an unknown platform is refused");
+    assert!(format!("{error}").contains("pnpm does not know the platform x86_64-linux"), "{error}");
 }
 
 /// Absent `supportedArchitectures` leaves the config field at
@@ -705,7 +750,7 @@ supportedArchitectures:
   os: [darwin]
 ";
     let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
-    let raw = settings.supported_architectures.expect("field present");
+    let raw = axes(settings.supported_architectures.expect("field present"));
     assert_eq!(raw.os.as_deref(), Some(&["darwin".to_string()][..]));
     assert!(raw.cpu.is_none());
     assert!(raw.libc.is_none());

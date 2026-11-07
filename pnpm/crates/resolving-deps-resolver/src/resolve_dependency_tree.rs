@@ -1,14 +1,24 @@
+pub use catalogs::{ChildCatalogs, local_directory_child_specs};
+pub use failure::DependencyResolutionError;
+pub use manifest::manifest_child_specs;
+
 pub use update_scope::{UpdateDepth, UpdateReuseScope, UpdateTargets, VersionLine};
 
 pub use reuse::real_package_name_of;
 
-pub use tree_ctx::TreeCtx;
+pub use tree_ctx::{TreeCtx, directory_package_dir};
+pub(crate) use tree_ctx::{declaring_manifest_dir, resolves_from_declaring_manifest};
 
 pub use workspace_ctx::WorkspaceTreeCtx;
 
 pub(crate) use catalogs::resolve_catalog_specifiers;
 
-pub(crate) use reuse::{record_changed_direct_deps, unwrap_package_name};
+pub(crate) use importer::importer_direct_wanted_specs;
+
+pub(crate) use reuse::{
+    preseed_changed_direct_versions, record_changed_direct_deps,
+    resolve_direct_dependency_detached, unwrap_package_name,
+};
 
 pub(crate) use workspace_ctx::SyncCursor;
 
@@ -19,28 +29,29 @@ use futures_util::future;
 use miette::Diagnostic;
 use pipe_trait::Pipe;
 use pnpm_catalogs_resolver::CatalogResolutionError;
-use pnpm_catalogs_types::Catalogs;
 use pnpm_hooks::PnpmfileHooks;
 use pnpm_package_manifest::{DependencyGroup, PackageManifest};
 use pnpm_patching::{PatchGroupRecord, PatchKeyConflictError};
+use pnpm_resolving_npm_resolver::PickPackageError;
 use pnpm_resolving_resolver_base::{
     GitResolveError, NoMatchingVersionError, PreferredVersionsOverlay, RegistryResponseError,
-    ResolveOptions, Resolver, WantedDependency,
+    ResolveError, ResolveOptions, Resolver, UnsupportedProtocolError, WantedDependency,
 };
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 
 use crate::{
     parent_pkg_aliases::ParentPkgAliases,
-    resolved_tree::{DirectDep, ResolvedTree},
+    resolved_tree::{AncestorPkgIds, DirectDep, ResolvedTree},
 };
 
 mod catalogs;
+mod failure;
 mod finalized;
+mod importer;
 mod manifest;
 mod reuse;
 mod tree_ctx;
@@ -50,6 +61,9 @@ mod workspace_ctx;
 #[cfg(test)]
 mod test_support;
 
+use importer::{
+    describe_importer, importer_injected_dependency_names, importer_optional_dependency_names,
+};
 use reuse::{ReuseSource, record_direct_dep_versions};
 use walk::{
     ChildEdge, NodeSeed, level_aliases, level_versions, resolve_node_seed, walk_from_seeds,
@@ -65,6 +79,16 @@ use walk::{
 /// failure.
 fn lock_recoverable<Inner>(mutex: &Mutex<Inner>) -> MutexGuard<'_, Inner> {
     mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// [`fn@lock_recoverable`] for a read guard on a [`RwLock`].
+fn read_recoverable<Inner>(lock: &RwLock<Inner>) -> RwLockReadGuard<'_, Inner> {
+    lock.read().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// [`fn@lock_recoverable`] for a write guard on a [`RwLock`].
+fn write_recoverable<Inner>(lock: &RwLock<Inner>) -> RwLockWriteGuard<'_, Inner> {
+    lock.write().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Options threaded into [`fn@resolve_dependency_tree`].
@@ -198,8 +222,11 @@ pub struct Deprecation {
     pub pkg_version: String,
     pub pkg_id: String,
     pub prefix: String,
-    pub deprecated: String,
     pub depth: i32,
+    /// A version of the same package that is not deprecated, when the
+    /// resolver knew one. Absent for a resolution reused from the lockfile,
+    /// which holds no packument to work it out from.
+    pub non_deprecated_alternative: Option<pnpm_resolving_resolver_base::NonDeprecatedAlternative>,
 }
 
 /// Sink for [`Deprecation`] notifications, pre-bound to the install's
@@ -210,10 +237,13 @@ pub type DeprecationLogFn = Arc<dyn Fn(Deprecation) + Send + Sync>;
 /// Error envelope returned by the tree walker.
 #[derive(Debug, Display, Error, Diagnostic)]
 pub enum ResolveDependencyTreeError {
+    #[diagnostic(transparent)]
+    DependencyContext(#[error(source)] DependencyResolutionError),
+
     /// One of the resolver chain calls failed (network, parse, etc.).
     /// The inner error is the boxed type the resolver returned.
     #[display("Failed to resolve dependency: {_0}")]
-    Resolve(#[error(not(source))] String),
+    Resolve(#[error(source)] ResolveError),
 
     #[display("Conflicting registry revisions were requested for \"{name}@{version}\".")]
     #[diagnostic(
@@ -239,16 +269,30 @@ pub enum ResolveDependencyTreeError {
     #[diagnostic(transparent)]
     GitResolve(#[error(source)] GitResolveError),
 
+    /// A specifier opens with a protocol no resolver supports, raised with
+    /// the `ERR_PNPM_UNSUPPORTED_PROTOCOL` code.
+    #[diagnostic(transparent)]
+    UnsupportedProtocol(#[error(source)] UnsupportedProtocolError),
+
+    /// The npm resolver's cache/fetch orchestration failed — most often
+    /// `ERR_PNPM_NO_OFFLINE_META`, raised with whatever code and help
+    /// [`PickPackageError`] itself carries.
+    #[diagnostic(transparent)]
+    Pick(#[error(source)] PickPackageError),
+
     /// An optional dependency failed to resolve while the wanted
     /// lockfile still holds a package entry satisfying the wanted
     /// range. Rethrown loudly instead of skipped, because skipping
     /// would erase the locked entries and make the lockfile differ
     /// depending on which machine ran the install
     /// (<https://github.com/pnpm/pnpm/issues/12853>).
-    #[diagnostic(help(
-        "This optional dependency is not skipped, because the lockfile contains a resolution for it. Skipping it would remove the locked entries, making the lockfile differ depending on which machine ran the install. If the version was intentionally removed from the registry, update the dependent package or remove the entries from the lockfile."
-    ))]
-    LockedOptionalResolutionFailure(#[error(not(source))] Box<ResolveDependencyTreeError>),
+    #[diagnostic(
+        forward(0),
+        help(
+            "This optional dependency is not skipped, because the lockfile contains a resolution for it. Skipping it would remove the locked entries, making the lockfile differ depending on which machine ran the install. If the version was intentionally removed from the registry, update the dependent package or remove the entries from the lockfile."
+        )
+    )]
+    LockedOptionalResolutionFailure(#[error(source)] Box<ResolveDependencyTreeError>),
 
     /// No resolver in the chain claimed the spec, raised with the
     /// `ERR_PNPM_SPEC_NOT_SUPPORTED_BY_ANY_RESOLVER` code.
@@ -299,19 +343,46 @@ pub enum ResolveDependencyTreeError {
         alias: String,
     },
 
-    /// A pnpmfile hook (`readPackage`) threw, timed out, or returned an
-    /// invalid package manifest; a bad hook aborts the install. Carries
-    /// `ERR_PNPM_PNPMFILE_FAIL` for all of those. pnpm splits them across
-    /// two codes, reserving `ERR_PNPM_BAD_READ_PACKAGE_HOOK_RESULT` for a
-    /// hook that returns a non-manifest; pacquet does not distinguish the
-    /// two yet.
     #[diagnostic(code(ERR_PNPM_PNPMFILE_FAIL))]
     PnpmfileHook(#[error(not(source))] pnpm_hooks::HookError),
+
+    #[diagnostic(code(ERR_PNPM_BAD_READ_PACKAGE_HOOK_RESULT))]
+    BadReadPackageHookResult(#[error(not(source))] pnpm_hooks::HookError),
+
+    /// An importer's `peerDependencies` entry held a value that is neither a
+    /// peer range nor a scheme-carrying specifier, raised with the
+    /// `ERR_PNPM_INVALID_PEER_DEPENDENCY_SPECIFICATION` code.
+    #[display(
+        "The peerDependencies field named '{dep_name}' of package '{project_id}' has an invalid value: '{specifier}'"
+    )]
+    #[diagnostic(
+        code(ERR_PNPM_INVALID_PEER_DEPENDENCY_SPECIFICATION),
+        help(
+            "The values in peerDependencies should be a valid semver range, a `workspace:`/`catalog:` spec, or a dependency specifier such as a named-registry (`<registry>:<version>`), `npm:`, `file:`, or git/URL spec"
+        )
+    )]
+    InvalidPeerDependencySpecification {
+        #[error(not(source))]
+        dep_name: String,
+        project_id: String,
+        specifier: String,
+    },
 }
 
 impl From<PatchKeyConflictError> for ResolveDependencyTreeError {
     fn from(err: PatchKeyConflictError) -> Self {
         ResolveDependencyTreeError::PatchKeyConflict(err)
+    }
+}
+
+impl From<pnpm_hooks::HookError> for ResolveDependencyTreeError {
+    fn from(err: pnpm_hooks::HookError) -> Self {
+        match err {
+            pnpm_hooks::HookError::BadReadPackageResult { .. } => {
+                Self::BadReadPackageHookResult(err)
+            }
+            _ => Self::PnpmfileHook(err),
+        }
     }
 }
 
@@ -354,25 +425,12 @@ where
         .with_pnpmfile_hook(opts.pnpmfile_hook)
         .with_read_package_log(opts.read_package_log)
         .with_auto_install_peers(opts.auto_install_peers);
-    let optional_names = importer_optional_dependency_names(manifest);
-    let injected_names = importer_injected_dependency_names(manifest);
-    let mut wanted: Vec<WantedSpec> = Vec::new();
-    for (name, range) in manifest.dependencies(dependency_groups) {
-        if !crate::is_valid_dependency_alias(name) {
-            return Err(ResolveDependencyTreeError::InvalidDependencyName {
-                parent: "The current package".to_string(),
-                alias: name.to_string(),
-            });
-        }
-        let optional = optional_names.contains(name);
-        let injected = injected_names.contains(name);
-        wanted.push((name.to_string(), range.to_string(), optional, injected));
-    }
+    let wanted = root_wanted_specs(manifest, dependency_groups)?;
     record_changed_direct_deps(&ctx, pnpm_lockfile::Lockfile::ROOT_IMPORTER_KEY, &wanted);
     let parent_pkg_aliases = ParentPkgAliases::root(
         wanted
             .iter()
-            .map(|(alias, ..)| alias.clone())
+            .map(|spec| spec.alias.clone())
             .collect(),
     );
     let direct = extend_tree(
@@ -386,38 +444,38 @@ where
     Ok(ctx.into_resolved_tree(direct))
 }
 
-/// Collect the names of the importer manifest's `optionalDependencies`
-/// entries so the walker can tag each direct dep with the right
-/// `wanted.optional` flag. `optionalDependencies` wins over the other
-/// groups when an alias appears in more than one, so the
-/// `ResolvedPackage.optional` propagation starts from the right
-/// per-direct-dep value.
-pub(crate) fn importer_optional_dependency_names(manifest: &PackageManifest) -> HashSet<String> {
+/// The root manifest's dependencies in `dependency_groups`, each checked
+/// to be an installable alias.
+fn root_wanted_specs<DependencyGroupList>(
+    manifest: &PackageManifest,
+    dependency_groups: DependencyGroupList,
+) -> Result<Vec<DependencySpec>, ResolveDependencyTreeError>
+where
+    DependencyGroupList: IntoIterator<Item = DependencyGroup>,
+{
+    let optional_names = importer_optional_dependency_names(manifest);
+    let injected_names = importer_injected_dependency_names(manifest);
     manifest
-        .dependencies([DependencyGroup::Optional])
-        .map(|(name, _)| name.to_string())
+        .dependencies(dependency_groups)
+        .map(|(name, range)| {
+            crate::is_valid_dependency_alias(name)
+                .then(|| DependencySpec {
+                    alias: name.to_string(),
+                    bare_specifier: range.to_string(),
+                    optional: optional_names.contains(name),
+                    injected: injected_names.contains(name),
+                })
+                .ok_or_else(|| ResolveDependencyTreeError::InvalidDependencyName {
+                    parent: describe_importer(manifest),
+                    alias: name.to_string(),
+                })
+        })
         .collect()
 }
 
-/// Collect the names of the importer manifest's `dependenciesMeta` entries
-/// whose `injected` flag is `true`. This per-alias `injected` opt-in
-/// flips a workspace dep onto the hard-linked `file:` path even when the
-/// global `injectWorkspacePackages` is off.
-pub(crate) fn importer_injected_dependency_names(manifest: &PackageManifest) -> HashSet<String> {
-    injected_dependency_names(manifest.value())
-}
-
-fn injected_dependency_names(manifest: &Value) -> HashSet<String> {
-    let Some(meta) = manifest.get("dependenciesMeta").and_then(Value::as_object) else {
-        return HashSet::default();
-    };
-    meta.iter()
-        .filter(|(_, entry)| dependency_meta_is_injected(entry))
-        .map(|(name, _)| name.clone())
-        .collect()
-}
-
-fn dependency_is_injected(manifest: &Value, name: &str) -> bool {
+/// Whether `manifest`'s `dependenciesMeta` injects the dependency `name`.
+#[must_use]
+pub fn dependency_is_injected(manifest: &Value, name: &str) -> bool {
     manifest
         .get("dependenciesMeta")
         .and_then(Value::as_object)
@@ -425,90 +483,27 @@ fn dependency_is_injected(manifest: &Value, name: &str) -> bool {
         .is_some_and(dependency_meta_is_injected)
 }
 
-fn dependency_meta_is_injected(meta: &Value) -> bool {
+/// Whether a `dependenciesMeta` entry sets `injected`.
+#[must_use]
+pub fn dependency_meta_is_injected(meta: &Value) -> bool {
     meta.get("injected")
         .and_then(Value::as_bool)
         .unwrap_or(false)
 }
 
-/// Build the importer's direct-dependency wanted specs: the manifest's
-/// `dependencies` (plus, when `auto_install_peers`, its own
-/// `peerDependencies`) tagged with the right `optional` / `injected`
-/// flags and with `catalog:` specifiers resolved.
-///
-/// An alias declared in several groups yields one spec, merged by
-/// spreading the groups in order: `peerDependencies` first (when
-/// `auto_install_peers`), then `devDependencies` < `dependencies` <
-/// `optionalDependencies`, a later group's range replacing an earlier
-/// one — matching `filterDependenciesByType` in
-/// `@pnpm/pkg-manifest.utils` (`{...dev, ...prod, ...optional}`), so a
-/// regular dep wins over a devDependency of the same alias, and either
-/// wins over its peer range.
-///
-/// Shared by [`fn@crate::resolve_importer`] (which walks them) and the
-/// `time-based` cutoff pre-pass in [`fn@crate::resolve_workspace`]
-/// (which only needs the resolved direct-dep publish dates), so both
-/// see the identical direct-dep set — the importer-dep computation runs
-/// once before resolving an importer's deps.
-pub(crate) fn importer_direct_wanted_specs<DependencyGroupList>(
-    manifest: &PackageManifest,
-    dependency_groups: DependencyGroupList,
-    auto_install_peers: bool,
-    catalogs: &Catalogs,
-) -> Result<Vec<WantedSpec>, ResolveDependencyTreeError>
-where
-    DependencyGroupList: IntoIterator<Item = DependencyGroup>,
-{
-    let included: Vec<DependencyGroup> = dependency_groups.into_iter().collect();
-    let mut groups: Vec<DependencyGroup> = Vec::new();
-    if auto_install_peers || included.contains(&DependencyGroup::Peer) {
-        groups.push(DependencyGroup::Peer);
-    }
-    groups.extend(
-        [DependencyGroup::Dev, DependencyGroup::Prod, DependencyGroup::Optional]
-            .into_iter()
-            .filter(|group| included.contains(group)),
-    );
-    let optional_names = importer_optional_dependency_names(manifest);
-    let injected_names = importer_injected_dependency_names(manifest);
-    let mut order: Vec<&str> = Vec::new();
-    let mut ranges: HashMap<&str, &str> = HashMap::default();
-    for (name, range) in manifest.dependencies(groups) {
-        if !crate::is_valid_dependency_alias(name) {
-            return Err(ResolveDependencyTreeError::InvalidDependencyName {
-                parent: "The current package".to_string(),
-                alias: name.to_string(),
-            });
-        }
-        if ranges.insert(name, range).is_none() {
-            order.push(name);
-        }
-    }
-    let wanted: Vec<WantedSpec> = order
-        .into_iter()
-        .map(|name| {
-            (
-                name.to_string(),
-                ranges[name].to_string(),
-                optional_names.contains(name),
-                injected_names.contains(name),
-            )
-        })
-        .collect();
-    resolve_catalog_specifiers(wanted, catalogs)
+/// One dependency as a manifest declares it, before resolution.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DependencySpec {
+    pub alias: String,
+    pub bare_specifier: String,
+    /// Declared under `optionalDependencies`.
+    pub optional: bool,
+    /// The importer manifest's `dependenciesMeta[alias].injected` flag. It
+    /// picks the `file:` resolution shape for this one dependency even when
+    /// [`pnpm_resolving_resolver_base::ResolverProjectOptions::inject_workspace_packages`]
+    /// is off.
+    pub injected: bool,
 }
-
-/// One spec carried through [`extend_tree`] and the importer-side
-/// orchestrator: `(alias, range, optional, injected)`. `injected`
-/// reflects the importer manifest's `dependenciesMeta[alias].injected`
-/// flag, threaded onto [`WantedDependency::injected`] so the workspace
-/// resolver branch picks the `file:` resolution shape for that one
-/// dep even when the global [`pnpm_resolving_resolver_base::ResolverProjectOptions::inject_workspace_packages`]
-/// is off. Hoisted-peer arms in
-/// [`fn@crate::resolve_importer::resolve_importer`] default this to
-/// `false` — peers picked up via auto-install don't carry per-dep
-/// meta from any manifest.
-pub(crate) type WantedSpec = (String, String, bool, bool);
 
 /// `injected: Some(true)` only when the importer manifest's
 /// `dependenciesMeta[name].injected = true` opted this dep in. Otherwise
@@ -518,10 +513,16 @@ pub(crate) type WantedSpec = (String, String, bool, bool);
 /// produce identical behavior — but keeping `None` aligns the
 /// [`WantedKey`](workspace_ctx::WantedKey) cache buckets across the two pacquet branches that
 /// surface `injected`.
-pub(crate) fn wanted_from_spec((name, range, optional, injected): WantedSpec) -> WantedDependency {
+pub(crate) fn wanted_from_spec(spec: DependencySpec) -> WantedDependency {
+    let DependencySpec {
+        alias,
+        bare_specifier,
+        optional,
+        injected,
+    } = spec;
     WantedDependency {
-        alias: Some(name),
-        bare_specifier: Some(range),
+        alias: Some(alias),
+        bare_specifier: Some(bare_specifier),
         optional: Some(optional),
         injected: injected.then_some(true),
         ..WantedDependency::default()
@@ -545,7 +546,7 @@ pub(crate) fn wanted_from_spec((name, range, optional, injected): WantedSpec) ->
 pub async fn extend_tree<Chain>(
     ctx: &TreeCtx,
     resolver: &Chain,
-    wanted: Vec<WantedSpec>,
+    wanted: Vec<DependencySpec>,
     importer_id: &str,
     parent_pkg_aliases: &Arc<ParentPkgAliases>,
 ) -> Result<Vec<DirectDep>, ResolveDependencyTreeError>
@@ -582,7 +583,7 @@ where
     // Recorded only now the level barrier has passed, so the subtree walk
     // sees the resolved direct-dep versions.
     record_direct_dep_versions(ctx, importer_id, &direct_versions);
-    let children_overlay = PreferredVersionsOverlay::layer(
+    let children_overlay = PreferredVersionsOverlay::layer_direct(
         ctx.options.base.version.preferred_versions_overlay.clone(),
         direct_versions,
     );
@@ -591,7 +592,7 @@ where
     // below it a level at a time.
     let direct =
         walk_from_seeds(ctx, resolver, seeds, children_overlay, children_pkg_aliases).await?;
-    ctx.workspace.versions.record_preferred_version_roots(direct.iter().map(|dep| dep.id.as_str()));
+    ctx.workspace.versions.record_preferred_version_roots(direct.iter().map(|dep| &*dep.id));
     // Second bump, after every write of this wave (including the roots
     // above) has landed: a `run_preferred_versions` read racing with
     // this call could bind the entry bump's revision to a partial
@@ -603,7 +604,7 @@ where
 /// What every direct dep of one importer wave resolves against.
 struct DirectRoot<'r> {
     reuse: ReuseSource,
-    ancestors: Arc<Vec<String>>,
+    ancestors: AncestorPkgIds,
     parent_pkg_aliases: &'r Arc<ParentPkgAliases>,
     base_overlay: &'r Option<Arc<PreferredVersionsOverlay>>,
 }
@@ -611,7 +612,7 @@ struct DirectRoot<'r> {
 async fn seed_direct<Chain>(
     ctx: &TreeCtx,
     resolver: &Chain,
-    spec: WantedSpec,
+    spec: DependencySpec,
     root: &DirectRoot<'_>,
 ) -> Result<NodeSeed, ResolveDependencyTreeError>
 where

@@ -1,7 +1,7 @@
 use super::{
     ArchiveStoreProjection, AuthHeaders, FASTIFY_ERROR_INTEGRITY, FASTIFY_ERROR_TARBALL,
     IngestTarballToStore, MemCache, SharedReportedProgressKeys, SharedVerifiedFilesCache,
-    StoreIndex, ThrottledClient, assert_eq, fast_fail_client, integrity,
+    StoreIndex, ThrottledClient, UNREACHABLE_URL, assert_eq, fast_fail_client, integrity,
     seed_row_holding_another_package, store_index_key, tempdir_with_leaked_path, test_retry_opts,
 };
 
@@ -29,8 +29,10 @@ async fn network_fetch_records_progress_key() {
             auth_headers: &AuthHeaders::default(),
             retry_opts: test_retry_opts(),
             offline: false,
+            tar_limits: crate::TarLimits::default(),
         },
         package: crate::TarballPackage {
+            integrity_kind: crate::IntegrityKind::Resource,
             integrity: Some(&pkg_integrity),
             unpacked_size: Some(16697),
             file_count: None,
@@ -103,12 +105,14 @@ async fn store_row_holding_another_package_only_warns_when_not_strict() {
             auth_headers: &AuthHeaders::default(),
             retry_opts: test_retry_opts(),
             offline: false,
+            tar_limits: crate::TarLimits::default(),
         },
         package: crate::TarballPackage {
+            integrity_kind: crate::IntegrityKind::Resource,
             integrity: Some(&pkg_integrity),
             unpacked_size: None,
             file_count: None,
-            url: "http://127.0.0.1:1/unreachable.tgz",
+            url: UNREACHABLE_URL,
             id: pkg_id,
         },
         store: crate::ArchiveStoreContext {
@@ -158,8 +162,7 @@ async fn store_row_holding_another_package_only_warns_when_not_strict() {
 /// Without a shared progress-dedupe set, `run_with_mem_cache`'s
 /// `Available` short-circuit emits `pnpm:progress found_in_store`
 /// against the caller's reporter, regardless of who originally
-/// populated the slot. This preserves the legacy install path where a
-/// later caller still needs its own visible cache-hit event.
+/// populated the slot.
 ///
 /// Drives two `run_with_mem_cache` calls for the same URL but
 /// different `package_id`s. The first uses `SilentReporter`
@@ -210,8 +213,10 @@ async fn mem_cache_hit_emits_found_in_store_against_callers_reporter() {
             auth_headers: &AuthHeaders::default(),
             retry_opts: test_retry_opts(),
             offline: false,
+            tar_limits: crate::TarLimits::default(),
         },
         package: crate::TarballPackage {
+            integrity_kind: crate::IntegrityKind::Resource,
             integrity: Some(&pkg_integrity),
             unpacked_size: None,
             file_count: None,
@@ -250,8 +255,10 @@ async fn mem_cache_hit_emits_found_in_store_against_callers_reporter() {
             auth_headers: &AuthHeaders::default(),
             retry_opts: test_retry_opts(),
             offline: false,
+            tar_limits: crate::TarLimits::default(),
         },
         package: crate::TarballPackage {
+            integrity_kind: crate::IntegrityKind::Resource,
             integrity: Some(&pkg_integrity),
             unpacked_size: None,
             file_count: None,
@@ -362,8 +369,10 @@ async fn mem_cache_hit_skips_package_status_when_progress_already_reported() {
             auth_headers: &AuthHeaders::default(),
             retry_opts: test_retry_opts(),
             offline: false,
+            tar_limits: crate::TarLimits::default(),
         },
         package: crate::TarballPackage {
+            integrity_kind: crate::IntegrityKind::Resource,
             integrity: Some(&pkg_integrity),
             unpacked_size: None,
             file_count: None,
@@ -413,8 +422,10 @@ async fn mem_cache_hit_skips_package_status_when_progress_already_reported() {
             auth_headers: &AuthHeaders::default(),
             retry_opts: test_retry_opts(),
             offline: false,
+            tar_limits: crate::TarLimits::default(),
         },
         package: crate::TarballPackage {
+            integrity_kind: crate::IntegrityKind::Resource,
             integrity: Some(&pkg_integrity),
             unpacked_size: None,
             file_count: None,

@@ -8,6 +8,7 @@
 //! routing: project-name normalization, the project document and its two
 //! renderings, distribution-filename parsing, and the upload form.
 
+pub mod archive;
 pub mod multipart;
 
 pub use pnpr_package_name::PythonNameError as NameError;
@@ -17,7 +18,11 @@ use pep440_rs::Version;
 use pnpr_package_name::canonicalize_python_name;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, fmt::Write as _, str::FromStr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Write as _,
+    str::FromStr,
+};
 
 /// The URL segment under a registry endpoint where the Simple API lives:
 /// `/~<name>/simple/`, `/~<name>/simple/<project>/`.
@@ -118,20 +123,36 @@ impl ProjectFile {
     }
 }
 
+pub const PROJECT_DOCUMENT_FORMAT_VERSION: u32 = 2;
+
+const fn default_format_version() -> u32 {
+    PROJECT_DOCUMENT_FORMAT_VERSION
+}
+
 /// A project's file listing: the document pnpr stores per hosted project,
 /// and the shape it reads an upstream PEP 691 page into (the page's extra
 /// keys are ignored).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectDocument {
+    #[serde(rename = "formatVersion", default = "default_format_version")]
+    pub format_version: u32,
     pub name: String,
     #[serde(default)]
     pub files: Vec<ProjectFile>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    /// Filenames permanently reserved after an administrator deletes them.
+    pub deleted_files: BTreeSet<String>,
 }
 
 impl ProjectDocument {
     #[must_use]
     pub fn new(name: &str) -> Self {
-        Self { name: name.to_string(), files: Vec::new() }
+        Self {
+            format_version: PROJECT_DOCUMENT_FORMAT_VERSION,
+            name: name.to_string(),
+            files: Vec::new(),
+            deleted_files: BTreeSet::new(),
+        }
     }
 
     pub fn parse(bytes: &[u8]) -> Result<Self, serde_json::Error> {

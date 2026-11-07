@@ -19,7 +19,7 @@ use crate::{
     reporter_bridge::{EngineCallGuard, LogSink, NodeBridgeReporter},
 };
 
-/// Inputs for [`pack`]. Mirrors [`PackOptions`] in `index.d.ts`.
+/// Inputs for [`pack`].
 #[napi(object)]
 #[cfg_attr(
     dylint_lib = "perfectionist",
@@ -41,7 +41,7 @@ pub struct PackOptions {
     pub extra_env: Option<HashMap<String, String>>,
 }
 
-/// Result of [`pack`]. Mirrors [`PackResult`] in `index.d.ts`.
+/// Result of [`pack`].
 #[napi(object)]
 pub struct PackResult {
     pub published_manifest: serde_json::Value,
@@ -55,6 +55,7 @@ pub struct PackResult {
 
 #[napi]
 pub async fn pack(options: PackOptions, on_log: Option<LogSink>) -> napi::Result<PackResult> {
+    pnpm_package_manager::configure_rayon_pool();
     // Share the serialization lock with install/rebuild: they all drive the
     // same process-global log sink, so overlapping calls would misroute events.
     let _guard = engine_call_lock().lock().await;
@@ -104,12 +105,14 @@ fn pack_options(options: PackOptions) -> pnpm_pack::PackOptions {
             // Bit does not use catalog: specifiers; workspace catalog loading is
             // deferred until a consumer needs it. See pnpm/plans/NAPI.md.
             catalogs: Catalogs::default(),
+            catalogs_dir: None,
             embed_readme: options.embed_readme.unwrap_or(false),
             node_linker: NodeLinker::default(),
             skip_obfuscation: false,
             // Bit drives its own `readPackage` hook through the napi bridge and
             // loads no `beforePacking` pnpmfiles, so the hook loop is a no-op.
             before_packing_hooks: Vec::new(),
+            workspace_packages: None,
         },
         output: pnpm_pack::PackOutputOptions {
             gzip_level: options.pack_gzip_level,

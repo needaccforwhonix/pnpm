@@ -2,6 +2,8 @@ use super::{
     BTreeMap, BTreeSet, DependencyGroup, PackageManifest, ProjectSnapshot, ResolvedDependencyMap,
     ResolvedDependencySpec, SpecDiff, StalenessReason, git_specifiers_are_equivalent,
 };
+use pnpm_semver_include_prerelease::{ANY_VERSION_RANGE, is_any_version_range};
+use pnpm_tool_protocol::tool_specifiers_equal;
 
 /// Verify the on-disk `package.json` is still satisfied by the
 /// lockfile's importer entry for the same project. Returns `Ok(())`
@@ -217,10 +219,10 @@ fn check_field_specs(
             return Err(StalenessReason::DepSpecifierMismatch {
                 field: field_name,
                 name: (*name).to_string(),
-                lockfile: importer_dep.map_or_else(
-                    || "(absent)".to_string(),
-                    |dep| dep.specifier.clone(),
-                ),
+                lockfile: match importer_dep {
+                    Some(dep) => dep.specifier.clone(),
+                    None => "(absent)".to_string(),
+                },
                 manifest: (*manifest_spec).to_string(),
             });
         }
@@ -239,10 +241,21 @@ fn check_resolution_satisfies(
     let (Some(dep), Ok(range)) = (importer_dep, manifest_spec.parse::<node_semver::Range>()) else {
         return Ok(());
     };
-    let Some(version) = dep.version.ver_peer().and_then(|version| version.version_semver()) else {
+    let Some(version) = dep.version
+        .ver_peer()
+        .and_then(|version| {
+            version
+                .version_semver()
+                .or_else(|| version.registry_qualified().map(|(_, version)| version))
+        })
+    else {
         return Ok(());
     };
-    if range.satisfies(version) {
+    // The resolver gives an any-version range the `latest` tag even when it is a prerelease.
+    if manifest_spec == ANY_VERSION_RANGE
+        || is_any_version_range(manifest_spec)
+        || range.satisfies(version)
+    {
         return Ok(());
     }
     Err(StalenessReason::ResolutionDoesNotSatisfy {
@@ -397,5 +410,7 @@ fn diff_flat_records(
 }
 
 pub(super) fn dependency_specifiers_equal(left: &str, right: &str) -> bool {
-    left == right || git_specifiers_are_equivalent(left, right)
+    left == right
+        || git_specifiers_are_equivalent(left, right)
+        || tool_specifiers_equal(left, right)
 }

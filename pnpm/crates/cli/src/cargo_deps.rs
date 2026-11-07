@@ -1,24 +1,29 @@
 pub(crate) mod add;
+pub(crate) mod toolchain;
 
-pub(crate) use lockfile::workspace_root;
-pub(crate) use sparse_registry::{cargo_auth_headers, latest_version};
+pub(crate) use lockfile::{canonical_cargo_path, workspace_metadata, workspace_root};
+pub(crate) use sparse_registry::{
+    cargo_auth_headers, fetch_crate_index_file, latest_version, resolve_target_version,
+};
+pub(crate) use toolchain::{installs_toolchains, provision as provision_toolchain};
 
 use crate::{
     cargo_deps::git::{GIT_SOURCE_DIRECTORY, GIT_SOURCE_NAME, GitPackage, GitSource},
     ecosystem_install::{EcosystemManifest, EcosystemWorkspaceInventory, InstallContext},
+    process::Command,
 };
 use cargo_util_schemas::index::RegistryConfig;
 use futures_util::{StreamExt, TryStreamExt, stream};
 
 use lockfile::{
     LockedCrate, discover_workspace_roots, parse_lockfile, read_or_resolve_lockfile,
-    validate_package_field,
+    validate_package_field, verify_existing_lockfile,
 };
-use materialize::{DownloadOptions, add_cargo_checksum, download_crates};
+use materialize::{DownloadOptions, add_cargo_checksum, download_crates, slot_is_complete};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use pnpm_cargo_resolver::is_crates_io;
 use pnpm_config::Config;
-use pnpm_deps_restorer::{ImportIndexedDirOpts, import_indexed_dir};
+use pnpm_deps_restorer::{CARGO_CHECKSUM_FILE, ImportIndexedDirOpts, import_indexed_dir};
 use pnpm_install_coordinator::{InstallTask, PreparedInstall};
 use pnpm_network::{AuthHeaders, RetryOpts, ThrottledClient};
 use pnpm_pnpr_client::{CargoResolveOptions, PnprClient};
@@ -33,31 +38,37 @@ use serde::{Deserialize, Serialize};
 use sparse_registry::{fetch_sparse_index, registry_download_config};
 use ssri::{Algorithm, Integrity};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet},
     fs, io,
     path::{Path, PathBuf},
-    process::Command,
     str::FromStr,
     sync::{Arc, atomic::AtomicU8},
 };
-#[cfg(all(test, windows))]
-use workspace_directory::ensure_workspace_directory_windows;
 use workspace_directory::{
     ManagedDirectory, ensure_workspace_directory, force_workspace_symlink, read_workspace_file,
     write_workspace_file,
 };
 
+use sources::{link_workspace, write_cargo_config, write_sources_config};
+
+mod build_std;
 mod checksum_cache;
 mod git;
 mod registry_auth;
+mod resolution;
+mod sources;
 
 const WORKSPACE_INSTALL_CONCURRENCY: usize = 8;
 
-const MANAGED_START: &str = "# >>> pnpm-managed cargo sources >>>";
-const MANAGED_END: &str = "# <<< pnpm-managed cargo sources <<<";
 /// Directory the registry crates are linked into, relative to the Cargo
 /// workspace root.
 const CRATES_SOURCE_DIRECTORY: [&str; 3] = [".pnpm", "crates", "crates-io"];
+/// Directory, relative to the Cargo workspace root, of [`SOURCES_CONFIG`].
+const SOURCES_CONFIG_DIRECTORY: [&str; 2] = [".pnpm", "crates"];
+/// The source replacement for the vendored crates. `.cargo/config.toml`
+/// includes it as optional, so a checkout without `.pnpm` still builds with
+/// plain Cargo.
+const SOURCES_CONFIG: &str = "config.toml";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CargoLockfilePolicy {
@@ -66,39 +77,93 @@ pub(crate) enum CargoLockfilePolicy {
 }
 
 #[derive(Deserialize)]
-struct CargoWorkspaceMetadata {
-    workspace_root: PathBuf,
-    packages: Vec<CargoWorkspacePackage>,
+pub(crate) struct CargoWorkspaceMetadata {
+    pub(crate) workspace_root: PathBuf,
+    pub(crate) packages: Vec<CargoWorkspacePackage>,
 }
 
 #[derive(Deserialize)]
-struct CargoWorkspacePackage {
-    manifest_path: PathBuf,
+pub(crate) struct CargoWorkspacePackage {
+    pub(crate) manifest_path: PathBuf,
+    #[serde(default)]
+    pub(crate) dependencies: Vec<CargoWorkspaceDependency>,
+}
+
+/// A dependency declaration as `cargo metadata` reports it, with the
+/// features of the workspace entry it inherits from merged in. Each
+/// target-specific table declaring it is an entry of its own.
+#[derive(Deserialize)]
+pub(crate) struct CargoWorkspaceDependency {
+    pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) rename: Option<String>,
+    pub(crate) req: String,
+    #[serde(default)]
+    pub(crate) features: Vec<String>,
+    /// `None` for a path dependency.
+    #[serde(default)]
+    pub(crate) source: Option<String>,
+    /// The index URL of an alternate registry, `None` for crates.io.
+    #[serde(default)]
+    pub(crate) registry: Option<String>,
 }
 
 pub(crate) async fn plan<Reporter: self::Reporter + 'static>(
     context: InstallContext,
     inventory: &EcosystemWorkspaceInventory,
 ) -> Result<InstallTask<'static>> {
-    let roots =
-        discover_workspace_roots(inventory.manifests(EcosystemManifest::Cargo).await?).await?;
+    let manifests = inventory.manifests(EcosystemManifest::Cargo).await?;
+    let checkout = checkout(inventory.workspace_root());
+    toolchain::provision::<Reporter>(
+        context.config,
+        &context.http_client,
+        manifests,
+        checkout.as_deref(),
+    )
+    .await?;
+    let workspaces = discover_workspace_roots(manifests, checkout.as_deref()).await?;
+    if context.frozen_lockfile {
+        workspaces.iter().try_for_each(verify_existing_lockfile)?;
+    }
+    let roots = workspaces
+        .into_iter()
+        .map(|workspace| workspace.root)
+        .collect::<Vec<_>>();
     let metadata = roots
         .iter()
         .flat_map(|root| metadata_paths(root))
         .collect();
     Ok(InstallTask::new(
         metadata,
-        prepare::<Reporter>(context, roots, CargoLockfilePolicy::UseExisting),
+        prepare::<Reporter>(context, roots, checkout, CargoLockfilePolicy::UseExisting),
     ))
 }
 
-pub(crate) fn metadata_paths(root: &Path) -> [PathBuf; 2] {
-    [root.join("Cargo.lock"), root.join(".cargo/config.toml")]
+/// The directory the repository controls, resolved for comparison against
+/// the canonical Cargo workspace roots. A Cargo workspace may sit inside it
+/// rather than at it, so everything at or under it is checkout content and
+/// what lies above it is the machine's.
+///
+/// [`None`] when the path does not resolve, which counts every configuration
+/// file in scope as checkout content: a boundary pnpm cannot compare must
+/// not widen what a checkout can point it at.
+pub(crate) fn checkout(dir: &Path) -> Option<PathBuf> {
+    dunce::canonicalize(dir).ok()
+}
+
+pub(crate) fn metadata_paths(root: &Path) -> [PathBuf; 3] {
+    [
+        root.join("Cargo.lock"),
+        root.join(".cargo/config.toml"),
+        root.join(SOURCES_CONFIG_DIRECTORY.join("/"))
+            .join(SOURCES_CONFIG),
+    ]
 }
 
 pub(crate) async fn prepare<Reporter: self::Reporter + 'static>(
     context: InstallContext,
     roots: Vec<PathBuf>,
+    checkout: Option<PathBuf>,
     lockfile_policy: CargoLockfilePolicy,
 ) -> Result<Vec<Prepared>> {
     let InstallContext {
@@ -107,6 +172,7 @@ pub(crate) async fn prepare<Reporter: self::Reporter + 'static>(
         lockfile_only,
         frozen_lockfile,
     } = context;
+    let checkout = checkout.as_deref();
     let mut prepared = stream::iter(roots)
         .map(|root| {
             let http_client = Arc::clone(&http_client);
@@ -114,6 +180,7 @@ pub(crate) async fn prepare<Reporter: self::Reporter + 'static>(
                 prepare_workspace::<Reporter>(
                     config,
                     &root,
+                    checkout,
                     lockfile_only,
                     frozen_lockfile,
                     lockfile_policy,
@@ -154,7 +221,8 @@ impl PreparedInstall for Prepared {
             if !slots.git.is_empty() {
                 link_workspace(&self.root, &GIT_SOURCE_DIRECTORY, &slots.git)?;
             }
-            write_cargo_config(&self.root, &self.index_url, &slots.git_sources)?;
+            write_sources_config(&self.root, &self.index_url, &slots.git_sources)?;
+            write_cargo_config(&self.root)?;
         }
         let path = self.root.join("Cargo.lock");
         let existing = match fs::read_to_string(&path) {
@@ -182,6 +250,7 @@ impl PreparedInstall for Prepared {
 async fn prepare_workspace<Reporter: self::Reporter + 'static>(
     config: &'static Config,
     root_dir: &Path,
+    checkout: Option<&Path>,
     lockfile_only: bool,
     frozen_lockfile: bool,
     lockfile_policy: CargoLockfilePolicy,
@@ -192,6 +261,7 @@ async fn prepare_workspace<Reporter: self::Reporter + 'static>(
         config,
         root_dir,
         &cargo_lock_path,
+        checkout,
         frozen_lockfile,
         lockfile_policy,
         &http_client,
@@ -202,12 +272,13 @@ async fn prepare_workspace<Reporter: self::Reporter + 'static>(
             root: root_dir.to_path_buf(),
             lock: cargo_lock,
             slots: None,
-            index_url: config.cargo.index_url.clone(),
+            index_url: config.cargo_index_url().to_string(),
         });
     }
     let slots = prepare_workspace_slots::<Reporter>(
         config,
         root_dir,
+        checkout,
         &cargo_lock_path,
         &cargo_lock,
         http_client,
@@ -218,107 +289,8 @@ async fn prepare_workspace<Reporter: self::Reporter + 'static>(
         root: root_dir.to_path_buf(),
         lock: cargo_lock,
         slots: Some(slots),
-        index_url: config.cargo.index_url.clone(),
+        index_url: config.cargo_index_url().to_string(),
     })
-}
-
-fn link_workspace(root_dir: &Path, directory: &[&str], slots: &[(String, PathBuf)]) -> Result<()> {
-    let source_dir = ensure_workspace_directory(root_dir, directory)?;
-    link_workspace_in(&source_dir, slots)
-}
-
-fn link_workspace_in(source_dir: &ManagedDirectory, slots: &[(String, PathBuf)]) -> Result<()> {
-    for (name, slot) in slots {
-        let outcome = force_workspace_symlink(source_dir, slot, name)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("link cargo package {name}"))?;
-        if let Some(warning) = outcome.warning {
-            tracing::warn!(target: "pacquet::cargo", ?warning, "cargo package link warning");
-        }
-    }
-    Ok(())
-}
-
-fn write_cargo_config(root_dir: &Path, index_url: &str, git_sources: &[GitSource]) -> Result<()> {
-    let cargo_dir = ensure_workspace_directory(root_dir, &[".cargo"])?;
-    write_cargo_config_in(&cargo_dir, index_url, git_sources)
-}
-
-fn write_cargo_config_in(
-    cargo_dir: &ManagedDirectory,
-    index_url: &str,
-    git_sources: &[GitSource],
-) -> Result<()> {
-    let config_path = cargo_dir.path.join("config.toml");
-    let (existing, mode) = match read_workspace_file(cargo_dir, "config.toml") {
-        Ok(existing) => existing,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => (String::new(), None),
-        Err(error) => {
-            return Err(error)
-                .into_diagnostic()
-                .wrap_err_with(|| format!("read {}", config_path.display()));
-        }
-    };
-    let updated = update_managed_config(&existing, index_url, git_sources)?;
-    if updated != existing {
-        write_workspace_file(cargo_dir, "config.toml", updated.as_bytes(), mode)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("write {}", config_path.display()))?;
-    }
-    Ok(())
-}
-
-fn update_managed_config(
-    existing: &str,
-    index_url: &str,
-    git_sources: &[GitSource],
-) -> Result<String> {
-    let managed_config = managed_config(index_url, git_sources);
-    match (existing.find(MANAGED_START), existing.find(MANAGED_END)) {
-        (None, None) => {
-            let separator = if existing.is_empty() || existing.ends_with("\n\n") {
-                ""
-            } else if existing.ends_with('\n') {
-                "\n"
-            } else {
-                "\n\n"
-            };
-            Ok(format!("{existing}{separator}{managed_config}\n"))
-        }
-        (Some(start), Some(end)) if start <= end => {
-            let after = end + MANAGED_END.len();
-            Ok(format!("{}{}{}", &existing[..start], managed_config, &existing[after..]))
-        }
-        _ => Err(miette::miette!(
-            ".cargo/config.toml contains an incomplete pnpm-managed Cargo source block"
-        )),
-    }
-}
-
-fn managed_config(index_url: &str, git_sources: &[GitSource]) -> String {
-    let crates = CRATES_SOURCE_DIRECTORY.join("/");
-    let mut body = if is_crates_io(index_url) {
-        format!(
-            "[source.crates-io]\nreplace-with = \"pnpm-crates-io\"\n\n[source.pnpm-crates-io]\ndirectory = \"{crates}\"\n",
-        )
-    } else {
-        let source = toml::Value::from(pnpm_cargo_resolver::sparse_source(index_url));
-        format!(
-            "[source.crates-io]\nreplace-with = \"pnpm-registry\"\n\n[source.pnpm-registry]\nregistry = {source}\nreplace-with = \"pnpm-registry-directory\"\n\n[source.pnpm-registry-directory]\ndirectory = \"{crates}\"\n",
-        )
-    };
-    if !git_sources.is_empty() {
-        let git = GIT_SOURCE_DIRECTORY.join("/");
-        let blocks = git_sources
-            .iter()
-            .fold(String::new(), |mut blocks, source| {
-                blocks.push('\n');
-                blocks.push_str(&source.config_block());
-                blocks
-            });
-        body = format!("{body}\n[source.{GIT_SOURCE_NAME}]\ndirectory = \"{git}\"\n{blocks}");
-    }
-    format!("{MANAGED_START}\n{body}{MANAGED_END}")
 }
 
 #[cfg(test)]
@@ -327,12 +299,14 @@ mod tests;
 async fn prepare_workspace_slots<Reporter: self::Reporter + 'static>(
     config: &'static Config,
     root_dir: &Path,
+    checkout: Option<&Path>,
     cargo_lock_path: &Path,
     cargo_lock: &str,
     http_client: Arc<ThrottledClient>,
 ) -> Result<WorkspaceSlots> {
-    let packages = parse_lockfile(cargo_lock, &config.cargo.index_url)
+    let packages = parse_lockfile(cargo_lock, config.cargo_index_url())
         .wrap_err_with(|| format!("parse {}", cargo_lock_path.display()))?;
+    let packages = build_std::include_packages(root_dir, checkout, packages).await?;
     let git_sources = packages.git_sources();
     let logged_methods = Arc::new(AtomicU8::new(0));
     let store_dir = &config.store_dir;

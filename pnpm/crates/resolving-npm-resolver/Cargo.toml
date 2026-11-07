@@ -12,13 +12,15 @@ repository.workspace = true
 
 [dependencies]
 pnpm-package-name = { workspace = true }
-pnpm-config = { workspace = true }
 pnpm-deps-path = { workspace = true }
 pnpm-lockfile = { workspace = true }
+pnpm-platform-variants = { workspace = true }
 pnpm-network = { workspace = true }
 pnpm-registry = { workspace = true }
 pnpm-resolving-jsr-specifier-parser = { workspace = true }
 pnpm-resolving-resolver-base = { workspace = true }
+pnpm-version-policy = { workspace = true }
+pnpm-store-dir = { workspace = true }
 pnpm-workspace-range-resolver = { workspace = true }
 pnpm-workspace-spec = { workspace = true }
 
@@ -32,7 +34,7 @@ miette = { workspace = true }
 node-semver = { workspace = true }
 percent-encoding = { workspace = true }
 pipe-trait = { workspace = true }
-reqwest = { workspace = true }
+rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -49,6 +51,15 @@ mockito = { workspace = true }
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
+tracing-subscriber = { workspace = true }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+reqwest = { workspace = true }
+tokio = { workspace = true, features = ["net", "signal"] }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+pnpm-wasm-host = { path = "../wasm-host" }
+pnpm-http = { workspace = true }
 
 [lints]
 workspace = true

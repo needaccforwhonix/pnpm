@@ -83,6 +83,16 @@ impl<'de> Deserialize<'de> for LedgerEntry {
 }
 
 impl LedgerEntry {
+    /// The released project's workspace-relative dir, as recorded. `None` for
+    /// a bare id list, which names no dir.
+    #[must_use]
+    pub fn dir(&self) -> Option<&str> {
+        match self {
+            LedgerEntry::Ids(_) => None,
+            LedgerEntry::Attributed { dir, .. } => Some(dir),
+        }
+    }
+
     #[must_use]
     pub fn intent_ids(&self) -> &[String] {
         match self {
@@ -111,7 +121,9 @@ pub fn read_ledger(workspace_dir: &Path) -> Result<Ledger, VersioningError> {
     if content.trim().is_empty() {
         return Ok(Ledger::new());
     }
-    serde_saphyr::from_str(&content).map_err(|_| VersioningError::InvalidLedger { ledger_path })
+    serde_saphyr::from_str::<Option<Ledger>>(&content)
+        .map_err(|_| VersioningError::InvalidLedger { ledger_path })
+        .map(Option::unwrap_or_default)
 }
 
 pub fn append_to_ledger(

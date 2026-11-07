@@ -62,9 +62,62 @@ fn write_or_remove_manifest_ignores_missing_empty_manifest() {
     let path = dir.path().join(WORKSPACE_MANIFEST_FILENAME);
     let manifest = crate::model::Manifest::parse(Some("")).expect("empty manifest");
 
-    crate::write_or_remove_manifest(&path, manifest).expect("remove missing empty manifest");
+    crate::write_or_remove_manifest(
+        &crate::ManifestTarget {
+            path: path.clone(),
+            included: false,
+            base_dir: dir.path().to_path_buf(),
+        },
+        manifest,
+    )
+    .expect("remove missing empty manifest");
 
     assert!(!path.exists());
+}
+
+#[test]
+fn comment_only_manifest_parses_as_empty() {
+    let manifest = crate::model::Manifest::parse(Some("# workspace settings\n"))
+        .expect("comment-only manifest");
+    assert!(manifest.catalogs.default.is_none());
+    assert!(manifest.catalogs.named.is_none());
+}
+
+#[test]
+fn null_root_manifest_is_rejected_without_writing() {
+    for original in [
+        "null\n",
+        "~\n",
+        "Null\n",
+        "NULL\n",
+        "!!null\n",
+        "!<tag:yaml.org,2002:null>\n",
+        "&settings\n",
+        "---\n&settings !!null # keep\n...\n",
+        "# workspace settings\nnull # keep\n",
+        "---\n!!null null\n...\n",
+    ] {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join(WORKSPACE_MANIFEST_FILENAME);
+        fs::write(&path, original).expect("seed manifest");
+
+        let result = crate::set_skills_dirs(dir.path(), &["skills".to_string()]);
+        let error = result.expect_err("a null root must not be edited as a mapping");
+        assert!(
+            matches!(&error, crate::UpdateWorkspaceManifestError::Parse { path: error_path, .. } if error_path == &path),
+            "{original:?}: {error}",
+        );
+        assert!(error.to_string().contains("expected a mapping"), "{error}");
+        assert_eq!(fs::read_to_string(&path).expect("read manifest"), original);
+    }
+}
+
+#[test]
+fn comment_only_manifest_can_be_updated() {
+    let original = "# workspace settings\n";
+    let output = run_update_field(Some(original), "saveExact", &serde_json::json!(true))
+        .expect("file written");
+    assert_eq!(output, "saveExact: true\n# workspace settings\n");
 }
 
 #[test]
@@ -74,8 +127,11 @@ fn write_or_remove_manifest_reports_remove_errors() {
     fs::create_dir(&path).expect("create manifest dir");
     let manifest = crate::model::Manifest::parse(Some("")).expect("empty manifest");
 
-    let err =
-        crate::write_or_remove_manifest(&path, manifest).expect_err("directory remove should fail");
+    let err = crate::write_or_remove_manifest(
+        &crate::ManifestTarget { path, included: false, base_dir: dir.path().to_path_buf() },
+        manifest,
+    )
+    .expect_err("directory remove should fail");
 
     assert!(matches!(err, crate::UpdateWorkspaceManifestError::Remove { .. }));
 }
@@ -83,14 +139,15 @@ fn write_or_remove_manifest_reports_remove_errors() {
 #[test]
 fn write_or_remove_manifest_reports_write_errors() {
     let dir = TempDir::new().expect("temp dir");
-    let path = dir
-        .path()
-        .join("missing")
-        .join(WORKSPACE_MANIFEST_FILENAME);
+    let path = dir.path().join(WORKSPACE_MANIFEST_FILENAME);
+    std::fs::create_dir(&path).expect("put a directory where the manifest goes");
     let manifest = crate::model::Manifest::parse(Some("packages:\n  - '*'\n")).expect("manifest");
 
-    let err =
-        crate::write_or_remove_manifest(&path, manifest).expect_err("missing parent should fail");
+    let err = crate::write_or_remove_manifest(
+        &crate::ManifestTarget { path, included: false, base_dir: dir.path().to_path_buf() },
+        manifest,
+    )
+    .expect_err("replacing a directory should fail");
 
     assert!(matches!(err, crate::UpdateWorkspaceManifestError::Write { .. }));
 }

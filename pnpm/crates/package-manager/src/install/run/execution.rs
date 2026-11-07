@@ -1,13 +1,20 @@
 use super::{
     super::{
-        ApplyMaterializationInputs, Arc, AtomicU8, InstallError, LogEvent, LogLevel,
-        MaterializationInputs, PackageManifest, PathBuf, Reporter, SummaryLog,
-        apply_materialization_result, materialize, prior_hoisted_dependencies,
-        prior_hoisted_locations,
+        ApplyMaterializationInputs, AtomicU8, InstallError, MaterializationInputs, PackageManifest,
+        PathBuf, Reporter, apply_materialization_result, materialize,
     },
-    Dispatched, InstallRunOutcome, InstallScope, Loaded, Lockfiles, RunExecution, Settled,
-    Verification, dispatch, load_lockfiles, settle_wanted_lockfile, workspace_projects,
+    Dispatched, InstallRunOutcome, InstallScope, Loaded, Lockfiles, RepeatInstallVerdict,
+    RunExecution, Verification,
+    dispatch::{announce_import, dispatch},
+    load_lockfiles,
+    materialization_inputs::materialization_lockfiles,
+    pre_resolution::run_pre_resolution_hook,
+    report_already_up_to_date, settle_wanted_lockfile,
+    settled::Settled,
+    time_machine_capture::capture_time_machine_exclusions,
+    workspace_projects,
 };
+use tracing::Instrument as _;
 
 impl<'a> RunExecution<'a> {
     fn select_scope(&self) -> InstallScope<'a> {
@@ -20,22 +27,38 @@ impl<'a> RunExecution<'a> {
         )
     }
 
+    /// [`Self::repeat_install_verdict`] inside the `check_repeat_install`
+    /// span, saying so when the install short-circuits.
+    async fn traced_repeat_install_verdict(
+        &mut self,
+        scope: &InstallScope<'_>,
+    ) -> Result<RepeatInstallVerdict, InstallError> {
+        let verdict = self
+            .repeat_install_verdict(scope)
+            .instrument(tracing::debug_span!(target: "pacquet::install", "check_repeat_install"))
+            .await?;
+        if matches!(verdict, RepeatInstallVerdict::Unchanged) {
+            tracing::debug!(
+                target: "pacquet::install",
+                "repeat-install fast path taken; nothing changed since the previous install",
+            );
+        }
+        Ok(verdict)
+    }
+
     pub(super) async fn run<Reporter: self::Reporter + 'static>(
         mut self,
+        time_machine_exclusions: &mut super::super::TimeMachineExclusions,
     ) -> Result<InstallRunOutcome, InstallError> {
-        let scope = self.select_scope();
-        if scope.is_already_up_to_date::<Reporter>(
-            self.install,
-            &self.owned,
-            &self.mode,
-            &self.workspace,
-        )? {
-            Reporter::emit(&LogEvent::Summary(SummaryLog {
-                level: LogLevel::Debug,
-                prefix: self.workspace.prefix,
-            }));
-            return Ok(InstallRunOutcome::AlreadyUpToDate);
-        }
+        let mut scope = self.select_scope();
+        capture_time_machine_exclusions(&self, &scope, time_machine_exclusions);
+        scope.project_scripts_current = match self.traced_repeat_install_verdict(&scope).await? {
+            RepeatInstallVerdict::Unchanged => {
+                return Ok(report_already_up_to_date::<Reporter>(self.workspace.prefix));
+            }
+            RepeatInstallVerdict::UnchangedFrozen => true,
+            RepeatInstallVerdict::Changed => false,
+        };
         let mut loaded = load_lockfiles::<Reporter>(
             self.install,
             &mut self.owned,
@@ -48,7 +71,8 @@ impl<'a> RunExecution<'a> {
         .await?;
         let manifests = std::mem::take(&mut loaded.manifests);
         let project_manifests = manifests.view(&scope.project_manifests);
-        let lockfiles = settle_wanted_lockfile::<Reporter>(
+        self.validate_project_manifests(&project_manifests)?;
+        let mut lockfiles = settle_wanted_lockfile::<Reporter>(
             self.install,
             &self.mode,
             &self.workspace,
@@ -58,7 +82,13 @@ impl<'a> RunExecution<'a> {
             self.options.selection.as_ref(),
         )
         .await?;
-        self.install_settled::<Reporter>(&scope, &mut loaded, &project_manifests, &lockfiles).await
+        Box::pin(self.install_settled::<Reporter>(
+            &scope,
+            &mut loaded,
+            &project_manifests,
+            &mut lockfiles,
+        ))
+        .await
     }
 
     fn take_settled_outcome(&mut self) -> InstallRunOutcome {
@@ -72,27 +102,28 @@ impl<'a> RunExecution<'a> {
         scope: &InstallScope<'_>,
         loaded: &mut Loaded<'_>,
         project_manifests: &[(PathBuf, &PackageManifest)],
-        lockfiles: &Lockfiles<'_>,
+        lockfiles: &mut Lockfiles<'_>,
     ) -> Result<InstallRunOutcome, InstallError> {
-        let verification = Verification::set_up(self, lockfiles.wanted.get().is_some())?;
-        let Some(mut dispatched) = dispatch::<Reporter>(
-            Settled {
-                install: self.install,
-                owned: &self.owned,
-                mode: &self.mode,
-                loaded,
-                lockfiles,
-                verification: &verification,
-                projects: crate::install::run::dispatch::SettledProjects {
-                    workspace: &self.workspace,
-                    scope,
-                    project_manifests,
-                },
-            },
-            &mut self.options,
+        let (verification, root_preinstall_ran) =
+            self.announce::<Reporter>((scope, project_manifests), loaded, lockfiles)?;
+        run_pre_resolution_hook::<Reporter>(
+            self.install,
+            &self.workspace,
+            loaded,
+            &mut lockfiles.wanted,
         )
-        .await?
+        .await?;
+        let lockfiles = &*lockfiles;
+        let settled = Settled::new(
+            (self.install, &self.owned, &self.mode, &self.workspace),
+            (loaded, lockfiles, &verification),
+            (scope, project_manifests),
+        );
+        let Some(mut dispatched) =
+            dispatch::<Reporter>(settled, &mut self.options, root_preinstall_ran).await?
         else {
+            super::store_fetch::fetch_wanted_lockfile::<Reporter>(self.store_fetch(), lockfiles)
+                .await?;
             return Ok(self.take_settled_outcome());
         };
         let materialized = materialize::<Reporter>(self.materialization_inputs(
@@ -113,6 +144,42 @@ impl<'a> RunExecution<'a> {
         .await
     }
 
+    /// Set up the verification, warn about a bypassed home store, announce
+    /// the install, and run `pnpm:devPreinstall`, which pnpm runs before the
+    /// `preResolution` hook. Also returns whether the root's `preinstall` is
+    /// taken care of.
+    fn announce<Reporter: self::Reporter>(
+        &self,
+        (scope, project_manifests): (&InstallScope<'_>, &[(PathBuf, &PackageManifest)]),
+        loaded: &Loaded<'_>,
+        lockfiles: &Lockfiles<'_>,
+    ) -> Result<(Verification, bool), InstallError> {
+        let verification = Verification::set_up(self, lockfiles, (scope, project_manifests))?;
+        if let Some(message) = self.install.context.config.bypassed_home_store_warning() {
+            pnpm_reporter::emit_global_warning::<Reporter>(&message);
+        }
+        let root_preinstall_ran = announce_import::<Reporter>(
+            Settled::new(
+                (self.install, &self.owned, &self.mode, &self.workspace),
+                (loaded, lockfiles, &verification),
+                (scope, project_manifests),
+            ),
+            &self.options,
+        )?;
+        Ok((verification, root_preinstall_ran))
+    }
+
+    fn store_fetch(&self) -> super::store_fetch::StoreFetchRun<'_> {
+        super::store_fetch::StoreFetchRun {
+            mode: &self.mode,
+            install: self.install,
+            owned: &self.owned,
+            requester: &self.workspace.prefix,
+            prefetch_downloads: self.prefetch_downloads.as_ref(),
+            store_verification: self.store_verification.as_ref(),
+        }
+    }
+
     async fn finish_materialization<Reporter: self::Reporter + 'static>(
         &mut self,
         projects: (&InstallScope<'_>, &[(PathBuf, &PackageManifest)]),
@@ -121,6 +188,22 @@ impl<'a> RunExecution<'a> {
         dispatched: Dispatched<'a>,
         materialized: super::super::materialize::MaterializationOutput,
     ) -> Result<InstallRunOutcome, InstallError> {
+        super::store_fetch::finish_fresh_fetch::<Reporter>(
+            self.store_fetch(),
+            materialized.materialized.fresh_lockfile.as_ref(),
+        )
+        .await?;
+        let dependencies_installed = self.owned.projects.dedicated
+            .as_ref()
+            .and_then(|dedicated| dedicated.dependencies_installed.clone());
+        if let Err(error) = wait_for_workspace_dependencies(dependencies_installed).await {
+            pnpm_store_dir::StoreIndexWriter::drain(
+                materialized.store_index_teardown,
+                "; some rows may not be persisted",
+            )
+            .await;
+            return Err(error);
+        }
         let workspace_manifest_dir = self.workspace.dirs.workspace_manifest_dir.clone();
         apply_materialization_result::<Reporter>(self.apply_inputs(
             projects,
@@ -148,8 +231,10 @@ impl<'a> RunExecution<'a> {
     ) -> MaterializationInputs<'r, 'a> {
         let resolution = self.materialization_resolution(loaded);
         let early_host_detection = loaded.early_host_detection.take();
-        let lockfiles = materialization_lockfiles(loaded, lockfiles, dispatched, verification);
-        let prior_modules = dispatched.modules.previous_modules_metadata.as_ref();
+        let mut lockfiles = materialization_lockfiles(loaded, lockfiles, dispatched, verification);
+        lockfiles.locked_registries = self.workspace.loaded_workspace
+            .locked_registry_routes
+            .as_ref();
         MaterializationInputs {
             install: self.install,
             resolution,
@@ -168,23 +253,27 @@ impl<'a> RunExecution<'a> {
                 ),
                 scope,
             ),
-            modules: crate::install::materialize::MaterializationModules {
-                included: self.mode.included,
-                rebuild: self.options.rebuild.as_ref(),
-                modules_manifest: dispatched.modules.old_modules.as_ref(),
-                prior_hoisted_dependencies: prior_hoisted_dependencies(prior_modules),
-                prior_hoisted_locations: prior_hoisted_locations(prior_modules),
-                prune_orphans: !scope.importers.filtered_install,
+            modules: dispatched.materialization_modules(
+                (self.mode.included, self.options.rebuild.as_ref()),
+                self.prune_tree_options(scope),
                 logged_methods,
-            },
+            ),
             execution: self.mode.materialization_execution(
-                &self.owned,
+                (&self.owned, self.install.execution),
                 &self.options,
                 dispatched.take_frozen_path,
                 early_host_detection,
                 &self.workspace.prefix,
             ),
-            downloads: (&self.owned).into(),
+            downloads: self.materialization_downloads(),
+        }
+    }
+
+    fn materialization_downloads(&self) -> crate::install::materialize::MaterializationDownloads {
+        crate::install::materialize::MaterializationDownloads {
+            prefetch_downloads: self.prefetch_downloads.clone(),
+            store_verification: self.store_verification.clone(),
+            ..(&self.owned).into()
         }
     }
 
@@ -196,6 +285,8 @@ impl<'a> RunExecution<'a> {
             pnpmfile_hook: loaded.pnpmfile_hook.take(),
             deploy_manifest_hook: self.options.manifests.deploy_hook,
             manifest_spec_bumps: self.options.manifests.spec_bumps,
+            known_requires_build: self.options.manifests.known_requires_build.take(),
+            lockfile_check_sink: self.options.save.lockfile_check.take(),
             inputs: std::mem::take(&mut self.owned.resolution),
         }
     }
@@ -208,17 +299,36 @@ impl<'a> RunExecution<'a> {
             catalog_context_present: self.workspace.catalog_context_present,
             verified_file_integrity_baseline: self.mode.verified_file_integrity_baseline,
             config: self.install.context.config,
+            save_workspace_state: self.options.save.workspace_state,
+            can_prompt: self.mode.can_prompt,
         }
     }
 
     fn take_project_scripts(
         &mut self,
+        root_preinstall_ran: bool,
     ) -> crate::install::state_options::PendingProjectScripts<'a, 'a> {
         crate::install::state_options::PendingProjectScripts {
             mutation: self.install.execution.mutation,
             manifest_dir: self.workspace.dirs.manifest_dir,
             selection: self.options.selection.take(),
             rebuild: self.options.rebuild.take(),
+            root_preinstall_ran,
+        }
+    }
+
+    fn selected_importers<'r>(
+        &self,
+        scope: &'r InstallScope<'_>,
+        project_manifests: &'r [(PathBuf, &'r PackageManifest)],
+    ) -> crate::install::state_options::SelectedImporters<'r> {
+        crate::install::state_options::SelectedImporters {
+            requested_ids: scope.importers.requested_importer_ids.as_ref(),
+            real_ids: &scope.importers.real_importer_ids,
+            manifests: project_manifests,
+            declared_manifests: scope.declared_manifests(),
+            workspace_projects: scope.workspace_projects.as_deref(),
+            ignore_manifest_check: self.install.lockfile_policy.ignore_manifest_check,
         }
     }
 
@@ -241,18 +351,10 @@ impl<'a> RunExecution<'a> {
                 dry_run: self.install.execution.dry_run,
                 peer_issues_sink_is_none: self.mode.peer_issues_sink_is_none,
             },
-            prior: crate::install::state_options::ApplyPriorState {
-                lockfile: loaded.current.take(),
-                layout: dispatched.modules.old_modules,
-                metadata: dispatched.modules.previous_modules_metadata,
-                is_inconsistent: dispatched.modules.is_inconsistent,
-            },
+            prior: self.take_apply_prior_state(loaded, dispatched.modules),
             projects: crate::install::state_options::ApplyProjectSelection {
-                importers: crate::install::state_options::SelectedImporters {
-                    requested_ids: scope.importers.requested_importer_ids.as_ref(),
-                    real_ids: &scope.importers.real_importer_ids,
-                    manifests: project_manifests,
-                },
+                importers: self.selected_importers(scope, project_manifests),
+                workspace_packages: self.workspace.workspace_packages.take(),
                 workspace_root: std::mem::take(&mut self.workspace.dirs.workspace_root),
                 included: self.mode.included,
                 node_linker: self.install.execution.node_linker,
@@ -265,96 +367,19 @@ impl<'a> RunExecution<'a> {
                 existing_wanted: lockfiles.wanted.loaded,
                 loaded: lockfiles.wanted.get(),
                 frozen: dispatched.take_frozen_path,
+                locked_registry_routes: self.workspace.loaded_workspace
+                    .locked_registry_routes
+                    .take(),
             },
-            scripts: self.take_project_scripts(),
-            write: lockfiles.write_policy(self.options.save_lockfile),
+            scripts: self.take_project_scripts(dispatched.root_preinstall_ran),
+            write: lockfiles.write_policy(self.options.save.lockfile),
             materialized,
         }
     }
 }
-/// The install's borrowed and `Copy` inputs, as one value every phase reads.
-pub(super) fn materialization_lockfiles<'r, 'install>(
-    loaded: &'r mut Loaded<'_>,
-    lockfiles: &'r Lockfiles<'_>,
-    dispatched: &mut Dispatched<'install>,
-    verification: Verification,
-) -> super::super::materialize::MaterializationLockfiles<'r, 'install> {
-    super::super::materialize::MaterializationLockfiles {
-        wanted: lockfiles.wanted.get(),
-        wanted_shared: lockfiles.wanted.loader_handle(loaded.shared.take()),
-        merge_wanted: loaded.merge_wanted_lockfile,
-        current: loaded.current.as_ref(),
-        verification,
-        verification_override: dispatched.modules.lockfile_verification_override.take(),
-    }
-}
-
-impl super::InstallWorkspace<'_> {
-    fn materialization_workspace<'r>(
-        &'r self,
-        (dependency_groups, lockfile_specifier_project_manifests): (
-            Vec<pnpm_package_manifest::DependencyGroup>,
-            Option<Vec<(PathBuf, PackageManifest)>>,
-        ),
-        (project_manifests, workspace_projects): (
-            &'r [(PathBuf, &'r PackageManifest)],
-            Option<&'r [pnpm_workspace::Project]>,
-        ),
-        scope: &'r InstallScope<'_>,
-    ) -> crate::install::materialize::MaterializationWorkspace<'r> {
-        crate::install::materialize::MaterializationWorkspace {
-            dependency_groups,
-            project_manifests,
-            lockfile_specifier_project_manifests,
-            workspace_projects,
-            requested_importer_ids: scope.importers.requested_importer_ids.as_ref(),
-            real_importer_ids: &scope.importers.real_importer_ids,
-            workspace_root: &self.dirs.workspace_root,
-            catalogs: &self.catalogs,
-        }
-    }
-}
-
-impl super::RunMode {
-    fn materialization_execution<'r>(
-        &mut self,
-        owned: &'r super::InstallOwned,
-        options: &super::InstallRunOptions<'_, '_>,
-        take_frozen_path: bool,
-        early_host_detection: Option<pnpm_deps_restorer::materialization_plan::HostDetection>,
-        prefix: &'r str,
-    ) -> crate::install::materialize::MaterializationExecution<'r> {
-        crate::install::materialize::MaterializationExecution {
-            effective_node_version: self.effective_node_version.take(),
-            take_frozen_path,
-            supported_architectures: owned.projects.supported_architectures.as_ref(),
-            early_host_detection,
-            resolve_only: self.resolve_only,
-            can_prompt: self.can_prompt,
-            save_lockfile: options.save_lockfile,
-            prefix,
-        }
-    }
-}
-
-impl From<&super::InstallOwned> for crate::install::materialize::MaterializationDownloads {
-    fn from(owned: &super::InstallOwned) -> Self {
-        Self {
-            tarball_mem_cache: Arc::clone(&owned.tarball_mem_cache),
-            http_client_arc: Arc::clone(&owned.http_client_arc),
-        }
-    }
-}
-
-impl Lockfiles<'_> {
-    pub(super) fn write_policy(
-        &self,
-        save: bool,
-    ) -> crate::install::state_options::LockfileWritePolicy {
-        crate::install::state_options::LockfileWritePolicy {
-            synthesized_from_current: self.wanted.synthesized_from_current(),
-            fast_updated: self.wanted.was_fast_updated(),
-            save,
-        }
-    }
+pub(super) async fn wait_for_workspace_dependencies(
+    dependencies_installed: Option<crate::WorkspaceDependenciesInstalled>,
+) -> Result<(), InstallError> {
+    let Some(dependencies_installed) = dependencies_installed else { return Ok(()) };
+    if dependencies_installed.await { Ok(()) } else { Err(InstallError::WorkspaceDependencyFailed) }
 }

@@ -151,6 +151,12 @@ impl TaskRunStateContext {
         Self { state_dir, latest_state_path, invocation, keys_by_id, ids_by_key }
     }
 
+    pub fn with_modules_dir(mut self, modules_dir: &Path) -> Self {
+        self.state_dir = modules_dir.join(STATE_DIR);
+        self.latest_state_path = self.state_dir.join(LATEST_STATE_FILE);
+        self
+    }
+
     pub fn read_completed_tasks(&self) -> miette::Result<Option<HashSet<TaskKey>>> {
         let Some(latest_run) = self.resumable_latest_run()? else { return Ok(None) };
         let (run, finished) = match self.newest_state(&latest_run) {
@@ -242,7 +248,7 @@ struct TaskRunStateWriter {
 impl TaskRunState {
     pub fn record_passed(
         &self,
-        key: &TaskKey,
+        key: TaskKey,
         node: &TaskNode,
         workspace_dir: &Path,
     ) -> miette::Result<()> {
@@ -250,7 +256,7 @@ impl TaskRunState {
         if writer.file.is_none() {
             return Ok(());
         }
-        if !writer.completed.insert(key.clone()) {
+        if writer.completed.contains(&key) {
             return Ok(());
         }
         let id = task_id(node, workspace_dir);
@@ -268,11 +274,11 @@ impl TaskRunState {
                 let _ = fs::remove_file(&self.published_path);
                 return Ok(());
             }
-            writer.completed.remove(key);
             return Err(error)
                 .into_diagnostic()
                 .wrap_err_with(|| format!("writing {}", self.file_path.display()));
         }
+        writer.completed.insert(key);
         Ok(())
     }
 
@@ -405,7 +411,7 @@ fn is_state_unavailable_error(error: &io::Error) -> bool {
 
 fn run_id(generation: u64) -> String {
     let sequence = RUN_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    format!("{generation:012x}-{}-{sequence}", std::process::id())
+    format!("{generation:012x}-{}-{sequence}", pnpm_fs::process_id())
 }
 
 #[cfg(test)]

@@ -54,13 +54,20 @@ async fn fetch_for_resolution_uses_package_id_for_scoped_auth() {
 
     let resolved = FetchTarballForResolution {
         http_client: &client,
-        store_dir: store_path,
-        store_index_writer: None,
-        package_url: &url,
-        package_id: "@scope/test-pkg@1.0.0",
+        store: crate::ResolutionStore { dir: store_path, index_writer: None },
+        package: crate::TarballPackage {
+            integrity_kind: crate::IntegrityKind::Resource,
+            integrity: None,
+            unpacked_size: None,
+            file_count: None,
+            url: &url,
+            id: "@scope/test-pkg@1.0.0",
+        },
         auth_headers: &auth_headers,
         retry_opts: fast_retry_opts(),
+        tar_limits: crate::TarLimits::default(),
         manifest_subdir: None,
+        revision_addressed: false,
     }
     .run::<SilentReporter>(None)
     .await
@@ -101,8 +108,12 @@ async fn fetch_attaches_authorization_header_when_creds_match_tarball_url() {
     let (_integrity, cas_paths, _idx) = fetch_and_extract_with_retry::<SilentReporter>(
         &client,
         &url,
-        Some(&pkg_integrity),
+        &crate::archive_integrity::ArchiveVerification::new(
+            Some(&pkg_integrity),
+            crate::IntegrityKind::Resource,
+        ),
         None,
+        crate::TarLimits::default(),
         0,
         "test-pkg",
         "",
@@ -144,8 +155,12 @@ async fn fetch_attaches_authorization_header_when_scope_creds_match_package_id()
     let (_integrity, cas_paths, _idx) = fetch_and_extract_with_retry::<SilentReporter>(
         &client,
         &url,
-        Some(&pkg_integrity),
+        &crate::archive_integrity::ArchiveVerification::new(
+            Some(&pkg_integrity),
+            crate::IntegrityKind::Resource,
+        ),
         None,
+        crate::TarLimits::default(),
         0,
         "@scope/test-pkg@1.0.0",
         "",
@@ -201,8 +216,12 @@ async fn retry_re_attaches_authorization_header_on_each_attempt() {
     let (_integrity, cas_paths, _idx) = fetch_and_extract_with_retry::<SilentReporter>(
         &client,
         &url,
-        Some(&pkg_integrity),
+        &crate::archive_integrity::ArchiveVerification::new(
+            Some(&pkg_integrity),
+            crate::IntegrityKind::Resource,
+        ),
         None,
+        crate::TarLimits::default(),
         0,
         "test-pkg",
         "",
@@ -234,7 +253,8 @@ fn url_bearing_errors_redact_inline_credentials() {
     let rendered = [
         TarballError::HttpStatus(HttpStatusError { url: url.clone(), status: 404 }).to_string(),
         TarballError::TarballTooLarge { url: url.clone(), advertised_size: u64::MAX }.to_string(),
-        TarballError::SiblingFetchFailed { url: url.clone() }.to_string(),
+        TarballError::NoOfflineTarball { package_id: "pkg@1.0.0".to_string(), url: url.clone() }
+            .to_string(),
         TarballError::OffAllowlist { url }.to_string(),
     ];
     for message in rendered {

@@ -1,19 +1,23 @@
 mod archive_contract;
 
 use super::{
-    ArchiveStoreProjection, FetchTarballForResolution, MAX_UNTRUSTED_PREALLOC_BYTES, MemCache,
-    RetryOpts, SharedReportedProgressKeys, auth_header_for_package_download,
+    ArchiveIntegrity, ArchiveStoreProjection, FetchTarballForResolution, IgnoreEntryFilter,
+    MAX_UNTRUSTED_PREALLOC_BYTES, MemCache, Reporter, RetryOpts, SharedReportedProgressKeys,
+    TarLimits,
+    archive_integrity::ArchiveVerification,
+    archive_retry::is_transient_error,
+    auth_header_for_package_download,
     download::{
-        IngestTarballToStore, download_priority, fetch_and_extract_with_retry, is_transient_error,
+        IngestTarballToStore, download_priority, fetch_and_extract_archive_with_retry,
         slow_download_warning, store_index_cache_key,
     },
     error::{HttpStatusError, NetworkError, TarballError, VerifyChecksumError},
     extract::{
         STREAM_ENTRY_BUFFER_MAX, STREAM_EXTRACT_COMPRESSED_THRESHOLD, allocate_tarball_buffer,
-        apply_append_manifest, apply_placeholder_manifest, bounded_gzip_size_hint, decompress_gzip,
-        extract_gzipped_tarball, extract_tarball_entries, gzip_isize_hint,
-        is_eager_decode_limit_exceeded, normalize_bundled_manifest, should_stream_extract,
-        stream_extract_gzipped_tarball,
+        apply_append_manifest, apply_placeholder_manifest, decompress_gzip,
+        extract_gzipped_tarball_with_tar, extract_tarball_entries_with_bins,
+        gzip::{bounded_gzip_size_hint, gzip_isize_hint, should_stream_extract},
+        is_eager_decode_limit_exceeded, stream_extract_gzipped_tarball_with_tar,
     },
     local_tarball::{
         allocate_local_tarball_buffer, local_file_tarball_path, open_local_tarball,
@@ -40,20 +44,89 @@ use std::{
 };
 use tempfile::{TempDir, tempdir};
 
+/// The store file each name maps to, without the modes the install read.
+fn store_paths(files: &pnpm_fs::CasPaths) -> HashMap<&str, &Path> {
+    files
+        .iter()
+        .map(|(name, file)| (name.as_str(), file.path.as_path()))
+        .collect()
+}
+
 fn integrity(integrity_str: &str) -> Integrity {
     integrity_str.parse().expect("parse integrity string")
 }
 
+fn extract_tarball_entries(
+    tar_data: &[u8],
+    limits: TarLimits,
+    store_dir: &StoreDir,
+    ignore_file_pattern: Option<&IgnoreEntryFilter>,
+) -> Result<(pnpm_fs::CasPaths, PackageFilesIndex), TarballError> {
+    let (files, index, _) =
+        extract_tarball_entries_with_bins(tar_data, limits, store_dir, ignore_file_pattern)?;
+    Ok((files, index))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "test wrapper forwarding install-scoped inputs to fetch_and_extract_archive_with_retry"
+)]
+async fn fetch_and_extract_with_retry<TestReporter: Reporter>(
+    http_client: &ThrottledClient,
+    package_url: &str,
+    verification: &ArchiveVerification,
+    package_unpacked_size: Option<usize>,
+    tar_limits: TarLimits,
+    download_priority: u64,
+    package_id: &str,
+    requester: &str,
+    store_dir: &'static StoreDir,
+    retry_opts: RetryOpts,
+    auth_headers: &AuthHeaders,
+    ignore_file_pattern: Option<Arc<IgnoreEntryFilter>>,
+    progress_key: Option<(&SharedReportedProgressKeys, &str)>,
+    revision_addressed: bool,
+) -> Result<(ArchiveIntegrity, pnpm_fs::CasPaths, PackageFilesIndex), TarballError> {
+    let (integrity, files, index, _) = fetch_and_extract_archive_with_retry::<TestReporter>(
+        http_client,
+        package_url,
+        verification,
+        package_unpacked_size,
+        tar_limits,
+        download_priority,
+        package_id,
+        requester,
+        store_dir,
+        retry_opts,
+        auth_headers,
+        ignore_file_pattern,
+        progress_key,
+        revision_addressed,
+    )
+    .await?;
+    Ok((integrity, files, index))
+}
+
+/// A URL whose connect fails at once on every OS. Linux and macOS refuse
+/// `0.0.0.0:1` as they would loopback; Windows rejects the address without
+/// sending a packet, where a refused loopback port takes 2 s to fail.
+const UNREACHABLE_URL: &str = "http://0.0.0.0:1/unreachable.tgz";
+
 /// HTTP client for the fall-through tests. A default `ThrottledClient`
 /// uses `Client::new()` with no connect / request timeout, so on a
-/// firewalled runner the unreachable `http://127.0.0.1:1/...` URL
-/// could stall for minutes of TCP retry. One-second bounds are
-/// plenty for loopback and keep the failure mode deterministic.
+/// firewalled runner an unreachable URL could stall for minutes of TCP
+/// retry. One-second bounds are plenty for loopback and keep the
+/// failure mode deterministic.
 fn fast_fail_client() -> ThrottledClient {
+    fast_fail_client_with_connect_timeout(Duration::from_secs(1))
+}
+
+/// [`fast_fail_client`] with a connect bound of the caller's choosing.
+fn fast_fail_client_with_connect_timeout(connect_timeout: Duration) -> ThrottledClient {
     let build = |redirect| {
         reqwest::Client::builder()
             .no_proxy()
-            .connect_timeout(std::time::Duration::from_secs(1))
+            .connect_timeout(connect_timeout)
             .timeout(std::time::Duration::from_secs(1))
             .redirect(redirect)
             .build()
@@ -114,6 +187,7 @@ fn seed_row_holding_another_package(store_path: &StoreDir, index_key: &str) {
         files,
         side_effects: None,
         remote_side_effects_quarantine: None,
+        tar_integrity: None,
     };
     let index = StoreIndex::open_in(store_path).unwrap();
     index.set(index_key, &entry).unwrap();
@@ -314,180 +388,6 @@ impl Read for EndlessReader {
     }
 }
 
-/// Pacquet's [`normalize_bundled_manifest`] picks the subset of
-/// `package.json` fields downstream install code reads (bin lookup,
-/// peer extraction, build-script detection) and narrows `scripts` to
-/// the three lifecycle hooks. Two cases are intentionally NOT covered:
-/// `semver.clean` normalization (pacquet keeps version verbatim, per
-/// the function's doc comment) and the missing-version default of
-/// `0.0.0` (pacquet leaves the field absent rather than synthesizing
-/// one).
-mod normalize_bundled_manifest_tests {
-    use super::normalize_bundled_manifest;
-    use pretty_assertions::assert_eq;
-    use serde_json::json;
-
-    #[test]
-    fn returns_none_for_empty_manifest() {
-        assert_eq!(normalize_bundled_manifest(&json!({})), None);
-    }
-
-    #[test]
-    fn returns_none_for_non_object() {
-        assert_eq!(normalize_bundled_manifest(&json!("not an object")), None);
-        assert_eq!(normalize_bundled_manifest(&json!(null)), None);
-        assert_eq!(normalize_bundled_manifest(&json!(42)), None);
-    }
-
-    #[test]
-    fn returns_none_when_manifest_has_only_excluded_fields() {
-        assert_eq!(
-            normalize_bundled_manifest(&json!({
-                "description": "a package",
-                "keywords": ["test"],
-                "license": "MIT",
-                "author": "test",
-                "repository": "test/test",
-            })),
-            None,
-        );
-    }
-
-    #[test]
-    fn picks_included_fields_and_excludes_others() {
-        let result = normalize_bundled_manifest(&json!({
-            "name": "foo",
-            "version": "1.0.0",
-            "description": "should be excluded",
-            "license": "MIT",
-            "bin": { "foo": "./bin/foo.js" },
-            "engines": { "node": ">=18" },
-            "cpu": ["x64"],
-            "os": ["linux"],
-            "libc": ["glibc"],
-            "dependencies": { "bar": "^1.0.0" },
-            "devDependencies": { "qux": "^3.0.0" },
-            "optionalDependencies": { "baz": "^2.0.0" },
-            "peerDependencies": { "react": "^18" },
-            "peerDependenciesMeta": { "react": { "optional": true } },
-            "bundledDependencies": ["bar"],
-            "directories": { "bin": "./bin" },
-        }))
-        .expect("non-empty pick");
-        let map = result.as_object().expect("object");
-        assert_eq!(map.get("name").and_then(|v| v.as_str()), Some("foo"));
-        assert_eq!(map.get("version").and_then(|v| v.as_str()), Some("1.0.0"));
-        assert_eq!(map.get("bin"), Some(&json!({ "foo": "./bin/foo.js" })));
-        assert_eq!(map.get("engines"), Some(&json!({ "node": ">=18" })));
-        assert_eq!(map.get("cpu"), Some(&json!(["x64"])));
-        assert_eq!(map.get("os"), Some(&json!(["linux"])));
-        assert_eq!(map.get("libc"), Some(&json!(["glibc"])));
-        assert_eq!(map.get("dependencies"), Some(&json!({ "bar": "^1.0.0" })));
-        assert_eq!(map.get("devDependencies"), Some(&json!({ "qux": "^3.0.0" })));
-        assert_eq!(map.get("optionalDependencies"), Some(&json!({ "baz": "^2.0.0" })));
-        assert_eq!(map.get("peerDependencies"), Some(&json!({ "react": "^18" })));
-        assert_eq!(
-            map.get("peerDependenciesMeta"),
-            Some(&json!({ "react": { "optional": true } })),
-        );
-        assert_eq!(map.get("bundledDependencies"), Some(&json!(["bar"])));
-        assert_eq!(map.get("directories"), Some(&json!({ "bin": "./bin" })));
-        // Excluded fields stay out.
-        assert!(map.get("description").is_none());
-        assert!(map.get("license").is_none());
-        assert!(map.get("keywords").is_none());
-    }
-
-    #[test]
-    fn only_picks_lifecycle_scripts_not_all_scripts() {
-        let result = normalize_bundled_manifest(&json!({
-            "name": "foo",
-            "version": "1.0.0",
-            "scripts": {
-                "preinstall": "echo pre",
-                "install": "echo install",
-                "postinstall": "echo post",
-                "test": "jest",
-                "build": "tsc",
-                "start": "node index.js",
-                "prepare": "tsc",
-            },
-        }))
-        .expect("non-empty pick");
-        assert_eq!(
-            result.get("scripts").expect("scripts present"),
-            &json!({
-                "preinstall": "echo pre",
-                "install": "echo install",
-                "postinstall": "echo post",
-            }),
-        );
-    }
-
-    #[test]
-    fn omits_scripts_key_when_no_lifecycle_scripts_exist() {
-        let result = normalize_bundled_manifest(&json!({
-            "name": "foo",
-            "version": "1.0.0",
-            "scripts": {
-                "test": "jest",
-                "build": "tsc",
-            },
-        }))
-        .expect("non-empty pick");
-        assert!(
-            result.get("scripts").is_none(),
-            "scripts key must be absent when no lifecycle hook is present",
-        );
-    }
-
-    /// `null` and `undefined` fields are skipped. Rust's
-    /// [`serde_json::Value`] has no `undefined`, but JSON `null`
-    /// reaches the picker as [`serde_json::Value::Null`] and must be
-    /// filtered out the same way.
-    #[test]
-    fn skips_null_fields() {
-        let result = normalize_bundled_manifest(&json!({
-            "name": "foo",
-            "version": "1.0.0",
-            "bin": null,
-            "engines": null,
-        }))
-        .expect("non-empty pick");
-        assert!(result.get("bin").is_none(), "null `bin` must be dropped");
-        assert!(result.get("engines").is_none(), "null `engines` must be dropped");
-        assert_eq!(result.get("name").and_then(|v| v.as_str()), Some("foo"));
-        assert_eq!(result.get("version").and_then(|v| v.as_str()), Some("1.0.0"));
-    }
-
-    /// The bundled manifest is downstream-fed into
-    /// `extract_peer_dependencies` and `extract_children`; dropping
-    /// `peerDependenciesMeta` or `optionalDependencies` here would
-    /// replicate the pnpm/pnpm#11934 resolver-side bug on the
-    /// install-side. Pin the keys explicitly.
-    #[test]
-    fn preserves_optional_dependencies_and_peer_dependencies_meta_keys() {
-        let result = normalize_bundled_manifest(&json!({
-            "name": "consumer",
-            "version": "1.0.0",
-            "optionalDependencies": { "sharp": "^0.34.0" },
-            "peerDependenciesMeta": {
-                "@vercel/kv": { "optional": true },
-                "ioredis": { "optional": true },
-            },
-        }))
-        .expect("non-empty pick");
-        assert_eq!(result.get("optionalDependencies"), Some(&json!({ "sharp": "^0.34.0" })));
-        assert_eq!(
-            result.get("peerDependenciesMeta"),
-            Some(&json!({
-                "@vercel/kv": { "optional": true },
-                "ioredis": { "optional": true },
-            })),
-        );
-    }
-}
-
 /// Build a gzipped tar whose *compressed* body is at least `min_bytes`,
 /// so the response carries a `Content-Length` over the in-progress
 /// threshold. The payload is LCG noise because gzip would otherwise
@@ -597,3 +497,32 @@ mod security;
 mod manifests;
 
 mod lockfile;
+
+mod fetch_for_resolution;
+
+mod tar_resources;
+
+mod tar_integrity;
+
+/// [`extract_gzipped_tarball_with_tar`] without the tar's integrity.
+fn extract_gzipped_tarball(
+    gz_data: &[u8],
+    unpacked_size: Option<usize>,
+    limits: crate::TarLimits,
+    store_dir: &pnpm_store_dir::StoreDir,
+    ignore_file_pattern: Option<&crate::IgnoreEntryFilter>,
+) -> Result<(pnpm_fs::CasPaths, pnpm_store_dir::PackageFilesIndex), TarballError> {
+    extract_gzipped_tarball_with_tar(gz_data, unpacked_size, limits, store_dir, ignore_file_pattern)
+        .map(|(files, index, _, _)| (files, index))
+}
+
+/// [`stream_extract_gzipped_tarball_with_tar`] without the tar's integrity.
+fn stream_extract_gzipped_tarball(
+    gz_data: &[u8],
+    limits: crate::TarLimits,
+    store_dir: &pnpm_store_dir::StoreDir,
+    ignore_file_pattern: Option<&crate::IgnoreEntryFilter>,
+) -> Result<(pnpm_fs::CasPaths, pnpm_store_dir::PackageFilesIndex), TarballError> {
+    stream_extract_gzipped_tarball_with_tar(gz_data, limits, store_dir, ignore_file_pattern)
+        .map(|(files, index, _, _)| (files, index))
+}

@@ -1,13 +1,12 @@
 //! Cache-aware metadata fetcher.
 //!
 //! When a cache directory is configured, the fetcher consults a
-//! shared mirror under `<cache_dir>/v11/metadata-full/` (full) or
-//! `<cache_dir>/v11/metadata/` (abbreviated), keyed by
+//! shared mirror under `<cache_dir>/v12/metadata-full/` (full) or
+//! `<cache_dir>/v12/metadata/` (abbreviated), keyed by
 //! `full_metadata`. It issues a conditional GET against the upstream
 //! registry, and either reads the cached body (304) or writes the
 //! new body back (2xx). Without a cache directory it falls through
-//! to a plain GET — the same behavior callers got before Phase 5
-//! from [`crate::fetch_full_metadata()`].
+//! to a plain GET.
 //!
 //! The directory layout matches pnpm's; the file format is pacquet's
 //! own indexed shape (see [`crate::mirror`]) so warm loads hydrate
@@ -16,25 +15,25 @@
 use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
-    time::{Duration, Instant},
 };
 
-use pipe_trait::Pipe;
 use pnpm_network::{ThrottledClientGuard, redact_url_credentials, retry_async};
 use pnpm_registry::Package;
-use reqwest::{Response, StatusCode, header};
+use reqwest::{Response, StatusCode};
 
 use crate::{
     FetchMetadataError,
+    errors::legacy_mirror_hint,
     fetch_full_metadata::{
-        ACCEPT_ABBREVIATED_DOC, ACCEPT_FULL_DOC, MetadataRequestOptions,
-        is_abbreviated_content_type, normalize_abbreviated_meta, send_metadata_request,
-        warn_if_request_is_slow,
+        ACCEPT_PNPR_DOC, MetadataRequestOptions, MetadataResponse, decode_metadata_response,
+        send_metadata_request,
     },
+    metadata_cache_policy::{DocumentKind, MirrorWrite},
     mirror::{
-        ABBREVIATED_META_DIR, FULL_FILTERED_META_DIR, FULL_META_DIR, MetaHeaders, clear_meta,
-        get_pkg_mirror_path, load_meta, load_meta_async, load_meta_headers_async,
-        save_meta_indexed, save_meta_ndjson, scoped_meta_dir,
+        ABBREVIATED_META_DIR, FULL_FILTERED_META_DIR, FULL_META_DIR, MetaHeaders, PNPR_META_DIR,
+        clear_meta, find_legacy_pkg_mirror, get_pkg_mirror_path, load_meta, load_meta_async,
+        load_meta_headers_async, save_meta_indexed_with_headers, save_meta_ndjson_with_headers,
+        scoped_meta_dir,
     },
     registry_url::to_registry_url,
 };
@@ -46,7 +45,7 @@ use crate::{
 pub struct FetchFullMetadataCachedOptions<'a> {
     pub registry: &'a str,
     /// When `Some`, the fetcher consults the on-disk mirror under
-    /// the matching `<cache_dir>/v11/metadata...` subdirectory.
+    /// the matching `<cache_dir>/v12/metadata...` subdirectory.
     /// When `None`, the fetcher short-circuits to an unconditional
     /// GET.
     pub cache_dir: Option<&'a Path>,
@@ -57,6 +56,10 @@ pub struct FetchFullMetadataCachedOptions<'a> {
     /// When full metadata is requested, use pnpm's filtered metadata
     /// mirror and persist the filtered packument shape.
     pub filter_metadata: bool,
+    /// Ask for pnpr's own package document instead of the abbreviated one,
+    /// and keep it in [`PNPR_META_DIR`]. Set for a registry declared
+    /// `serverType: pnpr`; ignored when full metadata is requested.
+    pub pnpr_format: bool,
     /// When true, use only the on-disk metadata mirror and never reach
     /// the registry.
     pub offline: bool,
@@ -70,37 +73,183 @@ pub struct FetchFullMetadataCachedOptions<'a> {
 
 /// Fetch the full registry metadata document for `pkg_name`, reusing
 /// the shared on-disk mirror when `cache_dir` is supplied.
+///
+/// Every version's mirror fragment is checked before the document is
+/// returned, because its callers read across all versions and have no
+/// fallback of their own. A damaged mirror fragment therefore reads as a
+/// missing mirror:
+/// offline it fails with `ERR_PNPM_NO_OFFLINE_META`, online the document
+/// is refetched without the conditional cache, which rewrites the mirror.
 pub async fn fetch_full_metadata_cached(
     pkg_name: &str,
     opts: &FetchFullMetadataCachedOptions<'_>,
 ) -> Result<Package, FetchMetadataError> {
+    let meta = fetch_metadata_cached(pkg_name, opts, CachedFetch::MIRROR_DOCUMENT).await?;
+    meta.versions.read_every_mirror_fragment();
+    if !meta.versions.corrupt_mirror_fragment_found() {
+        return Ok(meta);
+    }
+    refetch_damaged_mirror(pkg_name, opts).await
+}
+
+/// [`fetch_full_metadata_cached`] for a caller that keeps only `project`'s
+/// result. `project` must read every version, through
+/// [`pnpm_registry::PackageVersions::iter_policy_fields`], so the document is
+/// never hydrated as a whole. A damaged mirror fragment found by the walk is
+/// handled as [`fetch_full_metadata_cached`] handles it, and the refetched
+/// document is projected instead.
+pub(crate) async fn fetch_full_metadata_projected<Projection>(
+    pkg_name: &str,
+    opts: &FetchFullMetadataCachedOptions<'_>,
+    project: impl Fn(&Package) -> Projection,
+) -> Result<Projection, FetchMetadataError> {
+    let meta = fetch_metadata_cached(pkg_name, opts, CachedFetch::MIRROR_DOCUMENT).await?;
+    let projection = project(&meta);
+    if !meta.versions.corrupt_mirror_fragment_found() {
+        return Ok(projection);
+    }
+    drop(meta);
+    refetch_damaged_mirror(pkg_name, opts).await.map(|meta| project(&meta))
+}
+
+async fn refetch_damaged_mirror(
+    pkg_name: &str,
+    opts: &FetchFullMetadataCachedOptions<'_>,
+) -> Result<Package, FetchMetadataError> {
+    if opts.offline {
+        let url = to_registry_url(opts.registry, pkg_name);
+        return Err(FetchMetadataError::NoOfflineMeta {
+            pkg_name: pkg_name.to_string(),
+            pkg_mirror: mirror_path_for(pkg_name, opts, &url).unwrap_or_default(),
+            hint: None,
+        });
+    }
+    fetch_metadata_cached(pkg_name, opts, CachedFetch::BYPASSING_MIRROR).await
+}
+
+/// [`fetch_full_metadata_cached`] without the up-front fragment check, for the
+/// resolver, which checks the versions it reads itself.
+pub(crate) async fn fetch_full_metadata_cached_lazily(
+    pkg_name: &str,
+    opts: &FetchFullMetadataCachedOptions<'_>,
+) -> Result<FetchedDocument, FetchMetadataError> {
+    fetch_document_cached(pkg_name, opts, CachedFetch::MIRROR_DOCUMENT).await
+}
+
+pub(crate) async fn fetch_full_metadata_bypassing_cache(
+    pkg_name: &str,
+    opts: &FetchFullMetadataCachedOptions<'_>,
+) -> Result<FetchedDocument, FetchMetadataError> {
+    fetch_document_cached(pkg_name, opts, CachedFetch::BYPASSING_MIRROR).await
+}
+
+/// A document the cached fetcher returned, with the kind it asked the
+/// registry for. `requested` is `None` when it answered from the mirror
+/// offline.
+pub(crate) struct FetchedDocument {
+    pub(crate) meta: Package,
+    pub(crate) requested: Option<DocumentKind>,
+}
+
+/// Fetch the full document a `minimumReleaseAge` upgrade stores in the
+/// abbreviated mirror `opts` names, as
+/// [`DocumentKind::FullInAbbreviatedMirror`]. With `write_mirror` off (a
+/// dry run) the mirror is read but never written or touched.
+pub(crate) async fn fetch_release_age_upgrade(
+    pkg_name: &str,
+    opts: &FetchFullMetadataCachedOptions<'_>,
+    write_mirror: bool,
+) -> Result<Package, FetchMetadataError> {
+    debug_assert!(!opts.full_metadata, "an upgrade fills the abbreviated mirror");
+    let fetch = CachedFetch {
+        document: CachedDocument::ReleaseAgeUpgrade,
+        bypass_mirror: false,
+        write_mirror,
+    };
+    fetch_metadata_cached(pkg_name, opts, fetch).await
+}
+
+/// What one [`fetch_metadata_cached`] call asks for and may do to the mirror.
+#[derive(Debug, Clone, Copy)]
+struct CachedFetch {
+    document: CachedDocument,
+    /// Ignore the mirror's validators, so only a body can answer.
+    bypass_mirror: bool,
+    write_mirror: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CachedDocument {
+    /// The document the mirror slot holds ([`DocumentKind::for_mirror`]).
+    MirrorSlot,
+    /// [`DocumentKind::FullInAbbreviatedMirror`].
+    ReleaseAgeUpgrade,
+}
+
+impl CachedFetch {
+    const MIRROR_DOCUMENT: Self = CachedFetch {
+        document: CachedDocument::MirrorSlot,
+        bypass_mirror: false,
+        write_mirror: true,
+    };
+    const BYPASSING_MIRROR: Self = CachedFetch { bypass_mirror: true, ..Self::MIRROR_DOCUMENT };
+
+    fn kind(self, full_metadata: bool, stored: Option<&MetaHeaders>) -> DocumentKind {
+        match self.document {
+            CachedDocument::MirrorSlot => DocumentKind::for_mirror(full_metadata, stored),
+            CachedDocument::ReleaseAgeUpgrade => DocumentKind::FullInAbbreviatedMirror,
+        }
+    }
+}
+
+async fn fetch_metadata_cached(
+    pkg_name: &str,
+    opts: &FetchFullMetadataCachedOptions<'_>,
+    fetch: CachedFetch,
+) -> Result<Package, FetchMetadataError> {
+    fetch_document_cached(pkg_name, opts, fetch).await.map(|document| document.meta)
+}
+
+async fn fetch_document_cached(
+    pkg_name: &str,
+    opts: &FetchFullMetadataCachedOptions<'_>,
+    fetch: CachedFetch,
+) -> Result<FetchedDocument, FetchMetadataError> {
     let url = to_registry_url(opts.registry, pkg_name);
     let mirror_path = mirror_path_for(pkg_name, opts, &url);
 
     if opts.offline {
         if let Some(meta) = load_meta_async(mirror_path.as_deref()).await {
-            return Ok(meta);
+            return Ok(FetchedDocument { meta, requested: None });
         }
+        let hint = legacy_mirror_for(pkg_name, opts).await.map(|path| legacy_mirror_hint(&path));
         return Err(FetchMetadataError::NoOfflineMeta {
             pkg_name: pkg_name.to_string(),
             pkg_mirror: mirror_path.unwrap_or_default(),
+            hint,
         });
     }
 
+    let cache_headers = if fetch.bypass_mirror {
+        None
+    } else {
+        load_meta_headers_async(mirror_path.as_deref()).await
+    };
+    let kind = fetch.kind(opts.full_metadata, cache_headers.as_ref());
     let attempt = FetchAttempt {
         pkg_name,
         url: &url,
         opts,
         mirror_path: mirror_path.as_deref(),
-        cache_headers: load_meta_headers_async(mirror_path.as_deref()).await,
-        // A body retry re-enters the attempt from the top, so the bypass has
-        // to outlive the attempt that discovered the loss: re-validating
-        // against a mirror already known to be gone would 304 into the same
-        // dead end.
-        cache_bypass: AtomicBool::new(false),
+        kind,
+        write_mirror: fetch.write_mirror,
+        cache_headers,
+        cache_bypass: AtomicBool::new(fetch.bypass_mirror),
     };
-    retry_async(&url, opts.http.retry_opts, FetchMetadataError::is_body_retryable, || attempt.run())
-        .await
+    let meta =
+        retry_async(&url, opts.http.retry_opts, FetchMetadataError::is_transient, || attempt.run())
+            .await?;
+    Ok(FetchedDocument { meta, requested: Some(kind) })
 }
 
 /// One conditional metadata fetch, re-entered from the top by each body
@@ -110,29 +259,25 @@ struct FetchAttempt<'a> {
     url: &'a str,
     opts: &'a FetchFullMetadataCachedOptions<'a>,
     mirror_path: Option<&'a Path>,
+    kind: DocumentKind,
+    write_mirror: bool,
     cache_headers: Option<MetaHeaders>,
     cache_bypass: AtomicBool,
 }
 
-fn response_etag(response: &reqwest::Response) -> Option<String> {
-    response
-        .headers()
-        .get(header::ETAG)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string)
-}
-
 impl FetchAttempt<'_> {
     async fn run(&self) -> Result<Package, FetchMetadataError> {
-        let started_at = Instant::now();
         let opts = self.opts;
         let request = self.metadata_request();
         let (client, response) = send_metadata_request(&request).await?;
 
         let (client, response) = if response.status() == StatusCode::NOT_MODIFIED {
-            match recover_from_not_modified(client, &request, self.mirror_path, &self.cache_bypass)
-                .await?
-            {
+            let recovery = NotModifiedContext {
+                mirror_path: self.mirror_path,
+                cache_bypass: &self.cache_bypass,
+                renew_mirror: self.write_mirror,
+            };
+            match recover_from_not_modified(client, &request, recovery).await? {
                 NotModifiedRecovery::Serve(meta) => return Ok(meta),
                 NotModifiedRecovery::Refetched(client, response) => (client, response),
             }
@@ -140,79 +285,46 @@ impl FetchAttempt<'_> {
             (client, response)
         };
 
-        let response = response
-            .error_for_status()
-            .map_err(|error| FetchMetadataError::Network {
-                url: redact_url_credentials(self.url),
-                error,
-            })?;
-
-        let etag = response_etag(&response);
-        let normalize_to_abbreviated =
-            !opts.full_metadata && !is_abbreviated_content_type(response.headers());
-        let raw_body = response
-            .text()
-            .await
-            .map_err(|error| FetchMetadataError::BodyRead {
-                url: redact_url_credentials(self.url),
-                error,
-            })?;
-
-        // Body fully buffered — release the connection and its
-        // network-concurrency permit before the CPU-bound parse so the
-        // semaphore keeps bounding *sockets*, not parses. Same
-        // buffer-then-release shape as the tarball pipeline in
-        // `pnpm-tarball`.
-        drop(client);
-
-        // Deserialize and persist the mirror off the reactor. Packuments
-        // run to several megabytes for high-release-cadence packages
-        // (`@fluentui/*`, `@types/node`, ...); parsing one inline pins a
-        // tokio worker for hundreds of milliseconds and stalls every
-        // socket that worker pumps — on a cold babylon install the
-        // inline parses held the metadata phase to a third of pnpm's
-        // throughput.
-        let decode = self.decoder(etag, normalize_to_abbreviated, started_at);
-        let (meta, elapsed) = tokio::task::spawn_blocking(move || decode.run(&raw_body))
-            .await
-            .map_err(|error| FetchMetadataError::ParseTask {
-                url: redact_url_credentials(self.url),
-                error,
-            })??;
-
-        warn_if_request_is_slow(opts.http.http_client, elapsed, self.url);
-        meta.pipe(Ok)
+        let store = self.mirror_store(&response);
+        decode_metadata_response(
+            MetadataResponse {
+                client,
+                response,
+                url: self.url,
+                registry: opts.registry,
+                asked_install_v2: request.accept == ACCEPT_PNPR_DOC,
+                http_client: opts.http.http_client,
+            },
+            store.mirror_write.normalizes_to_abbreviated(),
+            move |meta| store.store(meta),
+        )
+        .await
     }
 
-    fn decoder(
-        &self,
-        etag: Option<String>,
-        normalize_to_abbreviated: bool,
-        started_at: Instant,
-    ) -> DecodeMeta {
-        DecodeMeta {
+    fn mirror_store(&self, response: &Response) -> MirrorStore {
+        MirrorStore {
             url: self.url.to_string(),
-            mirror_path: self.mirror_path.map(Path::to_path_buf),
-            etag,
-            normalize_to_abbreviated,
+            mirror_path: self.mirror_path.filter(|_| self.write_mirror).map(Path::to_path_buf),
+            mirror_write: MirrorWrite::on_response(self.kind, response.headers()),
             should_filter_metadata: self.opts.full_metadata && self.opts.filter_metadata,
-            started_at,
         }
     }
 
     fn metadata_request(&self) -> MetadataRequestOptions<'_> {
         let opts = self.opts;
+        let revalidation = self.kind.revalidation(
+            self.cache_headers.as_ref(),
+            self.cache_bypass.load(Ordering::Relaxed),
+        );
         MetadataRequestOptions {
             pkg_name: self.pkg_name,
             url: self.url,
-            accept: if opts.full_metadata { ACCEPT_FULL_DOC } else { ACCEPT_ABBREVIATED_DOC },
+            accept: self.kind.accept(opts.pnpr_format),
             priority: opts.priority,
-            etag: self.cache_headers.as_ref().and_then(|headers| headers.etag.as_deref()),
-            modified: self.cache_headers
-                .as_ref()
-                .and_then(|headers| headers.modified.as_deref()),
-            bypass_cache: self.cache_bypass.load(Ordering::Relaxed),
-            http: opts.http,
+            etag: revalidation.etag,
+            modified: revalidation.modified,
+            bypass_cache: revalidation.bypass_cache,
+            http: opts.http.one_attempt(),
         }
     }
 }
@@ -235,6 +347,8 @@ fn mirror_path_for(
 ) -> Option<PathBuf> {
     let base_meta_dir = if opts.full_metadata {
         if opts.filter_metadata { FULL_FILTERED_META_DIR } else { FULL_META_DIR }
+    } else if opts.pnpr_format {
+        PNPR_META_DIR
     } else {
         ABBREVIATED_META_DIR
     };
@@ -256,29 +370,31 @@ fn mirror_path_for(
     }
 }
 
-/// The off-reactor half of one fetch: parse the body, normalize it, and
-/// persist the mirror.
-struct DecodeMeta {
-    url: String,
-    mirror_path: Option<PathBuf>,
-    etag: Option<String>,
-    normalize_to_abbreviated: bool,
-    should_filter_metadata: bool,
-    started_at: Instant,
+/// Locate a legacy mirror of `pkg_name` in `opts.cache_dir`.
+/// Unlike [`mirror_path_for`], this checks only the unscoped directory.
+async fn legacy_mirror_for(
+    pkg_name: &str,
+    opts: &FetchFullMetadataCachedOptions<'_>,
+) -> Option<PathBuf> {
+    let base_meta_dir = if opts.full_metadata {
+        if opts.filter_metadata { FULL_FILTERED_META_DIR } else { FULL_META_DIR }
+    } else {
+        ABBREVIATED_META_DIR
+    };
+    find_legacy_pkg_mirror(opts.cache_dir?, base_meta_dir, opts.registry, pkg_name).await
 }
 
-impl DecodeMeta {
-    fn run(self, raw_body: &str) -> Result<(Package, Duration), FetchMetadataError> {
-        let mut meta: Package = serde_json::from_str(raw_body)
-            .map_err(|error| FetchMetadataError::Decode {
-                url: redact_url_credentials(&self.url),
-                error,
-            })?;
-        meta.drop_incomplete_publish_times();
-        let elapsed = self.started_at.elapsed();
-        if self.normalize_to_abbreviated {
-            meta = normalize_abbreviated_meta(meta);
-        }
+/// The off-reactor end of one fetch: filter the parsed document and persist
+/// the mirror.
+struct MirrorStore {
+    url: String,
+    mirror_path: Option<PathBuf>,
+    mirror_write: MirrorWrite,
+    should_filter_metadata: bool,
+}
+
+impl MirrorStore {
+    fn store(self, mut meta: Package) -> Result<Package, FetchMetadataError> {
         if self.should_filter_metadata {
             meta = clear_meta(&meta)
                 .map_err(|error| FetchMetadataError::FilterMetadata {
@@ -291,8 +407,8 @@ impl DecodeMeta {
             // its version fragments read from the file on demand, so the
             // multi-megabyte body drops here instead of living in the
             // packument cache for the rest of the install.
-            Some(saved) => Ok((saved, elapsed)),
-            None => Ok((meta, elapsed)),
+            Some(saved) => Ok(saved),
+            None => Ok(meta),
         }
     }
 
@@ -304,14 +420,17 @@ impl DecodeMeta {
     /// hydration.
     fn persist(&self, meta: &Package) -> Option<Package> {
         let path = self.mirror_path.as_deref()?;
+        let headers = self.mirror_write.headers(meta);
         if self.should_filter_metadata {
-            if let Err(error) = save_meta_ndjson(path, meta, self.etag.as_deref()) {
+            if let Err(error) = save_meta_ndjson_with_headers(path, meta, &headers) {
                 warn_mirror_write_failed(&error, path);
+                self.mirror_write.discard_after_failed_save(path);
             }
             return None;
         }
-        if let Err(error) = save_meta_indexed(path, meta, self.etag.as_deref()) {
+        if let Err(error) = save_meta_indexed_with_headers(path, meta, &headers) {
             warn_mirror_write_failed(&error, path);
+            self.mirror_write.discard_after_failed_save(path);
             return None;
         }
         load_meta(path)
@@ -325,6 +444,15 @@ fn warn_mirror_write_failed(error: &impl std::fmt::Debug, path: &Path) {
         path = %path.display(),
         "could not persist mirror; bypassing cache write",
     );
+}
+
+/// The mirror a `304 Not Modified` is honoured against.
+#[derive(Clone, Copy)]
+struct NotModifiedContext<'a> {
+    mirror_path: Option<&'a Path>,
+    cache_bypass: &'a AtomicBool,
+    /// Whether the fetch may touch the mirror ([`renew_mirror_freshness`]).
+    renew_mirror: bool,
 }
 
 /// Outcome of a `304 Not Modified` once it is honoured against the mirror.
@@ -346,9 +474,13 @@ enum NotModifiedRecovery<'a> {
 async fn recover_from_not_modified<'a>(
     client: ThrottledClientGuard<'a>,
     request: &MetadataRequestOptions<'a>,
-    mirror_path: Option<&Path>,
-    cache_bypass: &AtomicBool,
+    recovery: NotModifiedContext<'_>,
 ) -> Result<NotModifiedRecovery<'a>, FetchMetadataError> {
+    let NotModifiedContext {
+        mirror_path,
+        cache_bypass,
+        renew_mirror,
+    } = recovery;
     // No body to stream — release the connection and its network-concurrency
     // permit before the mirror disk read.
     drop(client);
@@ -358,7 +490,9 @@ async fn recover_from_not_modified<'a>(
         });
     };
     if let Some(meta) = load_meta_async(Some(path)).await {
-        renew_mirror_freshness(path);
+        if renew_mirror {
+            renew_mirror_freshness(path);
+        }
         return Ok(NotModifiedRecovery::Serve(meta));
     }
     cache_bypass.store(true, Ordering::Relaxed);

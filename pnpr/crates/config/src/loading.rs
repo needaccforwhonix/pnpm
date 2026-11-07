@@ -1,9 +1,14 @@
 use super::{
-    Config, ConfigFile, ConfigSource, DEFAULT_CONFIG_YAML, FeatureOverrides, HostedStoreConfig,
-    Path, PathBuf, RegistryError, ResolvedFileRegistries, SocketAddr, build_auth_config,
-    build_backend_config, build_cors_config, build_features, build_log_config, build_osv_config,
-    build_route_policy, config_file_in, parse_config_file, reject_removed_blocks,
-    resolution_secret, resolve_file_registries, resolve_storage_paths,
+    Arc, Config, ConfigFile, ConfigSource, DEFAULT_CONFIG_YAML, EnvVar, FeatureOverrides,
+    HostedStoreConfig, Path, PathBuf, RegistryError, RemovedGroupsBlock, RemovedPackagesBlock,
+    RemovedUplinksBlock, RemovedUpstreamsBlock, ResolvedFileRegistries, RoutesFile, SocketAddr,
+    SystemEnv, build_backend_config, build_cors_config, build_features, build_identity_config,
+    build_log_config, build_osv_config, build_route_policy, build_ui_config, config_file_in,
+    env_replace_lossy, resolve_file_registries, resolve_secrets, resolve_storage_paths,
+};
+use crate::{
+    config_file::{RegistryFile, RegistryGroupFile},
+    secrets::validate_secret_env_vars,
 };
 
 impl Config {
@@ -206,10 +211,16 @@ impl Config {
         public_url: Option<String>,
         overrides: FeatureOverrides,
     ) -> Result<Self, RegistryError> {
-        let storage = build_storage_config(&mut file, base_dir);
+        let hosts_packages = declares_a_hosted_registry(&file) && !overrides.disable_registry;
+        let storage = build_storage_config(&mut file, base_dir, hosts_packages)?;
+        let http = build_http_config(&mut file, base_dir, listen, public_url)?;
         let backend = build_backend_config(file.backend, base_dir)?;
-        let cors = build_cors_config(file.cors)?;
-        reject_removed_blocks(file.packages.is_some(), file.groups.is_some())?;
+        reject_removed_blocks(RemovedBlocks {
+            packages: file.packages.as_ref(),
+            groups: file.groups.as_ref(),
+            uplinks: file.uplinks.as_ref(),
+            upstreams: file.upstreams.as_ref(),
+        })?;
         let features = build_features(
             !file.registries.is_empty(),
             file.resolver,
@@ -217,43 +228,205 @@ impl Config {
             file.pipeline,
             overrides,
         )?;
-        let ResolvedFileRegistries { upstreams, hosted, registries } = resolve_file_registries(
+        let resolved = resolve_file_registries(
             file.registries,
             file.default_registry,
             features.registry.enabled,
         )?;
+        let routing = build_routing_config(resolved, file.routes)?;
+        let secrets = resolve_secrets(file.secret.as_deref(), file.secrets.as_ref())?;
         Ok(Self {
             logs: build_log_config(file.log.as_ref()),
             osv: build_osv_config(&file.osv, base_dir),
-            resolution_cache_secret: resolution_secret(file.secret.as_deref())?,
-            http: super::HttpConfig {
-                listen,
-                public_url: public_url.unwrap_or_else(|| format!("http://{listen}")),
-                cors,
-                oci: file.oci,
-                packument_ttl: Self::DEFAULT_PACKUMENT_TTL,
-            },
+            resolution_cache_secret: Arc::clone(&secrets.cache),
+            cache_secret: secrets.cache,
+            oci_secret: secrets.oci,
+            has_configured_secret: secrets.has_configured,
+            http,
             storage,
-            identity: super::IdentityConfig {
-                auth: build_auth_config(&file.auth, base_dir),
-                backend,
-            },
+            identity: build_identity_config(&file.auth, base_dir, backend)?,
             features,
-            routing: super::RoutingConfig {
-                upstreams,
-                route_policy: build_route_policy(file.routes),
-                registries,
-                hosted,
-            },
+            routing,
+            release_records: super::build_release_records_config(file.release_records.take())?,
+            gc: super::build_gc_config(file.gc.take())?,
         })
     }
 }
 
-fn build_storage_config(file: &mut ConfigFile, base_dir: &Path) -> super::StorageConfig {
-    let (hosted_dir, cache_dir) = resolve_storage_paths(file, base_dir);
-    super::StorageConfig {
-        hosted_dir,
-        cache_dir,
-        hosted_backend: file.s3.take().map_or(HostedStoreConfig::Fs, HostedStoreConfig::S3),
+fn build_routing_config(
+    resolved: ResolvedFileRegistries,
+    routes: Option<RoutesFile>,
+) -> Result<super::RoutingConfig, RegistryError> {
+    Ok(super::RoutingConfig {
+        upstreams: resolved.upstreams,
+        route_policy: build_route_policy(routes)?,
+        registries: resolved.registries,
+        hosted: resolved.hosted,
+        tar_registries: resolved.tar_registries,
+    })
+}
+
+fn build_http_config(
+    file: &mut ConfigFile,
+    base_dir: &Path,
+    listen: SocketAddr,
+    public_url: Option<String>,
+) -> Result<super::HttpConfig, RegistryError> {
+    let cors = build_cors_config(std::mem::take(&mut file.cors))?;
+    let ui = build_ui_config(std::mem::take(&mut file.ui), base_dir);
+    let trusted_proxies = super::parse_trusted_proxies(&file.trusted_proxies)?;
+    let trusted_proxy_header = match file.trusted_proxy_header.as_deref() {
+        Some(raw) => raw.parse::<super::TrustedProxyHeader>()?,
+        None => super::TrustedProxyHeader::default(),
+    };
+    let request_timeout = match file.request_timeout.as_ref() {
+        Some(interval) => {
+            let duration =
+                super::parse_interval(&interval.0)
+                    .ok_or_else(|| RegistryError::InvalidConfig {
+                        reason: format!(
+                            "http.requestTimeout {:?} is not a valid interval",
+                            interval.0,
+                        ),
+                    })?;
+            (!duration.is_zero()).then_some(duration)
+        }
+        None => Some(super::HttpConfig::DEFAULT_REQUEST_TIMEOUT),
+    };
+    Ok(super::HttpConfig {
+        listen,
+        public_url: public_url.unwrap_or_else(|| format!("http://{listen}")),
+        cors,
+        ui,
+        oci: std::mem::take(&mut file.oci),
+        packument_ttl: match &file.packument_ttl {
+            Some(interval) => super::parse_interval(&interval.0)
+                .ok_or_else(|| RegistryError::InvalidConfig {
+                    reason: format!("packumentTtl {:?} is not a valid interval", interval.0),
+                })?,
+            None => Config::DEFAULT_PACKUMENT_TTL,
+        },
+        trusted_proxies,
+        trusted_proxy_header,
+        request_timeout,
+        metrics: build_metrics_config(file, listen)?,
+        package_documents: super::build_package_documents_config(file.package_documents.take())?,
+    })
+}
+
+fn build_metrics_config(
+    file: &mut ConfigFile,
+    listen: SocketAddr,
+) -> Result<Option<super::MetricsConfig>, RegistryError> {
+    let metrics = file.metrics.take();
+    if let Some(metrics) = &metrics {
+        metrics.validate(listen)?;
     }
+    Ok(metrics)
+}
+
+/// Whether the config declares a hosted registry, flat or inside an
+/// ecosystem group: the only registries with package metadata of their own.
+fn declares_a_hosted_registry(file: &ConfigFile) -> bool {
+    file.registries
+        .values()
+        .any(|entry| match entry {
+            RegistryGroupFile::Registry(registry) => matches!(registry, RegistryFile::Hosted(_)),
+            RegistryGroupFile::Ecosystem(group) => group
+                .values()
+                .any(|registry| matches!(registry, RegistryFile::Hosted(_))),
+        })
+}
+
+fn build_storage_config(
+    file: &mut ConfigFile,
+    base_dir: &Path,
+    hosts_packages: bool,
+) -> Result<super::StorageConfig, RegistryError> {
+    let (hosted_dir, cache_dir, cache) = resolve_storage_paths(file, base_dir)?;
+    let hosted_backend = file.s3.take().map_or(HostedStoreConfig::Fs, HostedStoreConfig::S3);
+    let metadata = crate::storage_config::resolve_metadata_backend(
+        file.metadata.as_ref(),
+        &hosted_dir,
+        base_dir,
+        &hosted_backend,
+        hosts_packages,
+    )?;
+    Ok(super::StorageConfig { hosted_dir, cache_dir, cache, hosted_backend, metadata })
+}
+
+pub(super) fn parse_config_file(raw: &str) -> Result<ConfigFile, RegistryError> {
+    parse_config_file_with_env::<SystemEnv>(raw)
+}
+
+pub(super) fn parse_config_file_with_env<Sys: EnvVar>(
+    raw: &str,
+) -> Result<ConfigFile, RegistryError> {
+    validate_secret_env_vars::<Sys>(raw)?;
+    let (substituted, unresolved) = env_replace_lossy::<Sys>(raw);
+    if !unresolved.is_empty() {
+        tracing::warn!(?unresolved, "config references unset environment variables");
+    }
+    let parsed: Option<ConfigFile> = serde_saphyr::from_str(&substituted)
+        .map_err(|err| RegistryError::InvalidConfig { reason: err.to_string() })?;
+    let file = match parsed {
+        Some(file) => file,
+        None => serde_saphyr::from_str("{}")
+            .map_err(|err| RegistryError::InvalidConfig { reason: err.to_string() })?,
+    };
+    if file.oci.max_blob_bytes == 0 || file.oci.max_manifest_bytes == 0 {
+        return Err(RegistryError::InvalidConfig {
+            reason: "oci size limits must be greater than zero".to_string(),
+        });
+    }
+    Ok(file)
+}
+
+/// The global ACL and group blocks are gone, not ignorable: they used
+/// to *enforce* and *grant* access, so dropping either like an unknown
+/// verdaccio key would silently change who may reach what on upgrade.
+/// Fail loudly instead, naming the replacement.
+/// The top-level blocks a config may still carry from an older release,
+/// each one [`Some`] only while the config declares it.
+#[derive(Clone, Copy)]
+pub(super) struct RemovedBlocks<'a> {
+    pub(super) packages: Option<&'a RemovedPackagesBlock>,
+    pub(super) groups: Option<&'a RemovedGroupsBlock>,
+    pub(super) uplinks: Option<&'a RemovedUplinksBlock>,
+    pub(super) upstreams: Option<&'a RemovedUpstreamsBlock>,
+}
+
+pub(super) fn reject_removed_blocks(blocks: RemovedBlocks<'_>) -> Result<(), RegistryError> {
+    if blocks.packages.is_some() {
+        return Err(RegistryError::InvalidConfig {
+            reason: "the top-level `packages:` block was removed: declare per-package rules \
+                     on the registry that serves them, as `registries.<name>.packages` \
+                     (pattern keys, `access`/`publish`/`unpublish` values)"
+                .to_string(),
+        });
+    }
+    if blocks.groups.is_some() {
+        return Err(RegistryError::InvalidConfig {
+            reason: "the top-level `groups:` block was removed: declare teams on the \
+                     registry that uses them, as `registries.<name>.teams` (team-name keys, \
+                     member-list values), and reference them from that registry's access \
+                     lists as `team:<name>`"
+                .to_string(),
+        });
+    }
+    if blocks.uplinks.is_some() {
+        return Err(RegistryError::InvalidConfig {
+            reason: "the top-level `uplinks:` block is not supported: declare upstream \
+                     registries under `registries:` with `type: upstream`"
+                .to_string(),
+        });
+    }
+    if blocks.upstreams.is_some() {
+        return Err(RegistryError::InvalidConfig {
+            reason: "the top-level `upstreams:` block was removed: declare upstream \
+                     registries under `registries:` with `type: upstream`"
+                .to_string(),
+        });
+    }
+    Ok(())
 }

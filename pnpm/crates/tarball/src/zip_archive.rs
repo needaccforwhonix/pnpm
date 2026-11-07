@@ -3,16 +3,18 @@
 //! Wheels and runtime binaries use ZIP decoding within the shared artifact
 //! request, integrity, retry, progress and store-publication lifecycle.
 
+pub(crate) use download::check_zip_size;
+
 use super::{
-    Arc, ArchiveStoreProjection, Component, Cursor, HashMap, IgnoreEntryFilter, NetworkError,
-    PathBuf, Read, STREAM_ENTRY_BUFFER_MAX, TarballError, UNIX_EPOCH, allocate_tarball_buffer,
+    Arc, ArchiveStoreProjection, Component, Cursor, HashMap, IgnoreEntryFilter, NetworkError, Read,
+    STREAM_ENTRY_BUFFER_MAX, TarLimits, TarballError, allocate_tarball_buffer, checked_now,
     post_download_semaphore,
 };
 use pnpm_fs::file_mode;
 use pnpm_network::{AuthHeaders, RetryOpts, ThrottledClient};
 use pnpm_reporter::Reporter;
 use pnpm_store_dir::{
-    CafsFileInfo, FileHash, PackageFilesIndex, StoreDir, WriteCasFileFromReaderError,
+    CafsFileInfo, PackageFilesIndex, StoreDir, WriteCasFileFromReaderError, WrittenFile,
 };
 use ssri::Integrity;
 
@@ -20,7 +22,7 @@ use ssri::Integrity;
 /// and returning the `{relative-path → CAFS path}` map plus the
 /// per-package [`PackageFilesIndex`] row to hand off to the shared
 /// store-index writer. Same contract as
-/// [`crate::extract::extract_tarball_entries`], for the
+/// [`crate::extract::extract_tarball_entries_with_bins`], for the
 /// `BinaryResolution { archive: zip, .. }` artifacts Node.js / Bun /
 /// Deno ship their Windows builds in.
 ///
@@ -28,18 +30,17 @@ use ssri::Integrity;
 /// would pull in every descendant without consulting
 /// `ignore_file_pattern`, leaving the per-file filter no longer
 /// authoritative.
-///
-/// Unix mode comes from the central-directory record, which Windows
-/// tooling leaves unpopulated; those entries fall back to `0o644`.
 pub(crate) fn extract_zip_entries(
     archive: &mut zip::ZipArchive<Cursor<Vec<u8>>>,
     package_url: &str,
     store_dir: &StoreDir,
     archive_prefix: Option<&str>,
     ignore_file_pattern: Option<&IgnoreEntryFilter>,
-) -> Result<(HashMap<String, PathBuf>, PackageFilesIndex), TarballError> {
+    limits: TarLimits,
+) -> Result<(pnpm_fs::CasPaths, PackageFilesIndex), TarballError> {
     let entry_count = archive.len();
     let mut extracted = ExtractedEntries::with_capacity(entry_count);
+    let budget = crate::extract::TarBudget::new(limits);
 
     // Build the `{prefix}/` slice once. Treat `Some("")` as `None`,
     // keeping entry paths verbatim when there is no prefix. The
@@ -61,6 +62,7 @@ pub(crate) fn extract_zip_entries(
         else {
             continue;
         };
+        budget.announce_file(entry.size())?;
         let stored = store_zip_entry(&mut entry, package_url, &cleaned, store_dir)?;
         extracted.insert(cleaned, stored);
     }
@@ -70,7 +72,7 @@ pub(crate) fn extract_zip_entries(
 
 /// The CAS paths and index rows of the entries extracted so far.
 struct ExtractedEntries {
-    cas_paths: HashMap<String, PathBuf>,
+    cas_paths: pnpm_fs::CasPaths,
     files_index: PackageFilesIndex,
 }
 
@@ -86,11 +88,16 @@ impl ExtractedEntries {
                 files: HashMap::with_capacity(entry_count),
                 side_effects: None,
                 remote_side_effects_quarantine: None,
+                tar_integrity: None,
             },
         }
     }
 
-    fn insert(&mut self, entry_path: String, (file_path, file_attrs): (PathBuf, CafsFileInfo)) {
+    fn insert(
+        &mut self,
+        entry_path: String,
+        (file_path, file_attrs): (pnpm_fs::StoreFile, CafsFileInfo),
+    ) {
         if let Some(previous) = self.cas_paths.insert(entry_path.clone(), file_path) {
             tracing::warn!(?previous, "Duplication detected. Old entry has been ejected");
         }
@@ -113,10 +120,10 @@ fn store_zip_entry(
     package_url: &str,
     entry_path: &str,
     store_dir: &StoreDir,
-) -> Result<(PathBuf, CafsFileInfo), TarballError> {
+) -> Result<(pnpm_fs::StoreFile, CafsFileInfo), TarballError> {
     let file_mode = entry.unix_mode().unwrap_or(0o644) & 0o777;
     let declared_size = entry.size();
-    let (file_path, file_hash, file_size) = write_zip_entry_to_cas(
+    let written = write_zip_entry_to_cas(
         entry,
         declared_size,
         package_url,
@@ -124,19 +131,8 @@ fn store_zip_entry(
         store_dir,
         file_mode::is_executable(file_mode),
     )?;
-    let checked_at = UNIX_EPOCH
-        .elapsed()
-        .ok()
-        .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok());
-    Ok((
-        file_path,
-        CafsFileInfo {
-            digest: format!("{file_hash:x}"),
-            mode: file_mode,
-            size: file_size,
-            checked_at,
-        },
-    ))
+    let info = written.index_entry(file_mode, checked_now());
+    Ok((written.file, info))
 }
 
 /// The canonical, prefix-stripped path of one zip entry, or `None` when the
@@ -156,7 +152,7 @@ fn zip_entry_path(
     // below), but rejecting outright keeps the "no unsafe entry
     // accepted" contract intact for tooling that inspects the
     // error code.
-    let raw_name = entry.name().to_string();
+    let raw_name = String::from_utf8_lossy(entry.name_raw()).into_owned();
     let traversal = |entry_path: String| TarballError::PathTraversal {
         url: package_url.to_string(),
         entry_path,
@@ -164,10 +160,7 @@ fn zip_entry_path(
     };
     // [`zip::read::ZipFile::enclosed_name`] returns `None` for
     // absolute paths and any path with a `..` component — a
-    // single check covers both forms of path traversal. The
-    // returned `PathBuf` has every `.` segment collapsed and is
-    // what we use below to build the canonical `cas_paths` /
-    // `pkg_files_idx` keys.
+    // single check covers both forms of path traversal.
     let Some(enclosed) = entry.enclosed_name() else {
         return Err(traversal(raw_name));
     };
@@ -199,9 +192,7 @@ fn zip_entry_path(
 
     // Strip the archive's top-level basename (`prefix` on
     // `pnpm_lockfile::BinaryResolution`) so the ignore filter
-    // sees paths relative to the archive root. If the entry path
-    // doesn't start with `{prefix}/` we use the normalized form
-    // (a no-op when the entry already lives at the archive root).
+    // sees paths relative to the archive root.
     let cleaned = match basename_prefix {
         Some(prefix) => normalized
             .strip_prefix(prefix)
@@ -230,7 +221,7 @@ fn zip_entry_path(
 ///
 /// Entries above [`STREAM_ENTRY_BUFFER_MAX`] go straight into the store
 /// with an incremental hash, the same shape
-/// [`crate::extract::stream_extract_gzipped_tarball`] gives a large
+/// [`crate::extract::stream_extract_gzipped_tarball_with_tar`] gives a large
 /// tar entry, so a runtime archive's biggest member never has to fit in
 /// memory.
 ///
@@ -242,7 +233,7 @@ pub(crate) fn write_zip_entry_to_cas(
     entry_path: &str,
     store_dir: &StoreDir,
     executable: bool,
-) -> Result<(PathBuf, FileHash, u64), TarballError> {
+) -> Result<WrittenFile, TarballError> {
     let read_error = |source| TarballError::ReadZipEntries {
         url: package_url.to_string(),
         entry_path: entry_path.to_string(),
@@ -285,9 +276,7 @@ pub(crate) fn write_zip_entry_to_cas(
         )));
     }
 
-    let (file_path, file_hash) =
-        store_dir.write_cas_file(&buffer, executable).map_err(TarballError::WriteCasFile)?;
-    Ok((file_path, file_hash, declared_size))
+    store_dir.write_cas_file(&buffer, executable).map_err(TarballError::WriteCasFile)
 }
 
 /// Run one full zip-archive fetch attempt: hit the network, drain the
@@ -317,8 +306,10 @@ pub(crate) async fn fetch_and_extract_zip_once<Reporter: self::Reporter>(
     auth_headers: &AuthHeaders,
     archive_prefix: Option<&str>,
     ignore_file_pattern: Option<Arc<IgnoreEntryFilter>>,
-) -> Result<(HashMap<String, PathBuf>, PackageFilesIndex), TarballError> {
-    let (client, response_head) = crate::archive_request::request_archive::<Reporter>(
+    max_bytes: Option<usize>,
+    limits: TarLimits,
+) -> Result<(pnpm_fs::CasPaths, PackageFilesIndex), TarballError> {
+    let (client, response_head, _) = crate::archive_request::request_archive::<Reporter>(
         http_client,
         package_url,
         package_id,
@@ -326,71 +317,61 @@ pub(crate) async fn fetch_and_extract_zip_once<Reporter: self::Reporter>(
         pnpm_network::UNPRIORITIZED,
         attempt,
         false,
+        None,
+        crate::archive_request::ArchiveContentCoding::DecodedByClient,
     )
     .await?;
-    let buffer = download_zip_body::<Reporter>(response_head, package_url, package_id).await?;
+    let buffer = download_zip_body::<Reporter>(response_head, package_url, package_id, max_bytes)
+        .await
+        .inspect_err(|error| {
+            if error.is_fetch_timeout() {
+                http_client.downscale_while_peers_active(package_url);
+            }
+        })?;
     drop(client);
 
-    let post_download_permit = post_download_semaphore()
-        .acquire()
-        .await
-        .expect("post-download semaphore shouldn't be closed this soon");
-
-    tracing::info!(target: "pacquet::download", ?package_url, "Download completed");
-
-    let extraction = ZipExtraction {
+    let result = ZipExtraction {
         buffer,
         package_integrity: package_integrity.clone(),
         package_url: package_url.to_string(),
         archive_prefix: archive_prefix.map(str::to_string),
         ignore_file_pattern,
-    };
-    let result = crate::extraction_task::spawn_extraction(post_download_permit, move || {
-        extraction.extract(store_dir)
-    })
-    .await
-    .map_err(TarballError::TaskJoin)??;
+        limits,
+    }
+    .run(store_dir)
+    .await?;
 
     tracing::info!(target: "pacquet::download", ?package_url, "Checksum verified");
 
     Ok(result)
 }
 
-async fn download_zip_body<Reporter: self::Reporter>(
-    response_head: reqwest::Response,
-    package_url: &str,
-    package_id: &str,
-) -> Result<Vec<u8>, TarballError> {
-    use futures_util::StreamExt;
-    let expected_size = response_head.content_length();
-    let mut buf = allocate_tarball_buffer(expected_size, package_url)?;
-    let mut stream = response_head.bytes_stream();
-    let mut progress = crate::download::BodyProgress::new(expected_size, package_id);
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| {
-            TarballError::FetchTarball(NetworkError::new(package_url, error))
-        })?;
-        buf.extend_from_slice(&chunk);
-        progress.on_chunk::<Reporter>(chunk.len());
-    }
-    progress.finish::<Reporter>();
-    Ok(buf)
-}
-
 /// A downloaded archive with what its extraction task owns.
-struct ZipExtraction {
-    buffer: Vec<u8>,
-    package_integrity: Integrity,
-    package_url: String,
-    archive_prefix: Option<String>,
-    ignore_file_pattern: Option<Arc<IgnoreEntryFilter>>,
+pub(crate) struct ZipExtraction {
+    pub(crate) buffer: Vec<u8>,
+    pub(crate) package_integrity: Integrity,
+    pub(crate) package_url: String,
+    pub(crate) archive_prefix: Option<String>,
+    pub(crate) ignore_file_pattern: Option<Arc<IgnoreEntryFilter>>,
+    pub(crate) limits: TarLimits,
 }
 
 impl ZipExtraction {
+    pub(crate) async fn run(
+        self,
+        store_dir: &'static StoreDir,
+    ) -> Result<(pnpm_fs::CasPaths, PackageFilesIndex), TarballError> {
+        let permit =
+            post_download_semaphore().acquire().await.expect("post-download semaphore stays open");
+        crate::extraction_task::spawn_extraction(permit, move || self.extract(store_dir))
+            .await
+            .map_err(TarballError::TaskJoin)?
+    }
+
     fn extract(
         self,
         store_dir: &'static StoreDir,
-    ) -> Result<(HashMap<String, PathBuf>, PackageFilesIndex), TarballError> {
+    ) -> Result<(pnpm_fs::CasPaths, PackageFilesIndex), TarballError> {
         crate::download::verify_tarball_integrity(
             &self.buffer,
             Some(self.package_integrity),
@@ -410,16 +391,16 @@ impl ZipExtraction {
             store_dir,
             self.archive_prefix.as_deref(),
             self.ignore_file_pattern.as_deref(),
+            self.limits,
         )
     }
 }
 
 /// Run [`fetch_and_extract_zip_once`] under pnpm's retry policy.
-/// Same shape as [`crate::download::fetch_and_extract_with_retry`]: HTTP 401 / 403 /
-/// 404 fail fast, every other error retries with exponential
-/// backoff until [`RetryOpts::retries`] is exhausted. On success
-/// emits `pnpm:progress fetched` once per (resolved) package, same
-/// as the tarball path.
+/// Same shape as [`crate::download::fetch_and_extract_conditional`]:
+/// permanent errors fail fast, while transient errors retry with
+/// exponential backoff until [`RetryOpts::retries`] is exhausted.
+/// On success, emit `pnpm:progress fetched` once per resolved package.
 // 10 arguments — over the default clippy threshold for the same
 // reason `fetch_and_extract_with_retry` is: each is distinct, and
 // bundling into a struct would just push the same fields into a
@@ -436,7 +417,9 @@ pub(crate) async fn fetch_and_extract_zip_with_retry<Reporter: self::Reporter>(
     auth_headers: &AuthHeaders,
     archive_prefix: Option<&str>,
     ignore_file_pattern: Option<Arc<IgnoreEntryFilter>>,
-) -> Result<(HashMap<String, PathBuf>, PackageFilesIndex), TarballError> {
+    max_bytes: Option<usize>,
+    limits: TarLimits,
+) -> Result<(pnpm_fs::CasPaths, PackageFilesIndex), TarballError> {
     crate::archive_retry::retry_archive::<Reporter, _, _>(
         package_url,
         package_id,
@@ -454,6 +437,8 @@ pub(crate) async fn fetch_and_extract_zip_with_retry<Reporter: self::Reporter>(
                 auth_headers,
                 archive_prefix,
                 ignore_file_pattern.clone(),
+                max_bytes,
+                limits,
             )
         },
     )
@@ -462,11 +447,7 @@ pub(crate) async fn fetch_and_extract_zip_with_retry<Reporter: self::Reporter>(
 
 /// Counterpart to [`crate::download::IngestTarballToStore`] for zip-archive binary
 /// resolutions: the zip flow downloads the body, verifies the
-/// integrity hash, then walks zip entries and writes each to the CAFS
-/// — with the `prefix` field stripped from each entry path before the
-/// ignore filter and CAS write so the runtime's top-level
-/// `node-vX.Y.Z-<platform>-<arch>/` directory doesn't leak into
-/// downstream consumers' paths.
+/// integrity hash, then walks zip entries and writes each to the CAFS.
 ///
 /// The store-index lookup, prefetch cache reuse, and store-index
 /// writer queueing match [`crate::download::IngestTarballToStore`] — runtime
@@ -496,11 +477,30 @@ impl IngestZipArchiveToStore<'_> {
     /// Ingest through the shared archive cache, verification and publication lifecycle.
     pub async fn run_without_mem_cache<Reporter: self::Reporter>(
         &self,
-    ) -> Result<HashMap<String, PathBuf>, TarballError> {
+    ) -> Result<pnpm_fs::CasPaths, TarballError> {
+        self.ingestion().run::<Reporter>().await
+    }
+
+    /// Verify and publish an already downloaded ZIP through the shared store lifecycle.
+    pub async fn run_with_buffer<Reporter: self::Reporter>(
+        &self,
+        buffer: Vec<u8>,
+    ) -> Result<pnpm_fs::CasPaths, TarballError> {
+        let ingestion = self.ingestion();
+        if let Some(cached) = ingestion.load_cache::<Reporter>().await? {
+            return Ok(Arc::unwrap_or_clone(cached.files));
+        }
+        let paths = ingestion.ingest_zip_buffer(buffer).await?;
+        crate::download::emit_progress_fetched::<Reporter>(self.package.id, self.requester, None);
+        Ok(paths)
+    }
+
+    fn ingestion(&self) -> crate::ingestion::ArchiveIngestion<'_> {
         crate::ingestion::ArchiveIngestion {
             store: &self.store,
             fetching: self.fetching,
             package: crate::TarballPackage {
+                integrity_kind: crate::IntegrityKind::Resource,
                 integrity: Some(self.package.integrity),
                 url: self.package.url,
                 id: self.package.id,
@@ -517,9 +517,11 @@ impl IngestZipArchiveToStore<'_> {
             format: crate::ingestion::ArchiveFormat::Zip {
                 integrity: self.package.integrity,
                 prefix: self.archive_prefix,
+                max_bytes: self.package.max_bytes,
             },
         }
-        .run::<Reporter>()
-        .await
     }
 }
+
+mod download;
+use download::download_zip_body;

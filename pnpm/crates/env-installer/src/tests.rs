@@ -1,7 +1,7 @@
 use crate::{
-    ConfigDepError, ConfigDepsInstallOptions, install_config_deps, is_package_manager_resolved,
-    pnpm_engine_packages, prune_env_lockfile, resolve_and_install_config_deps,
-    resolve_package_manager_integrities,
+    ConfigDepError, ConfigDependencyVerification, ConfigDepsInstallOptions, install_config_deps,
+    is_package_manager_resolved, pnpm_engine_packages, prune_env_lockfile,
+    resolve_and_install_config_deps, resolve_package_manager_integrities,
 };
 use pnpm_lockfile::{
     EnvLockfile, LockfileResolution, PackageKey, PackageMetadata, RegistryResolution,
@@ -14,8 +14,8 @@ use pnpm_resolving_npm_resolver::{
     shared_picked_manifest_cache,
 };
 use pnpm_resolving_resolver_base::{
-    LatestInfo, LatestQuery, PkgResolutionId, ResolveFuture, ResolveLatestFuture, ResolveOptions,
-    ResolveResult, Resolver, WantedDependency,
+    LatestInfo, LatestQuery, NoMatchingVersionError, PkgResolutionId, ResolutionPolicyOptions,
+    ResolveFuture, ResolveLatestFuture, ResolveOptions, ResolveResult, Resolver, WantedDependency,
 };
 use pnpm_store_dir::StoreDir;
 use pnpm_testing_utils::registry::TestRegistry;
@@ -83,7 +83,7 @@ fn build_resolver(registry: &str) -> (NpmResolver<InMemoryPackageMetaCache>, Tem
     registries.insert("default".to_string(), registry.to_string());
     let resolver = NpmResolver {
         registries,
-        registries_by_prefix: std::collections::HashMap::new(),
+        declared_prefixes: pnpm_lockfile::DeclaredRegistryPrefixes::default(),
         metadata: pnpm_resolving_npm_resolver::RegistryMetadataClient {
             http_client: Arc::new(ThrottledClient::default()),
             auth_headers: Arc::new(AuthHeaders::default()),
@@ -97,12 +97,14 @@ fn build_resolver(registry: &str) -> (NpmResolver<InMemoryPackageMetaCache>, Tem
             full_metadata: false,
             needs_full_metadata_for: None,
             filter_metadata: false,
+            registry_options_by_url: std::sync::Arc::default(),
+            minimum_release_age: None,
         },
         cache_policy: pnpm_resolving_npm_resolver::MetadataCachePolicy {
-            offline: false,
-            prefer_offline: false,
+            network: pnpm_config::NetworkPolicy::Online,
             ignore_missing_time_field: false,
         },
+        store_view: None,
     };
     (resolver, cache_dir)
 }
@@ -121,7 +123,7 @@ struct Harness {
 }
 
 fn harness() -> Harness {
-    let registry_url = TestRegistry::start().url();
+    let registry_url = TestRegistry::start().url().to_string();
     let mut registries = std::collections::HashMap::new();
     registries.insert("default".to_string(), registry_url.clone());
     let store_root = TempDir::new().unwrap();
@@ -143,11 +145,30 @@ fn options<'a>(
     frozen: bool,
 ) -> ConfigDepsInstallOptions<'a> {
     ConfigDepsInstallOptions {
+        mode: crate::ConfigDepsInstallMode::Reconcile,
+        verification: ConfigDependencyVerification {
+            registries: &harness.registries,
+            resolution_verifiers: pnpm_package_manager::build_resolution_verifiers(
+                &pnpm_config::Config {
+                    registry: harness.registry_url.clone(),
+                    ..Default::default()
+                },
+                Arc::new(ThrottledClient::default()),
+                None,
+                Some(Arc::new(AuthHeaders::default())),
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+            resolution_policy: ResolutionPolicyOptions::default(),
+        },
         fetching: pnpm_tarball::ArchiveFetchOptions {
             http_client: &harness.http_client,
             auth_headers: &harness.auth_headers,
             retry_opts: RetryOpts::default(),
             offline: false,
+            tar_limits: pnpm_tarball::TarLimits::default(),
         },
         platform: pnpm_package_is_installable::InstallabilityOptions {
             supported_architectures: None,
@@ -163,11 +184,13 @@ fn options<'a>(
             strict_pkg_content_check: true,
             package_import_method: pnpm_config::PackageImportMethod::default(),
         },
+        store_index: crate::ConfigDependencyStoreIndex::default(),
         root_dir,
 
-        registries: &harness.registries,
-
-        frozen_lockfile: frozen,
+        lockfile: crate::EnvLockfileOptions {
+            frozen,
+            symlinked: pnpm_lockfile::SymlinkedLockfile::Refuse,
+        },
     }
 }
 
@@ -178,6 +201,10 @@ fn clean_spec(version: &str) -> ConfigDependency {
 #[derive(Default)]
 struct FixtureResolver {
     packages: HashMap<(String, String), serde_json::Value>,
+    /// Packages the registry serves without the wanted version, so the
+    /// resolver answers `ERR_PNPM_NO_MATCHING_VERSION` as the npm resolver
+    /// does for a release the registry does not publish.
+    unpublished: std::collections::HashSet<String>,
     /// Resolve to tarball resolutions whose URL is not derivable from the
     /// registry — the shape a load-balanced proxy or Artifactory-style
     /// mirror produces.
@@ -199,6 +226,11 @@ impl FixtureResolver {
             .expect("fixture package version")
             .to_string();
         self.packages.insert((name, version), manifest);
+        self
+    }
+
+    fn unpublished(mut self, name: &str) -> Self {
+        self.unpublished.insert(name.to_string());
         self
     }
 
@@ -225,6 +257,16 @@ impl Resolver for FixtureResolver {
                 .get(&(alias.to_string(), specifier.to_string()))
                 .cloned()
             else {
+                if self.unpublished.contains(alias) {
+                    // Boxed outermost, as a resolver must box it, so the
+                    // caller's downcast finds it.
+                    return Err(NoMatchingVersionError {
+                        dep: format!("{alias}@{specifier}"),
+                        registry: "https://registry.example/".to_string(),
+                        published_versions: String::new(),
+                    }
+                    .into());
+                }
                 return Ok(None);
             };
             let name = manifest["name"]
@@ -263,6 +305,7 @@ impl Resolver for FixtureResolver {
                     latest: Some(version),
                     published_at: None,
                     manifest: Some(Arc::new(manifest)),
+                    non_deprecated_alternative: None,
                 },
             }))
         })
@@ -309,3 +352,5 @@ mod lockfile;
 mod security;
 
 mod streaming;
+
+mod release_age;

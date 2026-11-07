@@ -8,10 +8,22 @@ use super::{
 /// stripping that runs on that file.
 #[test]
 fn scope_survives_workspace_only_field_clearing() {
-    let mut settings: WorkspaceSettings =
-        serde_saphyr::from_str("scope: '@from-global'\n").unwrap();
-    settings.clear_workspace_only_fields();
-    assert_eq!(settings.scope.as_deref(), Some("@from-global"));
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(crate::GLOBAL_CONFIG_YAML_FILENAME), "scope: '@from-global'\n")
+        .unwrap();
+    let settings = crate::TrustedSettings::load_global(dir.path()).unwrap().unwrap();
+    assert_eq!(settings.machine.scope.as_deref(), Some("@from-global"));
+}
+
+/// A double-quoted key may spell a machine setting with escape sequences, so
+/// the global file is read for the machine settings whenever it could.
+#[test]
+fn an_escaped_machine_setting_key_is_read() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(crate::GLOBAL_CONFIG_YAML_FILENAME), "\"\\u0063i\": true\n")
+        .unwrap();
+    let settings = crate::TrustedSettings::load_global(dir.path()).unwrap().unwrap();
+    assert_eq!(settings.machine.ci, Some(true));
 }
 
 /// The workspace-structural keys are parsed so `pnpm config get` / `list`
@@ -60,31 +72,36 @@ ignoredBuiltDependencies: [core-js]
 /// values into outbound requests.
 #[test]
 fn ignores_env_vars_inside_workspace_request_destination_values() {
-    struct EnvWithHost;
-    impl EnvVar for EnvWithHost {
-        fn var(name: &str) -> Option<String> {
-            (name == "WORK_HOST").then(|| "internal.example.com".to_owned())
-        }
-    }
-
     let yaml = r"
 pnprServer: https://${WORK_HOST}/pnpr/
-registry: https://${WORK_HOST}/npm/
 httpsProxy: http://${WORK_HOST}:8080/
 httpProxy: http://${WORK_HOST}:8081/
 noProxy: ${WORK_HOST}
 proxy: http://${WORK_HOST}:8082/
 noproxy: ${WORK_HOST}
+userAgent: agent/${WORK_HOST}
 registries:
   '@safe': https://safe.example.com/npm/
-  '@work': https://${WORK_HOST}/scope/
 namedRegistries:
   literal: 'https://registry.example.com/${/npm/'
   stable: https://registry.example.com/npm/
-  work: https://${WORK_HOST}/npm/
 ";
     let mut settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
-    settings.substitute_env_untrusted::<EnvWithHost>();
+    let warnings = settings.substitute_env_untrusted::<EnvWithWorkHost>().unwrap();
+    let ignored: Vec<&str> = warnings
+        .iter()
+        .map(|warning| {
+            warning
+                .strip_prefix(r#"Ignored ""#)
+                .and_then(|rest| rest.split_once('"'))
+                .map(|(setting, _)| setting)
+                .expect("an ignored-setting warning")
+        })
+        .collect();
+    assert_eq!(
+        ignored,
+        ["pnprServer", "httpsProxy", "httpProxy", "proxy", "userAgent", "noProxy", "noproxy",],
+    );
     let mut config = Config::new();
     settings.apply_to(&mut config, Path::new("/irrelevant"));
     assert_eq!(config.pnpr_server, None);
@@ -94,7 +111,6 @@ namedRegistries:
         config.registries_by_scope.get("@safe").map(String::as_str),
         Some("https://safe.example.com/npm/"),
     );
-    assert_eq!(config.registries_by_scope.get("@work"), None);
     assert_eq!(
         config.registries_by_prefix.get("stable").map(String::as_str),
         Some("https://registry.example.com/npm/"),
@@ -103,7 +119,67 @@ namedRegistries:
         config.registries_by_prefix.get("literal").map(String::as_str),
         Some("https://registry.example.com/${/npm/"),
     );
-    assert_eq!(config.registries_by_prefix.get("work"), None);
+}
+
+/// Dropping a registry URL would resolve the packages it serves from another
+/// registry.
+/// <https://github.com/pnpm/pnpm/issues/17762>
+#[test]
+fn refuses_env_vars_inside_workspace_registry_routes() {
+    for (yaml, expected_setting) in [
+        ("registry: https://${WORK_HOST}/npm/\n", "registry"),
+        ("registries:\n  default: https://${WORK_HOST}/npm/\n", "registries['default']"),
+        (
+            "registries:\n  https://${WORK_HOST}/:\n    serverType: artifactory\n",
+            "registries['https://${WORK_HOST}/']",
+        ),
+        ("registries:\n  '@work': https://${WORK_HOST}/scope/\n", "registries['@work']"),
+        ("namedRegistries:\n  work: https://${WORK_HOST}/npm/\n", "namedRegistries['work']"),
+        (
+            "registries:\n  https://${WORK_HOST}/:\n    scopes: ['@work']\n",
+            "registries['https://${WORK_HOST}/']",
+        ),
+        (
+            "registries:\n  https://${WORK_HOST}/:\n    prefix: work\n",
+            "registries['https://${WORK_HOST}/']",
+        ),
+        (
+            "registries:\n  https://${WORK_HOST}/simple/:\n    ecosystem: pypi\n    packages: [alpha]\n",
+            "registries['https://${WORK_HOST}/simple/']",
+        ),
+    ] {
+        let mut settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
+        let error = settings.substitute_env_untrusted::<EnvWithWorkHost>().unwrap_err();
+        eprintln!("{yaml}=> {error}");
+        assert!(matches!(
+            &error,
+            crate::LoadWorkspaceYamlError::RegistryEnvNotExpanded { setting, file }
+                if setting == expected_setting && file == WORKSPACE_MANIFEST_FILENAME
+        ));
+    }
+}
+
+#[test]
+fn a_config_dependency_entry_error_names_the_entry() {
+    let path = Path::new("/store/config-dep/pnpm-config.yaml");
+    let error = WorkspaceSettings::read_config_dependency_entry::<EnvWithWorkHost>(
+        "registries:\n  '@work': https://${WORK_HOST}/scope/\n",
+        path,
+    )
+    .unwrap_err();
+    eprintln!("{error}");
+    assert!(matches!(
+        &error,
+        crate::LoadWorkspaceYamlError::RegistryEnvNotExpanded { file, .. }
+            if file == &path.display().to_string()
+    ));
+}
+
+struct EnvWithWorkHost;
+impl EnvVar for EnvWithWorkHost {
+    fn var(name: &str) -> Option<String> {
+        (name == "WORK_HOST").then(|| "internal.example.com".to_owned())
+    }
 }
 
 #[test]
@@ -116,7 +192,6 @@ fn expands_env_vars_inside_non_registry_workspace_values() {
                 "HOOK" => Some("hook.js".to_owned()),
                 "SHELL" => Some("custom-shell".to_owned()),
                 "STORE_DIR" => Some("store-dir".to_owned()),
-                "USER_AGENT" => Some("pacquet-test/1.0".to_owned()),
                 _ => None,
             }
         }
@@ -127,10 +202,9 @@ storeDir: ${STORE_DIR}
 cacheDir: ${CACHE_DIR}
 scriptShell: ${SHELL}
 nodeOptions: --require=${HOOK}
-userAgent: ${USER_AGENT}
 ";
     let mut settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
-    settings.substitute_env_untrusted::<EnvWithPaths>();
+    settings.substitute_env_untrusted::<EnvWithPaths>().unwrap();
 
     let base = Path::new("/workspace/root");
     let mut config = Config::new();
@@ -140,7 +214,32 @@ userAgent: ${USER_AGENT}
     assert_eq!(config.cache_dir, base.join("cache-dir"));
     assert_eq!(config.script_shell.as_deref(), Some("custom-shell"));
     assert_eq!(config.node_options.as_deref(), Some("--require=hook.js"));
-    assert_eq!(config.user_agent, "pacquet-test/1.0");
+}
+
+/// `userAgent` is sent to whichever registry the same file names, so a
+/// placeholder in it would deliver the installer's environment to that host.
+#[test]
+fn drops_a_workspace_user_agent_with_an_env_placeholder() {
+    struct EnvWithToken;
+    impl EnvVar for EnvWithToken {
+        fn var(name: &str) -> Option<String> {
+            (name == "PNPM_TEST_TOKEN").then(|| "super-secret-token".to_owned())
+        }
+    }
+
+    let yaml = "userAgent: agent/${PNPM_TEST_TOKEN}\n";
+    let mut settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
+    settings.substitute_env_untrusted::<EnvWithToken>().unwrap();
+    assert_eq!(settings.user_agent, None);
+
+    let mut settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
+    settings.substitute_env_trusted::<EnvWithToken>();
+    assert_eq!(settings.user_agent.as_deref(), Some("agent/super-secret-token"));
+
+    let mut settings: WorkspaceSettings =
+        serde_saphyr::from_str("userAgent: my-agent/2.0\n").unwrap();
+    settings.substitute_env_untrusted::<EnvWithToken>().unwrap();
+    assert_eq!(settings.user_agent.as_deref(), Some("my-agent/2.0"));
 }
 
 #[test]
@@ -162,7 +261,7 @@ cacheDir: 日本語/${CACHE_DIR}
 scriptShell: ./ünicode-shell
 ";
     let mut settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
-    settings.substitute_env_untrusted::<EnvWithPaths>();
+    settings.substitute_env_untrusted::<EnvWithPaths>().unwrap();
 
     let base = Path::new("/workspace/root");
     let mut config = Config::new();
@@ -188,6 +287,17 @@ fn parses_include_workspace_root_from_yaml_and_applies() {
     assert!(!config.include_workspace_root, "the default is `false` to match pnpm");
     settings.apply_to(&mut config, Path::new("/irrelevant"));
     assert!(config.include_workspace_root, "yaml override wins");
+}
+
+#[test]
+fn parses_fail_if_no_match_from_yaml_and_applies() {
+    let settings: WorkspaceSettings = serde_saphyr::from_str("failIfNoMatch: true\n").unwrap();
+    assert_eq!(settings.fail_if_no_match, Some(true));
+
+    let mut config = Config::new();
+    assert!(!config.fail_if_no_match);
+    settings.apply_to(&mut config, Path::new("/irrelevant"));
+    assert!(config.fail_if_no_match);
 }
 
 /// The two workspace-cycle knobs are independent keys — one silences the
@@ -294,35 +404,140 @@ fn cargo_settings_parse_apply_and_remain_workspace_only() {
     let yaml = r"
 cargo:
   enabled: true
-  indexUrl: https://registry.example.test/index/
 ";
     let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
     assert_eq!(settings.cargo.as_ref().map(|cargo| cargo.enabled), Some(true));
-    assert_eq!(
-        settings.cargo.as_ref().map(|cargo| cargo.index_url.as_str()),
-        Some("https://registry.example.test/index/"),
-    );
     let mut config = Config::default();
     settings.apply_to(&mut config, Path::new("/workspace"));
 
     assert!(config.cargo.enabled);
-    assert_eq!(config.cargo.index_url, "https://registry.example.test/index/");
     let mut settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
     settings.clear_workspace_only_fields();
     assert!(settings.cargo.is_none());
 }
 
 #[test]
+fn tool_settings_parse_and_apply() {
+    let yaml = "tools:\n  node:\n    mirror: https://mirror.example.test/node/download\n  python:\n    mirror: https://mirror.example.test/python-build-standalone/releases\n  bun:\n    mirror: https://mirror.example.test/bun\n";
+    let settings: crate::MachineSettings = serde_saphyr::from_str(yaml).unwrap();
+    let mut config = Config::default();
+    settings.apply_to(&mut config, Path::new("/workspace"));
+    assert_eq!(
+        config.tool_mirror(crate::Tool::Node),
+        Some("https://mirror.example.test/node/download"),
+    );
+    assert_eq!(
+        config.tool_mirror(crate::Tool::Python),
+        Some("https://mirror.example.test/python-build-standalone/releases"),
+    );
+    assert_eq!(config.tool_mirror(crate::Tool::Bun), Some("https://mirror.example.test/bun"));
+
+    // A mirror says what this machine can reach, which is the user's to
+    // say, so it is a machine setting. `a_repository_cannot_name_a_mirror`
+    // covers the workspace end.
+    let settings: crate::MachineSettings = serde_saphyr::from_str(yaml).unwrap();
+    assert!(settings.tools.is_some());
+    let unknown =
+        serde_saphyr::from_str::<crate::MachineSettings>("tools:\n  node:\n    unknown: true\n");
+    assert!(unknown.is_err());
+}
+
+/// Deno and Yarn are not reachable through a base URL at all, so the
+/// setting cannot name one: the closed key set says so where the value
+/// is written, rather than leaving an entry that does nothing.
+#[test]
+fn refuses_a_tool_pnpm_does_not_download() {
+    let error = serde_saphyr::from_str::<crate::MachineSettings>(
+        "tools:\n  deno:\n    mirror: https://mirror.example.test/deno\n",
+    )
+    .expect_err("deno is not a tool pnpm downloads through a mirror");
+    assert!(format!("{error}").contains("deno"), "{error}");
+
+    let known = serde_saphyr::from_str::<crate::MachineSettings>(
+        "tools:\n  node:\n    mirror: https://mirror.example.test/node\n",
+    );
+    assert!(known.is_ok());
+}
+
+/// Only Node.js publishes more than one line of builds, so naming
+/// channels for another would sit in the file doing nothing.
+#[test]
+fn refuses_channels_for_a_tool_that_has_none() {
+    let error = serde_saphyr::from_str::<crate::MachineSettings>(
+        "tools:\n  bun:\n    channels:\n      canary: https://mirror.example.test/bun\n",
+    )
+    .expect_err("bun publishes one line of builds");
+    assert!(format!("{error}").contains("channels"), "{error}");
+
+    let node = serde_saphyr::from_str::<crate::MachineSettings>(
+        "tools:\n  node:\n    channels:\n      nightly: https://mirror.example.test/node\n",
+    );
+    assert!(node.is_ok());
+}
+
+/// Each tool is answered for separately, so naming one leaves the
+/// mirrors the machine's own config names for the others alone.
+#[test]
+fn a_later_layer_tool_keeps_the_mirrors_named_elsewhere() {
+    let mut config = Config::default();
+    let global: crate::MachineSettings =
+        serde_saphyr::from_str("tools:\n  node:\n    mirror: https://global.example.test/node\n")
+            .unwrap();
+    global.apply_to(&mut config, Path::new("/workspace"));
+    let later: crate::MachineSettings =
+        serde_saphyr::from_str("tools:\n  bun:\n    mirror: https://later.example.test/bun\n")
+            .unwrap();
+    later.apply_to(&mut config, Path::new("/workspace"));
+
+    assert_eq!(config.tool_mirror(crate::Tool::Node), Some("https://global.example.test/node"));
+    assert_eq!(config.tool_mirror(crate::Tool::Bun), Some("https://later.example.test/bun"));
+}
+
+#[test]
+fn a_tool_channel_is_read_beside_the_base_it_refines() {
+    let yaml = "tools:\n  node:\n    mirror: https://mirror.example.test/node/download\n    channels:\n      nightly: https://nightly.example.test/\n";
+    let settings: crate::MachineSettings = serde_saphyr::from_str(yaml).unwrap();
+    let mut config = Config::default();
+    settings.apply_to(&mut config, Path::new("/workspace"));
+    assert_eq!(
+        config.tool_mirror(crate::Tool::Node),
+        Some("https://mirror.example.test/node/download"),
+    );
+    assert_eq!(
+        config
+            .tool_channel_mirrors(crate::Tool::Node)
+            .get("nightly")
+            .map(String::as_str),
+        Some("https://nightly.example.test"),
+    );
+    assert!(!config.tool_channel_mirrors(crate::Tool::Node).contains_key("release"));
+    assert!(config.tool_channel_mirrors(crate::Tool::Bun).is_empty());
+}
+
+/// A caller joins a path onto what it is given.
+#[test]
+fn a_tool_mirror_is_read_without_its_trailing_slash() {
+    let mut config = Config::default();
+    let settings: crate::MachineSettings =
+        serde_saphyr::from_str("tools:\n  bun:\n    mirror: https://mirror.example.test/bun/\n")
+            .unwrap();
+    settings.apply_to(&mut config, Path::new("/workspace"));
+    assert_eq!(config.tool_mirror(crate::Tool::Bun), Some("https://mirror.example.test/bun"));
+}
+
+#[test]
 fn python_settings_parse_apply_and_remain_workspace_only() {
-    let yaml = "python:\n  enabled: true\n  executable: python3.13\n  indexUrl: https://example.org/simple/\n  extras: [speed]\n  groups: [test]\n";
+    let yaml = "python:\n  enabled: true\n  executable: python3.13\n  overrides: [demo>=2]\n  constraints: [demo<3]\n  extras: [speed]\n  groups: [test]\n  versions: ['3.12', '3.13']\n";
     let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
     let mut config = Config::default();
     settings.apply_to(&mut config, Path::new("/workspace"));
     assert!(config.python.enabled);
-    assert_eq!(config.python.executable, "python3.13");
-    assert_eq!(config.python.index_url, "https://example.org/simple/");
+    assert_eq!(config.python.executable.as_deref(), Some("python3.13"));
+    assert_eq!(config.python.overrides, ["demo>=2"]);
+    assert_eq!(config.python.constraints, ["demo<3"]);
     assert_eq!(config.python.extras, ["speed"]);
     assert_eq!(config.python.groups, ["test"]);
+    assert_eq!(config.python.versions, ["3.12", "3.13"]);
     let mut settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
     settings.clear_workspace_only_fields();
     assert!(settings.python.is_none());
@@ -593,9 +808,7 @@ fn hoist_false_disables_private_hoist_pattern() {
 }
 
 /// `hoistingLimits` deserializes as one of the `none` / `workspaces`
-/// / `dependencies` modes; the install pipeline translates the mode
-/// into the per-locator border map via
-/// `pnpm_package_manager::get_hoisting_limits`. Yaml-empty /
+/// / `dependencies` modes. Yaml-empty /
 /// missing keeps the `Config` field at its [`HoistingLimits::None`]
 /// default.
 #[test]
@@ -617,7 +830,8 @@ fn parses_hoisting_limits_from_yaml_and_applies() {
 #[test]
 fn omitting_hoisting_limits_and_external_dependencies_keeps_defaults() {
     let yaml = "";
-    let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
+    let settings: WorkspaceSettings =
+        serde_saphyr::from_str::<Option<WorkspaceSettings>>(yaml).unwrap().unwrap_or_default();
     assert!(settings.hoisting_limits.is_none());
     assert!(settings.external_dependencies.is_none());
 
@@ -643,7 +857,8 @@ fn catalog_mode_yaml_values_round_trip() {
         assert_eq!(config.catalog_mode, expected);
     }
 
-    let settings: WorkspaceSettings = serde_saphyr::from_str("").unwrap();
+    let settings: WorkspaceSettings =
+        serde_saphyr::from_str::<Option<WorkspaceSettings>>("").unwrap().unwrap_or_default();
     assert!(settings.catalog_mode.is_none());
     let mut config = Config::new();
     settings.apply_to(&mut config, Path::new("/irrelevant"));
@@ -739,4 +954,116 @@ fn reset_setting_to_default_keeps_virtual_store_only_hoisting_empty() {
     assert!(!config.virtual_store_only);
     assert_eq!(config.hoist_pattern, Some(vec!["eslint-*".to_string()]));
     assert_eq!(config.public_hoist_pattern, defaults.public_hoist_pattern);
+}
+
+#[test]
+fn rejects_workspace_controlled_remote_cache_secrets() {
+    for (setting, field) in [
+        ("url: https://attacker.example", "url"),
+        ("team: team_attacker", "team"),
+        ("trustedKeys:\n    ci: repository-controlled-key", "trustedKeys"),
+        ("privateKey: repository-controlled-key", "privateKey"),
+        ("keyId: ci", "keyId"),
+        ("builderId: ci/main/1", "builderId"),
+        ("publish: true", "publish"),
+        ("imageDigest: sha256:abc", "imageDigest"),
+        ("architectureBaseline: x64", "architectureBaseline"),
+        ("buildEnv:\n    CC: clang", "buildEnv"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(WORKSPACE_MANIFEST_FILENAME),
+            format!("remoteCache:\n  org: acme\n  {setting}\n"),
+        )
+        .unwrap();
+
+        let error = WorkspaceSettings::load_at(dir.path()).unwrap_err().to_string();
+        assert!(error.contains(&format!("remoteCache.{field}")), "{error}");
+    }
+}
+
+#[test]
+fn a_workspace_naming_the_org_keeps_the_machines_remote_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(WORKSPACE_MANIFEST_FILENAME), "remoteCache:\n  org: acme\n")
+        .unwrap();
+    let global: WorkspaceSettings = serde_saphyr::from_str(
+        "remoteCache:\n  url: https://cache.example.com\n  team: team_acme\n  privateKey: machine-key\n  publish: true\n",
+    )
+    .unwrap();
+
+    let mut config = Config::new();
+    global.apply_to(&mut config, Path::new("/workspace"));
+    WorkspaceSettings::load_at(dir.path())
+        .unwrap()
+        .unwrap()
+        .apply_to(&mut config, dir.path());
+
+    assert_eq!(
+        config.remote_cache_settings(),
+        crate::RemoteCacheSettings {
+            url: Some("https://cache.example.com".to_string()),
+            team: Some("team_acme".to_string()),
+            org: Some("acme".to_string()),
+            private_key: Some("machine-key".to_string()),
+            publish: Some(true),
+            ..Default::default()
+        },
+    );
+}
+
+/// `sideEffectsCache.remote` held the signing fields before `remoteCache`
+/// did, so a machine configured that way keeps its trust, and `remoteCache`
+/// wins where both set a field.
+#[test]
+fn remote_cache_falls_back_to_the_side_effects_signing_fields() {
+    let global: WorkspaceSettings = serde_saphyr::from_str(
+        "sideEffectsCache:\n  remote:\n    org: older-org\n    keyId: older-key\n    builderId: ci/older\n    trustedKeys:\n      older-key: AAAA\nremoteCache:\n  keyId: newer-key\n",
+    )
+    .unwrap();
+    let mut config = Config::new();
+    global.apply_to(&mut config, Path::new("/workspace"));
+
+    let settings = config.remote_cache_settings();
+    assert_eq!(settings.org.as_deref(), Some("older-org"));
+    assert_eq!(settings.key_id.as_deref(), Some("newer-key"));
+    assert_eq!(settings.builder_id.as_deref(), Some("ci/older"));
+    assert_eq!(
+        settings.trusted_keys,
+        Some(std::collections::BTreeMap::from([("older-key".to_string(), "AAAA".to_string())])),
+    );
+}
+
+#[test]
+fn remote_cache_environment_overrides_the_files() {
+    struct Env;
+    impl crate::EnvVar for Env {
+        fn var(key: &str) -> Option<String> {
+            match key {
+                "PNPM_REMOTE_CACHE_TEAM" => Some("team_ci".to_string()),
+                "PNPM_REMOTE_CACHE_TRUSTED_KEYS" => Some(r#"{"ci":"AAAA"}"#.to_string()),
+                "PNPM_REMOTE_CACHE_BUILD_ENV" => Some("not json".to_string()),
+                "PNPM_REMOTE_CACHE_PUBLISH" => Some("true".to_string()),
+                _ => None,
+            }
+        }
+    }
+
+    let mut config = Config::new();
+    config.remote_cache = Some(Box::new(crate::RemoteCacheSettings {
+        url: Some("https://cache.example.com".to_string()),
+        team: Some("team_file".to_string()),
+        ..Default::default()
+    }));
+    config.apply_remote_cache_env::<Env>();
+
+    let remote = config.remote_cache_settings();
+    assert_eq!(remote.url.as_deref(), Some("https://cache.example.com"));
+    assert_eq!(remote.team.as_deref(), Some("team_ci"));
+    assert_eq!(
+        remote.trusted_keys,
+        Some(std::collections::BTreeMap::from([("ci".to_string(), "AAAA".to_string())])),
+    );
+    assert_eq!(remote.build_env, None);
+    assert_eq!(remote.publish, Some(true));
 }

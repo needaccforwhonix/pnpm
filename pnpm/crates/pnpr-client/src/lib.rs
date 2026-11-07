@@ -18,11 +18,22 @@
 //! its own private namespace. The opt-in shared-artifact `PoC` is a separate
 //! stateful protocol surface.
 
+#![cfg_attr(dylint_lib = "perfectionist", feature(register_tool))]
+#![cfg_attr(dylint_lib = "perfectionist", register_tool(perfectionist))]
+
+#[cfg(target_family = "wasm")]
+extern crate pnpm_http as reqwest;
+
+pub use artifact_signer::ArtifactSigner;
+pub use artifact_store::{ArtifactStore, TurborepoArtifactStore};
 pub use artifacts::{
     ArtifactBuildPolicy, RejectedArtifact, ResolveArtifactsOptions, VerifiedArtifact,
 };
+pub use blob_transfer::{ArtifactBlobSource, ArtifactPublication};
 pub use ecosystem_cache::server_resolves;
 pub use ecosystems::{CARGO_ECOSYSTEM, PYPI_ECOSYSTEM};
+pub use error::PnprClientError;
+pub use pipeline_runs::PublishPipelineRunRequest;
 pub use pnpm_shared_artifact_protocol::{
     ARTIFACT_KIND, ArtifactBlobRequest, ArtifactBlobUpload, ArtifactCandidate, ArtifactFile,
     ArtifactManifest, ArtifactPayload, ArtifactSubject, BuilderProfile, COMPATIBILITY_TAG_SCHEMA,
@@ -30,17 +41,17 @@ pub use pnpm_shared_artifact_protocol::{
     DEPENDENCY_SIDE_EFFECTS_INPUT_KEY_PREFIX, INPUT_KEY_PREFIX, LinuxGlibcPlatform, MacOsPlatform,
     OwnerScope, PackageIdentity, PublishArtifactRequest, ResolveArtifactsRequest,
     SIGNATURE_ALGORITHM, SignedArtifactEnvelope, WORKSPACE_TASK_ARTIFACT_KIND,
-    WORKSPACE_TASK_INPUT_KEY_PREFIX, WindowsPlatform, blob_id, linux_glibc_supported_tags,
-    linux_glibc_tag, macos_supported_tags, macos_tag, platform_fingerprint, windows_supported_tags,
-    windows_tag,
+    WORKSPACE_TASK_INPUT_KEY_PREFIX, WindowsPlatform, blob_id, decode_trusted_keys,
+    linux_glibc_supported_tags, linux_glibc_tag, macos_supported_tags, macos_tag,
+    platform_fingerprint, windows_supported_tags, windows_tag,
 };
+pub use resolve::AppliedPolicies;
 
 use std::{
     collections::{BTreeMap, HashSet},
     time::Duration,
 };
 
-use derive_more::{Display, Error, From};
 use futures_util::StreamExt as _;
 use indexmap::IndexMap;
 use pnpm_catalogs_types::Catalogs;
@@ -49,14 +60,14 @@ use pnpm_graph_hasher::hash_object_nullable_with_prefix;
 use pnpm_lockfile::{Lockfile, TarballRevision};
 use pnpm_lockfile_verification::{RenderedViolation, VerifyError};
 use pnpm_shared_artifact_protocol::{
-    ArtifactVariant, MAX_CANDIDATES, MAX_FILE_SIZE, MAX_RESOLVE_RESPONSE_SIZE,
-    MAX_VARIANTS_PER_CANDIDATE, ResolveArtifactsResponse, ResolvedArtifact,
-    compatibility_rank_prevalidated, validate_supported_tags, verify_blob,
+    ArtifactVariant, MAX_CANDIDATES, MAX_RESOLVE_RESPONSE_SIZE, MAX_VARIANTS_PER_CANDIDATE,
+    ResolveArtifactsResponse, ResolvedArtifact, compatibility_rank_prevalidated,
+    validate_supported_tags,
 };
 use reqwest::Client;
 
 /// The `registries` a request declares, keyed by registry URL.
-pub type RegistryDeclarations = BTreeMap<String, RegistryDeclaration>;
+pub type RegistryDeclarations = IndexMap<String, RegistryDeclaration>;
 use serde::{Deserialize, Serialize};
 
 /// Dependency map (`name` -> `version range`).
@@ -68,6 +79,7 @@ pub struct PnprClient {
     http: Client,
     base_url: String,
     artifact_request_timeout: Duration,
+    capability: tokio::sync::OnceCell<HandshakeCapability>,
 }
 
 /// Inputs for a single-project resolution.
@@ -90,7 +102,6 @@ pub struct RegistryRouting {
     /// (and the registries declared alongside it) rather than its own
     /// configuration.
     pub registry: String,
-    /// The client's named-registry aliases.
     /// The registries the client declares, keyed by URL, in the shape
     /// of the `registries` setting. The default registry is not among
     /// them: it travels as `registry`.
@@ -137,6 +148,10 @@ pub struct ResolutionSettings {
     pub auto_install_peers: Option<bool>,
     pub dedupe_peers: Option<bool>,
     pub exclude_links_from_lockfile: Option<bool>,
+    pub add_missing_peer_types: Option<bool>,
+    /// Whether `projectScopedOptionalPeers` takes effect for the client,
+    /// which it does only while `dedupePeerDependents` is on.
+    pub project_scoped_optional_peers: Option<bool>,
     /// The client's `resolutionMode`. The server picks versions the way
     /// the client would, instead of falling back to its own default.
     pub resolution_mode: ResolutionMode,
@@ -179,6 +194,17 @@ pub struct VerificationPolicy {
     pub trust_policy_ignore_after: Option<u64>,
 }
 
+/// Workspace link target for one project. `directory` is the publish
+/// directory the manifest declares, relative to the project; `linkDirectory`
+/// is forwarded verbatim (`true` and absent both mean "link it").
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishConfig {
+    pub directory: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_directory: Option<bool>,
+}
+
 /// One workspace project sent to the pnpr resolver.
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -189,9 +215,18 @@ pub struct ResolveProject {
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// Omitted when the manifest declares no `publishConfig.directory`, so a
+    /// project that links its own root sends the same body to servers that
+    /// predate the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publish_config: Option<PublishConfig>,
     pub dependencies: DepMap,
     pub dev_dependencies: DepMap,
     pub optional_dependencies: DepMap,
+    /// Omitted when empty, so projects without peers send the same body to
+    /// servers that predate the field.
+    #[serde(skip_serializing_if = "DepMap::is_empty")]
+    pub peer_dependencies: DepMap,
 }
 
 /// Inputs for a multi-project workspace resolution.
@@ -220,9 +255,11 @@ impl From<ResolveOptions> for ResolveProjectsOptions {
                 dir: ".".to_string(),
                 name: None,
                 version: None,
+                publish_config: None,
                 dependencies: opts.dependencies,
                 dev_dependencies: opts.dev_dependencies,
                 optional_dependencies: opts.optional_dependencies,
+                peer_dependencies: DepMap::new(),
             }],
             fix_lockfile: false,
             routing: opts.routing,
@@ -271,11 +308,13 @@ impl VerifyLockfileOptions {
 }
 
 /// Result of [`PnprClient::resolve`].
+#[derive(Debug)]
 #[must_use]
 pub struct ResolveOutcome {
     /// The resolved lockfile, ready for a headless install.
     pub lockfile: Lockfile,
     pub stats: Stats,
+    pub applied_policies: Option<AppliedPolicies>,
 }
 
 /// Resolution statistics from the response. Field names mirror the
@@ -291,6 +330,13 @@ pub struct Stats {
 /// caller needs to start fetching the tarball before the full lockfile
 /// arrives.
 #[derive(Debug, Clone)]
+#[cfg_attr(
+    dylint_lib = "perfectionist",
+    expect(
+        perfectionist::too_many_struct_fields,
+        reason = "Mirrors the /-/pnpr/v0/resolve package frame."
+    )
+)]
 pub struct ResolvedPackage {
     /// Canonical `name@version` identifier.
     pub id: String,
@@ -312,33 +358,19 @@ pub struct ResolvedPackage {
     /// Registry artifact revision, when the server resolved an immutable
     /// integrity-addressed artifact.
     pub revision: Option<TarballRevision>,
+    /// `dist.pnpr.requiresBuild` from the server-side resolve, when the
+    /// registry derived it from the tarball's own bytes.
+    pub requires_build: Option<bool>,
 }
 
-#[derive(Debug, Display, Error, From)]
-pub enum PnprClientError {
-    #[display("pnpr request failed: {_0}")]
-    Http(reqwest::Error),
+/// Resolver protocol version this client speaks.
+pub const RESOLVER_PROTOCOL_VERSION: u32 = 0;
 
-    #[display("pnpr server error: {_0}")]
-    #[from(ignore)]
-    Server(#[error(not(source))] String),
+/// Shared artifacts protocol version this client speaks.
+pub const ARTIFACTS_PROTOCOL_VERSION: u32 = 0;
 
-    #[display("malformed pnpr response: {_0}")]
-    #[from(ignore)]
-    Protocol(#[error(not(source))] String),
-
-    /// The server rejected the input lockfile under the client's
-    /// verification policy. Carries the reconstructed [`VerifyError`]
-    /// so the CLI aborts with the same diagnostic code (and breakdown)
-    /// the local verification gate would have produced.
-    Verification(VerifyError),
-
-    Io(std::io::Error),
-}
-
-/// Protocol version this client speaks. The server advertises the
-/// versions it supports at `GET /-/pnpr`; today only v0 exists.
-const PROTOCOL_VERSION: u32 = 0;
+/// Pipeline runs protocol version this client speaks.
+pub const PIPELINE_PROTOCOL_VERSION: u32 = 0;
 
 #[derive(Default, Deserialize)]
 struct HandshakeResponse {
@@ -346,30 +378,18 @@ struct HandshakeResponse {
     pnpr: HandshakeCapability,
 }
 
-/// One `pnpm pipeline` run as `PUT /-/pnpr/v0/pipeline/runs` carries it:
-/// the workspace and run identifiers plus the run's summary document and
-/// event stream, verbatim.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PublishPipelineRunRequest {
-    pub workspace: String,
-    pub run_id: String,
-    pub summary: serde_json::Value,
-    pub events: Vec<serde_json::Value>,
-}
-
-#[derive(Default, Deserialize)]
-struct HandshakeCapability {
+#[derive(Default, Clone, Deserialize)]
+pub struct HandshakeCapability {
     #[serde(default)]
-    versions: Vec<u32>,
+    pub versions: Vec<u32>,
     #[serde(default)]
-    artifacts: Vec<u32>,
+    pub artifacts: Vec<u32>,
     #[serde(default, rename = "fixLockfile")]
-    fix_lockfile: Vec<u32>,
+    pub fix_lockfile: Vec<u32>,
     /// The package ecosystems `/-/pnpr/v0/resolve` reads in its request
     /// body. An empty list is a server that resolves npm alone.
     #[serde(default)]
-    ecosystems: Vec<String>,
+    pub ecosystems: Vec<String>,
 }
 
 /// Inputs for a Python resolution. Send them only to a server that
@@ -411,6 +431,25 @@ impl PnprClient {
             http: Client::new(),
             base_url,
             artifact_request_timeout: ARTIFACT_REQUEST_TIMEOUT,
+            capability: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// Obtain cached handshake capability from the server.
+    pub async fn ensure_handshake(&self) -> Result<&HandshakeCapability, PnprClientError> {
+        self.capability.get_or_try_init(|| self.fetch_handshake(None)).await
+    }
+
+    /// Negotiate the highest common resolver protocol version with the server.
+    pub async fn negotiated_resolver_version(&self) -> Result<u32, PnprClientError> {
+        let cap = self.ensure_handshake().await?;
+        if cap.versions.contains(&RESOLVER_PROTOCOL_VERSION) {
+            Ok(RESOLVER_PROTOCOL_VERSION)
+        } else {
+            Err(PnprClientError::server(format!(
+                "pnpr server speaks protocol versions {:?}, but this client requires v{RESOLVER_PROTOCOL_VERSION}",
+                cap.versions,
+            )))
         }
     }
 
@@ -418,25 +457,25 @@ impl PnprClient {
     /// if it's unreachable, isn't a pnpr (404 at `/-/pnpr`), or shares
     /// no protocol version with this client.
     pub async fn handshake(&self) -> Result<(), PnprClientError> {
-        let capability = self.fetch_handshake(None).await?;
-        Self::require_resolver_protocol(&capability)
+        let capability = self.ensure_handshake().await?;
+        Self::require_resolver_protocol(capability)
     }
 
     async fn handshake_fix_lockfile(&self) -> Result<(), PnprClientError> {
-        let capability = self.fetch_handshake(None).await?;
-        Self::require_resolver_protocol(&capability)?;
-        if !capability.fix_lockfile.contains(&PROTOCOL_VERSION) {
-            return Err(PnprClientError::Server(format!(
-                "pnpr server does not advertise lockfile repair support for resolver protocol v{PROTOCOL_VERSION}",
+        let capability = self.ensure_handshake().await?;
+        Self::require_resolver_protocol(capability)?;
+        if !capability.fix_lockfile.contains(&RESOLVER_PROTOCOL_VERSION) {
+            return Err(PnprClientError::server(format!(
+                "pnpr server does not advertise lockfile repair support for resolver protocol v{RESOLVER_PROTOCOL_VERSION}",
             )));
         }
         Ok(())
     }
 
     fn require_resolver_protocol(capability: &HandshakeCapability) -> Result<(), PnprClientError> {
-        if !capability.versions.contains(&PROTOCOL_VERSION) {
-            return Err(PnprClientError::Server(format!(
-                "pnpr server speaks protocol versions {:?}, but this client requires v{PROTOCOL_VERSION}",
+        if !capability.versions.contains(&RESOLVER_PROTOCOL_VERSION) {
+            return Err(PnprClientError::server(format!(
+                "pnpr server speaks protocol versions {:?}, but this client requires v{RESOLVER_PROTOCOL_VERSION}",
                 capability.versions,
             )));
         }
@@ -453,7 +492,7 @@ impl PnprClient {
         }
         let response = get.send().await?;
         if !response.status().is_success() {
-            return Err(PnprClientError::Server(format!(
+            return Err(PnprClientError::server(format!(
                 "{} is not a pnpr server (GET /-/pnpr returned {})",
                 self.base_url,
                 response.status(),
@@ -461,40 +500,6 @@ impl PnprClient {
         }
         let body: HandshakeResponse = response.json().await?;
         Ok(body.pnpr)
-    }
-
-    /// Record one `pnpm pipeline` run on the server. The document is
-    /// stored verbatim; a server without the pipeline surface answers 404.
-    pub async fn publish_pipeline_run(
-        &self,
-        request: &PublishPipelineRunRequest,
-        authorization: Option<&str>,
-    ) -> Result<(), PnprClientError> {
-        if authorization.is_some() && !pnpm_network::is_url_secure_for_credentials(&self.base_url) {
-            return Err(PnprClientError::Protocol(
-                "pipeline report credentials require HTTPS or a loopback server".to_string(),
-            ));
-        }
-        let http = Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
-        let mut put = http
-            .put(format!("{}-/pnpr/v0/pipeline/runs", self.base_url))
-            .timeout(self.artifact_request_timeout)
-            .json(request);
-        if let Some(authorization) = authorization {
-            put = put.header("authorization", authorization);
-        }
-        let response = put.send().await?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response_body_bounded(response, 64 * 1024).await?;
-            return Err(PnprClientError::Server(format!(
-                "/-/pnpr/v0/pipeline/runs returned {status}: {}",
-                String::from_utf8_lossy(&body),
-            )));
-        }
-        Ok(())
     }
 }
 
@@ -519,9 +524,7 @@ async fn response_body_bounded(
         .content_length()
         .is_some_and(|length| length > limit as u64)
     {
-        return Err(PnprClientError::Protocol(format!(
-            "pnpr response exceeds the {limit}-byte limit",
-        )));
+        return Err(PnprClientError::Protocol(format!("response exceeds the {limit}-byte limit")));
     }
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
@@ -529,7 +532,7 @@ async fn response_body_bounded(
         let chunk = chunk?;
         if body.len().saturating_add(chunk.len()) > limit {
             return Err(PnprClientError::Protocol(format!(
-                "pnpr response exceeds the {limit}-byte limit",
+                "response exceeds the {limit}-byte limit",
             )));
         }
         body.extend_from_slice(&chunk);
@@ -544,7 +547,11 @@ const MAX_ERROR_BODY_SIZE: usize = 64 * 1024;
 #[cfg(test)]
 mod tests;
 
+mod artifact_signer;
+mod artifact_store;
 mod artifacts;
+mod blob_transfer;
+mod pipeline_runs;
 use artifacts::ARTIFACT_REQUEST_TIMEOUT;
 
 mod resolve;
@@ -552,5 +559,6 @@ use resolve::read_ndjson_frames;
 
 mod ecosystem_cache;
 mod ecosystems;
+mod error;
 
 use ecosystems::{WireViolation, build_verify_error};

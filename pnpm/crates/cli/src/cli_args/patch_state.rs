@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     env, fs, io,
-    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -88,6 +87,14 @@ pub(crate) fn read_edit_dir_state(
     Ok(state.get(&key).cloned())
 }
 
+pub(crate) fn read_all_edit_dir_states(
+    modules_dir: &Path,
+) -> Result<BTreeMap<String, EditDirState>, StateFileError> {
+    let path = checked_state_file_path_for_read(modules_dir)?;
+    let Some(text) = read_state_file_text(&path)? else { return Ok(BTreeMap::new()) };
+    serde_json::from_str(&text).map_err(|source| StateFileError::Parse { path, source })
+}
+
 pub(crate) fn write_edit_dir_state(
     modules_dir: &Path,
     edit_dir: &Path,
@@ -99,7 +106,7 @@ pub(crate) fn write_edit_dir_state(
 
     let text = serde_json::to_string_pretty(&state)
         .map_err(|source| StateFileError::Serialize { path: path.clone(), source })?;
-    write_state_file_atomically(&path, text.as_bytes())
+    pnpm_fs::write_atomic(&path, text.as_bytes())
         .map_err(|source| StateFileError::Write { path, source })
 }
 
@@ -180,15 +187,6 @@ fn reject_state_symlink_if_exists(path: &Path) -> Result<(), StateFileError> {
         Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(source) => Err(StateFileError::Read { path: path.to_path_buf(), source }),
     }
-}
-
-fn write_state_file_atomically(target: &Path, content: &[u8]) -> io::Result<()> {
-    let parent = target.parent().unwrap_or_else(|| Path::new("."));
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-    tmp.write_all(content)?;
-    tmp.as_file().sync_all()?;
-    tmp.persist(target).map_err(|error| error.error)?;
-    Ok(())
 }
 
 fn edit_dir_key(edit_dir: &Path) -> Result<String, StateFileError> {

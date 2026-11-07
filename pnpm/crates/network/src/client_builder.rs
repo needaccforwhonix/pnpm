@@ -1,13 +1,16 @@
+#[cfg(not(target_family = "wasm"))]
+use super::Addrs;
 use super::{
-    Addrs, Arc, Client, DEFAULT_USER_AGENT, Duration, ForInstallsError, HeaderMap, HeaderValue,
-    LazyLock, Name, NetworkSettings, NoProxyMatcher, NonZeroUsize, Proxy, Resolve, Resolving,
-    Semaphore, TlsConfig, TrustRoots, USER_AGENT, apply_tls, bundled_root_certs, parse_proxy_url,
-    strip_userinfo,
+    AppliedTls, Arc, Client, DEFAULT_USER_AGENT, Duration, ForInstallsError, HeaderMap,
+    HeaderValue, LazyLock, Name, NetworkSettings, NoProxyMatcher, NonZeroUsize, Proxy,
+    RedirectGuard, Resolve, Resolving, Semaphore, TlsConfig, TrustRoots, USER_AGENT, apply_tls,
+    bundled_root_certs, parse_proxy_url, strip_userinfo,
 };
+use crate::redirect_guard::{BlockedRedirect, MAX_REDIRECT_HOPS};
 
-/// Shared builder with the install-time defaults
-/// ([`ThrottledClient::new_for_installs`](crate::ThrottledClient::new_for_installs) documents the why behind each
-/// setting). Both `new_for_installs` and [`ThrottledClient::for_installs`](crate::ThrottledClient::for_installs)
+/// Everything a client build shares across the per-registry variants.
+///
+/// Both `new_for_installs` and [`ThrottledClient::for_installs`](crate::ThrottledClient::for_installs)
 /// route through this helper so a single source of truth governs
 /// timeouts, HTTP-version, resolver, and the User-Agent header.
 ///
@@ -15,45 +18,7 @@ use super::{
 /// connect timeout, bounding how long a request may make no progress.
 /// `settings.user_agent` is sent verbatim; a value that cannot be
 /// encoded as an HTTP header falls back to [`DEFAULT_USER_AGENT`].
-/// A redirect-hop validator: returns `true` to follow a redirect to `url`,
-/// `false` to block it. See
-/// [`ThrottledClient::new_for_installs_with_redirect_guard`](crate::ThrottledClient::new_for_installs_with_redirect_guard).
-pub type RedirectGuard = Arc<dyn Fn(&reqwest::Url) -> bool + Send + Sync>;
-
-/// Cap on redirect hops, matching reqwest's default `Policy::default()` limit
-/// so the guarded client doesn't follow a redirect chain further than the
-/// unguarded one would.
-pub(super) const MAX_REDIRECT_HOPS: usize = 10;
-
-/// A redirect target the [`RedirectGuard`] rejected. Surfaced as the request
-/// error so a blocked redirect fails loudly rather than silently fetching.
-#[derive(Debug)]
-pub(super) struct BlockedRedirect(pub(super) reqwest::Url);
-
-impl std::fmt::Display for BlockedRedirect {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Surface only `scheme://host[:port]` — never the path, query,
-        // fragment, or userinfo, where a presigned-URL signature/token could
-        // live. This error string can reach a client, so it must not leak the
-        // very credential the redirect was carrying.
-        write!(
-            f,
-            "redirect to {}://{}",
-            self.0.scheme(),
-            self.0.host_str().unwrap_or("<unknown>"),
-        )?;
-        if let Some(port) = self.0.port() {
-            write!(f, ":{port}")?;
-        }
-        write!(f, " is not allowed by the fetch allowlist")
-    }
-}
-
-impl std::error::Error for BlockedRedirect {}
-
-/// Validate every redirect before either following it or returning it to a
-/// manual redirect loop. Rejected targets fail with [`BlockedRedirect`].
-/// Everything a client build shares across the per-registry variants.
+#[derive(Clone)]
 pub(super) struct ClientBuildInputs<'a> {
     pub(super) settings: &'a NetworkSettings,
     pub(super) https: Option<reqwest::Url>,
@@ -61,29 +26,77 @@ pub(super) struct ClientBuildInputs<'a> {
     pub(super) no_proxy: Arc<NoProxyMatcher>,
     pub(super) extra_ca_certs: Vec<reqwest::Certificate>,
     pub(super) redirect_guard: Option<&'a RedirectGuard>,
+    pub(super) dns_resolver: Arc<dyn Resolve>,
+}
+
+/// The behaviors in which the clients of one [`ThrottledClient`](crate::ThrottledClient)
+/// differ; everything else comes from [`ClientBuildInputs`].
+#[derive(Clone, Copy)]
+pub(super) struct ClientVariant {
+    pub(super) forbid_redirects: bool,
+    /// Whether reqwest removes the response's `Content-Encoding` itself. Archive
+    /// clients leave it to the fetcher, which bounds the zstd window.
+    pub(super) decode_content: bool,
 }
 
 /// Build one client, falling back to the bundled roots when the platform
-/// trust store cannot be loaded.
+/// trust store cannot be loaded or when the platform verifier is unavailable.
 pub(super) fn build_client_with_root_fallback(
     inputs: &ClientBuildInputs<'_>,
     effective_tls: &TlsConfig,
-    forbid_redirects: bool,
+    variant: ClientVariant,
 ) -> Result<Client, ForInstallsError> {
-    let platform = match client_builder(
-        inputs,
-        effective_tls,
-        TrustRoots::Platform,
-        forbid_redirects,
-    )?
-    .build()
-    {
-        Ok(client) => return Ok(client),
-        Err(platform) => platform,
-    };
-    client_builder(inputs, effective_tls, TrustRoots::Bundled, forbid_redirects)?
-        .build()
-        .map_err(|bundled| ForInstallsError::ClientBuild { platform, bundled })
+    #[cfg(target_vendor = "apple")]
+    let platform_supported = super::is_platform_verifier_available();
+    #[cfg(not(target_vendor = "apple"))]
+    let platform_supported = true;
+
+    if platform_supported {
+        let platform = match build_platform_client(inputs, effective_tls, variant)? {
+            Ok(client) => return Ok(client),
+            Err(platform) => platform,
+        };
+        client_builder(inputs, effective_tls, TrustRoots::Bundled, variant)?
+            .build()
+            .map_err(|bundled| ForInstallsError::ClientBuild { platform, bundled })
+    } else {
+        let bundled = client_builder(inputs, effective_tls, TrustRoots::Bundled, variant)?.build();
+        match bundled {
+            Ok(client) => Ok(client),
+            Err(bundled) => {
+                let platform =
+                    client_builder(inputs, effective_tls, TrustRoots::Platform, variant)?
+                        .build()
+                        .err()
+                        .unwrap_or_else(|| {
+                            reqwest::Client::builder()
+                                .tls_danger_accept_invalid_hostnames(true)
+                                .build()
+                                .unwrap_err()
+                        });
+                Err(ForInstallsError::ClientBuild { platform, bundled })
+            }
+        }
+    }
+}
+
+/// Build one client on the platform trust store. Extra roots alone keep the
+/// platform verifier constructible, so an empty system trust store only fails
+/// a build that leaves them out.
+pub(super) fn build_platform_client(
+    inputs: &ClientBuildInputs<'_>,
+    effective_tls: &TlsConfig,
+    variant: ClientVariant,
+) -> Result<reqwest::Result<Client>, ForInstallsError> {
+    if !inputs.extra_ca_certs.is_empty() {
+        let system_only = ClientBuildInputs { extra_ca_certs: Vec::new(), ..inputs.clone() };
+        if let Err(error) =
+            client_builder(&system_only, effective_tls, TrustRoots::Platform, variant)?.build()
+        {
+            return Ok(Err(error));
+        }
+    }
+    Ok(client_builder(inputs, effective_tls, TrustRoots::Platform, variant)?.build())
 }
 
 /// The builder for one client: proxies, additive roots, TLS, and the redirect
@@ -92,9 +105,14 @@ fn client_builder(
     inputs: &ClientBuildInputs<'_>,
     effective_tls: &TlsConfig,
     trust_roots: TrustRoots,
-    forbid_redirects: bool,
+    variant: ClientVariant,
 ) -> Result<reqwest::ClientBuilder, ForInstallsError> {
-    let mut builder = default_client_builder(inputs.settings);
+    // `no_proxy` also stops reqwest from reading the proxy environment
+    // variables itself. `ProxyConfig` has already resolved them, and a
+    // resolved "no proxy", such as `proxy=false`, must stay that way.
+    let mut builder = default_client_builder(inputs.settings, variant.decode_content)
+        .dns_resolver(Arc::clone(&inputs.dns_resolver))
+        .no_proxy();
     if let Some(url) = inputs.https.clone() {
         builder = builder.proxy(build_scheme_proxy(url, "https", Arc::clone(&inputs.no_proxy)));
     }
@@ -106,12 +124,49 @@ fn client_builder(
     for cert in &inputs.extra_ca_certs {
         builder = builder.add_root_certificate(cert.clone());
     }
-    builder = apply_tls(builder, effective_tls)?;
-    // Android's platform verifier requires a JVM, which the standalone CLI does not have.
-    if cfg!(target_os = "android") || trust_roots == TrustRoots::Bundled {
-        builder = builder.tls_certs_only(bundled_root_certs().iter().cloned());
+    let AppliedTls { mut builder, has_custom_ca } = apply_tls(builder, effective_tls)?;
+    match select_trust_roots(has_custom_ca, trust_roots) {
+        EffectiveTrustRoots::CustomOnly => {
+            // An explicit, readable `ca` / `cafile` defines the trusted CA set, matching
+            // Node's behavior where specifying a custom CA overrides the well-known/system
+            // CAs. Verifying with webpki directly also avoids relying on the platform
+            // verifier (such as macOS Security.framework / trustd).
+            builder = builder.tls_certs_only(std::iter::empty());
+        }
+        EffectiveTrustRoots::Bundled => {
+            // Android's platform verifier requires a JVM, which the standalone CLI does not have.
+            builder = builder.tls_certs_only(bundled_root_certs().iter().cloned());
+        }
+        EffectiveTrustRoots::Platform => {}
     }
-    Ok(apply_redirect_policy(builder, inputs.redirect_guard, forbid_redirects))
+    Ok(apply_redirect_policy(builder, inputs.redirect_guard, variant.forbid_redirects))
+}
+
+/// The trust roots selected for an HTTP client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EffectiveTrustRoots {
+    /// Custom CA certificates were provided; system / well-known roots are replaced.
+    CustomOnly,
+    /// Bundled Mozilla roots are used (either explicitly requested, fallback on Android,
+    /// or macOS sandbox fallback).
+    Bundled,
+    /// Platform trust store is used.
+    Platform,
+}
+
+/// Decide which trust root set to configure on the client builder based on
+/// whether custom CA roots were loaded and the requested fallback policy.
+pub(crate) fn select_trust_roots(
+    has_custom_ca: bool,
+    trust_roots: TrustRoots,
+) -> EffectiveTrustRoots {
+    if has_custom_ca {
+        EffectiveTrustRoots::CustomOnly
+    } else if cfg!(target_os = "android") || trust_roots == TrustRoots::Bundled {
+        EffectiveTrustRoots::Bundled
+    } else {
+        EffectiveTrustRoots::Platform
+    }
 }
 
 /// The proxy URL a setting names, treating an empty value as unset. See the
@@ -172,6 +227,7 @@ pub(super) struct CappedDnsResolver<Inner> {
 struct NativeDnsResolver;
 
 impl Resolve for NativeDnsResolver {
+    #[cfg(not(target_family = "wasm"))]
     fn resolve(&self, name: Name) -> Resolving {
         let host = name.as_str().to_owned();
         Box::pin(async move {
@@ -179,6 +235,21 @@ impl Resolve for NativeDnsResolver {
                 .map(|addrs| Box::new(addrs) as Addrs)
                 .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)
         })
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn resolve(&self, _name: Name) -> Resolving {
+        Box::pin(async {
+            Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Direct DNS resolution is unavailable in WebContainers",
+            )) as Box<dyn std::error::Error + Send + Sync>)
+        })
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn uses_host_resolution(&self) -> bool {
+        true
     }
 }
 
@@ -201,10 +272,6 @@ impl Resolve for NativeDnsResolver {
 /// which reqwest silently falls back to Google's public nameservers
 /// (pnpm/pnpm#14469). `getaddrinfo` also consults `nsswitch.conf`
 /// sources such as `nss-resolve` and `nss-mdns` that Hickory bypasses.
-pub(super) fn configure_dns(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
-    builder.dns_resolver(native_dns_resolver())
-}
-
 #[must_use]
 pub fn native_dns_resolver() -> Arc<dyn Resolve> {
     static RESOLVER: LazyLock<Arc<CappedDnsResolver<NativeDnsResolver>>> = LazyLock::new(|| {
@@ -214,25 +281,26 @@ pub fn native_dns_resolver() -> Arc<dyn Resolve> {
     Arc::clone(&RESOLVER) as Arc<dyn Resolve>
 }
 
-fn default_client_builder(settings: &NetworkSettings) -> reqwest::ClientBuilder {
+fn default_client_builder(
+    settings: &NetworkSettings,
+    decode_content: bool,
+) -> reqwest::ClientBuilder {
     let user_agent = HeaderValue::from_str(&settings.user_agent)
         .unwrap_or_else(|_| HeaderValue::from_static(DEFAULT_USER_AGENT));
     let mut default_headers = HeaderMap::with_capacity(1);
     default_headers.insert(USER_AGENT, user_agent);
-    let builder = Client::builder()
+    Client::builder()
         .http1_only()
-        // Request gzip and transparently decompress it. Packuments are the
-        // largest payloads pulled during resolution and registries serve
-        // them gzipped; tarballs are unaffected (no `Content-Encoding`, so
-        // store-integrity verification still sees the raw `.tgz`). Defaults
-        // to on with reqwest's `gzip` feature, but set explicitly so the
-        // intent is visible and survives a change to that default.
-        .gzip(true)
+        // Metadata clients let reqwest remove the content coding; archive
+        // clients leave it to the fetcher, which bounds the zstd window.
+        .gzip(decode_content)
+        .zstd(decode_content)
         .default_headers(default_headers)
         .connect_timeout(settings.fetch_timeout)
         .read_timeout(settings.fetch_timeout)
-        .pool_idle_timeout(Duration::from_secs(4));
-    configure_dns(builder)
+        .pool_idle_timeout(Duration::from_secs(4))
+        .pool_max_idle_per_host(super::DEFAULT_MAX_SOCKETS)
+        .tcp_keepalive(Some(Duration::from_secs(15)))
 }
 
 /// Build a [`Proxy`] that routes only requests whose target scheme matches

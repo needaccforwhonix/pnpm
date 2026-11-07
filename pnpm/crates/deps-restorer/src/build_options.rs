@@ -1,10 +1,13 @@
+pub(crate) use hoisted_bins::HoistedBinPlans;
+
+mod hoisted_bins;
+
 use pnpm_config::PackageImportMethod;
-use pnpm_executor::ScriptsPrependNodePath;
 use pnpm_lockfile::{PackageKey, ProjectSnapshot, SnapshotEntry};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{Mutex, atomic::AtomicBool},
+    sync::Mutex,
 };
 
 #[derive(Clone, Copy)]
@@ -13,10 +16,9 @@ pub struct BuildScriptOptions<'a> {
     /// Mirrors `config.user_agent`, stamped into each build script's
     /// `npm_config_user_agent`.
     pub user_agent: &'a str,
-    /// Mirrors `config.scripts_prepend_node_path`. Threaded through to
-    /// [`pnpm_executor::ScriptExecutionOptions::prepend_node_path`] for each
-    /// spawned lifecycle script. Default [`ScriptsPrependNodePath::Never`].
-    pub prepend_node_path: ScriptsPrependNodePath,
+    /// What goes on each build script's `PATH` besides its own package's
+    /// `node_modules/.bin` walk.
+    pub path: ScriptPath<'a>,
     /// Mirrors `config.script_shell`. Threaded through to
     /// [`pnpm_executor::ScriptExecutionOptions::shell`], so a workspace that
     /// configures a shell gets it for build scripts too, not only for
@@ -38,6 +40,33 @@ pub struct BuildScriptOptions<'a> {
     /// ignored-builds set. Patches still apply — a patch is applied
     /// even when scripts are suppressed.
     pub ignore: bool,
+    /// Engine check options for patched packages.
+    pub patched_engines: PatchedEngineCheck<'a>,
+}
+
+/// What goes on each build script's `PATH` besides its own package's
+/// `node_modules/.bin` walk.
+#[derive(Clone, Copy)]
+pub struct ScriptPath<'a> {
+    /// Mirrors `config.extra_bin_paths`: the workspace root's
+    /// `node_modules/.bin`.
+    pub extra_bin_paths: &'a [PathBuf],
+    /// Whether `config.hoist_pattern` hoists anything privately, which puts
+    /// hoisted bins in [`PatchedEngineCheck::install_state_dir`]'s
+    /// `node_modules/.bin`.
+    pub private_hoisting: bool,
+}
+
+/// Engine check options for patched packages.
+#[derive(Clone, Copy)]
+pub struct PatchedEngineCheck<'a> {
+    /// Whether strict engine checking is enabled.
+    pub engine_strict: bool,
+    /// Explicit Node.js version to check against, or `None` to detect ambient version.
+    pub node_version: Option<&'a str>,
+    /// [`pnpm_config::Config::install_state_dir`], whose `node_modules` holds
+    /// the privately hoisted links.
+    pub install_state_dir: Option<&'a Path>,
 }
 
 impl<'a> BuildScriptOptions<'a> {
@@ -48,22 +77,70 @@ impl<'a> BuildScriptOptions<'a> {
         Self {
             extra_env,
             user_agent: &config.user_agent,
-            prepend_node_path: crate::build_modules::exec_scripts_prepend_node_path(config),
+            path: ScriptPath {
+                extra_bin_paths: &config.extra_bin_paths,
+                private_hoisting: config.hoist_pattern
+                    .as_ref()
+                    .is_some_and(|patterns| !patterns.is_empty()),
+            },
             shell: config.script_shell.as_deref().map(Path::new),
             shell_emulator: config.shell_emulator,
             unsafe_perm: config.unsafe_perm,
             ignore: config.ignore_scripts,
+            patched_engines: PatchedEngineCheck {
+                engine_strict: config.effective_engine_strict(),
+                node_version: config.node_version.as_deref(),
+                install_state_dir: Some(&config.install_state_dir),
+            },
         }
+    }
+}
+
+/// The side-effects-cache rows `CreateVirtualStore`'s prefetch read from
+/// the store index, as the `is_built` gate looks them up.
+#[derive(Default, Clone, Copy)]
+pub struct CachedSideEffects<'a> {
+    /// Per-snapshot overlays, by cache key. `None` means no overlays were
+    /// prefetched, so the gate restores no cached build output.
+    pub overlays: Option<&'a crate::SideEffectsMapsBySnapshot>,
+    /// The raw rows the overlays were built from. An empty row has no
+    /// overlay, so only a rebuild with
+    /// [`crate::RebuildOptions::skip_if_has_side_effects_cache`] reads
+    /// it, to learn that the build already ran.
+    pub rows: Option<&'a crate::SideEffectsBySnapshot>,
+}
+
+impl<'a> CachedSideEffects<'a> {
+    /// The overlay recorded for `snapshot_key` under `cache_key`.
+    pub(crate) fn overlay(
+        self,
+        snapshot_key: &PackageKey,
+        cache_key: &str,
+    ) -> Option<&'a pnpm_store_dir::SideEffectsOverlay> {
+        self.overlays?.get(snapshot_key)?.get(cache_key)
+    }
+
+    /// Whether the row recorded for `snapshot_key` under `cache_key` is
+    /// empty: its build ran and changed nothing inside the package.
+    pub(crate) fn has_empty_row(self, snapshot_key: &PackageKey, cache_key: &str) -> bool {
+        self.rows
+            .and_then(|rows| rows.get(snapshot_key))
+            .and_then(|diffs| diffs.get(cache_key))
+            .is_some_and(pnpm_store_dir::SideEffectsDiff::is_empty)
+    }
+
+    pub(crate) fn has_overlays(self) -> bool {
+        self.overlays.is_some_and(|overlays| !overlays.is_empty())
+    }
+
+    pub(crate) fn has_rows(self) -> bool {
+        self.rows.is_some_and(|rows| !rows.is_empty())
     }
 }
 
 #[derive(Clone, Copy)]
 pub struct BuildCacheContext<'a> {
-    /// Per-snapshot side-effects-cache overlays — passed in from
-    /// `CreateVirtualStore`'s prefetch. `None` means the cache is
-    /// disabled or no rows were prefetched; the gate falls through
-    /// to "rebuild" for every snapshot.
-    pub maps_by_snapshot: Option<&'a crate::SideEffectsMapsBySnapshot>,
+    pub side_effects: CachedSideEffects<'a>,
     /// `<platform>;<arch>;node<major>` — the prefix part of the
     /// dep-state cache key. Computed once at install
     /// start by [`pnpm_graph_hasher::detect_node_major`] +
@@ -101,6 +178,8 @@ pub struct BuildCacheContext<'a> {
 
 #[derive(Clone, Copy)]
 pub struct BuildLayout<'a> {
+    /// Bin-link settings retained when completed dependency builds change executables.
+    pub link_options: &'a pnpm_cmd_shim::LinkBinsOptions,
     /// Install-scoped slot-directory mapping (GVS-aware). The layout
     /// knows the per-snapshot subdirectory shape (legacy flat-name vs
     /// GVS `<scope>/<name>/<version>/<hash>`). See
@@ -108,16 +187,14 @@ pub struct BuildLayout<'a> {
     pub layout: &'a crate::VirtualStoreLayout,
 
     /// Per-snapshot `pkgRoot` override, populated by the hoisted
-    /// linker with the slice 4 walker's
+    /// linker with the walker's
     /// [`crate::DependenciesGraphNode::dir`] values. When `Some`,
     /// every `pkgRoot` lookup goes through this map instead of the
     /// virtual-store-layout slot computation; a missing entry means
     /// the snapshot didn't make it into the hoisted graph (skipped
     /// optional, etc.) and the build phase silently passes over it.
     /// `None` for the isolated linker — its slot directories are
-    /// recovered from [`crate::VirtualStoreLayout::slot_dir`]. The
-    /// two-mode `pkgRoot` selection (override map vs. layout slot)
-    /// is handled by `PkgRoots`.
+    /// recovered from [`crate::VirtualStoreLayout::slot_dir`].
     ///
     /// One snapshot can occupy several directories: the walker nests a
     /// second copy of a package under a sibling when a version conflict
@@ -180,14 +257,32 @@ pub struct BuildGraphInputs<'a> {
     /// materialized package directory.
     pub requires_build_by_snapshot: Option<&'a crate::RequiresBuildBySnapshot>,
     pub importers: &'a HashMap<String, ProjectSnapshot>,
+    pub dependency_groups: Option<&'a [pnpm_package_manifest::DependencyGroup]>,
+    /// The snapshots this run may build, patch, or restore a cached build
+    /// into. A candidate outside it is left as it is on disk and is not
+    /// reported as ignored or deferred. `None` considers every candidate.
+    pub build_scope: Option<&'a HashSet<PackageKey>>,
+    /// The platforms the side-effects cache keys select each `variations`
+    /// resolution's archive for, as the install links it; `None` for the
+    /// host's.
+    pub variant_platforms: Option<&'a crate::platform_selection::VariantPlatforms>,
 }
 
 #[derive(Clone, Copy)]
 pub struct BuildSnapshotInputs<'a> {
+    pub(crate) skipped: &'a crate::SkippedSnapshots,
     pub(crate) snapshots: &'a HashMap<PackageKey, SnapshotEntry>,
     pub(crate) packages: Option<&'a HashMap<PackageKey, pnpm_lockfile::PackageMetadata>>,
     pub(crate) patches: Option<&'a HashMap<PackageKey, pnpm_patching::ExtendedPatchInfo>>,
     pub(crate) requires_build_map: &'a HashMap<PackageKey, bool>,
+    pub(crate) importers: &'a HashMap<String, ProjectSnapshot>,
+    pub(crate) build_scope: Option<&'a HashSet<PackageKey>>,
+}
+
+#[derive(Default)]
+pub(crate) struct BuildBinState {
+    pub(crate) slot_mutations: Mutex<HashSet<PackageKey>>,
+    pub(crate) refreshed_hoisted_bins: HoistedBinPlans,
 }
 
 #[derive(Clone, Copy)]
@@ -196,9 +291,19 @@ pub struct BuildProgress<'a> {
         Option<&'a HashMap<PackageKey, pnpm_graph_hasher::DepsGraphNode<PackageKey>>>,
     pub(crate) deps_state_cache: &'a Mutex<pnpm_graph_hasher::DepsStateCache<PackageKey>>,
     pub(crate) ignored_builds: &'a Mutex<BTreeSet<String>>,
-    /// Raised before any write that can change a linked slot's contents
+    /// Recorded before any write that can change a linked slot's contents
     /// (side-effects overlay, patch, lifecycle script) — set pre-attempt, so a
     /// half-applied write still counts. See
     /// [`crate::BuildModulesOutput::mutated_slots`].
-    pub(crate) slot_mutations: &'a AtomicBool,
+    pub(crate) slot_mutations: &'a Mutex<HashSet<PackageKey>>,
+    pub(crate) refreshed_hoisted_bins: &'a HoistedBinPlans,
+}
+
+impl BuildProgress<'_> {
+    pub(crate) fn record_slot_mutation(&self, key: &PackageKey) {
+        self.slot_mutations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key.clone());
+    }
 }

@@ -1,10 +1,10 @@
 use super::{
-    PNPM_VERSION, default_cache_dir, default_child_concurrency,
-    default_child_concurrency_with_parallelism, default_config_dir, default_fetch_timeout,
-    default_store_dir, default_unsafe_perm, default_user_agent, default_virtual_store_dir,
-    default_workspace_concurrency, install_command_for, is_unsafe_perm_posix,
+    PNPM_VERSION, default_cache_dir, default_child_concurrency, default_config_dir,
+    default_fetch_timeout, default_install_state_dir, default_pnpm_home_dir, default_store_dir,
+    default_unsafe_perm, default_user_agent, default_workspace_concurrency,
+    default_workspace_concurrency_with_parallelism, install_command_for, is_unsafe_perm_posix,
     resolve_child_concurrency, resolve_child_concurrency_with_parallelism,
-    resolve_configured_state_dir,
+    resolve_configured_state_dir, store_dir_for_os,
 };
 use crate::api::{EnvVar, GetCurrentDir, GetHomeDir};
 use pnpm_store_dir::{STORE_VERSION, StoreDir};
@@ -60,9 +60,7 @@ fn configured_relative_state_dir_rejects_a_symlink_escape() {
 
 /// The `home_dir` and `current_dir` capability impls call
 /// `unreachable!` because the early `PNPM_HOME` return short-circuits
-/// before either is consumed. Matches the worked example in
-/// `pnpm/CODE_STYLE_GUIDE.md` (Dependency injection for tests):
-/// satisfy the bound, document the precondition.
+/// before either is consumed.
 #[test]
 fn test_default_store_dir_with_pnpm_home_env() {
     struct EnvWithPnpmHome;
@@ -83,6 +81,51 @@ fn test_default_store_dir_with_pnpm_home_env() {
     }
     let store_dir = default_store_dir::<EnvWithPnpmHome>();
     assert_eq!(display_store_dir(&store_dir), format!("/tmp/pnpm-home/store/{STORE_VERSION}"));
+}
+
+#[cfg(not(windows))]
+#[test]
+fn test_default_pnpm_home_dir_keeps_percent_refs_off_windows() {
+    struct EnvWithPercentHome;
+    impl EnvVar for EnvWithPercentHome {
+        fn var(name: &str) -> Option<String> {
+            match name {
+                "PNPM_HOME" => Some("%SOME_ENV%/pnpm".to_owned()),
+                "SOME_ENV" => Some("/opt/tools".to_owned()),
+                _ => None,
+            }
+        }
+    }
+    impl GetHomeDir for EnvWithPercentHome {
+        fn home_dir() -> Option<PathBuf> {
+            unreachable!("home_dir must not be called when PNPM_HOME is set");
+        }
+    }
+    assert_eq!(
+        default_pnpm_home_dir::<EnvWithPercentHome>(),
+        Some(PathBuf::from("%SOME_ENV%/pnpm")),
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn test_default_pnpm_home_dir_expands_nested_percent_refs() {
+    struct EnvWithNestedHome;
+    impl EnvVar for EnvWithNestedHome {
+        fn var(name: &str) -> Option<String> {
+            match name {
+                "PNPM_HOME" => Some("%SOME_ENV%/pnpm".to_owned()),
+                "SOME_ENV" => Some(r"C:\tools".to_owned()),
+                _ => None,
+            }
+        }
+    }
+    impl GetHomeDir for EnvWithNestedHome {
+        fn home_dir() -> Option<PathBuf> {
+            unreachable!("home_dir must not be called when PNPM_HOME is set");
+        }
+    }
+    assert_eq!(default_pnpm_home_dir::<EnvWithNestedHome>(), Some(PathBuf::from(r"C:\tools/pnpm")));
 }
 
 /// The fake `Sys` here returns a value for `XDG_DATA_HOME` and `None`
@@ -139,11 +182,27 @@ fn test_default_store_dir_falls_back_to_home_dir() {
     }
     let store_dir = default_store_dir::<NoEnvWithHome>();
     let expected = match std::env::consts::OS {
-        "linux" => format!("/home/test-user/.local/share/pnpm/store/{STORE_VERSION}"),
         "macos" => format!("/home/test-user/Library/pnpm/store/{STORE_VERSION}"),
-        other => panic!("unexpected target OS in test: {other}"),
+        _ => format!("/home/test-user/.local/share/pnpm/store/{STORE_VERSION}"),
     };
     assert_eq!(display_store_dir(&store_dir), expected);
+}
+
+/// Calls [`store_dir_for_os`] rather than [`default_store_dir`] so the
+/// Unix fallback is pinned for OS strings no CI runner builds on.
+#[test]
+fn test_store_dir_for_os_unix_fallback_covers_freebsd() {
+    let home = PathBuf::from("/home/test-user");
+    let unix = home.join(".local/share/pnpm/store");
+    assert_eq!(store_dir_for_os(&home, "freebsd"), unix);
+    assert_eq!(store_dir_for_os(&home, "netbsd"), unix);
+    assert_eq!(store_dir_for_os(&home, "linux"), unix);
+}
+
+#[test]
+fn test_store_dir_for_os_macos_keeps_library_layout() {
+    let home = PathBuf::from("/home/test-user");
+    assert_eq!(store_dir_for_os(&home, "macos"), home.join("Library/pnpm/store"));
 }
 
 /// The [`GetHomeDir`] impl is `unreachable!` because the
@@ -263,29 +322,32 @@ fn test_default_config_dir_without_home_returns_none() {
 
 /// Default workspace concurrency when the CPU count is below 4.
 #[test]
-fn default_child_concurrency_with_parallelism_below_four() {
-    assert_eq!(default_child_concurrency_with_parallelism(1), 1);
+fn default_workspace_concurrency_with_parallelism_below_four() {
+    assert_eq!(default_workspace_concurrency_with_parallelism(1), 1);
 }
 
 /// Default workspace concurrency when the CPU count is above 4.
 #[test]
-fn default_child_concurrency_with_parallelism_above_four() {
-    assert_eq!(default_child_concurrency_with_parallelism(5), 4);
+fn default_workspace_concurrency_with_parallelism_above_four() {
+    assert_eq!(default_workspace_concurrency_with_parallelism(5), 4);
 }
 
 /// Default workspace concurrency when the CPU count is exactly 4.
 #[test]
-fn default_child_concurrency_with_parallelism_at_four() {
-    assert_eq!(default_child_concurrency_with_parallelism(4), 4);
+fn default_workspace_concurrency_with_parallelism_at_four() {
+    assert_eq!(default_workspace_concurrency_with_parallelism(4), 4);
 }
 
-/// `workspaceConcurrency` and `childConcurrency` resolve through the
-/// same default-concurrency formula, so the two pacquet defaults must
-/// agree. This pins that parity so a future change to one default that
-/// forgets the other fails here.
+/// pnpm's install and build entry points default `childConcurrency` to
+/// `5` on every host, so pacquet must too. `workspaceConcurrency` is the
+/// setting that scales with the core count, capped at 4.
 #[test]
-fn default_workspace_concurrency_matches_default_child_concurrency() {
-    assert_eq!(default_workspace_concurrency(), default_child_concurrency());
+fn default_child_concurrency_is_five() {
+    assert_eq!(default_child_concurrency(), 5);
+    assert_eq!(default_workspace_concurrency_with_parallelism(2), 2);
+    assert_eq!(default_workspace_concurrency_with_parallelism(4), 4);
+    assert_eq!(default_workspace_concurrency_with_parallelism(8), 4);
+    assert!(default_workspace_concurrency() <= 4, "the workspace default is capped at 4");
 }
 
 /// Default workspace concurrency resolves to 4 when at least 4 cores
@@ -321,9 +383,7 @@ fn resolve_child_concurrency_positive_amount() {
 }
 
 /// `resolve_child_concurrency(Some(i32::MIN))` must not panic.
-/// A naive `(-n) as u32` overflows in debug builds when
-/// `n == i32::MIN` because the negation itself overflows;
-/// `unsigned_abs` is the safe path. `i32::MIN.unsigned_abs()`
+/// `i32::MIN.unsigned_abs()`
 /// is `2_147_483_648`, well above any plausible host
 /// parallelism, so `saturating_sub` produces `0` and `.max(1)`
 /// lifts to exactly `1` — assert that precise value so a wrong
@@ -370,7 +430,7 @@ fn default_unsafe_perm_on_cygwin_is_always_true() {
 #[cfg(windows)]
 #[test]
 fn test_should_get_the_correct_drive_letter() {
-    let current_dir = Path::new("C:\\Users\\user\\project");
+    let current_dir = Path::new(r"C:\Users\user\project");
     let drive_letter = get_drive_letter(current_dir);
     assert_eq!(drive_letter, Some('C'));
 }
@@ -378,11 +438,23 @@ fn test_should_get_the_correct_drive_letter() {
 #[cfg(windows)]
 #[test]
 fn test_default_store_dir_with_windows_diff_drive() {
-    let current_dir = Path::new("D:\\Users\\user\\project");
-    let home_dir = Path::new("C:\\Users\\user");
+    let current_dir = Path::new(r"D:\Users\user\project");
+    let home_dir = Path::new(r"C:\Users\user");
 
     let store_dir = default_store_dir_windows(home_dir, current_dir);
     assert_eq!(store_dir, Path::new(r"D:\.pnpm-store"));
+}
+
+#[cfg(windows)]
+#[test]
+fn test_default_store_dir_with_unc_current_dir_does_not_panic() {
+    let current_dir = Path::new(r"\\server\share\project");
+    let home_dir = Path::new(r"C:\Users\user");
+
+    assert_eq!(
+        default_store_dir_windows(home_dir, current_dir),
+        Path::new(r"\\server\share\.pnpm-store"),
+    );
 }
 
 /// Compares the rendered string rather than the `Path`. On Windows
@@ -393,27 +465,27 @@ fn test_default_store_dir_with_windows_diff_drive() {
 #[cfg(windows)]
 #[test]
 fn test_dynamic_default_store_dir_with_windows_same_drive() {
-    let current_dir = Path::new("C:\\Users\\user\\project");
-    let home_dir = Path::new("C:\\Users\\user");
+    let current_dir = Path::new(r"C:\Users\user\project");
+    let home_dir = Path::new(r"C:\Users\user");
 
     let store_dir = default_store_dir_windows(home_dir, current_dir);
     assert_eq!(store_dir.to_str().unwrap(), r"C:\Users\user\AppData\Local\pnpm\store");
 }
 
-/// `default_virtual_store_dir` joins onto the current directory, so the
+/// `default_install_state_dir` joins onto the current directory, so the
 /// separator it appends is what lands in the `virtualStoreDir` recorded
 /// in `.modules.yaml`. Compares the rendered string for the reason given
-/// on `test_dynamic_default_store_dir_with_windows_same_drive`, through
+/// in the Windows store-directory test above, through
 /// `display` so a working directory that is not valid Unicode renders
 /// lossily instead of panicking before the assertion.
 #[test]
 #[cfg_attr(not(windows), ignore = "only one path separator style is tested")]
-fn test_default_virtual_store_dir_uses_native_separators() {
-    let virtual_store_dir = default_virtual_store_dir();
-    let rendered = virtual_store_dir.display().to_string();
+fn test_default_install_state_dir_uses_native_separators() {
+    let install_state_dir = default_install_state_dir();
+    let rendered = install_state_dir.display().to_string();
     assert!(
         rendered.ends_with(r"\node_modules\.pnpm"),
-        "virtual store dir {rendered:?} must end with a backslash-separated suffix",
+        "install state dir {rendered:?} must end with a backslash-separated suffix",
     );
 }
 

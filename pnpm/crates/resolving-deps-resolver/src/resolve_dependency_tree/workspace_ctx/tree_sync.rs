@@ -178,7 +178,7 @@ impl super::WorkspaceTreeStorage {
                     entry.insert(pkg.clone());
                 }
                 Entry::Occupied(entry) => {
-                    if entry.get().peer_dependencies != pkg.peer_dependencies {
+                    if entry.get().peer_set.taken() != pkg.peer_set.taken() {
                         return false;
                     }
                 }
@@ -201,6 +201,9 @@ impl super::WorkspaceTreeStorage {
                 Entry::Occupied(mut entry) => {
                     if entry.get().depth > node.depth {
                         entry.get_mut().depth = node.depth;
+                    }
+                    if matches!(node.children, crate::resolved_tree::TreeChildren::Lazy) {
+                        entry.get_mut().children = crate::resolved_tree::TreeChildren::Lazy;
                     }
                 }
             }
@@ -232,7 +235,7 @@ impl super::WorkspaceTreeStorage {
     pub(crate) fn provider_pkg_ids<'node_ids>(
         &self,
         node_ids: impl Iterator<Item = &'node_ids NodeId>,
-    ) -> HashMap<NodeId, String> {
+    ) -> HashMap<NodeId, Arc<str>> {
         let dependencies_tree = lock_recoverable(&self.dependencies_tree);
         let packages = lock_recoverable(&self.packages);
         node_ids
@@ -240,7 +243,7 @@ impl super::WorkspaceTreeStorage {
                 let pkg_id = &dependencies_tree.get(node_id)?.resolved_package_id;
                 packages
                     .contains_key(&**pkg_id)
-                    .then(|| (node_id.clone(), pkg_id.to_string()))
+                    .then(|| (node_id.clone(), Arc::clone(pkg_id)))
             })
             .collect()
     }

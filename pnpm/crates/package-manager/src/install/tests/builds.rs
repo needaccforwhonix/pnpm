@@ -2,12 +2,13 @@ use super::{
     super::{Install, InstallError, ProjectMutation, project_lifecycle_graph},
     InstallDirs,
 };
-use crate::PolicyExcludes;
+use crate::{PolicyExcludes, ResolvedPackages};
 use pnpm_config::Config;
 use pnpm_lockfile::{Lockfile, MaybeLazyLockfile};
 use pnpm_package_manifest::{DependencyGroup, PackageManifest};
 use pnpm_reporter::SilentReporter;
 use pnpm_testing_utils::registry::TestRegistry;
+use std::{fs, sync::Arc};
 use tempfile::tempdir;
 use text_block_macros::text_block;
 
@@ -86,7 +87,7 @@ fn build_modules_manifest_serializes_skipped_set() {
     let mut config = Config::new();
     config.store_dir = dir.path().join("store").into();
     config.modules_dir = dir.path().join("node_modules");
-    config.virtual_store_dir = dir.path().join("node_modules/.pacquet");
+    config.install_state_dir = dir.path().join("node_modules/.pacquet");
     let config = config.leak();
 
     let key1: PackageKey = "darwin-only-pkg@1.0.0".parse().unwrap();
@@ -138,7 +139,7 @@ fn build_modules_manifest_skipped_is_empty_on_empty_set() {
     let mut config = Config::new();
     config.store_dir = dir.path().join("store").into();
     config.modules_dir = dir.path().join("node_modules");
-    config.virtual_store_dir = dir.path().join("node_modules/.pacquet");
+    config.install_state_dir = dir.path().join("node_modules/.pacquet");
     let config = config.leak();
 
     let manifest = super::super::build_modules_manifest(
@@ -174,8 +175,8 @@ async fn fresh_install_uses_final_peer_suffix_for_transitive_pending_peer() {
     let mut config = Config::new();
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
-    config.registry = mock_instance.url();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
+    config.registry = mock_instance.url().to_string();
     let config = config.leak();
 
     Install {
@@ -227,6 +228,8 @@ async fn fresh_install_uses_final_peer_suffix_for_transitive_pending_peer() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -266,4 +269,100 @@ fn unapproved_recorded_ignored_builds_surfaces_invalid_allow_builds() {
     let config = config.leak();
 
     assert!(super::super::unapproved_recorded_ignored_builds(&modules, config).is_err());
+}
+
+async fn install_in_memory_project(dirs: &InstallDirs, manifest: &PackageManifest) {
+    let config = Config {
+        store_dir: dirs.store_dir.clone().into(),
+        cache_dir: dirs.path().join("cache"),
+        modules_dir: dirs.modules_dir.clone(),
+        install_state_dir: dirs.virtual_store_dir.clone(),
+        extra_bin_paths: vec![dirs.project_root.join("bin")],
+        offline: true,
+        lockfile: false,
+        workspace_search_skipped: true,
+        ..Config::new()
+    }
+    .leak();
+    let resolved_packages = ResolvedPackages::default();
+    let http_client: Arc<pnpm_network::ThrottledClient> = Arc::default();
+    Install::new(
+        Arc::default(),
+        &resolved_packages,
+        (&http_client, Arc::clone(&http_client)),
+        config,
+        manifest,
+        MaybeLazyLockfile::Loaded(None),
+        vec![DependencyGroup::Prod, DependencyGroup::Dev, DependencyGroup::Optional],
+    )
+    .run::<SilentReporter>()
+    .await
+    .expect("install in-memory project");
+}
+
+#[tokio::test]
+async fn native_preparation_preserves_in_memory_non_native_scripts() {
+    for value in [
+        serde_json::json!({ "gypfile": false, "scripts": { "postinstall": "node marker.cjs" } }),
+        serde_json::json!({ "scripts": { "install": "node marker.cjs" } }),
+        serde_json::json!({ "scripts": { "preinstall": "node marker.cjs" } }),
+    ] {
+        let dirs = InstallDirs::new();
+        fs::create_dir_all(&dirs.project_root).unwrap();
+        fs::write(dirs.project_root.join("binding.gyp"), "{}").unwrap();
+        fs::write(
+            dirs.project_root.join("marker.cjs"),
+            "require('fs').writeFileSync('explicit-marker', 'ran')",
+        )
+        .unwrap();
+        let manifest = PackageManifest::from_value(dirs.project_root.join("package.json"), value);
+        install_in_memory_project(&dirs, &manifest).await;
+        assert!(!manifest.path().exists(), "published a non-native API manifest");
+        assert!(
+            !dirs.project_root.join("explicit-marker").exists(),
+            "activated an explicit script",
+        );
+    }
+}
+
+#[tokio::test]
+async fn native_preparation_preserves_existing_alternate_manifests() {
+    for (name, contents) in [
+        (
+            "package.json5",
+            "{version: '2.0.0', gypfile: false, scripts: {install: 'node marker.cjs'}}\n",
+        ),
+        ("package.yaml", "version: 2.0.0\ngypfile: false\nscripts:\n  install: node marker.cjs\n"),
+    ] {
+        let dirs = InstallDirs::new();
+        let bin = dirs.project_root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(dirs.project_root.join(name), contents).unwrap();
+        fs::write(dirs.project_root.join("binding.gyp"), "{}").unwrap();
+        fs::write(
+            dirs.project_root.join("marker.cjs"),
+            "require('fs').writeFileSync('alternate-marker', process.env.npm_package_version)",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let compiler = bin.join("node-gyp");
+            fs::write(&compiler, "#!/bin/sh\nexit 17\n").unwrap();
+            fs::set_permissions(&compiler, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        #[cfg(windows)]
+        fs::write(bin.join("node-gyp.cmd"), "@exit /b 17\r\n").unwrap();
+        let manifest = PackageManifest::from_value(
+            dirs.project_root.join("package.json"),
+            serde_json::json!({}),
+        );
+        install_in_memory_project(&dirs, &manifest).await;
+        assert!(!manifest.path().exists(), "shadowed {name}");
+        assert_eq!(fs::read_to_string(dirs.project_root.join(name)).unwrap(), contents);
+        assert_eq!(
+            fs::read_to_string(dirs.project_root.join("alternate-marker")).unwrap(),
+            "2.0.0",
+        );
+    }
 }

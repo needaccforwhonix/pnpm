@@ -1,27 +1,9 @@
 use super::{
     AutoExcludeRoot, Config, Display, Entry, Hash, HashMap, HashSet, LazyLockfile, Lockfile,
     PackageKey, Path, PathBuf, SnapshotEntry, State, discover_workspace_projects,
-    importer_root_dir, no_projects_matched_message, notice_workspace_dir,
-    select_recursive_projects, selected_importer_ids, validate_importer_id,
+    importer_root_dir, print_no_projects_matched, select_recursive_projects,
+    selected_workspace_importer_ids, selectors_narrow_the_run, validate_importer_id,
 };
-
-/// Whether the run asked for a subset of the workspace: any `--filter` /
-/// `--filter-prod` selector, or `--workspace-root`. Without one, every
-/// importer in the lockfile is in scope.
-pub(super) fn selectors_narrow_the_run(config: &Config) -> bool {
-    !config.filter.is_empty() || !config.filter_prod.is_empty() || config.workspace_root
-}
-
-/// The lockfile importer ids of the workspace projects the run's selectors
-/// selected.
-fn selected_workspace_importer_ids(state: &State) -> miette::Result<HashSet<String>> {
-    let project_dir = state.project_dir();
-    let workspace_root = state.config.workspace_dir.as_deref().unwrap_or(project_dir);
-    let (projects, _) = discover_workspace_projects(workspace_root, state.config)?;
-    let selection =
-        select_recursive_projects(&projects, state.config, project_dir, AutoExcludeRoot::Disabled)?;
-    Ok(selected_importer_ids(&selection, state.lockfile_dir()).into_iter().collect())
-}
 
 /// The selected importer ids the lockfile has no entry for, sorted so the
 /// error names them in a stable order.
@@ -209,7 +191,7 @@ pub(super) fn merged_dedicated_lockfile_state(
 fn anchored_virtual_store_dir(config: &Config, project_dir: &Path) -> PathBuf {
     let mut project_config = config.clone();
     project_config.anchor_lockfile_paths(project_dir);
-    project_config.effective_virtual_store_dir().to_path_buf()
+    project_config.virtual_store_dir().to_path_buf()
 }
 
 /// Re-key a dedicated lockfile's importers from its own root to the
@@ -273,10 +255,10 @@ pub(super) fn select_importer_ids(
     if !selectors_narrow_the_run(state.config) {
         return Ok(Some(all_importer_ids));
     }
-    let selected = selected_workspace_importer_ids(state)?;
+    let selected =
+        selected_workspace_importer_ids(state.config, state.project_dir(), state.lockfile_dir())?;
     if selected.is_empty() {
-        let workspace_dir = notice_workspace_dir(state.config, state.project_dir());
-        println!("{}", no_projects_matched_message(workspace_dir));
+        print_no_projects_matched(state.config, state.project_dir());
         return Ok(None);
     }
     // Selecting through the workspace can name a project the lockfile has

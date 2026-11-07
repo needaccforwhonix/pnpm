@@ -1,14 +1,10 @@
 //! Build the per-install list of [`ResolutionVerifier`]s the lockfile
-//! gate fans out across. Currently only the npm-resolver verifier
-//! plugs in; future resolver-side verifiers append to the same vec.
+//! gate fans out across.
 //!
 //! Returning `Vec<Arc<dyn ResolutionVerifier>>` matches the runner's
 //! input shape ([`pnpm_lockfile_verification::verify_lockfile_resolutions()`])
 //! and lets the install path skip the call entirely when the vec is
-//! empty (the runner is a no-op on `&[]`). The function never returns
-//! an error; an invalid exclude pattern surfaces from
-//! [`pnpm_config::version_policy::create_package_version_policy()`]
-//! and propagates via [`BuildVerifiersError`].
+//! empty (the runner is a no-op on `&[]`).
 //!
 //! The verifier list is built from the install's config fields just
 //! before the lockfile-resolution gate runs over it.
@@ -24,11 +20,9 @@ use pnpm_config::{
 use pnpm_network::{AuthHeaders, ThrottledClient};
 use pnpm_resolving_npm_resolver::{
     CreateNpmResolutionVerifierOptions, MergeNamedRegistriesError, ObservedDistStats,
-    PackageMetaCache, create_npm_resolution_verifier, merge_named_registries,
+    PackageMetaCache, VerifierLookups, create_npm_resolution_verifier, merge_named_registries,
 };
 use pnpm_resolving_resolver_base::{PlannedCanonicalFetches, ResolutionVerifier};
-
-use crate::retry_config::retry_opts_from_config;
 
 /// Error from [`build_resolution_verifiers`]. Wraps the inner error so
 /// the install command can route the diagnostic code without
@@ -78,6 +72,9 @@ pub enum BuildVerifiersError {
 /// `observed_dist_stats` is the optional [`ObservedDistStats`] sink
 /// the npm verifier fills with each verified entry's `dist` work
 /// statistics; pass `None` when the caller has no use for them.
+///
+/// `lookups` shares the npm verifier's registry lookups with the
+/// verifiers of other installs; see [`VerifierLookups`].
 pub fn build_resolution_verifiers(
     config: &Config,
     http_client: Arc<ThrottledClient>,
@@ -85,6 +82,7 @@ pub fn build_resolution_verifiers(
     auth_override: Option<Arc<AuthHeaders>>,
     observed_dist_stats: Option<ObservedDistStats>,
     planned_canonical_fetches: Option<PlannedCanonicalFetches>,
+    lookups: Option<VerifierLookups>,
 ) -> Result<Vec<Arc<dyn ResolutionVerifier>>, BuildVerifiersError> {
     let mut verifiers: Vec<Arc<dyn ResolutionVerifier>> = Vec::new();
 
@@ -94,6 +92,7 @@ pub fn build_resolution_verifiers(
     let opts = CreateNpmResolutionVerifierOptions {
         registries,
         registries_by_prefix,
+        registry_options_by_url: Some(config.registry_options_by_url.clone()),
         now: None,
         release_age: pnpm_resolving_npm_resolver::VerificationReleaseAgeOptions {
             minimum_minutes: config.resolved_minimum_release_age(),
@@ -117,11 +116,12 @@ pub fn build_resolution_verifiers(
             cache_dir: Some(config.cache_dir.clone()),
             meta_cache,
             offline: config.offline,
-            retry_opts: retry_opts_from_config(config),
+            retry_opts: config.retry_opts(),
         },
         artifacts: pnpm_resolving_npm_resolver::VerificationArtifacts {
             observed_stats: observed_dist_stats,
             canonical_fetches: planned_canonical_fetches,
+            lookups,
         },
     };
 

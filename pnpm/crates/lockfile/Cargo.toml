@@ -16,8 +16,13 @@ pnpm-crypto-hash = { workspace = true }
 pnpm-deps-path = { workspace = true }
 pnpm-diagnostics = { workspace = true }
 pnpm-fs = { workspace = true }
+pnpm-local-spec = { workspace = true }
 pnpm-package-manifest = { workspace = true }
+pnpm-patching-config = { workspace = true }
+pnpm-platform-variants = { workspace = true }
 pnpm-resolving-parse-wanted-dependency = { workspace = true }
+pnpm-semver-include-prerelease = { workspace = true }
+pnpm-tool-protocol = { workspace = true }
 
 derive_more = { workspace = true }
 indexmap = { workspace = true }
@@ -36,6 +41,9 @@ url = { workspace = true }
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }
 text-block-macros = { workspace = true }
+
+[target.'cfg(windows)'.dev-dependencies]
+pnpm-fs = { workspace = true, features = ["test"] }
 
 [lints]
 workspace = true

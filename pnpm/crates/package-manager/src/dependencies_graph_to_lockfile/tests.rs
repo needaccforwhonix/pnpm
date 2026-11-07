@@ -1,3 +1,5 @@
+mod peer_proptest;
+
 mod runtimes;
 
 mod resolution;
@@ -21,14 +23,10 @@ use super::{
 use indexmap::IndexMap;
 use pnpm_deps_path::DepPath;
 use pnpm_lockfile::{
-    DirectoryResolution, ImporterDepVersion, LockfileResolution, PkgName, PkgNameVer,
-    ProjectSnapshot, RegistryResolution, ResolvedDependencyMap, ResolvedDependencySpec,
-    TarballResolution,
+    DirectoryResolution, LockfileResolution, PkgNameVer, RegistryResolution, TarballResolution,
 };
 use pnpm_package_manifest::PackageManifest;
-use pnpm_resolving_deps_resolver::{
-    DependenciesGraph, DependenciesGraphNode, PeerDep, UpdateReuseScope,
-};
+use pnpm_resolving_deps_resolver::{DependenciesGraph, DependenciesGraphNode, PeerDep};
 use pnpm_resolving_resolver_base::{PkgResolutionId, ResolveResult};
 use rustc_hash::FxHashSet as HashSet;
 
@@ -37,6 +35,11 @@ static EMPTY_REGISTRY_OPTIONS: std::collections::BTreeMap<String, pnpm_lockfile:
 
 static EMPTY_NAMED_REGISTRIES: std::sync::LazyLock<std::collections::HashMap<String, String>> =
     std::sync::LazyLock::new(std::collections::HashMap::new);
+
+static NPM_REGISTRIES: std::sync::LazyLock<std::collections::HashMap<String, String>> =
+    std::sync::LazyLock::new(|| {
+        [("default".to_string(), "https://registry.npmjs.org".to_string())].into()
+    });
 use serde_json::json;
 use ssri::Integrity;
 use std::{collections::BTreeMap, str::FromStr, sync::Arc};
@@ -75,27 +78,28 @@ fn single_importer_opts<'a>(
             auto_install_peers,
             dedupe_peers: None,
             exclude_links_from_lockfile,
+            add_missing_peer_types: None,
+            project_scoped_optional_peers: None,
             inject_workspace_packages: false,
             peers_suffix_max_length: None,
+            integrity_target: None,
+            resolution: pnpm_lockfile::ResolutionSettings::default(),
         },
         metadata_sources: crate::PackageMetadataSources {
             registries_by_prefix: &EMPTY_NAMED_REGISTRIES,
             registry_options_by_url: &EMPTY_REGISTRY_OPTIONS,
-            registry: "https://registry.npmjs.org",
+            registries: &NPM_REGISTRIES,
             lockfile_include_tarball_url: false,
             previous_packages: None,
         },
         manifest_settings: crate::LockfileManifestSettings {
+            include_peer_dependencies: false,
             overrides,
             ignored_optional_dependencies,
             patched_dependencies: None,
             package_extensions_checksum: None,
             pnpmfile_checksum: None,
-        },
-        reuse: crate::LockfileImporterReuse {
-            previous_importers: None,
-            scope: UpdateReuseScope::All,
-            scopes_by_importer: BTreeMap::new(),
+            untracked_pnpmfile_read_package_hook: None,
         },
     }
 }
@@ -123,6 +127,7 @@ fn make_resolve_result(name: &str, version: &str, manifest: serde_json::Value) -
             latest: None,
             published_at: None,
             manifest: Some(std::sync::Arc::new(manifest)),
+            non_deprecated_alternative: None,
         },
     }
 }
@@ -161,13 +166,12 @@ fn make_node_with_optional(
         resolved_package_id: format!("{name}@{version}"),
         resolve_result: std::sync::Arc::new(make_resolve_result(name, version, manifest)),
         depth: 1,
-        installable: true,
         is_pure: true,
         optional,
         edges: pnpm_resolving_deps_resolver::ResolvedDependencyEdges {
             children,
             optional_children: HashSet::default(),
-            peer_dependencies,
+            peer_set: pnpm_resolving_deps_resolver::PeerSet::taking_all(peer_dependencies),
             transitive_peer_dependencies,
             resolved_peer_names: HashSet::default(),
         },
@@ -215,6 +219,7 @@ fn git_hosted_node(alias: &str) -> (DepPath, DependenciesGraphNode) {
             latest: None,
             published_at: None,
             manifest: Some(Arc::new(json!({ "name": "is-negative", "version": "1.0.0" }))),
+            non_deprecated_alternative: None,
         },
     };
     let node = DependenciesGraphNode {
@@ -222,13 +227,12 @@ fn git_hosted_node(alias: &str) -> (DepPath, DependenciesGraphNode) {
         resolved_package_id: dep_path.to_string(),
         resolve_result: Arc::new(resolve_result),
         depth: 1,
-        installable: true,
         is_pure: true,
         optional: false,
         edges: pnpm_resolving_deps_resolver::ResolvedDependencyEdges {
             children: BTreeMap::new(),
             optional_children: HashSet::default(),
-            peer_dependencies: BTreeMap::new(),
+            peer_set: pnpm_resolving_deps_resolver::PeerSet::default(),
             transitive_peer_dependencies: HashSet::default(),
             resolved_peer_names: HashSet::default(),
         },
@@ -267,8 +271,7 @@ fn error_from_single_node_graph(alias: &str, dep_path: &str) -> DependenciesGrap
 
 /// Build a fake `DependenciesGraphNode` whose id is a `link:` workspace
 /// reference. The local resolver produces these for `workspace:` specs
-/// and leaves `name_ver` as `None`. Used in the link-shape lockfile
-/// tests below.
+/// and leaves `name_ver` as `None`.
 fn make_link_node(target: &str, manifest: serde_json::Value) -> DependenciesGraphNode {
     let id_text = format!("link:{target}");
     let resolve_result = ResolveResult {
@@ -285,6 +288,7 @@ fn make_link_node(target: &str, manifest: serde_json::Value) -> DependenciesGrap
             latest: None,
             published_at: None,
             manifest: Some(std::sync::Arc::new(manifest)),
+            non_deprecated_alternative: None,
         },
     };
     DependenciesGraphNode {
@@ -292,13 +296,12 @@ fn make_link_node(target: &str, manifest: serde_json::Value) -> DependenciesGrap
         resolved_package_id: id_text,
         resolve_result: std::sync::Arc::new(resolve_result),
         depth: 0,
-        installable: true,
         is_pure: true,
         optional: false,
         edges: pnpm_resolving_deps_resolver::ResolvedDependencyEdges {
             children: BTreeMap::new(),
             optional_children: HashSet::default(),
-            peer_dependencies: BTreeMap::new(),
+            peer_set: pnpm_resolving_deps_resolver::PeerSet::default(),
             transitive_peer_dependencies: HashSet::default(),
             resolved_peer_names: HashSet::default(),
         },
@@ -326,6 +329,7 @@ fn make_file_node(name: &str, directory: &str) -> DependenciesGraphNode {
             latest: None,
             published_at: None,
             manifest: Some(Arc::new(json!({ "name": name, "version": "1.0.0" }))),
+            non_deprecated_alternative: None,
         },
     };
     DependenciesGraphNode {
@@ -333,43 +337,20 @@ fn make_file_node(name: &str, directory: &str) -> DependenciesGraphNode {
         dep_path,
         resolve_result: Arc::new(resolve_result),
         depth: 1,
-        installable: true,
         is_pure: true,
         optional: false,
         edges: pnpm_resolving_deps_resolver::ResolvedDependencyEdges {
             children: BTreeMap::new(),
             optional_children: HashSet::default(),
-            peer_dependencies: BTreeMap::new(),
+            peer_set: pnpm_resolving_deps_resolver::PeerSet::default(),
             transitive_peer_dependencies: HashSet::default(),
             resolved_peer_names: HashSet::default(),
         },
     }
 }
 
-/// A single-importer previous lockfile whose `alias` dependency was
-/// recorded as `link:<target>`.
-fn previous_importers_with_link(
-    alias: &str,
-    specifier: &str,
-    target: &str,
-) -> std::collections::HashMap<String, ProjectSnapshot> {
-    let mut deps = ResolvedDependencyMap::new();
-    deps.insert(
-        PkgName::parse(alias).unwrap(),
-        ResolvedDependencySpec {
-            specifier: specifier.to_string(),
-            version: ImporterDepVersion::Link(target.to_string()),
-        },
-    );
-    let snapshot = ProjectSnapshot { dependencies: Some(deps), ..Default::default() };
-    let mut importers = std::collections::HashMap::new();
-    importers.insert(".".to_string(), snapshot);
-    importers
-}
-
 /// A `consumer -> n` edge whose fresh resolution is a divergent `file:`
-/// injection, with a previous lockfile that recorded it as `link:`.
-/// Shared by the guard tests below.
+/// injection.
 fn injected_link_fixture()
 -> (TempDir, PackageManifest, DependenciesGraph, BTreeMap<String, DepPath>) {
     let (tmp, manifest) = write_manifest(json!({
@@ -414,6 +395,7 @@ fn make_named_registry_node(
             latest: None,
             published_at: None,
             manifest: Some(std::sync::Arc::new(json!({ "name": name, "version": version }))),
+            non_deprecated_alternative: None,
         },
     };
     DependenciesGraphNode {
@@ -421,13 +403,12 @@ fn make_named_registry_node(
         resolved_package_id: format!("{name}@{registry_name}:{version}"),
         resolve_result: std::sync::Arc::new(resolve_result),
         depth: 1,
-        installable: true,
         is_pure: true,
         optional: false,
         edges: pnpm_resolving_deps_resolver::ResolvedDependencyEdges {
             children: BTreeMap::new(),
             optional_children: HashSet::default(),
-            peer_dependencies: BTreeMap::new(),
+            peer_set: pnpm_resolving_deps_resolver::PeerSet::default(),
             transitive_peer_dependencies: HashSet::default(),
             resolved_peer_names: HashSet::default(),
         },

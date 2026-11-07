@@ -6,21 +6,26 @@
 //! field arguments, only those fields are printed; otherwise a formatted
 //! summary (or, with `--json`, the whole assembled info object) is shown.
 
-use super::deprecate::normalize_registry_url;
+use crate::cli_args::{
+    registry_client::{
+        build_registry_client, package_endpoint_url, resolve_registries_with_override,
+        resolve_target_registry_for_package,
+    },
+    release_notes::{NotesReader, render_upgrade_notes, stores_notes, upgrade_notes_json},
+};
 use chrono::{DateTime, Utc};
 use clap::Args;
 use derive_more::{Display, Error};
-use miette::{Context, Diagnostic, IntoDiagnostic};
+use miette::Diagnostic;
 use owo_colors::{OwoColorize, Stream, Style};
 use pnpm_config::Config;
-use pnpm_network::{RetryOpts, ThrottledClient};
+use pnpm_package_manifest::safe_read_project_manifest_from_dir;
 use pnpm_resolving_npm_resolver::{
     FetchFullMetadataOptions, FetchFullMetadataOutcome, PickPackageFromMetaOptions,
-    fetch_full_metadata, parse_bare_specifier, pick_package_from_meta, pick_registry_for_package,
+    fetch_full_metadata, parse_bare_specifier, pick_package_from_meta,
     pick_version_by_version_range,
 };
 use pnpm_resolving_parse_wanted_dependency::parse_wanted_dependency;
-use pnpm_workspace::try_read_project_manifest;
 use render::{render_fields, render_summary, to_pretty};
 use serde_json::{Map, Value};
 use std::{path::Path, sync::Arc};
@@ -93,7 +98,16 @@ impl ViewArgs {
 
         let (meta, picked) =
             fetch_package_metadata(config, self.registry.as_deref(), &package_spec, "view").await?;
-        let info = assemble_info(&meta, &picked);
+        let mut info = assemble_info(&meta, &picked);
+        if fields
+            .iter()
+            .any(|field| field == RELEASE_NOTES_FIELD)
+        {
+            let notes = self.release_notes(config, &meta.name, &picked.version.to_string()).await?;
+            if let Value::Object(info) = &mut info {
+                info.insert(RELEASE_NOTES_FIELD.to_owned(), notes);
+            }
+        }
 
         if !fields.is_empty() {
             return Ok(render_fields(&info, fields, self.json));
@@ -105,6 +119,38 @@ impl ViewArgs {
     }
 }
 
+/// The field that reads the version's release notes from the registry
+/// rather than from its metadata.
+const RELEASE_NOTES_FIELD: &str = "releaseNotes";
+
+impl ViewArgs {
+    /// The version's note and its publication's: rendered text, or the
+    /// structured notes under `--json`. `null` when there are none, or the
+    /// registry is not declared `serverType: pnpr`, which has no notes
+    /// routes.
+    async fn release_notes(
+        &self,
+        config: &Config,
+        name: &str,
+        version: &str,
+    ) -> miette::Result<Value> {
+        let registries = resolve_registries_with_override(config, self.registry.as_deref());
+        let registry =
+            resolve_target_registry_for_package(&registries, self.registry.as_deref(), name, None);
+        if !stores_notes(config, &registry) {
+            return Ok(Value::Null);
+        }
+        let client = build_registry_client(config)?;
+        let notes =
+            NotesReader::new(&client, config).version_notes(&registry, name, version).await?;
+        Ok(match (notes.is_empty(), self.json) {
+            (true, _) => Value::Null,
+            (false, true) => upgrade_notes_json(&notes),
+            (false, false) => Value::String(render_upgrade_notes(&notes)),
+        })
+    }
+}
+
 /// Find the nearest project manifest's `name`, searching upward from
 /// `start_dir`. A missing manifest is [`ViewError::MissingPackageName`]; a
 /// present-but-invalid manifest (parse error, non-object body, or no `name`)
@@ -112,8 +158,8 @@ impl ViewArgs {
 fn nearest_manifest_name(start_dir: &Path) -> Result<String, ViewError> {
     let mut dir = start_dir;
     loop {
-        if dir.join("package.json").is_file() {
-            return manifest_name(dir);
+        if let Some(name) = manifest_name(dir)? {
+            return Ok(name);
         }
         match dir.parent() {
             Some(parent) => dir = parent,
@@ -125,20 +171,21 @@ fn nearest_manifest_name(start_dir: &Path) -> Result<String, ViewError> {
 /// The non-empty `name` of the manifest in `dir`. A body that is not an
 /// object, or carries no usable name, is as invalid as one that fails to
 /// parse.
-fn manifest_name(dir: &Path) -> Result<String, ViewError> {
-    let manifest = try_read_project_manifest(dir)
+fn manifest_name(dir: &Path) -> Result<Option<String>, ViewError> {
+    let manifest = safe_read_project_manifest_from_dir(dir)
         .map_err(|err| ViewError::InvalidPackageJson {
             message: format!(
                 r#"Failed to read or parse project manifest in "{dir}": {err}"#,
                 dir = dir.display(),
             ),
         })?;
-    let value = manifest.map_or(Value::Null, |(_, manifest)| manifest.value().clone());
+    let Some(value) = manifest else { return Ok(None) };
     value
         .get("name")
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty())
         .map(ToString::to_string)
+        .map(Some)
         .ok_or_else(|| invalid_manifest(dir))
 }
 
@@ -147,7 +194,7 @@ fn manifest_name(dir: &Path) -> Result<String, ViewError> {
 fn invalid_manifest(dir: &Path) -> ViewError {
     ViewError::InvalidPackageJson {
         message: format!(
-            r#"Invalid package.json at "{}". The "name" field is required and must be a non-empty string."#,
+            r#"Invalid project manifest at "{}". The "name" field is required and must be a non-empty string."#,
             dir.display(),
         ),
     }
@@ -159,53 +206,55 @@ pub(super) async fn fetch_package_metadata(
     config: &Config,
     registry_override: Option<&str>,
     package_spec: &str,
-    command_name: &str,
+    _command_name: &str,
 ) -> miette::Result<(pnpm_registry::Package, Arc<pnpm_registry::PackageVersion>)> {
     let parsed = parse_wanted_dependency(package_spec);
     let alias = parsed.alias.as_deref();
     let bare = parsed.bare_specifier.as_deref().unwrap_or("latest");
     let name_hint = alias.unwrap_or(package_spec);
 
-    let mut registries: std::collections::HashMap<String, String> = config
-        .resolved_registries()
-        .into_iter()
-        .collect();
-    if let Some(registry) = registry_override {
-        registries.insert("default".to_string(), normalize_registry_url(registry));
-    }
-    let registry = pick_registry_for_package(&registries, name_hint, Some(bare));
+    let registries = resolve_registries_with_override(config, registry_override);
+    let registry =
+        resolve_target_registry_for_package(&registries, registry_override, name_hint, Some(bare));
 
     let spec = parse_bare_specifier(bare, alias, "latest", &registry)
         .ok_or_else(|| ViewError::InvalidPackageName { spec: package_spec.to_string() })?;
 
-    let http_client = metadata_client(config, command_name)?;
+    let meta = fetch_metadata_outcome(config, &registry, &spec.name).await?;
+    let picked = pick_view_version(&meta, &spec)?;
+
+    Ok((meta, picked))
+}
+
+async fn fetch_metadata_outcome(
+    config: &Config,
+    registry: &str,
+    package_name: &str,
+) -> miette::Result<pnpm_registry::Package> {
+    let http_client = build_registry_client(config)?;
     let outcome = fetch_full_metadata(
-        &spec.name,
+        package_name,
         &FetchFullMetadataOptions {
-            registry: &registry,
+            registry,
             full_metadata: true,
             etag: None,
             modified: None,
             http: pnpm_resolving_npm_resolver::MetadataHttpClient {
                 http_client: &http_client,
                 auth_headers: &config.auth_headers,
-                retry_opts: RetryOpts::default(),
+                retry_opts: config.retry_opts(),
             },
         },
     )
     .await
-    .map_err(|error| map_fetch_error(error, &registry, &spec.name))?;
+    .map_err(|error| map_fetch_error(error, registry, package_name))?;
 
-    let meta = match outcome {
-        FetchFullMetadataOutcome::Modified(meta) => *meta,
+    match outcome {
+        FetchFullMetadataOutcome::Modified(meta) => Ok(*meta),
         FetchFullMetadataOutcome::NotModified => {
-            miette::bail!("registry returned 304 Not Modified unexpectedly for {}", spec.name)
+            miette::bail!("registry returned 304 Not Modified unexpectedly for {package_name}")
         }
-    };
-
-    let picked = pick_view_version(&meta, &spec)?;
-
-    Ok((meta, picked))
+    }
 }
 
 /// Build the info object the renderers consume from the picked version's
@@ -274,27 +323,15 @@ fn map_fetch_error(
     if let FetchMetadataError::Network { error: ref source, .. } = error
         && source.status() == Some(reqwest::StatusCode::NOT_FOUND)
     {
-        return ViewError::Fetch404 {
-            url: pnpm_network::redact_url_credentials(&format!("{registry}{pkg_name}")),
-        }
-        .into();
+        let url = package_endpoint_url(registry, pkg_name)
+            .unwrap_or_else(|_| format!("{registry}{pkg_name}"));
+        return ViewError::Fetch404 { url: pnpm_network::redact_url_credentials(&url) }.into();
     }
     miette::Report::new(error)
 }
 
 #[cfg(test)]
 mod tests;
-
-fn metadata_client(config: &Config, command_name: &str) -> miette::Result<ThrottledClient> {
-    ThrottledClient::for_installs(
-        &config.proxy,
-        &config.tls,
-        &config.tls_by_uri,
-        &config.network_settings(),
-    )
-    .into_diagnostic()
-    .wrap_err_with(|| format!("create the network client for {command_name}"))
-}
 
 fn pick_view_version(
     meta: &pnpm_registry::Package,

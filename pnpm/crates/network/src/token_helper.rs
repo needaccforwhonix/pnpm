@@ -8,9 +8,10 @@
 //! invocation that makes no matching request. The mapping from the
 //! command's stdout to a header mirrors pnpm's `executeTokenHelper`.
 
+use crate::process::{Child, Command, Stdio};
+
 use std::{
     io::{self, Read},
-    process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -169,8 +170,6 @@ fn run_token_helper_command_with_timeout(
         }
         thread::sleep(Duration::from_millis(20));
     };
-    // The child is reaped; disarm so the guard can't signal a pid the OS
-    // may already have recycled.
     guard.disarm();
 
     Ok(TokenHelperOutput {

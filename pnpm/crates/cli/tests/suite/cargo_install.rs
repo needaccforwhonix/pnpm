@@ -1,9 +1,10 @@
 //! `pnpm install` against a Cargo workspace, resolving and downloading
-//! through the registry `cargo.indexUrl` selects.
+//! through the Cargo registry `registries` selects.
 
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
-use pnpm_testing_utils::git_repo::GitRepoFixture;
+use pnpm_cargo_resolver::CRATES_IO_SOURCE;
+use pnpm_testing_utils::{diagnostics::assert_diagnostic_contains, git_repo::GitRepoFixture};
 use sha2::{Digest, Sha256};
 use std::{fs, path::Path, process::Command};
 use tempfile::TempDir;
@@ -11,13 +12,20 @@ use tempfile::TempDir;
 /// A `.crate` archive holding the one source file a dependent needs, laid
 /// out under the `<name>-<version>` root `cargo` expects.
 pub(crate) fn crate_archive(name: &str, version: &str) -> Vec<u8> {
+    crate_archive_with_manifest(
+        name,
+        version,
+        &format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\n"),
+    )
+}
+
+fn crate_archive_with_manifest(name: &str, version: &str, manifest: &str) -> Vec<u8> {
     let root = format!("{name}-{version}");
     let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
     let mut builder = tar::Builder::new(encoder);
-    for (path, contents) in [
-        ("Cargo.toml", format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\n")),
-        ("src/lib.rs", "pub fn answer() -> u8 { 42 }\n".to_string()),
-    ] {
+    for (path, contents) in
+        [("Cargo.toml", manifest), ("src/lib.rs", "pub fn answer() -> u8 { 42 }\n")]
+    {
         let mut header = tar::Header::new_gnu();
         header.set_size(contents.len() as u64);
         header.set_mode(0o644);
@@ -33,7 +41,7 @@ pub(crate) fn crate_archive(name: &str, version: &str) -> Vec<u8> {
         .unwrap()
 }
 
-fn cargo_workspace(index_url: &str, dependencies: &str, source: &str) -> TempDir {
+pub(super) fn cargo_workspace(index_url: &str, dependencies: &str, source: &str) -> TempDir {
     let root = TempDir::new().expect("create Cargo workspace");
     std::fs::create_dir(root.path().join("src")).expect("create Cargo source directory");
     std::fs::write(root.path().join("src/lib.rs"), source).expect("write Cargo source");
@@ -46,21 +54,25 @@ fn cargo_workspace(index_url: &str, dependencies: &str, source: &str) -> TempDir
     .expect("write Cargo manifest");
     std::fs::write(
         root.path().join("pnpm-workspace.yaml"),
-        format!("cargo:\n  enabled: true\n  indexUrl: {index_url}\n"),
+        format!("cargo:\n  enabled: true\nregistries:\n  {index_url}:\n    ecosystem: cargo\n"),
     )
     .expect("enable Cargo dependency management");
     root
 }
 
-fn install_in(root: &TempDir, args: &[&str]) {
+pub(super) fn install_in(root: &TempDir, args: &[&str]) {
+    let cargo_home = TempDir::new().expect("create isolated Cargo home");
+    install_command(root, &cargo_home, args).assert().success();
+}
+
+fn install_command(root: &TempDir, cargo_home: &TempDir, args: &[&str]) -> Command {
     Command::cargo_bin("pnpm")
         .expect("find the pnpm binary")
         .with_current_dir(root.path())
+        .with_env("CARGO_HOME", cargo_home.path())
         .with_env("PNPM_CONFIG_CACHE_DIR", root.path().join("cache"))
         .with_env("PNPM_CONFIG_STORE_DIR", root.path().join("store"))
         .with_args(args)
-        .assert()
-        .success();
 }
 
 #[test]
@@ -105,7 +117,9 @@ fn install_resolves_and_downloads_through_the_configured_registry() {
 
     let lockfile =
         std::fs::read_to_string(root.path().join("Cargo.lock")).expect("read Cargo.lock");
-    assert!(lockfile.contains(&format!(r#"source = "sparse+{}/""#, registry.url())), "{lockfile}");
+    // pnpm reaches the configured registry by replacing `[source.crates-io]`,
+    // and a lockfile records the replaced source rather than its replacement.
+    assert!(lockfile.contains(&format!(r#"source = "{CRATES_IO_SOURCE}""#)), "{lockfile}");
     assert!(
         root.path()
             .join(".pnpm/crates/crates-io/demo-1.0.0/src/lib.rs")
@@ -113,12 +127,212 @@ fn install_resolves_and_downloads_through_the_configured_registry() {
     );
     Command::new("cargo")
         .with_current_dir(root.path())
-        .with_args(["check", "--offline"])
+        .with_args(["check", "--locked", "--offline"])
         .assert()
         .success();
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("Cargo.lock")).expect("read Cargo.lock"),
+        lockfile,
+    );
 
     index_mock.assert();
     download_mock.assert();
+}
+
+#[test]
+fn install_resolves_past_a_candidate_whose_dependency_is_yanked() {
+    let mut registry = mockito::Server::new();
+    let demo = crate_archive("demo", "1.0.0");
+    let helper = crate_archive("helper", "1.0.0");
+    let _config_mock = registry
+        .mock("GET", "/config.json")
+        .with_body(
+            serde_json::json!({
+                "dl": format!("{}/dl/{{crate}}/{{version}}", registry.url()),
+                "api": registry.url(),
+            })
+            .to_string(),
+        )
+        .create();
+    // `demo` 1.0.0-beta.1 shares a compatibility line with the version the
+    // workspace asks for, so the solver weighs it, and the `helper` it needs
+    // is in the index only as a yanked release. The workspace depends on
+    // `helper` itself, which is what fetches that index entry.
+    let _demo_index_mock = registry
+        .mock("GET", "/de/mo/demo")
+        .with_body(format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "name": "demo", "vers": "1.0.0-beta.1",
+                "deps": [{
+                    "name": "helper", "req": "^2", "features": [], "optional": false,
+                    "default_features": true, "target": null, "kind": "normal",
+                }],
+                "cksum": format!("{:x}", Sha256::digest("demo 1.0.0-beta.1")),
+                "features": {}, "yanked": false, "v": 1,
+            }),
+            serde_json::json!({
+                "name": "demo", "vers": "1.0.0", "deps": [],
+                "cksum": format!("{:x}", Sha256::digest(&demo)),
+                "features": {}, "yanked": false, "v": 1,
+            }),
+        ))
+        .create();
+    let _helper_index_mock = registry
+        .mock("GET", "/he/lp/helper")
+        .with_body(format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "name": "helper", "vers": "1.0.0", "deps": [],
+                "cksum": format!("{:x}", Sha256::digest(&helper)),
+                "features": {}, "yanked": false, "v": 1,
+            }),
+            serde_json::json!({
+                "name": "helper", "vers": "2.0.0", "deps": [],
+                "cksum": format!("{:x}", Sha256::digest("helper 2.0.0")),
+                "features": {}, "yanked": true, "v": 1,
+            }),
+        ))
+        .create();
+    let _demo_download_mock = registry
+        .mock("GET", "/dl/demo/1.0.0")
+        .with_body(&demo)
+        .create();
+    let _helper_download_mock = registry
+        .mock("GET", "/dl/helper/1.0.0")
+        .with_body(&helper)
+        .create();
+    let root = cargo_workspace(
+        &registry.url(),
+        "demo = \"1\"\nhelper = \"1\"\n",
+        "pub use demo::answer;\n",
+    );
+
+    install_in(&root, &["install"]);
+
+    let lockfile =
+        std::fs::read_to_string(root.path().join("Cargo.lock")).expect("read Cargo.lock");
+    assert!(lockfile.contains(r#"name = "demo""#), "{lockfile}");
+    assert!(lockfile.contains(r#"name = "helper""#), "{lockfile}");
+    assert!(!lockfile.contains("beta"), "{lockfile}");
+    // Offline, so the graph cargo reads is the one the install vendored.
+    Command::new("cargo")
+        .with_current_dir(root.path())
+        .with_args(["metadata", "--locked", "--offline", "--format-version", "1"])
+        .assert()
+        .success();
+}
+
+/// A dependency that names the configured registry is locked against it,
+/// not against the crates.io source that replacement serves it through.
+#[test]
+fn install_keeps_the_source_a_named_registry_dependency_declares() {
+    let mut registry = mockito::Server::new();
+    let demo = crate_archive("demo", "1.0.0");
+    let _config_mock = registry
+        .mock("GET", "/config.json")
+        .with_body(
+            serde_json::json!({
+                "dl": format!("{}/dl/{{crate}}/{{version}}", registry.url()),
+                "api": registry.url(),
+            })
+            .to_string(),
+        )
+        .create();
+    let _index_mock = registry
+        .mock("GET", "/de/mo/demo")
+        .with_body(format!(
+            "{}\n",
+            serde_json::json!({
+                "name": "demo", "vers": "1.0.0", "deps": [],
+                "cksum": format!("{:x}", Sha256::digest(&demo)),
+                "features": {}, "yanked": false, "v": 1,
+            }),
+        ))
+        .create();
+    let _download_mock = registry
+        .mock("GET", "/dl/demo/1.0.0")
+        .with_body(&demo)
+        .create();
+    let root = cargo_workspace(&registry.url(), "", "");
+    // The registry definition is the user's own; pnpm keeps it and appends
+    // its managed block.
+    fs::create_dir_all(root.path().join(".cargo")).unwrap();
+    fs::write(
+        root.path().join(".cargo/config.toml"),
+        format!("[registries.mock]\nindex = \"sparse+{}/\"\n", registry.url()),
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\ndemo = { version = \"1\", registry = \"mock\" }\n",
+    )
+    .unwrap();
+
+    install_in(&root, &["install"]);
+
+    let lockfile = fs::read_to_string(root.path().join("Cargo.lock")).expect("read Cargo.lock");
+    assert!(lockfile.contains(&format!(r#"source = "sparse+{}/""#, registry.url())), "{lockfile}");
+    Command::new("cargo")
+        .with_current_dir(root.path())
+        .with_args(["metadata", "--locked", "--offline", "--format-version", "1"])
+        .assert()
+        .success();
+    assert_eq!(fs::read_to_string(root.path().join("Cargo.lock")).unwrap(), lockfile);
+}
+
+/// A packager builds a checkout with Cargo alone, after `pnpm install` has
+/// written `.cargo/config.toml` and without the `.pnpm` directory.
+#[test]
+fn cargo_builds_the_checkout_without_the_vendored_sources() {
+    let mut registry = mockito::Server::new();
+    let archive = crate_archive("demo", "1.0.0");
+    let checksum = format!("{:x}", Sha256::digest(&archive));
+    let _config_mock = registry
+        .mock("GET", "/config.json")
+        .with_body(
+            serde_json::json!({ "dl": format!("{}/dl/{{crate}}/{{version}}", registry.url()) })
+                .to_string(),
+        )
+        .create();
+    let _index_mock = registry
+        .mock("GET", "/de/mo/demo")
+        .with_body(format!(
+            "{}\n",
+            serde_json::json!({
+                "name": "demo",
+                "vers": "1.0.0",
+                "deps": [],
+                "cksum": checksum,
+                "features": {},
+                "yanked": false,
+                "v": 1,
+            }),
+        ))
+        .create();
+    let _download_mock = registry
+        .mock("GET", "/dl/demo/1.0.0")
+        .with_body(&archive)
+        .create();
+    let root = cargo_workspace(&registry.url(), "demo = \"1\"\n", "pub use demo::answer;\n");
+    install_in(&root, &["install"]);
+    fs::remove_dir_all(root.path().join(".pnpm")).unwrap();
+    let cargo_home = TempDir::new().unwrap();
+    fs::write(
+        cargo_home.path().join("config.toml"),
+        format!(
+            "[source.crates-io]\nreplace-with = \"mock\"\n\n[source.mock]\nregistry = \"sparse+{}/\"\n",
+            registry.url(),
+        ),
+    )
+    .unwrap();
+
+    Command::new("cargo")
+        .with_current_dir(root.path())
+        .with_env("CARGO_HOME", cargo_home.path())
+        .with_args(["check", "--locked"])
+        .assert()
+        .success();
 }
 
 #[test]
@@ -128,9 +342,72 @@ fn offline_install_without_registry_crates_never_reads_the_registry_config() {
     install_in(&root, &["install", "--offline"]);
 
     assert!(root.path().join("Cargo.lock").is_file());
-    let config = std::fs::read_to_string(root.path().join(".cargo/config.toml"))
+    let config = std::fs::read_to_string(root.path().join(".pnpm/crates/config.toml"))
         .expect("read managed Cargo configuration");
     assert!(config.contains(r#"registry = "sparse+https://registry.example.test/index/""#));
+}
+
+#[test]
+fn frozen_install_rejects_a_lockfile_that_does_not_satisfy_the_manifest() {
+    let mut registry = mockito::Server::new();
+    let archive = crate_archive("demo", "1.0.0");
+    let checksum = format!("{:x}", Sha256::digest(&archive));
+    let _config_mock = registry
+        .mock("GET", "/config.json")
+        .with_body(
+            serde_json::json!({
+                "dl": format!("{}/dl/{{crate}}/{{version}}", registry.url()),
+                "api": registry.url(),
+            })
+            .to_string(),
+        )
+        .create();
+    let _index_mock = registry
+        .mock("GET", "/de/mo/demo")
+        .with_body(format!(
+            "{}\n",
+            serde_json::json!({
+                "name": "demo",
+                "vers": "1.0.0",
+                "deps": [],
+                "cksum": checksum,
+                "features": {},
+                "yanked": false,
+                "v": 1,
+            }),
+        ))
+        .create();
+    let _download_mock = registry
+        .mock("GET", "/dl/demo/1.0.0")
+        .with_body(&archive)
+        .create();
+    let root = cargo_workspace(&registry.url(), "demo = \"1\"\n", "pub use demo::answer;\n");
+    install_in(&root, &["install"]);
+    install_in(&root, &["install", "--frozen-lockfile"]);
+    let lockfile = fs::read(root.path().join("Cargo.lock")).expect("read Cargo.lock");
+    let manifest = root.path().join("Cargo.toml");
+    fs::write(
+        &manifest,
+        fs::read_to_string(&manifest)
+            .expect("read Cargo manifest")
+            .replace(r#"demo = "1""#, r#"demo = "=1.0.1""#),
+    )
+    .expect("write Cargo manifest");
+
+    let cargo_home = TempDir::new().expect("create isolated Cargo home");
+    let output = install_command(&root, &cargo_home, &["install", "--frozen-lockfile"])
+        .output()
+        .expect("run pnpm install");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("A frozen install must fail on a stale Cargo.lock: {output:?}");
+    assert!(!output.status.success());
+    assert_diagnostic_contains(
+        &stderr,
+        "app depends on demo =1.0.1, but Cargo.lock locks demo 1.0.0",
+    );
+    assert_diagnostic_contains(&stderr, "ERR_PNPM_OUTDATED_LOCKFILE");
+    assert_eq!(fs::read(root.path().join("Cargo.lock")).expect("read Cargo.lock"), lockfile);
 }
 
 fn append_manifest_section(manifest: &Path, section: &str) {
@@ -203,14 +480,14 @@ fn install_vendors_a_git_patched_crate_beside_the_registry_crates() {
             "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n",
             "dependencies = [\n \"demo\",\n \"patched\",\n]\n\n",
             "[[package]]\nname = \"demo\"\nversion = \"1.0.0\"\n",
-            "source = \"sparse+{registry}/\"\nchecksum = \"{checksum}\"\n\n",
+            "source = \"{crates_io}\"\nchecksum = \"{checksum}\"\n\n",
             "[[package]]\nname = \"patched\"\nversion = \"1.0.0\"\n",
             "source = \"git+{repository_url}?rev={commit}#{commit}\"\n",
             "dependencies = [\n \"sibling\",\n]\n\n",
             "[[package]]\nname = \"sibling\"\nversion = \"1.0.0\"\n",
             "source = \"git+{repository_url}?rev={commit}#{commit}\"\n",
         ),
-        registry = registry.url(),
+        crates_io = CRATES_IO_SOURCE,
         checksum = checksum,
         repository_url = repository_url,
         commit = commit,
@@ -235,7 +512,7 @@ fn install_vendors_a_git_patched_crate_beside_the_registry_crates() {
             .join(".pnpm/crates/git/sibling-1.0.0/src/lib.rs")
             .is_file(),
     );
-    let config = fs::read_to_string(root.path().join(".cargo/config.toml")).unwrap();
+    let config = fs::read_to_string(root.path().join(".pnpm/crates/config.toml")).unwrap();
     assert!(
         config.contains(&format!(r#"[source."git+{repository_url}?rev={commit}"]"#)),
         "{config}",
@@ -244,9 +521,10 @@ fn install_vendors_a_git_patched_crate_beside_the_registry_crates() {
     // Offline, so the revision has to come from what the install vendored.
     Command::new("cargo")
         .with_current_dir(root.path())
-        .with_args(["check", "--offline"])
+        .with_args(["check", "--locked", "--offline"])
         .assert()
         .success();
+    assert_eq!(fs::read_to_string(root.path().join("Cargo.lock")).unwrap(), lockfile);
 }
 
 #[test]
@@ -269,7 +547,7 @@ fn a_workspace_with_a_cargo_patch_is_not_resolved_from_the_registry() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "{stderr}");
     // One word: a diagnostic wraps at a width the path length decides.
-    assert!(stderr.contains("[patch]"), "{stderr}");
+    assert!(stderr.contains("registries"), "{stderr}");
 }
 
 #[cfg(unix)]
@@ -395,3 +673,5 @@ fn install_does_not_parse_or_modify_excluded_cargo_workspaces() {
     assert!(!excluded.join(".cargo").exists());
     assert!(!excluded.join(".pnpm").exists());
 }
+
+mod lockfile_features;

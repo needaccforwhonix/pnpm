@@ -1,28 +1,43 @@
+pub use abbreviate::{abbreviate_packument, abbreviate_version};
+pub use discovery::SearchResponse;
 pub use packument::{
-    abbreviate_packument, extract_upstream_version_manifest, extract_version_manifest,
-    rewrite_tarball_urls, rewrite_upstream_tarball_urls, tarball_basename,
+    extract_upstream_revision_integrity, extract_upstream_version_manifest,
+    extract_version_manifest, rewrite_tarball_urls, rewrite_upstream_tarball_urls,
+    tarball_basename, tarball_basename_for_package, version_route_tarball_version,
 };
+pub use time::TIME_PRECISION_HORIZON_DAYS;
 
 pub use oci::oci_download_allowed;
 
 mod http;
-use http::{UpstreamHttp, read_upstream_error_body, same_origin};
+mod request;
+use http::{UpstreamHttp, same_origin};
+use request::Deadline;
 
 mod circuit_breaker;
 use circuit_breaker::CircuitBreaker;
 
+mod discovery;
+
 mod packument;
+
+mod abbreviate;
 
 mod oci;
 
-use chrono::{DateTime, Utc};
+mod audit;
+
+mod attestations;
+
+mod time;
+
 use pnpm_lockfile::{
-    MAX_TARBALL_REVISION, TarballRevision, integrity_addressed_registry_tarball_url,
-    is_integrity_addressed_registry_tarball_url,
+    MAX_TARBALL_REVISION, TarballRevision, has_complete_sha512_digest,
+    is_revision_registry_tarball_url, revision_registry_tarball_url,
 };
 use pnpm_network::{
-    RedirectGuard, ThrottledClient, ThrottledClientGuard, ThrottledResponse, UNPRIORITIZED,
-    is_url_secure_for_credentials, read_limited_body,
+    HeadError, RedirectGuard, ThrottledClient, ThrottledClientGuard, ThrottledResponse,
+    UNPRIORITIZED, is_url_secure_for_credentials, read_limited_body,
 };
 use pnpr_config::{RedactedHeaders, UpstreamConfig};
 use pnpr_error::{RegistryError, Result};
@@ -31,8 +46,8 @@ use reqwest::{
     StatusCode,
     header::{self, HeaderMap, HeaderValue},
 };
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::{Map, Value};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use ssri::Integrity;
 use std::{
     fmt,
@@ -42,16 +57,7 @@ use std::{
 
 const UPSTREAM_DISCOVERY_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
-#[derive(Debug, Deserialize)]
-pub struct SearchResponse {
-    pub objects: Vec<Value>,
-    pub total: usize,
-}
-
-/// Wraps a shared [`ThrottledClient`] (so the registry inherits pnpm's
-/// tuned reqwest defaults: `User-Agent: pnpm`, HTTP/1.1, capped native DNS,
-/// pool/timeout tuning, concurrency semaphore, and per-registry TLS
-/// routing if it's ever wired in later) and adds the per-upstream glue a
+/// Wraps a shared [`ThrottledClient`] and adds the per-upstream glue a
 /// proxy needs: building the upstream URL, applying verdaccio's
 /// `timeout`/`max_fails`/`fail_timeout` knobs, and fishing the packument
 /// or tarball response out of it.
@@ -115,7 +121,6 @@ pub struct CacheValidators {
     pub last_modified: Option<String>,
 }
 
-/// A packument fetched against an upstream.
 /// A document fetched by [`Upstream::fetch_document`].
 #[derive(Debug)]
 pub struct FetchedDocument {
@@ -217,7 +222,8 @@ impl Upstream {
             conditional_headers.insert(header::IF_MODIFIED_SINCE, value);
         }
         let sent_conditional = !conditional_headers.is_empty();
-        let (response, _guard) = self.get_with_scoped_headers(&url, &conditional_headers).await?;
+        let (response, _guard) =
+            self.get_with_scoped_headers(&url, &conditional_headers, Deadline::Whole).await?;
         if response.status() == StatusCode::NOT_FOUND {
             // A 404 is an authoritative answer, not an upstream failure.
             self.breaker.record_success();
@@ -237,7 +243,7 @@ impl Upstream {
             .bytes()
             .await
             .map_err(|source| {
-                self.breaker.record_failure();
+                self.record_body_failure(&source);
                 RegistryError::Upstream { url: url.clone(), source }
             })?;
         self.breaker.record_success();
@@ -256,23 +262,50 @@ impl Upstream {
         name: &CanonicalPackageName,
         filename: &str,
     ) -> Result<FetchOutcome<ThrottledResponse>> {
-        let started = Instant::now();
-        self.ensure_available()?;
         let url = format!("{}/{}/-/{}", self.base.trim_end_matches('/'), name.as_str(), filename);
-        let (response, guard) = self.get_with_scoped_headers(&url, &HeaderMap::new()).await?;
+        self.fetch_tarball_url(&url).await
+    }
+
+    /// Fetch a version-addressed tarball (`{base}/{name}@{version}`) from an
+    /// upstream `pnpr` registry.
+    pub async fn fetch_version_tarball_response(
+        &self,
+        name: &CanonicalPackageName,
+        version: &str,
+    ) -> Result<FetchOutcome<ThrottledResponse>> {
+        let url = format!("{}/{}@{version}", self.base.trim_end_matches('/'), name.as_str());
+        self.fetch_tarball_url(&url).await
+    }
+
+    /// Fetch a tarball by its version route (`{base}/{name}@{version}`) when
+    /// the upstream advertised one, or by its archive route
+    /// (`{base}/{name}/-/{filename}`) otherwise.
+    pub async fn fetch_tarball_or_version_response(
+        &self,
+        name: &CanonicalPackageName,
+        filename: &str,
+        version_route: Option<&str>,
+    ) -> Result<FetchOutcome<ThrottledResponse>> {
+        match version_route {
+            Some(version) => self.fetch_version_tarball_response(name, version).await,
+            None => self.fetch_tarball_response(name, filename).await,
+        }
+    }
+
+    async fn fetch_tarball_url(&self, url: &str) -> Result<FetchOutcome<ThrottledResponse>> {
+        self.ensure_available()?;
+        let (response, guard) =
+            self.get_with_scoped_headers(url, &HeaderMap::new(), Deadline::Head).await?;
         if response.status() == StatusCode::NOT_FOUND {
             self.breaker.record_success();
             return Ok(FetchOutcome::NotFound);
         }
-        let response = self.checked(response, &url).await?;
+        let response = self.checked(response, url).await?;
         // Success here covers only headers; a mid-stream body failure is
         // the caller's to observe. Recording success on a clean status is
         // what verdaccio does too.
         self.breaker.record_success();
-        Ok(FetchOutcome::Ok(guard.retain_for_body(
-            response,
-            self.http.timeout.saturating_sub(started.elapsed()),
-        )))
+        Ok(FetchOutcome::Ok(guard.retain_for_body(response, self.http.timeout)))
     }
 
     /// Fetch a document by path relative to the upstream's base URL — a Cargo
@@ -300,7 +333,8 @@ impl Upstream {
         {
             headers.insert(header::ACCEPT, value);
         }
-        let (response, _guard) = self.get_with_scoped_headers(&url, &headers).await?;
+        let (response, _guard) =
+            self.get_with_scoped_headers(&url, &headers, Deadline::Whole).await?;
         if response.status() == StatusCode::NOT_FOUND {
             self.breaker.record_success();
             return Ok(FetchOutcome::NotFound);
@@ -309,7 +343,7 @@ impl Upstream {
         let final_url = response.url().to_string();
         let body = read_limited_body(response, limit).await
             .map_err(|err| {
-                self.breaker.record_failure();
+                self.record_body_failure(&err);
                 RegistryError::UpstreamResponse { url: url.clone(), reason: err.to_string() }
             })?;
         if body.truncated {
@@ -336,107 +370,48 @@ impl Upstream {
         &self,
         url: &str,
     ) -> Result<FetchOutcome<ThrottledResponse>> {
-        let started = Instant::now();
         self.ensure_available()?;
-        let (response, guard) = self.get_with_scoped_headers(url, &HeaderMap::new()).await?;
+        let (response, guard) =
+            self.get_with_scoped_headers(url, &HeaderMap::new(), Deadline::Head).await?;
         if response.status() == StatusCode::NOT_FOUND {
             self.breaker.record_success();
             return Ok(FetchOutcome::NotFound);
         }
         let response = self.checked(response, url).await?;
         self.breaker.record_success();
-        Ok(FetchOutcome::Ok(guard.retain_for_body(
-            response,
-            self.http.timeout.saturating_sub(started.elapsed()),
-        )))
+        Ok(FetchOutcome::Ok(guard.retain_for_body(response, self.http.timeout)))
     }
 
-    /// Fetch an immutable sha512 registry artifact without following redirects.
+    /// Fetch an immutable registry revision without following redirects.
+    /// The revision is a tar resource. The response keeps its content coding,
+    /// gzip or none, for the caller to decode and verify.
     pub async fn fetch_revision_tarball_response(
         &self,
-        digest: &str,
+        pkg: &CanonicalPackageName,
+        version: &str,
+        revision: TarballRevision,
     ) -> Result<FetchOutcome<ThrottledResponse>> {
         self.ensure_available()?;
-        let url = format!("{}/-/tarballs/sha512/{digest}", self.base.trim_end_matches('/'));
-        let client =
-            self.http.client.acquire_for_url_without_redirects_with_priority(&url, 0).await;
+        let url =
+            format!("{}/{}@{version}+r{revision}", self.base.trim_end_matches('/'), pkg.as_str());
+        let client = self.http.client.acquire_archive_for_url_with_priority(&url, 0, false).await;
         let started = Instant::now();
         let request = client
             .get(&url)
-            .timeout(self.http.timeout)
-            .headers(self.request_headers(&url));
-        let response = self.run(request, &url).await?;
+            .headers(self.request_headers(&url))
+            .header(reqwest::header::ACCEPT_ENCODING, "gzip");
+        let deadline = started + self.http.timeout;
+        let response = self.within_head_deadline(&url, deadline, self.run(request, &url)).await?;
         if response.status() == StatusCode::NOT_FOUND {
             self.breaker.record_success();
             return Ok(FetchOutcome::NotFound);
         }
         let response = self.checked(response, &url).await?;
         self.breaker.record_success();
-        Ok(FetchOutcome::Ok(client.retain_for_body(
-            response,
-            self.http.timeout.saturating_sub(started.elapsed()),
-        )))
+        Ok(FetchOutcome::Ok(client.retain_for_body(response, self.http.timeout)))
     }
 
-    /// Query an upstream npm search endpoint with the caller's already-encoded
-    /// query string. The upstream client contributes only configured headers,
-    /// never headers supplied by the browser caller.
-    pub async fn fetch_search(&self, query_string: &str) -> Result<FetchOutcome<SearchResponse>> {
-        self.fetch_discovery_json(&format!("/-/v1/search?{query_string}")).await
-    }
-
-    /// Fetch the npm organization package map for one validated scope.
-    pub async fn fetch_org_packages(
-        &self,
-        scope: &str,
-    ) -> Result<FetchOutcome<Map<String, Value>>> {
-        self.fetch_discovery_json(&format!("/-/org/{scope}/package")).await
-    }
-
-    async fn fetch_discovery_json<Payload: DeserializeOwned>(
-        &self,
-        path_and_query: &str,
-    ) -> Result<FetchOutcome<Payload>> {
-        self.ensure_available()?;
-        let url = format!("{}{path_and_query}", self.base.trim_end_matches('/'));
-        let client =
-            self.http.client.acquire_for_url_without_redirects_with_priority(&url, UNPRIORITIZED)
-                .await;
-        let request = client
-            .get(&url)
-            .timeout(self.http.timeout)
-            .headers(self.request_headers(&url));
-        let response = self.run(request, &url).await?;
-        if response.status() == StatusCode::NOT_FOUND {
-            self.breaker.record_success();
-            return Ok(FetchOutcome::NotFound);
-        }
-        let response = self.checked(response, &url).await?;
-        let body = read_limited_body(response, UPSTREAM_DISCOVERY_BODY_LIMIT)
-            .await
-            .map_err(|err| {
-                self.breaker.record_failure();
-                RegistryError::UpstreamResponse { url: url.clone(), reason: err.to_string() }
-            })?;
-        if body.truncated {
-            self.breaker.record_failure();
-            return Err(RegistryError::UpstreamResponse {
-                url,
-                reason: format!(
-                    "response body exceeds the {UPSTREAM_DISCOVERY_BODY_LIMIT}-byte limit",
-                ),
-            });
-        }
-        let parsed = serde_json::from_slice(&body.bytes)
-            .map_err(|err| {
-                self.breaker.record_failure();
-                RegistryError::UpstreamResponse { url, reason: err.to_string() }
-            })?;
-        self.breaker.record_success();
-        Ok(FetchOutcome::Ok(parsed))
-    }
-
-    fn request_headers(&self, url: &str) -> HeaderMap {
+    pub(crate) fn request_headers(&self, url: &str) -> HeaderMap {
         if same_origin(&self.base, url) && is_url_secure_for_credentials(url) {
             return self.http.headers.clone();
         }
@@ -446,76 +421,14 @@ impl Upstream {
     /// Fail fast with [`RegistryError::UpstreamUnavailable`] when the
     /// breaker is open, so callers never pay a request to a known-down
     /// upstream.
-    fn ensure_available(&self) -> Result<()> {
+    pub(crate) fn ensure_available(&self) -> Result<()> {
         if self.breaker.try_acquire() {
             return Ok(());
         }
-        Err(RegistryError::UpstreamUnavailable { upstream: self.name.clone() })
-    }
-
-    /// Send a built request, mapping a transport error to
-    /// [`RegistryError::Upstream`] and counting it against the breaker.
-    async fn run(&self, request: reqwest::RequestBuilder, url: &str) -> Result<reqwest::Response> {
-        self.ensure_allowed_url(url)?;
-        request
-            .send()
-            .await
-            .map_err(|source| {
-                self.breaker.record_failure();
-                RegistryError::Upstream { url: url.to_string(), source }
-            })
-    }
-
-    async fn get_with_scoped_headers(
-        &self,
-        url: &str,
-        headers: &HeaderMap,
-    ) -> Result<(reqwest::Response, ThrottledClientGuard<'_>)> {
-        self.ensure_allowed_url(url)?;
-        let started = Instant::now();
-        self.http.client
-            .get_response_with_scoped_headers(url, |request, destination| {
-                request
-                    .timeout(self.http.timeout.saturating_sub(started.elapsed()))
-                    .headers(self.request_headers(destination))
-                    .headers(headers.clone())
-            })
-            .await
-            .map_err(|source| {
-                self.breaker.record_failure();
-                RegistryError::Upstream { url: url.to_string(), source }
-            })
-    }
-
-    fn ensure_allowed_url(&self, url: &str) -> Result<()> {
-        if let Some(guard) = &self.http.fetch_guard
-            && !reqwest::Url::parse(url).is_ok_and(|url| guard(&url))
-        {
-            return Err(RegistryError::UpstreamResponse {
-                url: url.to_string(),
-                reason: "URL is not allowed by the fetch allowlist".to_string(),
-            });
-        }
-        Ok(())
-    }
-
-    /// Pass a successful response through; map any non-success status to
-    /// [`RegistryError::UpstreamStatus`]. Only a `5xx` counts against the
-    /// breaker — a non-404 `4xx` is an authoritative client error (auth,
-    /// rate-limit, bad request), not an availability signal, so it leaves
-    /// the breaker untouched rather than opening the circuit and masking
-    /// the real status behind a `503`. The `404`/`304` paths are handled
-    /// by the callers before reaching here.
-    async fn checked(&self, response: reqwest::Response, url: &str) -> Result<reqwest::Response> {
-        let status = response.status();
-        if status.is_success() {
-            return Ok(response);
-        }
-        if status.is_server_error() {
-            self.breaker.record_failure();
-        }
-        let body = read_upstream_error_body(response).await;
-        Err(RegistryError::UpstreamStatus { url: url.to_string(), status: status.as_u16(), body })
+        Err(RegistryError::UpstreamUnavailable {
+            upstream: self.name.clone(),
+            retry_after: self.breaker.retry_after(),
+        })
     }
 }
 

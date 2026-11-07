@@ -11,7 +11,7 @@
 //! `dedupeDirectDeps` regression that broke the v11.5.1 release) fails
 //! here instead of in a release pipeline.
 //!
-//! Three buckets classify every key in `defaultOptions`:
+//! Buckets classify every key in `defaultOptions`:
 //!
 //! - **mapped** — pacquet implements the setting with a directly
 //!   comparable literal default; the value is asserted equal.
@@ -20,15 +20,14 @@
 //!   `workspace-concurrency`, ...) with no source literal to compare.
 //! - **not ported** — pacquet has no `Config` field for it yet.
 //!
-//! The completeness guard asserts the three buckets exactly partition
+//! The completeness guard asserts the buckets exactly partition
 //! pnpm's key set, so a *new* pnpm setting (neither mapped nor skipped)
 //! fails the test until someone classifies it — which is how this test
 //! keeps catching the next default that needs porting.
 
 use crate::{
     CatalogMode, ColorMode, Config, InitType, LinkWorkspacePackages, NodeLinker,
-    NodePackageMapType, ResolutionMode, SaveWorkspaceProtocol, ScriptsPrependNodePath,
-    VerifyDepsBeforeRun,
+    NodePackageMapType, ResolutionMode, SaveWorkspaceProtocol, VerifyDepsBeforeRun,
 };
 use std::collections::BTreeSet;
 
@@ -65,9 +64,11 @@ const NON_LITERAL: &[&str] = &[
     "workspace-prefix",             // the discovered workspace directory
 ];
 
-/// pnpm settings pacquet has no `Config` field for yet. Porting one
-/// means moving its key from here into a `mapped` row.
-const NOT_PORTED: &[&str] = &[];
+/// pnpm settings pacquet has no `Config` field for. Porting one means
+/// moving its key from here into a `mapped` row.
+const NOT_PORTED: &[&str] = &[
+    "scripts-prepend-node-path", // ignored: no Node.js process runs pnpm
+];
 
 /// Settings both stacks implement but deliberately default differently,
 /// with the reason each divergence is intended. Entries here are exempt
@@ -80,8 +81,14 @@ const NOT_PORTED: &[&str] = &[];
 /// is exactly what the rest of this module exists to prevent. Add a row
 /// only for a staged rollout whose end state is convergence, and delete
 /// it once both stacks agree.
-fn divergent_rows(_cfg: &Config) -> Vec<(&'static str, Scalar, &'static str)> {
-    Vec::new()
+fn divergent_rows(cfg: &Config) -> Vec<(&'static str, Scalar, &'static str)> {
+    vec![(
+        "force-ignores-platform",
+        Scalar::Bool(cfg.force_ignores_platform),
+        "pnpm v11 keeps the behaviour its `--force` always had, installing \
+         optional dependencies of every platform; pnpm v12 matches npm 7+ \
+         and keeps the platform filter under `--force`",
+    )]
 }
 
 /// `(pnpm key, pacquet default rendered as a [`Scalar`])` for every
@@ -149,13 +156,8 @@ fn mapped_rows(cfg: &Config) -> Vec<(&'static str, Scalar)> {
         // `boolean | 'install' | 'warn' | 'error' | 'prompt'` upstream;
         // the default is `'install'`.
         ("verify-deps-before-run", verify_deps_before_run_scalar(cfg.verify_deps_before_run)),
-        // `boolean | 'warn-only'` upstream; the default is `false`.
-        (
-            "scripts-prepend-node-path",
-            scripts_prepend_node_path_scalar(cfg.scripts_prepend_node_path),
-        ),
         ("node-linker", node_linker_scalar(cfg.node_linker)),
-        ("node-experimental-package-map", Bool(cfg.node_experimental_package_map)),
+        ("node-experimental-package-map", Bool(cfg.node_package_map_mode.loads())),
         ("node-package-map-type", node_package_map_type_scalar(cfg.node_package_map_type)),
         ("resolution-mode", resolution_mode_scalar(cfg.resolution_mode)),
         ("catalog-mode", catalog_mode_scalar(cfg.catalog_mode)),
@@ -168,6 +170,7 @@ fn mapped_rows(cfg: &Config) -> Vec<(&'static str, Scalar)> {
         ("fetch-timeout", Int(cfg.fetch_timeout as i64)),
         ("fetch-warn-timeout-ms", Int(cfg.fetch_warn_timeout_ms as i64)),
         ("fetch-min-speed-ki-bps", Int(cfg.fetch_min_speed_ki_bps as i64)),
+        ("max-tarball-unpacked-size", Int(cfg.max_tarball_unpacked_size as i64)),
         ("frozen-store", Bool(cfg.frozen_store)),
         (
             "minimum-release-age",
@@ -229,6 +232,7 @@ fn node_linker_scalar(value: NodeLinker) -> Scalar {
         NodeLinker::Isolated => s("isolated"),
         NodeLinker::Hoisted => s("hoisted"),
         NodeLinker::Pnp => s("pnp"),
+        NodeLinker::Loaded => s("loaded"),
     }
 }
 
@@ -289,19 +293,14 @@ fn save_workspace_protocol_scalar(value: SaveWorkspaceProtocol) -> Scalar {
     }
 }
 
-fn scripts_prepend_node_path_scalar(value: ScriptsPrependNodePath) -> Scalar {
-    match value {
-        ScriptsPrependNodePath::Never => Scalar::Bool(false),
-        ScriptsPrependNodePath::Always => Scalar::Bool(true),
-        ScriptsPrependNodePath::WarnOnly => s("warn-only"),
-    }
-}
-
 /// The `defaultOptions` object literal, sliced out of pnpm's
 /// config-reader source. Read live so the test tracks pnpm rather than
 /// a checked-in copy that could silently drift.
 fn read_pnpm_default_options() -> String {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../pnpm11/config/reader/src/index.ts");
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../pnpm11/config/reader/src/getConfig/defaultOptions.ts",
+    );
     let src = std::fs::read_to_string(path)
         .unwrap_or_else(|err| {
             panic!(
@@ -313,13 +312,15 @@ fn read_pnpm_default_options() -> String {
     let marker = "const defaultOptions: Partial<KebabCaseConfig> = {";
     let start = src
         .find(marker)
-        .unwrap_or_else(|| panic!("`{marker}` not found in config/reader/src/index.ts"));
+        .unwrap_or_else(|| {
+            panic!("`{marker}` not found in config/reader/src/getConfig/defaultOptions.ts")
+        });
     let body = &src[start + marker.len()..];
     // The block ends at the first line that is exactly the closing brace
-    // at the object's indentation (`\n  }`).
+    // at the object's indentation (`\n}`).
     let end = body
-        .find("\n  }")
-        .expect("unterminated `defaultOptions` object literal in config/reader/src/index.ts");
+        .find("\n}")
+        .expect("unterminated `defaultOptions` object literal in config/reader/src/getConfig/defaultOptions.ts");
     body[..end].to_string()
 }
 

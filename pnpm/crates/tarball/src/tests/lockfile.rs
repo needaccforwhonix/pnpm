@@ -29,13 +29,20 @@ async fn fetch_for_resolution_writes_no_index_row_for_a_subdirectory_package() {
 
     let resolved = FetchTarballForResolution {
         http_client: &client,
-        store_dir: store_path,
-        store_index_writer: Some(Arc::clone(&writer)),
-        package_url: &url,
-        package_id: &url,
+        store: crate::ResolutionStore { dir: store_path, index_writer: Some(Arc::clone(&writer)) },
+        package: crate::TarballPackage {
+            integrity_kind: crate::IntegrityKind::Resource,
+            integrity: None,
+            unpacked_size: None,
+            file_count: None,
+            url: &url,
+            id: &url,
+        },
         auth_headers: &AuthHeaders::default(),
         retry_opts: fast_retry_opts(),
+        tar_limits: crate::TarLimits::default(),
         manifest_subdir: Some("/packages/foo"),
+        revision_addressed: false,
     }
     .run::<SilentReporter>(None)
     .await

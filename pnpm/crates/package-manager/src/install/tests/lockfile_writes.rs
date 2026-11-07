@@ -50,7 +50,7 @@ async fn lockfile_only_routes_scoped_packages_to_configured_scoped_registry() {
     let mut config = Config::new();
     config.store_dir = dir.path().join("pacquet-store").into();
     config.modules_dir = modules_dir;
-    config.virtual_store_dir = virtual_store_dir;
+    config.install_state_dir = virtual_store_dir;
     config.registry = format!("{}/", default_registry.url());
     config.registries_by_scope.insert("@private".to_string(), scoped_registry_url);
     let config = config.leak();
@@ -100,6 +100,8 @@ async fn lockfile_only_routes_scoped_packages_to_configured_scoped_registry() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -141,7 +143,7 @@ pub(super) async fn warm_reinstall_skips_snapshot_when_current_lockfile_matches(
     config.enable_global_virtual_store = false;
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
     let config = config.leak();
 
     let lockfile: Lockfile = serde_saphyr::from_str(PARTIAL_INSTALL_LOCKFILE)
@@ -152,7 +154,7 @@ pub(super) async fn warm_reinstall_skips_snapshot_when_current_lockfile_matches(
     // store slot the skip check stats against.
     std::fs::create_dir_all(&dirs.virtual_store_dir).unwrap();
     lockfile
-        .save_current_to_virtual_store_dir(&dirs.virtual_store_dir)
+        .save_current_to_install_state_dir(&dirs.virtual_store_dir)
         .expect("seed current lockfile");
     seed_placeholder_virtual_store_slot(&dirs.virtual_store_dir);
 
@@ -202,6 +204,8 @@ pub(super) async fn warm_reinstall_skips_snapshot_when_current_lockfile_matches(
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -213,7 +217,7 @@ pub(super) async fn warm_reinstall_skips_snapshot_when_current_lockfile_matches(
 
     // `lock.yaml` survives the install — the end-of-install write
     // persists the wanted lockfile back to disk.
-    let written = Lockfile::load_current_from_virtual_store_dir(&dirs.virtual_store_dir)
+    let written = Lockfile::load_current_from_install_state_dir(&dirs.virtual_store_dir)
         .expect("read written current lockfile")
         .expect("current lockfile should be written");
     assert_eq!(written.snapshots.as_ref().map(std::collections::HashMap::len), Some(1));
@@ -222,8 +226,8 @@ pub(super) async fn warm_reinstall_skips_snapshot_when_current_lockfile_matches(
 }
 /// Section A + D of pnpm/pacquet#433: a second install observes
 /// `pnpm:context.currentLockfileExists: true` once the first install
-/// has written `<virtual_store_dir>/lock.yaml`. Drives the read site
-/// (`Install::run` → `load_current_from_virtual_store_dir`) on real
+/// has written `<install_state_dir>/lock.yaml`. Drives the read site
+/// (`Install::run` → `load_current_from_install_state_dir`) on real
 /// disk state produced by the matching write site.
 #[tokio::test]
 pub(super) async fn context_log_reflects_current_lockfile_after_first_install() {
@@ -244,39 +248,38 @@ pub(super) async fn context_log_reflects_current_lockfile_after_first_install() 
 
     let manifest_path = dirs.path().join("package.json");
     let mut manifest = PackageManifest::create_if_needed(manifest_path).unwrap();
-    // Manifest must match the fixture lockfile below — the freshness
+    // Manifest must match the fixture lockfile below. The freshness
     // check (<https://github.com/pnpm/pacquet/issues/447>) rejects any drift between the on-disk manifest and
     // the lockfile importer entry.
-    manifest.add_dependency("placeholder", "1.0.0", DependencyGroup::Prod).unwrap();
+    manifest.add_dependency("sibling", "link:./sibling", DependencyGroup::Prod).unwrap();
     manifest.save().unwrap();
+
+    let sibling_dir = dirs.path().join("sibling");
+    std::fs::create_dir_all(&sibling_dir).unwrap();
+    std::fs::write(sibling_dir.join("package.json"), r#"{"name":"sibling","version":"1.0.0"}"#)
+        .unwrap();
 
     let mut config = Config::new();
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
     let config = config.leak();
 
-    // Non-empty lockfile with no snapshots: the root importer lists
-    // one dependency so `Lockfile::is_empty` returns `false` (and
-    // the end-of-install write persists the file rather than
-    // deleting it), but the empty `snapshots:` map means
-    // `CreateVirtualStore::run` has no fetches to attempt. The
-    // dangling symlink that `SymlinkDirectDependencies` creates is
-    // fine — `link_direct_dep_bins` swallows `NotFound` on the
-    // target's `package.json`. This keeps the test off the mock
-    // registry while still driving the read-after-write loop.
+    // A `link:` dependency keeps the lockfile non-empty without pulling a
+    // snapshot from a registry: `Lockfile::is_empty` is false, the write
+    // path persists the file, and the install needs no network.
     let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
         "lockfileVersion: '9.0'"
         "importers:"
         "  .:"
         "    dependencies:"
-        "      placeholder:"
-        "        specifier: 1.0.0"
-        "        version: 1.0.0"
+        "      sibling:"
+        "        specifier: link:./sibling"
+        "        version: link:./sibling"
         "packages: {}"
         "snapshots: {}"
     })
-    .expect("parse minimal v9 lockfile");
+    .expect("parse minimal v9 lockfile with one link dep");
     assert!(!lockfile.is_empty(), "fixture must be non-empty so the write path persists it");
 
     // First install: `lock.yaml` does not exist yet.
@@ -326,6 +329,8 @@ pub(super) async fn context_log_reflects_current_lockfile_after_first_install() 
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<RecordingReporter>()
@@ -344,7 +349,7 @@ pub(super) async fn context_log_reflects_current_lockfile_after_first_install() 
     assert!(!first_context.current_lockfile_exists);
 
     // The first install must have persisted the lockfile under the
-    // virtual store. If `save_current_to_virtual_store_dir` regressed
+    // virtual store. If `save_current_to_install_state_dir` regressed
     // for non-empty lockfiles, this check fails — and so does the
     // false→true assertion below, which is the whole point of pinning
     // the read-after-write loop.
@@ -404,6 +409,8 @@ pub(super) async fn context_log_reflects_current_lockfile_after_first_install() 
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<RecordingReporter>()
@@ -426,8 +433,8 @@ pub(super) async fn context_log_reflects_current_lockfile_after_first_install() 
 
     drop(dirs.dir);
 }
-/// Wiring proof for the new `nodeLinker: hoisted` install branch
-/// (umbrella [#438] slice 6). Empty lockfile drives the cheapest
+/// Wiring proof for the new `nodeLinker: hoisted` install branch.
+/// Empty lockfile drives the cheapest
 /// successful install path:
 ///
 /// 1. `Install::run` dispatches into `InstallFrozenLockfile::run`.
@@ -439,19 +446,14 @@ pub(super) async fn context_log_reflects_current_lockfile_after_first_install() 
 ///    walker result against the empty `snapshots:` map.
 /// 4. [`crate::link_hoisted_modules()`] is called with an empty
 ///    graph (no-op).
-/// 5. `BuildModules` is skipped under hoisted (slice 7 retargets
-///    it onto `hoistedLocations`).
+/// 5. `BuildModules` is skipped under hoisted.
 /// 6. `.modules.yaml` is written with `nodeLinker: hoisted` and
 ///    `hoisted_locations: None` (the field is dropped when empty
 ///    so an isolated install never produces a hoisted-only key).
 ///
 /// The empty-lockfile shape exercises every branch on `is_hoisted`
 /// without needing a real package fetch — proving the wiring
-/// composes with the existing pipeline phases. End-to-end coverage
-/// against the registry-mock with a real package is left to a
-/// follow-up CLI integration test.
-///
-/// [#438]: https://github.com/pnpm/pacquet/issues/438
+/// composes with the existing pipeline phases.
 #[tokio::test]
 async fn hoisted_node_linker_empty_lockfile_writes_modules_yaml() {
     let dirs = InstallDirs::new();
@@ -464,7 +466,7 @@ async fn hoisted_node_linker_empty_lockfile_writes_modules_yaml() {
     config.lockfile = false;
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
     let config = config.leak();
 
     let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
@@ -522,6 +524,8 @@ async fn hoisted_node_linker_empty_lockfile_writes_modules_yaml() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -572,8 +576,8 @@ async fn fresh_install_lockfile_round_trips_through_load_save_load() {
     let mut config = Config::new();
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
-    config.registry = mock_instance.url();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
+    config.registry = mock_instance.url().to_string();
     let config = config.leak();
 
     Install {
@@ -625,6 +629,8 @@ async fn fresh_install_lockfile_round_trips_through_load_save_load() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -635,7 +641,9 @@ async fn fresh_install_lockfile_round_trips_through_load_save_load() {
     let first = std::fs::read_to_string(&lockfile_path).expect("read first");
     let parsed: Lockfile = serde_saphyr::from_str(&first).expect("parse first");
     let second_path = dirs.path().join("pnpm-lock.round-trip.yaml");
-    parsed.save_to_path(&second_path).expect("save round-trip lockfile");
+    parsed
+        .save_to_path(&second_path, pnpm_lockfile::SymlinkedLockfile::Refuse)
+        .expect("save round-trip lockfile");
     let second = std::fs::read_to_string(&second_path).expect("read second");
     let reparsed: Lockfile = serde_saphyr::from_str(&second).expect("parse second");
 
@@ -664,8 +672,8 @@ async fn fresh_install_with_lockfile_disabled_does_not_write_a_lockfile() {
     config.lockfile = false;
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
-    config.registry = mock_instance.url();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
+    config.registry = mock_instance.url().to_string();
     let config = config.leak();
 
     Install {
@@ -717,6 +725,8 @@ async fn fresh_install_with_lockfile_disabled_does_not_write_a_lockfile() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -736,7 +746,7 @@ async fn fresh_install_with_lockfile_disabled_does_not_write_a_lockfile() {
 
     drop((dirs.dir, mock_instance));
 }
-/// A fresh install also writes `<virtual_store_dir>/lock.yaml` so the
+/// A fresh install also writes `<install_state_dir>/lock.yaml` so the
 /// next install's slot-skip optimization has something to diff
 /// against. The current-lockfile write runs at the tail of the
 /// install pipeline. The contents round-trip
@@ -758,8 +768,8 @@ async fn fresh_install_also_writes_current_lockfile_under_virtual_store() {
     let mut config = Config::new();
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
-    config.registry = mock_instance.url();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
+    config.registry = mock_instance.url().to_string();
     let config = config.leak();
 
     Install {
@@ -811,6 +821,8 @@ async fn fresh_install_also_writes_current_lockfile_under_virtual_store() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -851,11 +863,11 @@ async fn fresh_install_also_writes_current_lockfile_under_virtual_store() {
 
     drop((dirs.dir, mock_instance));
 }
-/// `config.lockfile = false` opts out of *both* lockfile writes (the
-/// wanted `pnpm-lock.yaml` and the per-virtual-store `lock.yaml`) —
-/// the `useLockfile` setting is all-or-nothing.
+/// `config.lockfile = false` opts out of the wanted `pnpm-lock.yaml` write,
+/// but still persists the per-virtual-store `lock.yaml` so subsequent operations
+/// (such as `prune`) can determine the installed dependency graph.
 #[tokio::test]
-async fn fresh_install_with_lockfile_disabled_skips_current_lockfile_too() {
+async fn fresh_install_with_lockfile_disabled_writes_current_lockfile() {
     let mock_instance = TestRegistry::start();
 
     let dirs = InstallDirs::new();
@@ -871,8 +883,8 @@ async fn fresh_install_with_lockfile_disabled_skips_current_lockfile_too() {
     config.lockfile = false;
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
-    config.registry = mock_instance.url();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
+    config.registry = mock_instance.url().to_string();
     let config = config.leak();
 
     Install {
@@ -924,6 +936,8 @@ async fn fresh_install_with_lockfile_disabled_skips_current_lockfile_too() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -931,8 +945,15 @@ async fn fresh_install_with_lockfile_disabled_skips_current_lockfile_too() {
     .expect("install should succeed");
 
     assert!(
-        !dirs.virtual_store_dir.join(Lockfile::CURRENT_FILE_NAME).exists(),
-        "current-lockfile must also be skipped when config.lockfile = false",
+        !dirs
+            .path()
+            .join(Lockfile::FILE_NAME)
+            .exists(),
+        "wanted-lockfile must be skipped when config.lockfile = false",
+    );
+    assert!(
+        dirs.virtual_store_dir.join(Lockfile::CURRENT_FILE_NAME).exists(),
+        "current-lockfile must be written even when config.lockfile = false",
     );
 
     drop((dirs.dir, mock_instance));

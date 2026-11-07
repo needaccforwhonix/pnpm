@@ -39,6 +39,27 @@ fn a_manifest_that_inherits_nothing_is_vendored_verbatim() {
 }
 
 #[test]
+fn an_omitted_version_defaults_to_zero_without_rewriting_the_manifest() {
+    let text = "[package]\nname = \"demo\"\npublish = false\n";
+
+    let vendored = vendored_package(&manifest(text), None).unwrap();
+
+    assert_eq!(vendored.version, "0.0.0");
+    assert_eq!(vendored.manifest, text);
+}
+
+#[test]
+fn an_explicit_invalid_version_does_not_use_the_default() {
+    for value in ["123", "true", r#""""#, r#""invalid""#] {
+        let text = format!("[package]\nname = \"demo\"\nversion = {value}\n");
+        let error = vendored_package(&manifest(&text), None).unwrap_err();
+
+        eprintln!("An explicitly invalid version must be rejected: {error:?}");
+        assert!(format!("{error:?}").contains("package.version"));
+    }
+}
+
+#[test]
 fn workspace_inheritance_is_resolved_into_the_vendored_manifest() {
     let workspace = manifest(
         r#"
@@ -306,7 +327,20 @@ fn a_vendored_package_is_taken_from_the_store_without_a_second_checkout() {
     );
     let store_dir = StoreDir::from(temp_dir.path().join("store"));
     store_dir.init().unwrap();
+    let legacy = store_dir
+        .root()
+        .join("crates/demo/1.0.0")
+        .join(format!("git-{commit}"));
+    fs::create_dir_all(&legacy).unwrap();
+    fs::write(legacy.join(".cargo-checksum.json"), "{}").unwrap();
     let linked = vendor_from(&repository, &commit, &store_dir, &[("demo", "1.0.0")]);
+
+    eprintln!("Legacy Git slots must be refetched: {linked:?}");
+    assert_ne!(linked[0].1, legacy);
+    assert_eq!(
+        fs::read_to_string(linked[0].1.join("src/lib.rs")).unwrap().trim(),
+        "pub fn demo() {}",
+    );
 
     // Offline, so a second checkout of the repository would be an error.
     let relinked =

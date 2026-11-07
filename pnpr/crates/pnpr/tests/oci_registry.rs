@@ -14,23 +14,16 @@ mod discovery;
 #[path = "oci_registry/manifests.rs"]
 mod manifests;
 
+#[path = "oci_registry/upload_hint.rs"]
+mod upload_hint;
+
 #[path = "oci_registry/uploads.rs"]
 mod uploads;
 
 #[path = "oci_registry/behavior.rs"]
 mod behavior;
 
-// `#[path]` rather than the `tests/common/mod.rs` layout, which the
-// Perfectionist dylint forbids.
-#[path = "common/ecosystem.rs"]
-#[allow(
-    dead_code,
-    reason = "the shared fixtures include helpers for the Cargo and Python surfaces"
-)]
-mod common;
-
-#[path = "common/pausing_store.rs"]
-mod pausing_store;
+use crate::{ecosystem as common, pausing_store};
 
 #[path = "../src/server/striped_locks.rs"]
 #[allow(dead_code, reason = "the collision fixture uses the production stripe mapping")]

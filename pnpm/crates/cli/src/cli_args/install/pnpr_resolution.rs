@@ -1,75 +1,14 @@
 use super::{
-    Catalogs, Context, DependencyGroup, Diagnostic, Display, Error, InstallFamilySelection,
-    LocalLockfileInstall, Lockfile, MaybeLazyLockfile, PnprBenchmarkRegistryOverride, PnprClient,
-    PnprClientError, PnprLink, PnprRequestInputs, Reporter, ResolveProject, ResolveProjectsOptions,
-    State, TarballPrefetcher, WantedLockfileSatisfactionCheck, full_workspace_importer_ids,
-    install_from_local_lockfile, link_pnpr_lockfile, merge_and_save_pnpr_lockfile, pnpr_catalogs,
-    pnpr_lockfile_dir, pnpr_request_inputs, resolve_projects_for_pnpr, resolve_projects_options,
+    Catalogs, Display, Error, InstallFamilySelection, LocalLockfileInstall, Lockfile,
+    MaybeLazyLockfile, PnprBenchmarkRegistryOverride, PnprClient, PnprClientError, PnprLink,
+    PnprRequestInputs, PnprTarget, Reporter, ResolveProject, ResolveProjectsOptions, State,
+    TarballPrefetcher, WantedLockfileSatisfactionCheck, check_frozen_pnpmfile,
+    check_pnpr_applied_settings, full_workspace_importer_ids, install_from_local_lockfile,
+    link_pnpr_lockfile, merge_and_save_pnpr_lockfile, pnpr_catalogs,
+    pnpr_config_validation::validate_pnpr_config, pnpr_lockfile_dir, pnpr_request_inputs,
+    report_merged_lockfile_conflicts, resolve_projects_for_pnpr, resolve_projects_options,
     selection_importer_ids, wanted_lockfile_satisfies_workspace,
 };
-
-/// `frozenStore` was enabled together with a configured `pnprServer`.
-/// The pnpr path writes resolved files into the store, which `frozenStore`
-/// opens read-only, so the combination can't proceed. Mirrors pnpm's
-/// `ERR_PNPM_FROZEN_STORE_INCOMPATIBLE_WITH_PNPR`.
-#[derive(Debug, Display, Error, Diagnostic)]
-#[display(
-    "The pnpr server resolves dependencies and writes new entries into the store, which is opened read-only when frozenStore is enabled."
-)]
-#[diagnostic(
-    code(ERR_PNPM_FROZEN_STORE_INCOMPATIBLE_WITH_PNPR),
-    help(
-        "Disable the pnpr server (unset `--pnpr-server` / `pnprServer` in pnpm-workspace.yaml) so the install reads from the existing store, or unset `frozenStore` to allow store writes."
-    )
-)]
-struct FrozenStoreIncompatibleWithPnpr;
-
-/// `--dry-run` was requested with a configured `pnprServer`. The pnpr path
-/// resolves and links through the server, so it can't honor the dry-run
-/// "writes nothing" contract. Mirrors pnpm's
-/// `ERR_PNPM_CONFIG_CONFLICT_DRY_RUN_WITH_PNPR_SERVER`.
-#[derive(Debug, Display, Error, Diagnostic)]
-#[display(
-    "Cannot use --dry-run with a configured pnpr server because the pnpr install path resolves and links through the server."
-)]
-#[diagnostic(
-    code(ERR_PNPM_CONFIG_CONFLICT_DRY_RUN_WITH_PNPR_SERVER),
-    help(
-        "Unset the pnpr server (`--pnpr-server` / `pnprServer` in pnpm-workspace.yaml) to preview locally, or drop --dry-run."
-    )
-)]
-pub(super) struct DryRunIncompatibleWithPnpr;
-
-pub(super) fn resolve_project(
-    dir: String,
-    manifest: &pnpm_package_manifest::PackageManifest,
-) -> ResolveProject {
-    ResolveProject {
-        dir,
-        name: manifest
-            .value()
-            .get("name")
-            .and_then(|value| value.as_str())
-            .map(str::to_string),
-        version: manifest
-            .value()
-            .get("version")
-            .and_then(|value| value.as_str())
-            .map(str::to_string),
-        dependencies: manifest
-            .dependencies([DependencyGroup::Prod])
-            .map(|(name, spec)| (name.to_string(), spec.to_string()))
-            .collect(),
-        dev_dependencies: manifest
-            .dependencies([DependencyGroup::Dev])
-            .map(|(name, spec)| (name.to_string(), spec.to_string()))
-            .collect(),
-        optional_dependencies: manifest
-            .dependencies([DependencyGroup::Optional])
-            .map(|(name, spec)| (name.to_string(), spec.to_string()))
-            .collect(),
-    }
-}
 
 /// Resolve the active project or selected workspace projects through a
 /// `pnpr` server, then link them.
@@ -91,40 +30,33 @@ pub(super) fn resolve_project(
 /// ([pnpm/pnpm#13904](https://github.com/pnpm/pnpm/issues/13904)).
 pub(crate) async fn install_via_pnpr<Reporter: self::Reporter + 'static>(
     state: &State,
-    pnpr_server: &str,
+    target: PnprTarget<'_>,
     link: PnprLink<'_>,
 ) -> miette::Result<()> {
-    Box::pin(install_via_pnpr_inner::<Reporter>(state, pnpr_server, None, link)).await
+    Box::pin(install_via_pnpr_inner::<Reporter>(state, target, None, link)).await
 }
 
 pub(crate) async fn install_selected_via_pnpr<Reporter: self::Reporter + 'static>(
     state: &State,
-    pnpr_server: &str,
+    target: PnprTarget<'_>,
     selection: &InstallFamilySelection,
     link: PnprLink<'_>,
 ) -> miette::Result<()> {
-    Box::pin(install_via_pnpr_inner::<Reporter>(state, pnpr_server, Some(selection), link)).await
+    Box::pin(install_via_pnpr_inner::<Reporter>(state, target, Some(selection), link)).await
 }
 
 pub(super) async fn install_via_pnpr_inner<Reporter: self::Reporter + 'static>(
     state: &State,
-    pnpr_server: &str,
+    target: PnprTarget<'_>,
     selection: Option<&InstallFamilySelection>,
     link: PnprLink<'_>,
 ) -> miette::Result<()> {
-    // The pnpr server resolves dependencies and streams missing files
-    // straight into the store, so this path inherently writes the store.
-    // `frozenStore` promises the store is complete and read-only, so the
-    // two are mutually exclusive — refuse up front instead of failing on
-    // the read-only write with the `FROZEN_STORE_INCOMPATIBLE_WITH_PNPR`
-    // guard.
-    if state.config.frozen_store {
-        return Err(FrozenStoreIncompatibleWithPnpr.into());
-    }
+    validate_pnpr_config(state.config, link.lockfile.frozen)?;
 
+    let pnpr_server = target.server;
     let lockfile_dir = pnpr_lockfile_dir(state, &link);
     let session = prepare_pnpr_session::<Reporter>(state, selection, &link, lockfile_dir).await?;
-    let inputs = pnpr_request_inputs(state, &link, lockfile_dir).await?;
+    let inputs = pnpr_request_inputs(state, &link, lockfile_dir, target.pnpmfile_hook).await?;
 
     if (session.satisfied_without_server
         || (link.lockfile.frozen && (selection.is_some() || !link.lockfile.only)))
@@ -182,7 +114,10 @@ async fn prepare_pnpr_session<'a, Reporter: self::Reporter + 'static>(
     link: &PnprLink<'_>,
     lockfile_dir: &std::path::Path,
 ) -> miette::Result<PnprSession<'a>> {
-    let previous_wanted = load_previous_wanted::<Reporter>(state, link, lockfile_dir)?;
+    let PreviousWanted {
+        lockfile: previous_wanted,
+        had_conflicts,
+    } = load_previous_wanted::<Reporter>(state, link, lockfile_dir)?;
     let merge_wanted = merge_source(state, link, previous_wanted)?;
 
     let selection_importer_ids = selection_importer_ids(state, selection);
@@ -197,14 +132,17 @@ async fn prepare_pnpr_session<'a, Reporter: self::Reporter + 'static>(
 
     let catalogs = pnpr_catalogs(state)?;
 
-    let satisfied_without_server = satisfied_without_server(
-        state,
-        link,
-        previous_wanted,
-        catalogs.as_ref(),
-        partial_selection,
-    )
-    .await;
+    // A merged conflict makes the on-disk lockfile a file no install may
+    // leave as it found it, and only the server exchange writes it back.
+    let satisfied_without_server = !had_conflicts
+        && satisfied_without_server(
+            state,
+            link,
+            previous_wanted,
+            catalogs.as_ref(),
+            partial_selection,
+        )
+        .await;
     Ok(PnprSession {
         previous_wanted,
         merge_wanted,
@@ -234,15 +172,6 @@ pub(super) async fn prefetch_allowed(
         .any(|fetcher| fetcher.has_can_fetch() && fetcher.has_fetch()))
 }
 
-/// Whether the resolve streams its packages into a prefetcher, and what
-/// the prefetcher needs to start.
-struct ResolveStreaming<'a> {
-    lockfile_dir: &'a std::path::Path,
-    lockfile_only: bool,
-    partial_selection: bool,
-    prefetch_allowed: bool,
-}
-
 /// Ask the pnpr server to resolve the projects, streaming each resolved
 /// package into a tarball prefetcher as its frame arrives so the fetch
 /// overlaps the server's resolution
@@ -254,45 +183,75 @@ struct ResolveStreaming<'a> {
 /// consumed with a no-op callback. A partial install also waits for the
 /// merged lockfile before fetching, because only then is the selected
 /// workspace closure known.
+struct PnprResolveResult {
+    outcome: pnpm_pnpr_client::ResolveOutcome,
+    prefetcher: Option<TarballPrefetcher>,
+    known_requires_build: Option<std::collections::HashMap<pnpm_lockfile::PackageKey, bool>>,
+}
+
 async fn resolve_via_pnpr(
-    state: &State,
     pnpr_server: &str,
     opts: ResolveProjectsOptions,
     benchmark_registry_override: Option<&PnprBenchmarkRegistryOverride>,
-    streaming: ResolveStreaming<'_>,
-) -> miette::Result<(pnpm_pnpr_client::ResolveOutcome, Option<TarballPrefetcher>)> {
+    prefetcher: Option<TarballPrefetcher>,
+) -> miette::Result<PnprResolveResult> {
     let client = PnprClient::new(pnpr_server);
-    let prefetcher = streaming_prefetcher(state, &streaming).await;
+    let mut known_requires_build = std::collections::HashMap::new();
 
-    let result = match prefetcher.as_ref() {
-        Some(prefetcher) => {
-            client.resolve_projects_streaming(opts, |pkg| {
-                let tarball = benchmark_registry_override.map_or_else(
-                    || pkg.tarball.clone(),
-                    |registry| registry.client_tarball_url(&pkg.tarball),
-                );
-                prefetcher.prefetch(
-                    pkg.id,
-                    tarball,
-                    &pkg.integrity,
-                    pkg.unpacked_size,
-                    pkg.file_count,
-                    pkg.revision.is_some(),
-                );
-            })
-            .await
+    let result = client.resolve_projects_streaming(opts, |pkg| {
+        if let Some(requires_build) = pkg.requires_build
+            && let Ok(key) = pkg.id.parse::<pnpm_lockfile::PackageKey>()
+        {
+            known_requires_build.insert(key.without_peer(), requires_build);
         }
-        None => client.resolve_projects(opts).await,
-    };
+        if let Some(prefetcher) = prefetcher.as_ref() {
+            let tarball = match benchmark_registry_override {
+                Some(registry) => registry.client_tarball_url(&pkg.tarball),
+                None => pkg.tarball.clone(),
+            };
+            prefetcher.prefetch(
+                pkg.id,
+                tarball,
+                &pkg.integrity,
+                pkg.unpacked_size,
+                pkg.file_count,
+                pkg.revision.is_some(),
+            );
+        }
+    })
+    .await;
     match result {
-        Ok(outcome) => Ok((outcome, prefetcher)),
-        // The server rejected the input lockfile under our policy.
-        // Surface the reconstructed `VerifyError` so the abort + the
-        // `ERR_PNPM_*` diagnostic code match the local gate exactly.
-        Err(PnprClientError::Verification(verify_err)) => Err(miette::Report::new(verify_err)),
-        Err(err) => {
-            Err(miette::miette!("{err}")).wrap_err("resolving dependencies via the pnpr server")
+        Ok(outcome) => Ok(PnprResolveResult {
+            outcome,
+            prefetcher,
+            known_requires_build: (!known_requires_build.is_empty()).then_some(
+                known_requires_build,
+            ),
+        }),
+        Err(err) => Err(map_pnpr_client_error(err)),
+    }
+}
+
+#[derive(Debug, Display, Error)]
+#[display("{message}")]
+struct ServerErrorWithCode {
+    message: String,
+    code: String,
+}
+
+impl miette::Diagnostic for ServerErrorWithCode {
+    fn code<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
+        Some(Box::new(&self.code))
+    }
+}
+
+fn map_pnpr_client_error(err: PnprClientError) -> miette::Report {
+    match err {
+        PnprClientError::Verification(verify_err) => miette::Report::new(verify_err),
+        PnprClientError::Server { message, code: Some(code) } => {
+            miette::Report::new(ServerErrorWithCode { message, code })
         }
+        other => miette::miette!("{other}").wrap_err("resolving dependencies via the pnpr server"),
     }
 }
 
@@ -307,14 +266,26 @@ fn load_previous_wanted<'a, Reporter: self::Reporter + 'static>(
     state: &'a State,
     link: &PnprLink<'_>,
     lockfile_dir: &std::path::Path,
-) -> miette::Result<Option<&'a Lockfile>> {
+) -> miette::Result<PreviousWanted<'a>> {
     if !link.use_state_lockfile {
-        return Ok(None);
+        return Ok(PreviousWanted::default());
     }
-    let loaded =
-        if link.lockfile.fix { state.lockfile.get_for_fix() } else { state.lockfile.get() };
+    let lockfile_source = if link.lockfile.fix {
+        MaybeLazyLockfile::Repair(&state.lockfile)
+    } else {
+        MaybeLazyLockfile::Lazy(&state.lockfile)
+    };
+    let loaded = lockfile_source.get();
     match loaded {
-        Ok(lockfile) => Ok(lockfile),
+        Ok(lockfile) => {
+            let merged_conflict_files =
+                lockfile_source.merged_conflict_files().map_err(miette::Report::new)?;
+            report_merged_lockfile_conflicts::<Reporter>(
+                merged_conflict_files,
+                &lockfile_dir.to_string_lossy(),
+            );
+            Ok(PreviousWanted { lockfile, had_conflicts: merged_conflict_files > 0 })
+        }
         Err(error) if !link.lockfile.frozen => {
             <Reporter as pnpm_reporter::Reporter>::emit(&pnpm_reporter::LogEvent::Pnpm(
                 pnpm_reporter::PnpmLog {
@@ -326,10 +297,19 @@ fn load_previous_wanted<'a, Reporter: self::Reporter + 'static>(
                     prefix: lockfile_dir.to_string_lossy().into_owned(),
                 },
             ));
-            Ok(None)
+            Ok(PreviousWanted::default())
         }
         Err(error) => Err(miette::Report::new(error).wrap_err("load the lockfile")),
     }
+}
+
+/// The lockfile this install starts from, and whether reading it meant
+/// merging Git conflict markers away. The markers are still in the file,
+/// so a run that reused this lockfile unchanged would leave them there.
+#[derive(Default)]
+struct PreviousWanted<'a> {
+    lockfile: Option<&'a Lockfile>,
+    had_conflicts: bool,
 }
 
 /// The lockfile the filtered merge below reuses entries from. A
@@ -392,58 +372,59 @@ async fn resolve_and_link_pnpr<Reporter: self::Reporter + 'static>(
     mut session: PnprSession<'_>,
     mut inputs: PnprRequestInputs,
 ) -> miette::Result<()> {
+    if link.lockfile.frozen
+        && let Some(previous_wanted) = session.previous_wanted
+    {
+        check_frozen_pnpmfile(state, inputs.pnpmfile_hook.as_ref(), previous_wanted).await?;
+    }
+    let prefetcher = streaming_prefetcher(state, lockfile_dir, &link, &session, &inputs).await;
     let opts = resolve_projects_options(state, pnpr_server, &link, &mut session, &mut inputs);
-    let (mut outcome, prefetcher) = resolve_via_pnpr(
-        state,
+    let resolved = resolve_via_pnpr(
         pnpr_server,
         opts,
         inputs.benchmark_registry_override.as_ref(),
-        ResolveStreaming {
-            lockfile_dir,
-            lockfile_only: link.lockfile.only,
-            partial_selection: session.partial_selection,
-            prefetch_allowed: inputs.prefetch_allowed,
-        },
+        prefetcher,
     )
     .await?;
-
-    outcome.lockfile = merge_and_save_pnpr_lockfile::<Reporter>(
+    check_pnpr_applied_settings(state.config, resolved.outcome.lockfile.settings.as_ref())?;
+    let lockfile = merge_and_save_pnpr_lockfile::<Reporter>(
         state,
         selection,
         &link,
         &session,
         &inputs,
-        outcome.lockfile,
+        resolved.outcome.lockfile,
     )
     .await?;
-
-    // `--lockfile-only`: the server resolved and returned the lockfile
-    // but fetched nothing; pnpm links nothing in this mode, so stop after
-    // writing the lockfile rather than running the materialization pass.
-    // See [pnpm/pnpm#12146](https://github.com/pnpm/pnpm/issues/12146).
-    if link.lockfile.only {
-        return Ok(());
-    }
-
-    link_pnpr_lockfile::<Reporter>(state, selection, link, &outcome.lockfile, inputs.pnpmfile_hook)
+    if !link.lockfile.only {
+        link_pnpr_lockfile::<Reporter>(
+            state,
+            selection,
+            link,
+            &lockfile,
+            resolved.known_requires_build,
+            inputs.pnpmfile_hook,
+        )
         .await?;
-
-    // The materialization install has awaited every tarball's mem-cache
-    // slot, so all prefetch downloads have finished and queued their
-    // store-index rows. Drain the writer so those rows are persisted for
-    // the next install before returning.
-    if let Some(prefetcher) = prefetcher {
-        prefetcher.shutdown().await;
+        // The materialization install has awaited every tarball's mem-cache
+        // slot, so all prefetch downloads have finished and queued their
+        // store-index rows. Drain the writer so those rows are persisted for
+        // the next install before returning.
+        if let Some(prefetcher) = resolved.prefetcher {
+            prefetcher.shutdown().await;
+        }
     }
-
     Ok(())
 }
 
 async fn streaming_prefetcher(
     state: &State,
-    streaming: &ResolveStreaming<'_>,
+    lockfile_dir: &std::path::Path,
+    link: &PnprLink<'_>,
+    session: &PnprSession<'_>,
+    inputs: &PnprRequestInputs,
 ) -> Option<TarballPrefetcher> {
-    if streaming.lockfile_only || streaming.partial_selection || !streaming.prefetch_allowed {
+    if link.lockfile.only || session.partial_selection || !inputs.prefetch_allowed {
         None
     } else {
         Some(
@@ -452,7 +433,8 @@ async fn streaming_prefetcher(
                 &state.http_client,
                 &state.tarball_mem_cache,
                 None,
-                &streaming.lockfile_dir.to_string_lossy(),
+                &lockfile_dir.to_string_lossy(),
+                None,
             )
             .await,
         )

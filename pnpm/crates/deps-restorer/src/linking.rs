@@ -8,21 +8,19 @@
 //! reports.
 
 use crate::{
-    LinkVirtualStoreBins, SkippedSnapshots, SymlinkDirectDependencies, VirtualStoreLayout,
+    LinkVirtualStoreBins, SkippedSnapshots, SymlinkDirectDependencies,
     install_frozen_lockfile::{
-        HoistPlan, HoistedLinkerError, HoistedLinkerInputs, collect_public_hoist_targets,
-        compute_hoist_plan, run_hoisted_linker, workspace_packages_for_hoist,
+        HoistPlan, HoistedLinkerError, HoistedLinkerInputs, run_hoisted_linker,
     },
-    link_direct_dep_bins_resolved, link_root_component_members, symlink_hoisted_dependencies,
+    link_direct_dep_bins_resolved_excluding, link_root_component_members,
 };
 use derive_more::{Display, Error};
 use miette::Diagnostic;
-use pnpm_cmd_shim::LinkBinsOptions;
-use pnpm_config::{Config, NodeLinker};
+use pnpm_config::NodeLinker;
 use pnpm_lockfile::PackageKey;
-use pnpm_reporter::{LogEvent, LogLevel, Reporter, StatsLog, StatsMessage};
+use pnpm_reporter::Reporter;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     path::PathBuf,
 };
 
@@ -55,12 +53,19 @@ pub enum LinkPhaseError {
     HoistedDepGraph(#[error(source)] crate::HoistedDepGraphError),
     #[diagnostic(transparent)]
     LinkHoistedModules(#[error(source)] crate::LinkHoistedModulesError),
+    #[diagnostic(transparent)]
+    ReadModules(#[error(source)] pnpm_modules_yaml::ReadModulesError),
+    #[diagnostic(transparent)]
+    WriteModules(#[error(source)] pnpm_modules_yaml::WriteModulesError),
     #[display("failed to write package map: {_0}")]
     #[diagnostic(code(ERR_PNPM_PACKAGE_MANAGER_WRITE_PACKAGE_MAP))]
     WritePackageMap(#[error(source)] crate::WritePackageMapError),
     #[display("failed to write PnP loader: {_0}")]
     #[diagnostic(code(ERR_PNPM_PACKAGE_MANAGER_WRITE_PNP_FILE))]
     WritePnpFile(#[error(source)] crate::WritePnpFileError),
+    #[display("Failed to write CAS installation: {_0}")]
+    #[diagnostic(code(ERR_PNPM_CAS_INSTALL))]
+    Cas(#[error(source)] std::io::Error),
 }
 
 impl From<HoistedLinkerError> for LinkPhaseError {
@@ -73,7 +78,12 @@ impl From<HoistedLinkerError> for LinkPhaseError {
             HoistedLinkerError::SymlinkDirectDependencies(error) => {
                 LinkPhaseError::SymlinkDirectDependencies(error)
             }
+            HoistedLinkerError::ReadModules(error) => LinkPhaseError::ReadModules(error),
+            HoistedLinkerError::WriteModules(error) => LinkPhaseError::WriteModules(error),
             HoistedLinkerError::WritePackageMap(error) => LinkPhaseError::WritePackageMap(error),
+            HoistedLinkerError::PruneStaleLinks(error) => LinkPhaseError::PruneStaleModules(error),
+            HoistedLinkerError::HoistSymlink(error) => LinkPhaseError::HoistSymlink(error),
+            HoistedLinkerError::HoistLinkBins(error) => LinkPhaseError::HoistLinkBins(error),
         }
     }
 }
@@ -93,6 +103,33 @@ pub struct LinkPhaseInputs<'a> {
     pub supported_architectures: Option<&'a pnpm_package_is_installable::SupportedArchitectures>,
 }
 
+impl LinkPhaseInputs<'_> {
+    fn scheduled_builds(&self) -> Option<crate::build_modules::ScheduledBuilds<'_>> {
+        crate::build_modules::ScheduledBuilds::new(crate::build_modules::ScheduledBuildsInputs {
+            materialized_snapshots: self.graph.materialized_snapshots,
+            packages: self.graph.lockfile.packages.as_ref(),
+            allow_build_policy: self.ctx.allow_build_policy,
+            ignore_scripts: self.ctx.config.ignore_scripts,
+        })
+    }
+}
+
+/// Bin state handed from [`run_link_phase`] to [`crate::run_build_phase`] so
+/// held-back hoisted bins, cached hoisted bin manifests, and isolated importer
+/// `.bin` pruning settle after dependency builds complete.
+#[derive(Default)]
+pub struct PendingBinLinks {
+    /// See [`crate::HoistedLinkerOutput::held_back_bins_dirs`].
+    pub held_back_bins_dirs: Vec<crate::HeldBackBinsDir>,
+    pub hoisted_bin_sources: crate::HoistedBinSources,
+    /// Command names linked into each isolated importer's `<modules_dir>/.bin`
+    /// during the link phase.
+    pub claimed_importer_bins: crate::ClaimedCommands,
+    /// Privately-hoisted `(alias, snapshot key)` pairs with bins under
+    /// `<install_state_dir>/node_modules`.
+    pub privately_hoisted_bins: Vec<(String, PackageKey)>,
+}
+
 /// What the link phase hands to the build phase and the caller's
 /// `.modules.yaml` writer.
 pub struct LinkPhaseOutput {
@@ -101,6 +138,9 @@ pub struct LinkPhaseOutput {
     pub hoisted_pkg_roots_by_key: Option<HashMap<PackageKey, Vec<PathBuf>>>,
     /// See [`crate::HoistedLinkerOutput::hoisted_build_snapshots`].
     pub hoisted_build_snapshots: Option<Vec<PackageKey>>,
+    /// See [`crate::BuildGraphInputs::build_scope`]. Set for the isolated
+    /// linker only.
+    pub build_scope: Option<HashSet<PackageKey>>,
     /// Publicly-hoisted aliases carrying bins. Public hoist promotes a
     /// transitive dep to `<root>/node_modules/<alias>`, whose bin then
     /// competes for the same `<root>/node_modules/.bin` slot as a root
@@ -110,6 +150,7 @@ pub struct LinkPhaseOutput {
     ///
     /// [`BinOrigin`]: pnpm_cmd_shim::BinOrigin
     pub publicly_hoisted_for_post_build: Vec<String>,
+    pub pending_bins: PendingBinLinks,
 }
 
 impl LinkPhaseOutput {
@@ -121,30 +162,15 @@ impl LinkPhaseOutput {
     }
 
     /// The result of a run that materialized nothing.
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         LinkPhaseOutput {
             hoisted_dependencies: crate::HoistedDependencies::new(),
             hoisted_locations: BTreeMap::new(),
             hoisted_pkg_roots_by_key: None,
             hoisted_build_snapshots: None,
+            build_scope: None,
             publicly_hoisted_for_post_build: Vec::new(),
-        }
-    }
-}
-
-/// What [`write_hoist_links`] put on disk.
-struct HoistLinks {
-    hoisted_dependencies: crate::HoistedDependencies,
-    /// See [`LinkPhaseOutput::publicly_hoisted_for_post_build`].
-    publicly_hoisted_with_bins: Vec<String>,
-}
-
-impl HoistLinks {
-    /// The result of a run with no hoist plan to write.
-    fn none() -> Self {
-        HoistLinks {
-            hoisted_dependencies: crate::HoistedDependencies::new(),
-            publicly_hoisted_with_bins: Vec::new(),
+            pending_bins: PendingBinLinks::default(),
         }
     }
 }
@@ -168,14 +194,19 @@ pub fn run_link_phase<Reporter: self::Reporter>(
     inputs: LinkPhaseInputs<'_>,
     skipped: &mut SkippedSnapshots,
 ) -> Result<LinkPhaseOutput, LinkPhaseError> {
+    if inputs.ctx.linker.kind == NodeLinker::Loaded {
+        return crate::cas::link_phase(&inputs, skipped);
+    }
     let hoist = plan_hoist(&inputs, skipped);
 
     // `nodeLinker: hoisted` writes no virtual store — `CreateVirtualStore`
     // skipped the slots — so there is nothing to link into or out of.
     let has_virtual_store = !inputs.ctx.is_hoisted();
-    if has_virtual_store && !inputs.ctx.config.virtual_store_only {
-        relink_importer_tree::<Reporter>(&inputs, skipped, hoist.public_targets.as_ref())?;
-    }
+    let claimed_importer_bins = if has_virtual_store && !inputs.ctx.config.virtual_store_only {
+        relink_importer_tree::<Reporter>(&inputs, skipped, &hoist)?
+    } else {
+        crate::ClaimedCommands::default()
+    };
     if has_virtual_store {
         link_virtual_store_bins(&inputs, skipped)?;
     }
@@ -185,48 +216,7 @@ pub fn run_link_phase<Reporter: self::Reporter>(
     if inputs.ctx.config.virtual_store_only {
         return Ok(LinkPhaseOutput::empty());
     }
-    write_project_links::<Reporter>(inputs, skipped, hoist.plan)
-}
-
-/// Planned before the links are written, not with them: an importer's
-/// dep that public-hoist lands at root has to be in
-/// `SymlinkDirectDependencies`'s dedupe map, and [`write_hoist_links`]
-/// reuses the plan rather than walking a second time.
-struct PlannedHoist {
-    plan: Option<HoistPlan>,
-    public_targets: Option<BTreeMap<String, PathBuf>>,
-}
-
-fn plan_hoist(inputs: &LinkPhaseInputs<'_>, skipped: &SkippedSnapshots) -> PlannedHoist {
-    let config = inputs.ctx.config;
-    // `hoistWorkspacePackages`: named non-root projects become hoist
-    // candidates whose links point at the project dirs.
-    let hoisted_workspace_packages = config.hoist_workspace_packages.then(|| {
-        workspace_packages_for_hoist(inputs.ctx.workspace_root, inputs.projects.manifests)
-    });
-    let phase_start = std::time::Instant::now();
-    let plan = compute_hoist_plan(
-        config,
-        inputs.graph.lockfile.snapshots.as_ref(),
-        inputs.graph.lockfile.packages.as_ref(),
-        &inputs.graph.lockfile.importers,
-        inputs.projects.dependency_groups,
-        skipped,
-        inputs.ctx.is_hoisted(),
-        hoisted_workspace_packages.as_ref(),
-    );
-    let public_targets = plan
-        .as_ref()
-        .map(|plan| {
-            collect_public_hoist_targets(
-                &plan.result,
-                &plan.graph,
-                inputs.ctx.linker.layout,
-                &plan.skipped,
-            )
-        });
-    tracing::info!(target: "pacquet::install::phase", phase = "link.hoist_plan", elapsed_ms = phase_start.elapsed().as_millis() as u64, "phase complete");
-    PlannedHoist { plan, public_targets }
+    write_project_links::<Reporter>(inputs, skipped, hoist.plan, claimed_importer_bins)
 }
 
 /// Reconcile first, so stale direct-dep and orphaned hoist links vacate
@@ -237,13 +227,14 @@ fn plan_hoist(inputs: &LinkPhaseInputs<'_>, skipped: &SkippedSnapshots) -> Plann
 fn relink_importer_tree<Reporter: self::Reporter>(
     inputs: &LinkPhaseInputs<'_>,
     skipped: &SkippedSnapshots,
-    public_hoist_targets: Option<&BTreeMap<String, PathBuf>>,
-) -> Result<(), LinkPhaseError> {
+    hoist: &PlannedHoist,
+) -> Result<crate::ClaimedCommands, LinkPhaseError> {
     let config = inputs.ctx.config;
-    prune_importer_tree::<Reporter>(inputs)?;
+    prune_importer_tree::<Reporter>(inputs, skipped, hoist)?;
 
+    let scheduled_builds = inputs.scheduled_builds();
     let phase_start = std::time::Instant::now();
-    SymlinkDirectDependencies {
+    let claimed_bins = SymlinkDirectDependencies {
         context: crate::ImporterLinkContext {
             config,
             layout: inputs.ctx.linker.layout,
@@ -256,7 +247,7 @@ fn relink_importer_tree<Reporter: self::Reporter>(
             skipped,
         },
         policy: crate::DirectLinkPolicy {
-            public_hoist_targets,
+            public_hoist_targets: hoist.public_targets.as_ref(),
             trusted_importer_ids: Some(inputs.projects.trusted_importer_ids),
             link_only: false,
         },
@@ -264,9 +255,11 @@ fn relink_importer_tree<Reporter: self::Reporter>(
         dependency_groups: inputs.projects.dependency_groups.iter().copied(),
 
         package_manifests: Some(inputs.packages.package_manifests),
+        package_bins: inputs.packages.package_bins,
         requires_build_by_snapshot: inputs.packages.requires_build_by_snapshot,
+        scheduled_builds: scheduled_builds.as_ref(),
     }
-    .run::<Reporter>()
+    .run_claiming_bins::<Reporter>()
     .map_err(LinkPhaseError::SymlinkDirectDependencies)?;
     tracing::info!(target: "pacquet::install::phase", phase = "link.symlink_direct_deps", elapsed_ms = phase_start.elapsed().as_millis() as u64, "phase complete");
 
@@ -280,38 +273,8 @@ fn relink_importer_tree<Reporter: self::Reporter>(
         inputs.projects.dependency_groups,
         skipped,
     )
-    .map_err(LinkPhaseError::LinkRootComponentMembers)
-}
-
-fn prune_importer_tree<Reporter: self::Reporter>(
-    inputs: &LinkPhaseInputs<'_>,
-) -> Result<(), LinkPhaseError> {
-    let config = inputs.ctx.config;
-    let removed_count = inputs.graph.current_lockfile
-        .map(|current| {
-            crate::PruneStaleModules {
-                config,
-                workspace_root: inputs.projects.symlink_root,
-                wanted_lockfile: inputs.graph.lockfile,
-                current_lockfile: current,
-                prior_hoisted_dependencies: inputs.prior.hoisted_dependencies,
-                included_groups: inputs.projects.dependency_groups,
-                prune_orphans: inputs.prior.prune_orphans,
-            }
-            .run::<Reporter>()
-            .map_err(LinkPhaseError::PruneStaleModules)
-        })
-        .transpose()?
-        .unwrap_or(0);
-    Reporter::emit(&LogEvent::Stats(StatsLog {
-        level: LogLevel::Debug,
-        message: StatsMessage::Removed {
-            prefix: inputs.ctx.requester.to_owned(),
-            removed: removed_count,
-        },
-    }));
-
-    Ok(())
+    .map_err(LinkPhaseError::LinkRootComponentMembers)?;
+    Ok(claimed_bins)
 }
 
 /// Unlike every other link pass this one also runs under
@@ -329,6 +292,7 @@ fn link_virtual_store_bins(
         selected_snapshots: inputs.graph.materialized_snapshots,
         packages: inputs.graph.lockfile.packages.as_ref(),
         package_manifests: inputs.packages.package_manifests,
+        package_bins: inputs.packages.package_bins,
         skipped,
         link_options: inputs.ctx.linker.bin_options,
     }
@@ -342,8 +306,10 @@ fn write_project_links<Reporter: self::Reporter>(
     mut inputs: LinkPhaseInputs<'_>,
     skipped: &mut SkippedSnapshots,
     pre_hoist: Option<HoistPlan>,
+    mut claimed_importer_bins: crate::ClaimedCommands,
 ) -> Result<LinkPhaseOutput, LinkPhaseError> {
     let config = inputs.ctx.config;
+    let build_scope = crate::build_scope::isolated_build_scope(&inputs);
     let hoisted = link_hoisted_projects::<Reporter>(&mut inputs, skipped)?;
 
     let bin_deps = public_workspace_bin_deps(pre_hoist.as_ref());
@@ -357,22 +323,52 @@ fn write_project_links<Reporter: self::Reporter>(
     tracing::info!(target: "pacquet::install::phase", phase = "link.write_hoist_links", elapsed_ms = phase_start.elapsed().as_millis() as u64, "phase complete");
 
     write_project_sidecars(&inputs)?;
-    if !bin_deps.is_empty() {
-        link_direct_dep_bins_resolved(
-            &config.modules_dir,
-            &bin_deps,
-            inputs.ctx.linker.bin_options,
-        )
-        .map_err(LinkPhaseError::LinkBins)?;
-    }
+    finish_project_bins(&inputs, &bin_deps, &mut claimed_importer_bins)?;
 
+    let mut hoisted_dependencies = links.hoisted_dependencies;
+    hoisted_dependencies.extend(hoisted.hoisted_dependencies);
+    let mut hoisted_bin_sources = hoisted.hoisted_bin_sources;
+    if !links.privately_hoisted_with_bins.is_empty() {
+        hoisted_bin_sources.insert(
+            config.install_state_dir.join("node_modules"),
+            links.private_bin_sources,
+        );
+    }
     Ok(LinkPhaseOutput {
-        hoisted_dependencies: links.hoisted_dependencies,
+        hoisted_dependencies,
         hoisted_locations: hoisted.hoisted_locations,
         hoisted_pkg_roots_by_key: hoisted.hoisted_pkg_roots_by_key,
         hoisted_build_snapshots: hoisted.hoisted_build_snapshots,
+        build_scope,
         publicly_hoisted_for_post_build: links.publicly_hoisted_with_bins,
+        pending_bins: PendingBinLinks {
+            held_back_bins_dirs: hoisted.held_back_bins_dirs,
+            hoisted_bin_sources,
+            claimed_importer_bins,
+            privately_hoisted_bins: links.privately_hoisted_with_bins,
+        },
     })
+}
+
+fn finish_project_bins(
+    inputs: &LinkPhaseInputs<'_>,
+    bin_deps: &[(String, PathBuf)],
+    claimed_importer_bins: &mut crate::ClaimedCommands,
+) -> Result<(), LinkPhaseError> {
+    let config = inputs.ctx.config;
+    if !bin_deps.is_empty() {
+        let empty = HashSet::new();
+        let excluded = claimed_importer_bins.get(&config.modules_dir).unwrap_or(&empty);
+        let workspace_hoist_bins = link_direct_dep_bins_resolved_excluding(
+            &config.modules_dir,
+            bin_deps,
+            excluded,
+            inputs.ctx.linker.bin_options,
+        )
+        .map_err(LinkPhaseError::LinkBins)?;
+        claimed_importer_bins.claim_recorded(&config.modules_dir, workspace_hoist_bins);
+    }
+    Ok(())
 }
 
 fn write_project_sidecars(inputs: &LinkPhaseInputs<'_>) -> Result<(), LinkPhaseError> {
@@ -420,8 +416,7 @@ fn link_hoisted_projects<Reporter: self::Reporter>(
     inputs: &mut LinkPhaseInputs<'_>,
     skipped: &mut SkippedSnapshots,
 ) -> Result<crate::HoistedLinkerOutput, LinkPhaseError> {
-    let config = inputs.ctx.config;
-    let hoisted = inputs.ctx
+    inputs.ctx
         .is_hoisted()
         .then(|| {
             run_hoisted_linker::<Reporter>(
@@ -431,12 +426,7 @@ fn link_hoisted_projects<Reporter: self::Reporter>(
                         layout: inputs.ctx.linker.layout,
                         cas_paths_by_pkg_id: inputs.packages.cas_paths_by_pkg_id.take(),
                     },
-                    prior: crate::PriorHoistedState {
-                        current_lockfile: inputs.graph.current_lockfile,
-                        current_hoisted_locations: inputs.prior.hoisted_locations,
-                        unbuilt_builds: inputs.prior.unbuilt_builds,
-                        build_present_packages: inputs.prior.build_present_packages,
-                    },
+                    prior: inputs.prior.hoisted_state(inputs.graph.current_lockfile),
                     projects: crate::HoistedProjects {
                         importers: &inputs.graph.lockfile.importers,
                         dependency_groups: inputs.projects.dependency_groups,
@@ -445,80 +435,28 @@ fn link_hoisted_projects<Reporter: self::Reporter>(
                         walker_lockfile_dir: inputs.ctx.workspace_root,
                         symlink_workspace_root: inputs.projects.symlink_root,
                     },
-                    config,
-
+                    config: inputs.ctx.config,
                     host_node: inputs.host_node,
                     supported_architectures: inputs.supported_architectures,
-
-                    logged_methods: inputs.ctx.logged_methods,
-                    requester: inputs.ctx.requester,
+                    materialization: crate::HoistedMaterialization {
+                        logged_methods: inputs.ctx.caches.logged_methods,
+                        swap_lock: inputs.ctx.caches.swap_lock,
+                        requester: inputs.ctx.requester,
+                        requires_build_by_snapshot: inputs.packages.requires_build_by_snapshot,
+                        dir_clone_cache: inputs.ctx.caches.dir_clone_cache,
+                    },
                 },
                 skipped,
             )
             .map_err(LinkPhaseError::from)
         })
-        .transpose()?
-        .unwrap_or_default();
-
-    Ok(hoisted)
+        .transpose()
+        .map(Option::unwrap_or_default)
 }
 
-/// Publicly hoisted *workspace* packages are the one source of root
-/// bins nothing else shims: every importer's direct-dep bins were
-/// written by `SymlinkDirectDependencies`, and publicly hoisted regular
-/// packages go through the post-build top-level pass
-/// (`publicly_hoisted_for_post_build`) — but that pass resolves bins out
-/// of virtual-store slots, which a workspace project doesn't have.
-/// Collected before [`write_hoist_links`] consumes the plan; shimmed after
-/// the hoist symlinks land.
-fn public_workspace_bin_deps(plan: Option<&HoistPlan>) -> Vec<(String, PathBuf)> {
-    plan.map(|plan| {
-        plan.result.hoisted_workspace_aliases
-            .iter()
-            .filter(|(_, kind, _)| matches!(kind, pnpm_modules_yaml::HoistKind::Public))
-            .map(|(alias, _, project_dir)| (alias.clone(), project_dir.clone()))
-            .collect()
-    })
-    .unwrap_or_default()
-}
-
-/// Symlink the hoist plan's aliases into the private
-/// (`<virtual_store>/node_modules`) and public (`<root>/node_modules`)
-/// targets, then shim the private side's bins.
-///
-/// Enabling the global virtual store does not move the private target:
-/// pacquet leaves `virtual_store_dir` at its project-local (or
-/// yaml-pinned) value and routes the shared root through
-/// `global_virtual_store_dir` instead — see
-/// [`Config::apply_global_virtual_store_derivation`]. Only the symlink
-/// *target* under the slot dir is GVS-aware, which `layout` resolves.
-fn write_hoist_links(
-    plan: HoistPlan,
-    config: &Config,
-    layout: &VirtualStoreLayout,
-    link_options: &LinkBinsOptions,
-) -> Result<HoistLinks, LinkPhaseError> {
-    let HoistPlan { graph, result, skipped, .. } = plan;
-    let private_hoist_dir = config.virtual_store_dir.join("node_modules");
-    let public_hoist_dir = config.modules_dir.clone();
-    symlink_hoisted_dependencies(
-        &result.hoisted_dependencies_by_node_id,
-        &result.hoisted_workspace_aliases,
-        &graph,
-        layout,
-        &private_hoist_dir,
-        &public_hoist_dir,
-        &skipped,
-    )
-    .map_err(LinkPhaseError::HoistSymlink)?;
-    link_direct_dep_bins_resolved(
-        &private_hoist_dir,
-        &crate::resolve_hoisted_bin_deps(layout, &result.hoisted_aliases_with_bins),
-        link_options,
-    )
-    .map_err(LinkPhaseError::HoistLinkBins)?;
-    Ok(HoistLinks {
-        hoisted_dependencies: result.hoisted_dependencies,
-        publicly_hoisted_with_bins: result.publicly_hoisted_aliases_with_bins,
-    })
-}
+mod hoist_links;
+mod prune;
+use hoist_links::{
+    HoistLinks, PlannedHoist, plan_hoist, public_workspace_bin_deps, write_hoist_links,
+};
+use prune::prune_importer_tree;

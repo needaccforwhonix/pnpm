@@ -12,8 +12,11 @@ repository.workspace = true
 
 [dependencies]
 
+pnpm-process = { path = "../process" }
 [dev-dependencies]
 pretty_assertions = { workspace = true }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
 
 [lints]
 workspace = true

@@ -1,15 +1,22 @@
-use super::{unapplied_package_configs_warning, unmatched_registry_options_warning};
+use super::{
+    shared_workspace_lockfile_outside_workspace_warning, unapplied_package_configs_warning,
+    unmatched_registry_options_warning,
+};
 use indexmap::IndexMap;
 use pnpm_config::{Config, ProjectConfig};
 use pnpm_lockfile::{RegistryOptions, RegistryServerType};
 use pretty_assertions::assert_eq;
 
+/// `registries` are keyed by scope; a `default` entry is the default
+/// registry, which a registry override records under both fields.
 fn config_with(registries: &[(&str, &str)], registry_options_by_url: &[&str]) -> Config {
     let mut config = Config::new();
-    config.registries_by_scope = registries
-        .iter()
-        .map(|(scope, url)| ((*scope).to_string(), (*url).to_string()))
-        .collect();
+    for (scope, url) in registries {
+        if *scope == "default" {
+            config.registry = (*url).to_string();
+        }
+        config.registries_by_scope.insert((*scope).to_string(), (*url).to_string());
+    }
     config.registry_options_by_url = registry_options_by_url
         .iter()
         .map(|registry| {
@@ -49,6 +56,17 @@ fn no_warning_for_a_builtin_named_registry() {
     assert_eq!(unmatched_registry_options_warning(&config), None);
 }
 
+/// A `registries` entry whose only route is the bare `@` scope becomes the
+/// default registry and is stored under no scope, so it must be matched
+/// through `config.registry`.
+#[test]
+fn no_warning_for_an_entry_routed_only_through_the_default_scope() {
+    let mut config = config_with(&[], &["https://pnpr.example.com/npm/"]);
+    config.registry = "https://pnpr.example.com/npm/".to_string();
+    assert!(config.registries_by_scope.is_empty());
+    assert_eq!(unmatched_registry_options_warning(&config), None);
+}
+
 #[test]
 fn warns_about_an_entry_matching_no_configured_registry() {
     let config = config_with(
@@ -85,7 +103,7 @@ mod workspace_key_issues {
         non_camel_case_workspace_keys_warning, refused_workspace_keys_warning,
         report_workspace_key_issues,
     };
-    use pnpm_config::WorkspaceKeyIssues;
+    use pnpm_config::{UnrecognizedSettings, WorkspaceKeyIssues};
     use pretty_assertions::assert_eq;
 
     #[test]
@@ -121,6 +139,64 @@ mod workspace_key_issues {
             "The following settings in pnpm-workspace.yaml are not recognized by this version of \
              pnpm: \"minimumReleaseAg\" (did you mean \"minimumReleaseAge\"?).",
         );
+    }
+
+    #[test]
+    fn unrecognized_task_settings_error_only_when_strict() {
+        let issues = WorkspaceKeyIssues {
+            unrecognized_task_settings: UnrecognizedSettings {
+                named: vec!["tasks['build'].dependson".to_string()],
+                total: 1,
+            },
+            ..WorkspaceKeyIssues::default()
+        };
+        report_workspace_key_issues(&issues, false).expect("a warning, not an error");
+        let error =
+            report_workspace_key_issues(&issues, true).expect_err("strict must fail").to_string();
+        assert_eq!(
+            error,
+            "The following task settings in pnpm-workspace.yaml are not recognized by this \
+             version of pnpm: \"tasks['build'].dependson\".",
+        );
+    }
+
+    /// A file may name more unrecognized task settings than a message can
+    /// usefully carry, and the count is what tells the reader so.
+    #[test]
+    fn a_report_says_how_many_task_settings_it_did_not_name() {
+        let issues = WorkspaceKeyIssues {
+            unrecognized_task_settings: UnrecognizedSettings {
+                named: vec!["tasks['build'].one".to_string()],
+                total: 4,
+            },
+            ..WorkspaceKeyIssues::default()
+        };
+        let error =
+            report_workspace_key_issues(&issues, true).expect_err("strict must fail").to_string();
+        assert_eq!(
+            error,
+            "The following task settings in pnpm-workspace.yaml are not recognized by this \
+             version of pnpm: \"tasks['build'].one\", and 3 more.",
+        );
+    }
+
+    /// The error is the top-level key's, not the task settings'. That the
+    /// task settings still reach the user is
+    /// `a_task_setting_is_reported_when_an_unrecognized_key_takes_the_error`
+    /// in the end-to-end suite, which can read what was written to stderr.
+    #[test]
+    fn an_unrecognized_key_takes_the_error_over_task_settings() {
+        let issues = WorkspaceKeyIssues {
+            unrecognized: vec!["minimumReleaseAg".to_string()],
+            unrecognized_task_settings: UnrecognizedSettings {
+                named: vec!["tasks['build'].dependson".to_string()],
+                total: 1,
+            },
+            ..WorkspaceKeyIssues::default()
+        };
+        let error =
+            report_workspace_key_issues(&issues, true).expect_err("strict must fail").to_string();
+        assert!(error.contains("minimumReleaseAg"), "unexpected error: {error}");
     }
 
     #[test]
@@ -180,4 +256,26 @@ fn sanitizes_the_project_name() {
     let received = unapplied_package_configs_warning(&config).expect("a warning");
     println!("{received}");
     assert!(!received.contains('\u{1b}'), "{received}");
+}
+
+#[test]
+fn warns_when_shared_workspace_lockfile_is_set_outside_a_workspace() {
+    let received =
+        shared_workspace_lockfile_outside_workspace_warning(Some(true), None).expect("a warning");
+    assert_eq!(
+        received,
+        r#"The "shared-workspace-lockfile" option was ignored because no "pnpm-workspace.yaml" was found."#,
+    );
+}
+
+#[test]
+fn no_warning_when_in_workspace_or_not_set_on_cli() {
+    assert_eq!(shared_workspace_lockfile_outside_workspace_warning(None, None), None);
+    assert_eq!(
+        shared_workspace_lockfile_outside_workspace_warning(
+            Some(true),
+            Some(std::path::Path::new("/workspace")),
+        ),
+        None,
+    );
 }

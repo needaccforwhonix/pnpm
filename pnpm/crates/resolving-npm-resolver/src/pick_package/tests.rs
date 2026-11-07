@@ -2,13 +2,23 @@ mod behavior;
 
 mod release_age;
 
+mod upgraded_mirror_revalidation;
+
+mod mature_fallback;
+
 mod trust_policy;
 
 mod cache_partitions;
 
+mod cache_policy;
 mod cache_read_modes;
 
+mod corrupt_mirror;
+mod stable_range_mirror;
+
 mod version_selection;
+
+mod offline_store_pick;
 
 use std::sync::Arc;
 
@@ -19,19 +29,21 @@ use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 
 use chrono::{DateTime, Utc};
-use pnpm_config::version_policy::create_package_version_policy;
 use pnpm_resolving_resolver_base::{
     EXISTING_VERSION_SELECTOR_WEIGHT, VersionSelectorEntry, VersionSelectorType,
     VersionSelectorWithWeight, VersionSelectors,
 };
+use pnpm_version_policy::create_package_version_policy;
 
 use super::{
-    InMemoryPackageMetaCache, PickPackageContext, PickPackageError, PickPackageOptions,
-    metadata_cache_key, persist_meta_to_mirror, pick_package, shared_packument_fetch_locker,
+    InMemoryPackageMetaCache, PackumentSource, PickPackageContext, PickPackageError,
+    PickPackageOptions, metadata_cache_key, persist_meta_to_mirror, pick_package,
+    shared_packument_fetch_locker,
 };
 use crate::{
     mirror::{
-        ABBREVIATED_META_DIR, FULL_FILTERED_META_DIR, FULL_META_DIR, get_pkg_mirror_path, load_meta,
+        ABBREVIATED_META_DIR, FULL_FILTERED_META_DIR, FULL_META_DIR, get_legacy_pkg_mirror_paths,
+        get_pkg_mirror_path, load_meta,
     },
     pick_package_from_meta::{RegistryPackageSpec, RegistryPackageSpecType},
     registry_url::to_registry_url,
@@ -150,12 +162,14 @@ fn default_opts(registry: &str) -> PickPackageOptions<'_> {
         blocked_versions: None,
         policy: crate::PackagePickPolicy {
             published_by: None,
+            fallback_published_by: None,
             published_by_exclude: None,
             trust_policy: None,
         },
         request: crate::MetadataPickRequest {
             dry_run: false,
             optional: false,
+            refresh_metadata: false,
             update_checksums: false,
         },
     }

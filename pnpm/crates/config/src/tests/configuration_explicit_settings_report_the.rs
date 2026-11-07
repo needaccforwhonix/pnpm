@@ -1,6 +1,6 @@
 use super::{
     Config, EnvGuard, EnvVar, EnvVarOs, GetCurrentDir, GetHomeDir, HostNoHome, LinkProbe,
-    NodePackageMapType, OsString, Path, PathBuf, WorkspaceSettings, assert_eq, capture_warnings,
+    NodePackageMapMode, NodePackageMapType, OsString, Path, PathBuf, assert_eq, capture_warnings,
     config_from_workspace_yaml, env, fs, io, load_with_project_and_user, repo_on_branch,
     safe_host_var, tempdir, write_file,
 };
@@ -72,6 +72,8 @@ pub fn proxy_env_fallback_applies_through_current() {
         "proxy",
         "NO_PROXY",
         "no_proxy",
+        "PNPM_CONFIG_WORKSPACE_DIR",
+        "pnpm_config_workspace_dir",
         "NPM_CONFIG_WORKSPACE_DIR",
         "npm_config_workspace_dir",
     ]);
@@ -89,6 +91,8 @@ pub fn proxy_env_fallback_applies_through_current() {
         env::remove_var("proxy");
         env::remove_var("NO_PROXY");
         env::remove_var("no_proxy");
+        env::remove_var("PNPM_CONFIG_WORKSPACE_DIR");
+        env::remove_var("pnpm_config_workspace_dir");
         env::remove_var("NPM_CONFIG_WORKSPACE_DIR");
         env::remove_var("npm_config_workspace_dir");
         env::set_var("HTTPS_PROXY", "http://env.example:8080");
@@ -405,7 +409,7 @@ pub fn package_map_settings_load_from_env() {
 
     let tmp = tempdir().unwrap();
     let config = Config::new().current::<HostWithPackageMapEnv>(tmp.path()).expect("loads");
-    assert!(config.node_experimental_package_map);
+    assert_eq!(config.node_package_map_mode, NodePackageMapMode::Load);
     assert_eq!(config.node_package_map_type, NodePackageMapType::Loose);
 }
 
@@ -565,10 +569,10 @@ pub fn global_config_yaml_kebab_case_key_is_reported() {
         .expect("write global config.yaml");
 
     let warnings = capture_warnings(|| {
-        let settings = WorkspaceSettings::load_global(config_dir.path())
+        let settings = crate::TrustedSettings::load_global(config_dir.path())
             .expect("load global config.yaml")
             .expect("global config.yaml is present");
-        assert_eq!(settings.store_dir.as_deref(), Some("/camel-store"));
+        assert_eq!(settings.settings.store_dir.as_deref(), Some("/camel-store"));
     });
 
     assert_eq!(
@@ -590,10 +594,10 @@ pub fn global_config_yaml_keys_it_cannot_set_are_reported() {
         .expect("write global config.yaml");
 
     let warnings = capture_warnings(|| {
-        let settings = WorkspaceSettings::load_global(config_dir.path())
+        let settings = crate::TrustedSettings::load_global(config_dir.path())
             .expect("load global config.yaml")
             .expect("global config.yaml is present");
-        assert_eq!(settings.node_linker, None);
+        assert_eq!(settings.settings.node_linker, None);
     });
 
     assert_eq!(
@@ -615,7 +619,7 @@ pub fn global_config_yaml_keys_settable_nowhere_are_reported_with_their_route() 
         .expect("write global config.yaml");
 
     let warnings = capture_warnings(|| {
-        WorkspaceSettings::load_global(config_dir.path())
+        crate::TrustedSettings::load_global(config_dir.path())
             .expect("load global config.yaml")
             .expect("global config.yaml is present");
     });
@@ -641,7 +645,7 @@ pub fn global_config_yaml_unrecognized_keys_are_reported_with_a_suggestion() {
         .expect("write global config.yaml");
 
     let warnings = capture_warnings(|| {
-        WorkspaceSettings::load_global(config_dir.path())
+        crate::TrustedSettings::load_global(config_dir.path())
             .expect("load global config.yaml")
             .expect("global config.yaml is present");
     });
@@ -666,7 +670,7 @@ pub fn global_config_yaml_schema_directive_is_silent() {
     .expect("write global config.yaml");
 
     let warnings = capture_warnings(|| {
-        WorkspaceSettings::load_global(config_dir.path())
+        crate::TrustedSettings::load_global(config_dir.path())
             .expect("load global config.yaml")
             .expect("global config.yaml is present");
     });
@@ -683,7 +687,7 @@ pub fn global_config_yaml_key_pnpm_honors_stays_silent() {
     fs::write(&config_file, "globalPath: /usr/local/pnpm\n").expect("write global config.yaml");
 
     let warnings = capture_warnings(|| {
-        WorkspaceSettings::load_global(config_dir.path())
+        crate::TrustedSettings::load_global(config_dir.path())
             .expect("load global config.yaml")
             .expect("global config.yaml is present");
     });
@@ -704,7 +708,7 @@ pub fn global_config_yaml_null_key_is_silent_and_the_warnings_are_ordered() {
     .expect("write global config.yaml");
 
     let warnings = capture_warnings(|| {
-        WorkspaceSettings::load_global(config_dir.path())
+        crate::TrustedSettings::load_global(config_dir.path())
             .expect("load global config.yaml")
             .expect("global config.yaml is present");
     });

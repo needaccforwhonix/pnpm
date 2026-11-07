@@ -1,40 +1,20 @@
-use super::{dispatch::RunCtx, recursive::discover_workspace_projects, run::RunArgs};
-use derive_more::{Display, Error};
-use miette::{Context, Diagnostic, IntoDiagnostic};
+use super::{dispatch::RunCtx, recursive::discover_workspace_projects};
+use miette::{Context, IntoDiagnostic};
 use pnpm_config::Config;
 use pnpm_fs::{is_subdir, lexical_normalize, relative_path, remove_dirent};
-use pnpm_workspace::read_project_manifest_only;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 /// `pnpm clean` / `pnpm purge`: safely remove the `node_modules`
 /// directories of the current project (or every project in the workspace)
 /// without following NTFS junctions into their targets. A `clean` /
-/// `purge` script in `package.json` overrides the built-in command,
-/// mirroring pnpm's `overridableByScript` flag; `pnpm pm clean` /
-/// `pnpm pm purge` runs the built-in regardless.
+/// `purge` script in `package.json` overrides the built-in command;
+/// `pnpm pm clean` / `pnpm pm purge` runs the built-in regardless.
 #[derive(Debug, clap::Args)]
 pub struct CleanArgs {
     /// Also remove `pnpm-lock.yaml` files.
     #[clap(short = 'l', long = "lockfile")]
     pub lockfile: bool,
-}
-
-/// `pnpm clean` was invoked from a subdirectory of a workspace
-/// whose root `package.json` declares a `clean` / `purge` script.
-/// pnpm refuses to run the built-in from the subdirectory in that
-/// case (it would shadow the root script), and directs the user to
-/// `pnpm run <script>` at the root.
-#[derive(Debug, Display, Error, Diagnostic)]
-#[display(
-    "The workspace root has a \"{command}\" script, so the built-in \"pnpm {command}\" command cannot run from a subdirectory"
-)]
-#[diagnostic(
-    code(ERR_PNPM_SCRIPT_OVERRIDE_IN_WORKSPACE_ROOT),
-    help("Run \"pnpm run {command}\" from the workspace root to execute the script")
-)]
-struct ScriptOverrideInWorkspaceRoot {
-    command: String,
 }
 
 /// The pnpm hidden entries inside `node_modules` that `clean` removes
@@ -43,69 +23,9 @@ struct ScriptOverrideInWorkspaceRoot {
 const PNPM_HIDDEN_ENTRIES: &[&str] =
     &[".bin", ".modules.yaml", ".pnpm", ".pnpm-workspace-state-v1.json"];
 
-impl CleanArgs {
-    pub(super) fn run(self, ctx: &RunCtx<'_>, command_name: &str) -> miette::Result<()> {
-        let config = (ctx.loaders.config)()?;
-        if ctx.builtin_command_forced {
-            return clean_builtin(ctx, config, self.lockfile);
-        }
-        // A `<command_name>` script in the current project's `package.json`
-        // replaces the built-in command.
-        if let Some(script) =
-            script_of(read_project_manifest_only(ctx.locations.dir).ok(), command_name)
-            && !script.is_empty()
-        {
-            return RunArgs {
-                script: RunArgs::script(command_name, []),
-                if_present: false,
-                sequential: false,
-                dry_run: false,
-                json: false,
-                workspace: crate::cli_args::recursive::RecursiveExecutionArgs {
-                    resume_from: None,
-                    report_summary: false,
-                    no_bail: false,
-                    sort: true,
-                    reverse: false,
-                    parallel: false,
-                },
-            }
-            .run(ctx.locations.dir, config, ctx.reporter);
-        }
-        // Inside a workspace subdirectory, a `<command_name>` script at the
-        // workspace root must be run from the root rather than shadowed by
-        // the built-in command here.
-        if let Some(workspace_dir) = config.workspace_dir.as_deref()
-            && lexical_normalize(workspace_dir) != lexical_normalize(ctx.locations.dir)
-            && let Some(script) =
-                script_of(read_project_manifest_only(workspace_dir).ok(), command_name)
-            && !script.is_empty()
-        {
-            return Err(ScriptOverrideInWorkspaceRoot { command: command_name.to_string() }.into());
-        }
-        clean_builtin(ctx, config, self.lockfile)
-    }
-}
-
-/// Resolve the `<command_name>` script body from an optional manifest
-/// (`None` when the manifest is absent), mirroring pnpm's
-/// `safeReadProjectManifestOnly` tolerance for a missing `package.json`.
-fn script_of(
-    manifest: Option<pnpm_package_manifest::PackageManifest>,
-    command_name: &str,
-) -> Option<String> {
-    manifest?
-        .value()
-        .get("scripts")
-        .and_then(Value::as_object)
-        .and_then(|scripts| scripts.get(command_name))
-        .and_then(Value::as_str)
-        .map(str::to_string)
-}
-
 /// Remove `node_modules` contents and (optionally) lockfiles from the
 /// current project or every workspace project.
-fn clean_builtin(ctx: &RunCtx<'_>, config: &Config, remove_lockfile: bool) -> miette::Result<()> {
+pub(super) fn run(ctx: &RunCtx<'_>, config: &Config, remove_lockfile: bool) -> miette::Result<()> {
     // The `Removing <path>` lines render each target relative to the cwd.
     // It is canonicalized once here so it shares the symlink-resolved
     // representation of the paths built from the canonicalized `--dir`; on
@@ -165,27 +85,55 @@ fn remove_workspace_lockfile(cwd: &Path, root_dir: &Path) -> miette::Result<()> 
 /// A virtual store dir configured outside `node_modules` (e.g. a custom
 /// `virtual-store-dir`) is removed separately; the default
 /// `node_modules/.pnpm` is cleaned along with the modules dir's
-/// contents.
+/// contents. Under a global virtual store, `virtualStoreDir` or
+/// `globalVirtualStoreDir` names the shared store's root, which is removed
+/// as well; the default store under `storeDir` is kept.
 fn remove_external_virtual_store(
     cwd: &Path,
     config: &Config,
     root_dir: &Path,
     modules_leaf: &Path,
 ) -> miette::Result<()> {
-    let resolved_virtual_store_dir: PathBuf = if config.virtual_store_dir.is_absolute() {
-        config.virtual_store_dir.clone()
+    let virtual_store_dir = if ["virtualStoreDir", "globalVirtualStoreDir"]
+        .iter()
+        .any(|setting| config.explicit_settings.contains_key(*setting))
+    {
+        config.virtual_store_dir()
     } else {
-        root_dir.join(&config.virtual_store_dir)
+        &config.install_state_dir
+    };
+    let resolved_virtual_store_dir: PathBuf = if virtual_store_dir.is_absolute() {
+        virtual_store_dir.to_path_buf()
+    } else {
+        root_dir.join(virtual_store_dir)
     };
     let root_modules_dir = root_dir.join(modules_leaf);
-    if !is_subdir(&root_modules_dir, &resolved_virtual_store_dir)
-        && is_subdir(root_dir, &resolved_virtual_store_dir)
-        && resolved_virtual_store_dir.exists()
-    {
-        print_removing(cwd, &resolved_virtual_store_dir);
-        remove_path(&resolved_virtual_store_dir)?;
+    if is_subdir(&root_modules_dir, &resolved_virtual_store_dir) {
+        return Ok(());
+    }
+    let Some(virtual_store_in_project) = resolve_inside(root_dir, &resolved_virtual_store_dir)
+    else {
+        return Ok(());
+    };
+    if virtual_store_in_project.exists() {
+        print_removing(cwd, &virtual_store_in_project);
+        remove_path(&virtual_store_in_project)?;
     }
     Ok(())
+}
+
+/// `path` with its parent resolved through symlinks, when it names an entry
+/// strictly inside `root`. A symlinked ancestor cannot carry the removal out
+/// of the project, and the last component stays unresolved so a symlinked
+/// store is unlinked rather than followed. `None` when either path cannot be
+/// resolved.
+fn resolve_inside(root: &Path, path: &Path) -> Option<PathBuf> {
+    let root = dunce::canonicalize(root).ok()?;
+    let path = lexical_normalize(path);
+    let resolved = dunce::canonicalize(path.parent()?)
+        .ok()?
+        .join(path.file_name()?);
+    (resolved.starts_with(&root) && resolved != root).then_some(resolved)
 }
 
 /// Whether `modules_dir` holds anything `clean` removes: a regular
@@ -235,5 +183,5 @@ fn print_removing(base: &Path, path: &Path) {
     let relative = relative_path(base, path);
     let owned: PathBuf =
         if relative.as_os_str().is_empty() { PathBuf::from(".") } else { relative };
-    println!("Removing {}", owned.display());
+    pnpm_diagnostics::println!("Removing {}", owned.display());
 }

@@ -9,9 +9,10 @@ use axum::{
     http::{HeaderValue, Request, StatusCode, header},
 };
 use pnpr::{
-    AuthConfig, AuthState, Config, HtpasswdConfig, MaxUsers, TokenStore, TokensConfig,
-    UpsertOutcome, UserBackend, router, router_with_auth,
+    AuthConfig, AuthState, Config, HtpasswdConfig, MaxUsers, PasswordChange, TokenStore,
+    TokensConfig, UpsertOutcome, UserBackend, UserCreation, UserRemoval, router, router_with_auth,
 };
+use pnpr_fixtures::MockConfigPresets;
 use serde_json::{Value, json};
 use std::{
     fmt::Write as _,
@@ -39,6 +40,7 @@ fn persistent_config(storage: PathBuf, htpasswd: PathBuf, tokens_db: PathBuf) ->
         oidc: Vec::new(),
         htpasswd: HtpasswdConfig { file: Some(htpasswd), max_users: MaxUsers::Unlimited },
         tokens: TokensConfig { file: Some(tokens_db) },
+        scim: None,
     };
     config
 }
@@ -120,6 +122,26 @@ impl UserBackend for CanonicalUserBackend {
         assert_eq!(username, "alice");
         Ok((UpsertOutcome::LoggedIn, "Alice".to_string()))
     }
+
+    async fn list_users(&self) -> pnpr::Result<Vec<String>> {
+        Ok(vec!["Alice".to_string()])
+    }
+
+    async fn password_hash(&self, username: &str) -> pnpr::Result<Option<String>> {
+        Ok(username.eq_ignore_ascii_case("alice").then(|| "hash".to_string()))
+    }
+
+    async fn create_user(&self, _username: &str, _password: &str) -> pnpr::Result<UserCreation> {
+        Ok(UserCreation::NameTaken)
+    }
+
+    async fn set_password(&self, _username: &str, _password: &str) -> pnpr::Result<PasswordChange> {
+        Ok(PasswordChange::NoSuchUser)
+    }
+
+    async fn delete_user(&self, _username: &str) -> pnpr::Result<UserRemoval> {
+        Ok(UserRemoval::NoSuchUser)
+    }
 }
 
 #[tokio::test]
@@ -164,6 +186,29 @@ async fn adduser_issues_token_for_canonical_username() {
     assert_eq!(response.status(), StatusCode::OK);
     let payload = body_json(response.into_body()).await;
     assert_eq!(payload["username"].as_str(), Some("Alice"));
+}
+
+#[tokio::test]
+async fn adduser_accepts_bare_user_route_without_couchdb_prefix() {
+    let tmp = TempDir::new().unwrap();
+    let app = router(static_config(tmp.path().to_path_buf()));
+
+    let response = app
+        .clone()
+        .oneshot(put_json("/-/user/alice", adduser_body("alice", "secret")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let payload = body_json(response.into_body()).await;
+    let token = payload["token"].as_str().expect("token in response");
+
+    let response = app
+        .oneshot(get_with_bearer("/-/whoami", token))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload = body_json(response.into_body()).await;
+    assert_eq!(payload["username"].as_str(), Some("alice"));
 }
 
 #[tokio::test]
@@ -371,8 +416,6 @@ async fn revoke_token_by_key_removes_the_token() {
 /// Returns true when `key` is the hash of `raw_token`. We can't
 /// inspect the store from the test, so we drive a revocation through
 /// the public API and check whether the raw token stopped working.
-/// Used by [`revoke_token_by_key_removes_the_token`] to pick which of
-/// the two listed keys belongs to the token we want to revoke.
 async fn uses_token(app: &axum::Router, raw_token: &str, candidate_key: &str) -> bool {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -641,4 +684,59 @@ async fn revocation_survives_restart() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn login_rate_limiting_enforces_retry_after_after_repeated_failures() {
+    let storage = TempDir::new().unwrap();
+    let app = router(static_config(storage.path().to_path_buf()));
+    let (app, _) = add_user_and_get_token(app, "alice", "correct-secret").await;
+
+    let login_request = || {
+        let body = json!({
+            "_id": "org.couchdb.user:alice",
+            "name": "alice",
+            "password": "wrong-password",
+            "email": "foo@bar.net",
+            "type": "user",
+            "roles": [],
+        });
+        {
+            let mut request = put_json("/-/user/org.couchdb.user:alice", body);
+            request
+                .headers_mut()
+                .insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer unknown-token"));
+            request
+        }
+    };
+
+    // First 5 attempts fail with 401 Unauthorized
+    for _ in 0..5 {
+        let res = app
+            .clone()
+            .oneshot(login_request())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(res.headers()[header::WWW_AUTHENTICATE], "Bearer");
+        let payload = body_json(res.into_body()).await;
+        assert!(
+            payload["error"]
+                .as_str()
+                .unwrap()
+                .contains("Authentication required"),
+        );
+        assert_eq!(payload["error"], payload["reason"]);
+    }
+
+    // 6th attempt is rate-limited: 429 Too Many Requests with Retry-After header
+    let res = app
+        .oneshot(login_request())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(res.headers().contains_key("retry-after"));
+    let payload = body_json(res.into_body()).await;
+    assert_eq!(payload["error"], "too many failed login attempts, please try again later");
+    assert_eq!(payload["error"], payload["reason"]);
 }

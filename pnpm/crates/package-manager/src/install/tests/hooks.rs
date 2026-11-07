@@ -42,6 +42,27 @@ fn deploy_manifest_hook_reuses_unchanged_arc() {
 
     assert!(Arc::ptr_eq(&manifest, &transformed));
 }
+
+#[test]
+fn deploy_manifest_hook_copies_linked_dependencies() {
+    let manifest = Arc::new(serde_json::json!({
+        "dependencies": { "a": "link:./a", "registry": "^1.0.0", "file": "file:./file" },
+        "devDependencies": { "b": "link:../b" },
+        "optionalDependencies": { "c": "link:./c" },
+    }));
+
+    let transformed = apply_deploy_manifest_hook_to_arc(Arc::clone(&manifest));
+
+    assert_eq!(
+        *transformed,
+        serde_json::json!({
+            "dependencies": { "a": "file:./a", "registry": "^1.0.0", "file": "file:./file" },
+            "devDependencies": { "b": "file:../b" },
+            "optionalDependencies": { "c": "file:./c" },
+        }),
+    );
+    assert_eq!(manifest["dependencies"]["a"], "link:./a");
+}
 // The `readPackage` hook rewrites a resolved package's
 // dependency range, and resolution honors it. `@pnpm.e2e/pkg-with-1-dep`
 // depends on `@pnpm.e2e/dep-of-pkg-with-1-dep@^100.0.0`, which would resolve
@@ -374,6 +395,29 @@ async fn pre_resolution_hook_log_is_forwarded_to_pnpm_hook_channel() {
         assert_eq!(log.from, "pnpmfile", "preResolution from is hardcoded to 'pnpmfile'");
         assert_eq!(log.prefix, *dir.path().to_string_lossy(), "prefix must be the lockfile dir");
     }
+
+    drop((dir, registry));
+}
+
+// Each evaluation of the pnpmfile appends to `loads`. The long-lived worker
+// that serves every hook evaluates it once.
+#[tokio::test]
+async fn pnpmfile_without_pre_resolution_is_loaded_once() {
+    let registry = TestRegistry::start();
+    let dir = tempdir().unwrap();
+
+    install_with_pnpmfile(
+        registry.url(),
+        dir.path(),
+        &[("@pnpm.e2e/pkg-with-1-dep", "100.0.0")],
+        r"require('fs').appendFileSync(require('path').join(__dirname, 'loads'), 'x');
+module.exports = { hooks: { readPackage: (pkg) => pkg } }",
+    )
+    .await
+    .expect("install should succeed");
+
+    let loads = std::fs::read_to_string(dir.path().join("loads")).expect("read loads");
+    assert_eq!(loads, "x");
 
     drop((dir, registry));
 }

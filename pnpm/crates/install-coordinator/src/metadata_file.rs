@@ -132,12 +132,15 @@ fn read_file(parent: &PinnedDirectory, name: &OsStr) -> io::Result<FileState> {
         Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {}
         Err(error) => return Err(error),
     }
+    // `O_NONBLOCK` so that a path which is a FIFO or a device is rejected
+    // below on its type. Opening one read-only otherwise waits for a writer,
+    // and a metadata path never has one. A regular file is unaffected.
     // SAFETY: `name` is NUL-terminated and the pinned parent remains valid.
     let descriptor = unsafe {
         libc::openat(
             parent.handle.as_raw_fd(),
             name.as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
         )
     };
     let mut file = match file_from_descriptor(descriptor) {
@@ -191,7 +194,7 @@ fn write_file(
     let result = (|| {
         file.write_all(contents)?;
         file.set_permissions(fs::Permissions::from_mode(mode))?;
-        file.sync_all()?;
+        pnpm_fs::sync_file(&file)?;
         rename_at(parent, &temporary, &destination)
     })();
     drop(file);
@@ -251,7 +254,7 @@ fn windows_temporary_path(parent: &PinnedDirectory, name: &OsStr) -> PathBuf {
     temporary.push(name);
     temporary.push(format!(
         ".pnpm-{}-{}",
-        std::process::id(),
+        pnpm_fs::process_id(),
         TEMPORARY_FILE_ID.fetch_add(1, Ordering::Relaxed),
     ));
     parent.path.join(temporary)
@@ -345,7 +348,7 @@ fn temporary_name(name: &OsStr) -> io::Result<std::ffi::CString> {
     temporary.push(name);
     temporary.push(format!(
         ".pnpm-{}-{}",
-        std::process::id(),
+        pnpm_fs::process_id(),
         TEMPORARY_FILE_ID.fetch_add(1, Ordering::Relaxed),
     ));
     Ok(std::ffi::CString::new(temporary.as_bytes())?)
@@ -436,3 +439,6 @@ mod directory;
 use directory::PinnedDirectory;
 #[cfg(windows)]
 use directory::is_windows_reparse_point;
+
+#[cfg(all(test, unix))]
+mod tests;

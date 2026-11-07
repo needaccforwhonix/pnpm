@@ -38,7 +38,10 @@ fn copy_entry(src: &Path, dst: &Path, metadata: &fs::Metadata) -> io::Result<()>
         copy_dir_contents(src, dst)?;
         // After the contents, so a source directory the owner cannot
         // write to is still populated before it turns read-only.
-        return fs::set_permissions(dst, metadata.permissions());
+        #[cfg(not(target_os = "wasi"))]
+        return crate::CopyPermissions::of_metadata(metadata).apply_to_path(dst);
+        #[cfg(target_os = "wasi")]
+        return crate::copy_permissions(src)?.apply_to_path(dst);
     }
     if !file_type.is_file() {
         return Err(io::Error::new(
@@ -46,7 +49,37 @@ fn copy_entry(src: &Path, dst: &Path, metadata: &fs::Metadata) -> io::Result<()>
             format!("cannot copy {}: it is neither a file, a directory, nor a link", src.display()),
         ));
     }
-    fs::copy(src, dst).map(drop)
+    #[cfg(not(target_os = "wasi"))]
+    {
+        fs::copy(src, dst).map(drop)
+    }
+    #[cfg(target_os = "wasi")]
+    {
+        crate::copy_file_atomic(src, dst)
+    }
+}
+
+/// Create a symlink at `dst` pointing to `target`.
+pub fn create_symlink(target: &Path, dst: &Path, is_dir: bool) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        let target = crate::to_native_separators(target);
+        let dst = crate::to_native_separators(dst);
+        if is_dir {
+            return std::os::windows::fs::symlink_dir(&target, &dst);
+        }
+        std::os::windows::fs::symlink_file(&target, &dst)
+    }
+    #[cfg(unix)]
+    {
+        let _ = is_dir;
+        std::os::unix::fs::symlink(target, dst)
+    }
+    #[cfg(target_os = "wasi")]
+    {
+        let _ = is_dir;
+        crate::wasi_fs::symlink(target, dst)
+    }
 }
 
 /// Recreate `src`'s link at `dst`. Windows types its links at creation
@@ -58,17 +91,12 @@ fn copy_symlink(src: &Path, dst: &Path, file_type: fs::FileType) -> io::Result<(
     #[cfg(windows)]
     {
         use std::os::windows::fs::FileTypeExt;
-        let target = crate::to_native_separators(&target);
-        let dst = crate::to_native_separators(dst);
-        if file_type.is_symlink_dir() {
-            return std::os::windows::fs::symlink_dir(&target, &dst);
-        }
-        std::os::windows::fs::symlink_file(&target, &dst)
+        create_symlink(&target, dst, file_type.is_symlink_dir())
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, target_os = "wasi"))]
     {
         let _ = file_type;
-        std::os::unix::fs::symlink(target, dst)
+        create_symlink(&target, dst, false)
     }
 }
 

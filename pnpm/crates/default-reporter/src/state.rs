@@ -18,9 +18,9 @@ use pnpm_reporter::{
     AddedRoot, ContextLog, DedupeCheckLog, DependencyType, DeprecationLog, ExecutionTimeLog,
     FetchingProgressMessage, HookLog, IgnoredScriptsLog, InstallingConfigDepsLog,
     InstallingConfigDepsStatus, LifecycleMessage, LifecycleStdio, LockfileVerificationMessage,
-    LogEvent, LogLevel, PackageImportMethod, PackageManifestMessage, ProgressMessage, RemovedRoot,
-    RequestRetryLog, ScopeLog, SkippedOptionalDependencyLog, SkippedOptionalPackage, Stage,
-    StatsMessage, UpdateCheckLog,
+    LogEvent, LogLevel, PackageImportMethod, PackageManifestMessage, PendingSkillsLog,
+    ProgressMessage, RemovedRoot, RequestRetryLog, ScopeLog, SkippedOptionalDependencyLog,
+    SkippedOptionalPackage, SkippedOptionalReason, Stage, StatsMessage, UpdateCheckLog,
 };
 use serde_json::Value;
 
@@ -32,7 +32,8 @@ use crate::{
     colors::Colors,
     format::{
         contains_path, cut_line, format_prefix, format_prefix_no_trim, highlight_last_folder,
-        normalize, pretty_bytes, pretty_ms, pretty_ms_compact, relative, visible_width, zoom_out,
+        normalize, pretty_bytes, pretty_ms, pretty_ms_compact, printable_script_line, relative,
+        visible_width, zoom_out,
     },
 };
 
@@ -58,6 +59,10 @@ struct ProgressStats {
 struct ProgressEntry {
     stats: ProgressStats,
     slot: BlockSlot,
+    /// Set once the `, done` line is rendered. Like pnpm's `takeWhile`
+    /// on `importingDone$`, later progress events for the requester are
+    /// dropped instead of starting a new line.
+    done: bool,
 }
 
 /// One dependency added or removed, ready to render.
@@ -316,10 +321,12 @@ impl ReporterState {
             LogEvent::Summary(log) => self.on_summary(&log.prefix),
             LogEvent::Lifecycle(log) => self.on_lifecycle(&log.message),
             LogEvent::IgnoredScripts(log) => self.on_ignored_scripts(log),
+            LogEvent::PendingSkills(log) => self.on_pending_skills(log),
             LogEvent::UpdateCheck(log) => self.on_update_check(log),
             LogEvent::SkippedOptionalDependency(log) => self.on_skipped_optional(log),
             LogEvent::InstallingConfigDeps(log) => self.on_config_deps(log),
             LogEvent::LockfileVerification(log) => self.on_lockfile_verification(&log.message),
+            LogEvent::Lockfile(log) => self.on_pnpm(log.level, &log.message, &log.prefix),
             LogEvent::RequestRetry(log) => self.on_request_retry(log),
             LogEvent::Pnpm(log) => self.on_pnpm(log.level, &log.message, &log.prefix),
             LogEvent::DedupeCheck(log) => self.on_dedupe_check(log),
@@ -337,20 +344,29 @@ impl ReporterState {
     }
 
     /// Which events render at the configured `--loglevel`, mirroring the
-    /// tiers in `@pnpm/cli.default-reporter`'s `reporterForClient`: the
-    /// request-retry and deprecation streams need `warn`, the visual
-    /// streams (progress, stats, lifecycle, summary, `Done in ...`) need
-    /// `info`, and the `pnpm` / `pnpm:global` misc streams filter per
-    /// message level in [`Self::on_pnpm`], so errors always pass.
-    /// Dedupe-check issues always pass too — upstream reports them as an
-    /// error-level log (`ERR_PNPM_DEDUPE_CHECK_ISSUES` in
-    /// `reportError.ts`).
+    /// tiers in `@pnpm/cli.default-reporter`'s `reporterForClient`. The
+    /// `pnpm` / `pnpm:global` misc streams filter per message level in
+    /// [`Self::on_pnpm`], so errors always pass. Lifecycle events always
+    /// pass: below `info`, [`Self::on_lifecycle`] buffers each script and
+    /// prints only failed ones. Dedupe-check issues always pass too —
+    /// upstream reports them as an error-level log
+    /// (`ERR_PNPM_DEDUPE_CHECK_ISSUES` in `reportError.ts`).
     fn level_permits(&self, event: &LogEvent) -> bool {
         match event {
-            LogEvent::Pnpm(_) | LogEvent::Global(_) | LogEvent::DedupeCheck(_) => true,
-            LogEvent::RequestRetry(_)
+            LogEvent::Lockfile(_)
+            | LogEvent::Pnpm(_)
+            | LogEvent::Global(_)
+            | LogEvent::DedupeCheck(_)
+            | LogEvent::Lifecycle(_) => true,
+            LogEvent::IgnoredScripts(_)
+            | LogEvent::PendingSkills(_)
+            | LogEvent::RequestRetry(_)
             | LogEvent::Deprecation(_)
             | LogEvent::PeerDependencyIssues(_) => self.options.max_log_level >= MaxLogLevel::Warn,
+            LogEvent::LockfileVerification(log) => {
+                matches!(log.message, LockfileVerificationMessage::Failed { .. })
+                    || self.options.max_log_level >= MaxLogLevel::Info
+            }
             _ => self.options.max_log_level >= MaxLogLevel::Info,
         }
     }
@@ -405,7 +421,7 @@ mod update_check;
 use update_check::{detect_install_source, is_strictly_newer, update_command};
 
 mod frame;
-use frame::{BlockSlot, Frame};
+use frame::{BlockPlacement, BlockSlot, Frame};
 
 mod paths;
 use paths::normalized_prefix;
@@ -430,7 +446,7 @@ impl DisplayState {
 impl Frame {
     pub(super) fn push_block(&mut self, message: String) {
         let mut slot = BlockSlot::default();
-        self.emit(&mut slot, message, false);
+        self.emit(&mut slot, message, BlockPlacement::Scrolling);
     }
 }
 

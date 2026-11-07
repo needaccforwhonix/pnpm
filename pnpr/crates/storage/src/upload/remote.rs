@@ -55,7 +55,7 @@ pub(super) struct RemoteChunk {
 
 impl RemoteUploadStore {
     pub(crate) fn new(store: Arc<dyn ObjectStore>, prefix: &str, scratch: PathBuf) -> Self {
-        Self { store, prefix: format!("{prefix}.pnpr-uploads/"), scratch }
+        Self { store, prefix: format!("{prefix}{}/", super::UPLOADS_DIR), scratch }
     }
 
     fn key(&self, id: &str, object: &str) -> Path {
@@ -102,6 +102,7 @@ impl RemoteUploadStore {
         Ok(UpdateVersion { e_tag: result.e_tag, version: result.version })
     }
 
+    #[expect(clippy::disallowed_methods, reason = "an upload scratch file stays owner-only")]
     async fn temp(&self) -> Result<TempPath> {
         fs::create_dir_all(&self.scratch).await?;
         Ok(tempfile::NamedTempFile::new_in(&self.scratch)?.into_temp_path())
@@ -388,7 +389,7 @@ impl RemoteChunk {
         if size == 0 {
             let current = self.upload.backend.read(&self.upload.id).await?;
             if current.is_none_or(|current| {
-                current.record.closed || current.version != self.version
+                current.record.closed || !same_object_version(&current.version, &self.version)
             }) {
                 return Err(RegistryError::BlobUploadConflict { id: self.upload.id.clone() });
             }
@@ -419,6 +420,16 @@ impl RemoteChunk {
         let offset = self.snapshot.size;
         *self.upload.state.lock().await = VersionedRecord { record: self.snapshot, version };
         Ok(offset)
+    }
+}
+
+/// Whether two observations name the same object version. The version id
+/// decides when both sides carry one, the `ETag` otherwise: Cloudflare R2
+/// returns `x-amz-version-id` on PUT but not on GET.
+fn same_object_version(left: &UpdateVersion, right: &UpdateVersion) -> bool {
+    match (&left.version, &right.version) {
+        (Some(left), Some(right)) => left == right,
+        _ => left.e_tag == right.e_tag,
     }
 }
 

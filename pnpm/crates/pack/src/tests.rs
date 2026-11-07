@@ -1,5 +1,8 @@
 use super::{Host, PackError, PackOptions, PackResult, format_pack_output, to_pack_result_json};
-use crate::capabilities::{FsAtomicWrite, FsCreateDirAll, FsFileLen, FsReadFile};
+use crate::{
+    capabilities::{FsAtomicWrite, FsCreateDirAll, FsFileLen, FsIsExecutable, FsReadFile},
+    manifest_entry::is_manifest_entry,
+};
 use flate2::read::GzDecoder;
 use pnpm_config::NodeLinker;
 use pnpm_reporter::{LogEvent, Reporter, SilentReporter};
@@ -34,10 +37,12 @@ fn fixture(manifest: &Value) -> (TempDir, PackOptions) {
         },
         manifest: crate::PackManifestOptions {
             catalogs: BTreeMap::new(),
+            catalogs_dir: None,
             embed_readme: false,
             node_linker: NodeLinker::Isolated,
             skip_obfuscation: false,
             before_packing_hooks: Vec::new(),
+            workspace_packages: None,
         },
         output: crate::PackOutputOptions {
             gzip_level: None,
@@ -58,7 +63,7 @@ fn fixture(manifest: &Value) -> (TempDir, PackOptions) {
 fn api<Reporter, Sys>(opts: &PackOptions) -> Result<PackResult, PackError>
 where
     Reporter: pnpm_reporter::Reporter,
-    Sys: FsReadFile + FsFileLen + FsCreateDirAll + FsAtomicWrite,
+    Sys: FsReadFile + FsFileLen + FsCreateDirAll + FsAtomicWrite + FsIsExecutable,
 {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -123,6 +128,18 @@ fn tarball_entry_content(tarball: &Path, entry_name: &str) -> Option<String> {
     None
 }
 
+fn tarball_entry_mode(tarball: &Path, entry_name: &str) -> u32 {
+    let file = std::fs::File::open(tarball).unwrap();
+    let mut archive = tar::Archive::new(GzDecoder::new(file));
+    for entry in archive.entries().unwrap() {
+        let entry = entry.unwrap();
+        if entry.path().unwrap().to_str() == Some(entry_name) {
+            return entry.header().mode().unwrap();
+        }
+    }
+    panic!("entry {entry_name:?} not found in {}", tarball.display());
+}
+
 #[test]
 fn injected_files_are_packed_and_supersede_an_on_disk_entry() {
     let (dir, mut opts) = fixture(&json!({ "name": "foo", "version": "1.1.0" }));
@@ -146,6 +163,168 @@ fn injected_files_are_packed_and_supersede_an_on_disk_entry() {
         1,
     );
     assert_eq!(tarball_entry_content(&tarball, "package/CHANGELOG.md").as_deref(), Some(composed));
+}
+
+/// The workspace-root LICENSE and the injected `mmm.txt` join the pack
+/// after the packlist walk, so they exercise the ordering of entries the
+/// maps carry last. The expected order is not byte order, which would put
+/// `B.txt` before `a.txt` and `LICENSE` before `dir/`.
+#[test]
+fn tarball_entries_are_written_in_compression_order() {
+    let workspace = tempdir().unwrap();
+    std::fs::write(workspace.path().join("LICENSE"), "MIT").unwrap();
+    let (dir, mut opts) = fixture(&json!({ "name": "foo", "version": "1.0.0" }));
+    touch(dir.path(), "zzz.txt", "z\n");
+    touch(dir.path(), "dir/x.js", "x\n");
+    touch(dir.path(), "B.txt", "B\n");
+    touch(dir.path(), "a.txt", "a\n");
+    opts.workspace_dir = Some(workspace.path().to_path_buf());
+    opts.output.injected_files = vec![("package/mmm.txt".to_string(), b"m\n".to_vec())];
+
+    api::<SilentReporter, Host>(&opts).unwrap();
+
+    let names = tarball_entry_names(&dir.path().join("foo-1.0.0.tgz"));
+    assert_eq!(
+        names,
+        vec![
+            "package/LICENSE".to_string(),
+            "package/dir/x.js".into(),
+            "package/package.json".into(),
+            "package/a.txt".into(),
+            "package/B.txt".into(),
+            "package/mmm.txt".into(),
+            "package/zzz.txt".into(),
+        ],
+    );
+}
+
+/// Template collections carry the same file names in many directories
+/// with identical or near-identical contents. Grouping by extension and
+/// basename keeps those copies adjacent, which is the whole point of the
+/// order: a path-ordered archive scatters them beyond DEFLATE's window.
+#[test]
+fn duplicate_named_files_are_adjacent_for_compression() {
+    let (dir, opts) = fixture(&json!({ "name": "foo", "version": "1.0.0" }));
+    touch(dir.path(), "template-a/hero.png", "png-bytes");
+    touch(dir.path(), "template-b/hero.png", "png-bytes");
+    touch(dir.path(), "template-a/index.html", "<html>a</html>\n");
+    touch(dir.path(), "template-b/index.html", "<html>b</html>\n");
+
+    api::<SilentReporter, Host>(&opts).unwrap();
+
+    let names = tarball_entry_names(&dir.path().join("foo-1.0.0.tgz"));
+    assert_eq!(
+        names,
+        vec![
+            "package/template-a/index.html".to_string(),
+            "package/template-b/index.html".into(),
+            "package/package.json".into(),
+            "package/template-a/hero.png".into(),
+            "package/template-b/hero.png".into(),
+        ],
+    );
+}
+
+/// The verdicts `String.prototype.localeCompare(b, 'en')` gives in Node,
+/// which pnpm 11 sorts packed paths with. Code-point order disagrees with
+/// every one of these but the last two: it puts the digit ahead of `_`,
+/// `-` ahead of `_`, `-` ahead of the space, and every accented letter
+/// past `z`.
+#[test]
+fn en_collator_matches_javascript_locale_compare() {
+    use super::collation::en_collator;
+    use std::cmp::Ordering;
+
+    let en = en_collator();
+    let collator = en.as_borrowed();
+    assert_eq!(collator.compare("é.txt", "z.txt"), Ordering::Less);
+    assert_eq!(collator.compare("ä.txt", "b.txt"), Ordering::Less);
+    assert_eq!(collator.compare("_a.js", "1a.js"), Ordering::Less);
+    assert_eq!(collator.compare("a-b.js", "a_b.js"), Ordering::Greater);
+    assert_eq!(collator.compare("a b.js", "a-b.js"), Ordering::Less);
+    assert_eq!(collator.compare("readme.md", "README.md"), Ordering::Less);
+    assert_eq!(collator.compare("a.txt", "B.txt"), Ordering::Less);
+    assert_eq!(collator.compare("dir/x.js", "LICENSE"), Ordering::Less);
+    assert_eq!(collator.compare("a.txt", "a.txt"), Ordering::Equal);
+}
+
+/// `en_collator` leaves out the per-locale tailorings, so it must order
+/// strings exactly as ICU4X's full compiled `en` collator does.
+#[test]
+fn en_collator_matches_full_compiled_en_collation() {
+    use super::collation::en_collator;
+    use icu_collator::{CollatorBorrowed, options::CollatorOptions};
+    use icu_locale_core::locale;
+
+    let full = CollatorBorrowed::try_new(locale!("en").into(), CollatorOptions::default()).unwrap();
+    let en = en_collator();
+    let root = en.as_borrowed();
+    let mut by_full: Vec<String> = ('\u{20}'..='\u{24FF}')
+        .flat_map(|char| [char.to_string(), format!("{char}\u{301}")])
+        .collect();
+    let mut by_root = by_full.clone();
+    by_full.sort_by(|left, right| full.compare(left, right));
+    by_root.sort_by(|left, right| root.compare(left, right));
+    assert!(by_full == by_root, "root-only `en` collation diverges from the full data");
+}
+
+/// A name ending in a bare dot has the extension `.`, which sorts ahead of
+/// every real extension but behind no extension at all. Such a name cannot
+/// be created on Windows, so the key is pinned directly rather than through
+/// a fixture.
+#[test]
+fn extname_keys_a_trailing_dot_apart_from_no_extension() {
+    use super::tarball::extname;
+
+    assert_eq!(extname("archive."), ".");
+    assert_eq!(extname("archive"), "");
+    assert_eq!(extname(".npmrc"), "");
+    assert_eq!(extname("archive.tar.gz"), ".gz");
+}
+
+/// The packed manifest comes from memory rather than from its on-disk file,
+/// but `publishConfig.executableFiles` names it by source path, so listing
+/// it there must keep marking it executable in the archive.
+#[test]
+fn manifest_named_in_executable_files_is_packed_executable() {
+    let (dir, opts) = fixture(&json!({
+        "name": "foo",
+        "version": "1.0.0",
+        "publishConfig": { "executableFiles": ["package.json"] },
+    }));
+
+    api::<SilentReporter, Host>(&opts).unwrap();
+
+    let mode = tarball_entry_mode(&dir.path().join("foo-1.0.0.tgz"), "package/package.json");
+    assert_eq!(mode, 0o755);
+}
+
+#[test]
+#[cfg(unix)]
+fn on_disk_executable_file_is_packed_executable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (dir, opts) = fixture(&json!({
+        "name": "foo",
+        "version": "1.0.0",
+        "files": ["scripts/run.sh", "index.js"],
+    }));
+    touch(dir.path(), "scripts/run.sh", "#!/bin/sh\necho hi\n");
+    touch(dir.path(), "index.js", "module.exports = 1;\n");
+
+    std::fs::set_permissions(
+        dir.path().join("scripts/run.sh"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+
+    api::<SilentReporter, Host>(&opts).unwrap();
+
+    let mode = tarball_entry_mode(&dir.path().join("foo-1.0.0.tgz"), "package/scripts/run.sh");
+    assert_eq!(mode, 0o755);
+
+    let js_mode = tarball_entry_mode(&dir.path().join("foo-1.0.0.tgz"), "package/index.js");
+    assert_eq!(js_mode, 0o644);
 }
 
 /// A `publishConfig.name` rename has to reach the tarball filename and the
@@ -187,6 +366,30 @@ fn packs_a_basic_package_to_a_tarball() {
     let mut names = tarball_entry_names(&tarball);
     names.sort();
     assert_eq!(names, vec!["package/index.js".to_string(), "package/package.json".into()]);
+}
+
+#[test]
+fn omits_default_excluded_swap_and_apple_double_files() {
+    let (dir, opts) = fixture(&json!({ "name": "foo", "version": "1.2.3" }));
+    touch(dir.path(), "index.js", "");
+    touch(dir.path(), ".index.js.swp", "");
+    touch(dir.path(), "._index.js", "");
+    touch(dir.path(), "lib/a.js", "");
+    touch(dir.path(), "lib/._a.js", "");
+    touch(dir.path(), "lib/.a.js.swp", "");
+
+    api::<SilentReporter, Host>(&opts).unwrap();
+
+    let mut names = tarball_entry_names(&dir.path().join("foo-1.2.3.tgz"));
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            "package/index.js".to_string(),
+            "package/lib/a.js".into(),
+            "package/package.json".into(),
+        ],
+    );
 }
 
 #[test]
@@ -369,6 +572,66 @@ fn files_field_restricts_the_tarball_contents() {
 }
 
 #[test]
+fn files_field_restricts_the_tarball_contents_with_package_yaml() {
+    let (dir, opts) = fixture(&json!({}));
+    std::fs::remove_file(dir.path().join("package.json")).unwrap();
+    std::fs::write(
+        dir.path().join("package.yaml"),
+        "name: foo\nversion: 1.0.0\nfiles:\n  - dist\n",
+    )
+    .unwrap();
+    touch(dir.path(), "dist/index.js", "x\n");
+    touch(dir.path(), "src/index.ts", "x\n");
+
+    let result = api::<SilentReporter, Host>(&opts).unwrap();
+    assert_eq!(result.contents, vec!["dist/index.js".to_string(), "package.json".into()]);
+    let mut entry_names = tarball_entry_names(&dir.path().join("foo-1.0.0.tgz"));
+    entry_names.sort();
+    assert_eq!(entry_names, vec!["package/dist/index.js", "package/package.json"]);
+}
+
+#[test]
+fn uppercase_manifest_names_ship_as_ordinary_files() {
+    let (dir, opts) = fixture(&json!({
+        "name": "foo",
+        "version": "1.0.0",
+        "files": ["dist"],
+    }));
+    touch(dir.path(), "PACKAGE.YAML", "not a manifest\n");
+    touch(dir.path(), "dist/index.js", "x\n");
+
+    let result = api::<SilentReporter, Host>(&opts).unwrap();
+    assert_eq!(
+        result.contents,
+        vec!["dist/index.js".to_string(), "package.json".into(), "PACKAGE.YAML".into()],
+    );
+    let mut entry_names = tarball_entry_names(&dir.path().join("foo-1.0.0.tgz"));
+    entry_names.sort();
+    assert_eq!(
+        entry_names,
+        vec!["package/PACKAGE.YAML", "package/dist/index.js", "package/package.json"],
+    );
+}
+
+#[test]
+fn matches_manifest_entries_at_root() {
+    assert!(is_manifest_entry("package/package.json"));
+    assert!(is_manifest_entry("package/package.yaml"));
+    assert!(is_manifest_entry("package/package.json5"));
+
+    assert!(!is_manifest_entry("package/sub/package.json"));
+    assert!(!is_manifest_entry("other/package.json"));
+    assert!(!is_manifest_entry("package/package.js"));
+}
+
+#[test]
+fn uppercase_manifest_names_are_not_manifest_entries() {
+    assert!(!is_manifest_entry("package/PACKAGE.JSON"));
+    assert!(!is_manifest_entry("package/PACKAGE.YAML"));
+    assert!(!is_manifest_entry("package/PACKAGE.JSON5"));
+}
+
+#[test]
 fn files_field_entries_do_not_match_at_depth() {
     let (dir, opts) = fixture(&json!({
         "name": "foo",
@@ -380,6 +643,24 @@ fn files_field_entries_do_not_match_at_depth() {
 
     let result = api::<SilentReporter, Host>(&opts).unwrap();
     assert_eq!(result.contents, vec!["package.json".to_string(), "src/index.js".into()]);
+}
+
+#[test]
+fn files_field_entry_naming_a_file_survives_an_ancestor_exclusion() {
+    let (dir, opts) = fixture(&json!({
+        "name": "foo",
+        "version": "1.0.0",
+        "files": ["**", "!dist", "dist/index.d.ts"],
+    }));
+    touch(dir.path(), "app.js", "x\n");
+    touch(dir.path(), "dist/app.js", "x\n");
+    touch(dir.path(), "dist/index.d.ts", "x\n");
+
+    let result = api::<SilentReporter, Host>(&opts).unwrap();
+    assert_eq!(
+        result.contents,
+        vec!["app.js".to_string(), "dist/index.d.ts".into(), "package.json".into()],
+    );
 }
 
 #[test]
@@ -447,23 +728,7 @@ fn out_and_pack_destination_together_is_rejected() {
 }
 
 #[test]
-fn bundled_dependencies_without_hoisted_is_rejected() {
-    let (_dir, opts) = fixture(&json!({
-        "name": "foo",
-        "version": "1.0.0",
-        "bundledDependencies": ["bar"],
-    }));
-    assert!(matches!(
-        api::<SilentReporter, Host>(&opts),
-        Err(PackError::BundledDependenciesWithoutHoisted { field: "bundledDependencies", .. })
-    ));
-}
-
-#[test]
 fn bundle_dependencies_false_is_allowed_without_hoisted() {
-    // pnpm gates on truthiness (`if (bundledDependencies)`), so an
-    // explicit `false` must pack cleanly under the default non-hoisted
-    // linker instead of tripping the guard.
     let (_dir, opts) = fixture(&json!({
         "name": "foo",
         "version": "1.0.0",
@@ -471,6 +736,23 @@ fn bundle_dependencies_false_is_allowed_without_hoisted() {
         "bundledDependencies": false,
     }));
     assert!(api::<SilentReporter, Host>(&opts).is_ok());
+}
+
+#[test]
+fn bundled_dependencies_with_pnp_are_rejected() {
+    let (_dir, mut opts) = fixture(&json!({
+        "name": "foo",
+        "version": "1.0.0",
+        "bundledDependencies": [],
+    }));
+    opts.manifest.node_linker = NodeLinker::Pnp;
+    assert!(matches!(
+        api::<SilentReporter, Host>(&opts),
+        Err(PackError::BundledDependenciesWithPnp {
+            field: "bundledDependencies",
+            node_linker: "pnp",
+        })
+    ));
 }
 
 #[test]
@@ -521,10 +803,12 @@ fn workspace_license_is_injected_into_a_sub_package() {
         },
         manifest: crate::PackManifestOptions {
             catalogs: BTreeMap::new(),
+            catalogs_dir: None,
             embed_readme: false,
             node_linker: NodeLinker::Isolated,
             skip_obfuscation: false,
             before_packing_hooks: Vec::new(),
+            workspace_packages: None,
         },
         output: crate::PackOutputOptions {
             gzip_level: None,
@@ -581,10 +865,12 @@ fn symlinked_workspace_license_is_not_injected() {
         },
         manifest: crate::PackManifestOptions {
             catalogs: BTreeMap::new(),
+            catalogs_dir: None,
             embed_readme: false,
             node_linker: NodeLinker::Isolated,
             skip_obfuscation: false,
             before_packing_hooks: Vec::new(),
+            workspace_packages: None,
         },
         output: crate::PackOutputOptions {
             gzip_level: None,
@@ -631,10 +917,12 @@ fn workspace_root_gitignore_excludes_workspace_package_files() {
         },
         manifest: crate::PackManifestOptions {
             catalogs: BTreeMap::new(),
+            catalogs_dir: None,
             embed_readme: false,
             node_linker: NodeLinker::Isolated,
             skip_obfuscation: false,
             before_packing_hooks: Vec::new(),
+            workspace_packages: None,
         },
         output: crate::PackOutputOptions {
             gzip_level: None,
@@ -703,10 +991,99 @@ fn tarball_write_failure_surfaces_as_write_error() {
             Err(io::Error::new(io::ErrorKind::PermissionDenied, "mocked"))
         }
     }
+    impl FsIsExecutable for DeniedWrite {
+        fn is_executable(path: &Path) -> io::Result<bool> {
+            Host::is_executable(path)
+        }
+    }
 
     let (_dir, opts) = fixture(&json!({ "name": "foo", "version": "1.0.0" }));
     let err = api::<SilentReporter, DeniedWrite>(&opts).unwrap_err();
     assert!(matches!(err, PackError::WriteTarball { .. }), "got {err:?}");
+}
+
+#[test]
+fn executable_inspection_failure_surfaces_as_write_error() {
+    struct DeniedExecInspection;
+    impl FsReadFile for DeniedExecInspection {
+        fn read_file(path: &Path) -> io::Result<Vec<u8>> {
+            std::fs::read(path)
+        }
+    }
+    impl FsFileLen for DeniedExecInspection {
+        fn file_len(path: &Path) -> io::Result<u64> {
+            std::fs::metadata(path).map(|metadata| metadata.len())
+        }
+    }
+    impl FsCreateDirAll for DeniedExecInspection {
+        fn create_dir_all(path: &Path) -> io::Result<()> {
+            std::fs::create_dir_all(path)
+        }
+    }
+    impl FsAtomicWrite for DeniedExecInspection {
+        fn atomic_write(
+            dest: &Path,
+            write_body: &mut dyn FnMut(&mut dyn std::io::Write) -> io::Result<()>,
+        ) -> io::Result<()> {
+            Host::atomic_write(dest, write_body)
+        }
+    }
+    impl FsIsExecutable for DeniedExecInspection {
+        fn is_executable(path: &Path) -> io::Result<bool> {
+            if path.ends_with("run.sh") {
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, "simulated EACCES"))
+            } else {
+                Host::is_executable(path)
+            }
+        }
+    }
+
+    let (dir, opts) = fixture(&json!({
+        "name": "foo",
+        "version": "1.0.0",
+        "files": ["scripts/run.sh"],
+    }));
+    touch(dir.path(), "scripts/run.sh", "#!/bin/sh\necho hi\n");
+
+    let err = api::<SilentReporter, DeniedExecInspection>(&opts).unwrap_err();
+    assert!(
+        matches!(err, PackError::WriteTarball { ref source, .. } if source.kind() == io::ErrorKind::PermissionDenied),
+        "got {err:?}",
+    );
+}
+
+#[test]
+fn host_is_executable_returns_false_for_missing_file() {
+    let dir = tempdir().unwrap();
+    let missing = dir.path().join("does-not-exist");
+    assert!(!Host::is_executable(&missing).unwrap());
+}
+
+#[test]
+#[cfg(unix)]
+fn host_is_executable_propagates_non_not_found_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let unreadable_dir = dir.path().join("unreadable");
+    std::fs::create_dir(&unreadable_dir).unwrap();
+    let file = unreadable_dir.join("test.sh");
+    std::fs::write(&file, "#!/bin/sh\n").unwrap();
+
+    std::fs::set_permissions(&unreadable_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let probe = std::fs::metadata(&file);
+    let result = Host::is_executable(&file);
+
+    let _ = std::fs::set_permissions(&unreadable_dir, std::fs::Permissions::from_mode(0o755));
+
+    if probe.is_ok() {
+        return;
+    }
+    assert_eq!(probe.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+
+    let err = result.unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "got {err:?}");
 }
 
 #[test]
@@ -716,6 +1093,7 @@ fn format_pack_output_json_single_vs_multiple() {
         contents: vec!["package.json".to_string()],
         tarball_path: "foo-1.0.0.tgz".to_string(),
         unpacked_size: 42,
+        archive: None,
     };
     let json_single = format_pack_output(&[to_pack_result_json(&result)], true, false);
     let parsed: Value = serde_json::from_str(&json_single).unwrap();
@@ -750,6 +1128,7 @@ fn text_output_strips_control_characters_from_paths() {
         contents: vec!["evil\u{1b}[2K.js".to_string(), "package.json".into()],
         tarball_path: "foo-1.0.0.tgz".to_string(),
         unpacked_size: 0,
+        archive: None,
     };
     let text = format_pack_output(&[to_pack_result_json(&result)], false, false);
     assert!(!text.contains('\u{1b}'), "escape sequence must be stripped: {text:?}");
@@ -763,6 +1142,7 @@ fn format_pack_output_text_block() {
         contents: vec!["index.js".to_string(), "package.json".into()],
         tarball_path: "foo-1.0.0.tgz".to_string(),
         unpacked_size: 0,
+        archive: None,
     };
     let text = format_pack_output(&[to_pack_result_json(&result)], false, false);
     assert!(text.starts_with("package: foo@1.0.0"));
@@ -773,9 +1153,7 @@ fn format_pack_output_text_block() {
 }
 
 /// `pack` runs `prepack`, `prepare`, and `postpack`.
-/// Exercises `run_scripts_if_present` / `script_body`: with scripts
-/// enabled, each of `prepack` / `prepare` / `postpack` runs and leaves a
-/// marker file. Gated to Unix like the executor's other script-running
+/// Gated to Unix like the executor's other script-running
 /// tests, since it shells out through the platform shell.
 #[cfg(unix)]
 #[test]
@@ -903,4 +1281,146 @@ fn install_module(dir: &Path, name: &str, version: &str, extra: &[(&str, &str)])
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn pack_preserves_internal_symlinks() {
+    let (dir, opts) = fixture(&json!({
+        "name": "test-pack-symlinks",
+        "version": "1.0.0",
+        "files": ["real-file.txt", "symlink-file.txt", "sub", "symlink-dir", "symlink-outside"],
+    }));
+    let root = dir.path();
+    touch(root, "real-file.txt", "hello from real file");
+    touch(root, "sub/nested.txt", "nested content");
+
+    let outside = tempdir().unwrap();
+    touch(outside.path(), "secret.txt", "secret");
+
+    std::os::unix::fs::symlink("real-file.txt", root.join("symlink-file.txt")).unwrap();
+    std::os::unix::fs::symlink("sub", root.join("symlink-dir")).unwrap();
+    std::os::unix::fs::symlink(outside.path().join("secret.txt"), root.join("symlink-outside"))
+        .unwrap();
+
+    let result = api::<SilentReporter, Host>(&opts).unwrap();
+    let tarball = dir.path().join(&result.tarball_path);
+
+    let file = std::fs::File::open(&tarball).unwrap();
+    let mut archive = tar::Archive::new(GzDecoder::new(file));
+    let mut symlink_file_entry = None;
+    let mut symlink_dir_entry = None;
+    let mut found_outside = false;
+
+    for entry in archive.entries().unwrap() {
+        let entry = entry.unwrap();
+        let name = entry
+            .path()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        if name == "package/symlink-file.txt" {
+            symlink_file_entry = Some((
+                entry.header().entry_type(),
+                entry
+                    .link_name()
+                    .unwrap()
+                    .map(|target_path| target_path.to_string_lossy().into_owned()),
+            ));
+        } else if name == "package/symlink-dir" {
+            symlink_dir_entry = Some((
+                entry.header().entry_type(),
+                entry
+                    .link_name()
+                    .unwrap()
+                    .map(|target_path| target_path.to_string_lossy().into_owned()),
+            ));
+        } else if name == "package/symlink-outside" {
+            found_outside = true;
+        }
+    }
+
+    assert_eq!(
+        symlink_file_entry,
+        Some((tar::EntryType::Symlink, Some("real-file.txt".to_string()))),
+    );
+    assert_eq!(symlink_dir_entry, Some((tar::EntryType::Symlink, Some("sub".to_string()))));
+    assert!(!found_outside, "escaping symlinks must be excluded");
+}
+
 mod bundled_dependencies;
+mod dotenv;
+mod variants;
+
+mod variant_warnings;
+
+#[test]
+fn bin_with_crlf_shebang_is_rejected() {
+    use miette::Diagnostic;
+    let (dir, opts) = fixture(&json!({
+        "name": "foo",
+        "version": "1.0.0",
+        "bin": { "foo": "bin/foo.js" }
+    }));
+    touch(dir.path(), "bin/foo.js", "#!/usr/bin/env node\r\nconsole.log(1);\n");
+
+    let Err(err) = api::<SilentReporter, Host>(&opts) else {
+        panic!("expected BinCrlf error");
+    };
+    assert_eq!(err.code().unwrap().to_string(), "ERR_PNPM_BIN_CRLF");
+    let PackError::BinCrlf { path } = err else {
+        panic!("expected BinCrlf error");
+    };
+    assert_eq!(path, "bin/foo.js");
+}
+
+#[test]
+fn bin_with_lf_shebang_and_crlf_body_is_accepted() {
+    let (dir, opts) = fixture(&json!({
+        "name": "foo",
+        "version": "1.0.0",
+        "bin": { "foo": "bin/foo.js" }
+    }));
+    touch(dir.path(), "bin/foo.js", "#!/usr/bin/env node\nconsole.log(1);\r\n");
+
+    assert!(api::<SilentReporter, Host>(&opts).is_ok());
+}
+
+#[test]
+fn bin_without_shebang_is_accepted() {
+    let (dir, opts) = fixture(&json!({
+        "name": "foo",
+        "version": "1.0.0",
+        "bin": { "foo": "bin/foo.js" }
+    }));
+    touch(dir.path(), "bin/foo.js", "console.log(1);\r\n");
+
+    assert!(api::<SilentReporter, Host>(&opts).is_ok());
+}
+
+#[test]
+fn bin_with_bom_and_crlf_shebang_is_rejected() {
+    let (dir, opts) = fixture(&json!({
+        "name": "foo",
+        "version": "1.0.0",
+        "bin": "bin/foo.js"
+    }));
+    touch(dir.path(), "bin/foo.js", "\u{feff}#!/usr/bin/env node\r\nconsole.log(1);\n");
+
+    let Err(PackError::BinCrlf { path }) = api::<SilentReporter, Host>(&opts) else {
+        panic!("expected BinCrlf error");
+    };
+    assert_eq!(path, "bin/foo.js");
+}
+
+#[test]
+fn excluded_executable_file_with_crlf_shebang_is_accepted() {
+    let (dir, opts) = fixture(&json!({
+        "name": "foo",
+        "version": "1.0.0",
+        "files": ["index.js"],
+        "publishConfig": { "executableFiles": ["ignored-bin.js"] }
+    }));
+    touch(dir.path(), "index.js", "console.log(1);\n");
+    touch(dir.path(), "ignored-bin.js", "#!/usr/bin/env node\r\nconsole.log(1);\n");
+
+    assert!(api::<SilentReporter, Host>(&opts).is_ok());
+}

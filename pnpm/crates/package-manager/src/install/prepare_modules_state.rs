@@ -1,5 +1,8 @@
 mod up_to_date;
-use up_to_date::{FrozenTreeUpToDate, UpToDateInstall, frozen_tree_up_to_date, report_up_to_date};
+use up_to_date::{
+    CarriedWorkspaceState, FrozenTreeUpToDate, UpToDateInstall, frozen_tree_up_to_date,
+    report_up_to_date,
+};
 
 mod purge;
 use purge::{
@@ -8,9 +11,11 @@ use purge::{
 };
 
 use super::{
-    Config, Host, InstallError, Lockfile, Modules, NodeLinker, Reporter,
-    modules_layout_consistent_with,
+    Config, Host, InstallError, Lockfile, Modules, NodeLinker, PackageManifest, PathBuf, Reporter,
+    WorkspaceState, modules_layout_consistent_with, tree_may_move,
 };
+use crate::{install::state_options::RecordedWorkspace, install_state::recorded_elsewhere};
+use pnpm_workspace_state::load_workspace_state_in_modules;
 
 pub(super) struct PrepareModulesStateInputs<'a, 'install> {
     pub(crate) tree: crate::install::state_options::ModulesTreeContext<'a>,
@@ -30,6 +35,7 @@ pub(super) struct PreparedModulesState<'install> {
     pub(super) is_inconsistent: bool,
     pub(super) lockfile_verification_override:
         Option<super::LockfileVerificationOverride<'install>>,
+    pub(super) tree_moved: bool,
 }
 
 pub(super) fn prior_hoisted_dependencies(
@@ -44,8 +50,8 @@ pub(super) fn prior_hoisted_locations(
     previous_modules_metadata.and_then(|modules| modules.hoisted_locations.as_ref())
 }
 
-/// Returns `Ok(None)` after completing an up-to-date install; the caller must return successfully
-/// without materializing.
+/// Returns `Ok(None)` after finding the tree up to date; the caller must run
+/// the projects' lifecycle scripts and close the install without materializing.
 pub(super) async fn prepare_modules_state<'install, Reporter: self::Reporter + 'static>(
     inputs: PrepareModulesStateInputs<'_, 'install>,
 ) -> Result<Option<PreparedModulesState<'install>>, InstallError> {
@@ -57,14 +63,29 @@ pub(super) async fn prepare_modules_state<'install, Reporter: self::Reporter + '
         inputs.repeat.filtered,
         inputs.tree.config,
     )?;
-    let is_inconsistent =
-        modules_layout_drifted(modules_manifest, inputs.tree.config, inputs.tree.node_linker);
+    let drifted = modules_layout_drifted(modules_manifest, &inputs);
+    let is_inconsistent = prepare_modules_layout(&inputs, modules_manifest, drifted)?;
 
-    prepare_modules_layout(&inputs, modules_manifest, is_inconsistent)?;
-
-    let up_to_date = frozen_tree_inputs(&inputs, modules_manifest);
+    let recorded_state = load_recorded_workspace_state(&inputs);
+    let recorded = recorded_workspace(
+        recorded_state.as_ref(),
+        modules_manifest.is_some() || inputs.lockfiles.current.is_some(),
+        inputs.tree.config,
+        inputs.tree.node_linker,
+        inputs.projects.manifests,
+    );
+    let up_to_date = frozen_tree_inputs(&inputs, modules_manifest, recorded);
     if let Some((wanted_lockfile, modules)) = frozen_tree_up_to_date(&up_to_date) {
-        report_prepared_up_to_date::<Reporter>(inputs, wanted_lockfile, modules).await?;
+        let carried_state = CarriedWorkspaceState {
+            recorded_auto_dedupe: up_to_date.recorded.state.and_then(|state| {
+                state.settings.auto_dedupe
+            }),
+            recorded_registry_routes: up_to_date.recorded.state.and_then(|state| {
+                state.settings.registry_routes.clone()
+            }),
+        };
+        report_prepared_up_to_date::<Reporter>(inputs, wanted_lockfile, modules, carried_state)
+            .await?;
         return Ok(None);
     }
 
@@ -73,23 +94,48 @@ pub(super) async fn prepare_modules_state<'install, Reporter: self::Reporter + '
         previous_modules_metadata,
         is_inconsistent,
         lockfile_verification_override: inputs.verification.override_check,
+        tree_moved: recorded.moved,
     }))
 }
 
+/// The workspace state, read once for the recorded `supportedArchitectures`
+/// and to tell a tree that moved with its project. An existing tree without
+/// readable state may have moved too. Where a moved tree is never reused
+/// ([`tree_may_move`]), one is not told from a tree in place.
+fn recorded_workspace<'a>(
+    state: Option<&'a WorkspaceState>,
+    existing_tree: bool,
+    config: &Config,
+    node_linker: NodeLinker,
+    projects: &'a [(PathBuf, &'a PackageManifest)],
+) -> RecordedWorkspace<'a> {
+    RecordedWorkspace {
+        state,
+        moved: tree_may_move(config, node_linker)
+            && state.map_or(existing_tree, |state| recorded_elsewhere(state, projects)),
+        projects,
+        bin_projects: projects,
+    }
+}
+
+/// Returns `is_inconsistent` as [`purge_inconsistent_modules_dir`] leaves it.
 fn prepare_modules_layout(
     inputs: &PrepareModulesStateInputs<'_, '_>,
     modules_manifest: Option<&pnpm_modules_yaml::ModulesLayout>,
     is_inconsistent: bool,
-) -> Result<(), InstallError> {
-    if !inputs.resolve_only && is_inconsistent {
+) -> Result<bool, InstallError> {
+    let is_inconsistent = if !inputs.resolve_only && is_inconsistent {
         purge_inconsistent_modules_dir(&InconsistentModulesDir {
             config: inputs.tree.config,
             workspace_root: inputs.tree.workspace_root,
             modules_manifest,
+            node_linker: inputs.tree.node_linker,
             installs_only: inputs.installs_only,
             filtered_install: inputs.repeat.filtered,
-        })?;
-    }
+        })?
+    } else {
+        is_inconsistent
+    };
 
     prune_excluded_direct_deps(&ExcludedGroupPrune {
         eligibility: crate::install::state_options::PruneEligibility {
@@ -104,8 +150,39 @@ fn prepare_modules_layout(
         modules_manifest,
         current_lockfile: inputs.lockfiles.current,
         requested_importer_ids: inputs.lockfiles.importer_ids,
+        manifest_links: purge::ManifestLinkProjects {
+            manifests: inputs.projects.manifests,
+            workspace_links: inputs.projects.workspace_packages.map(|packages| {
+                crate::WorkspaceLinks { packages, catalogs: inputs.projects.catalogs }
+            }),
+        },
     })?;
 
+    Ok(is_inconsistent)
+}
+
+/// An up-to-date tree skips the materialization that links agent skills,
+/// but an approval, a `skills.dirs` change, or a new agent directory still
+/// changes what to link. Only a project with approved, linked, or pending
+/// skills pays for the check.
+fn resync_agent_skills_when_up_to_date<Reporter: self::Reporter>(
+    inputs: &PrepareModulesStateInputs<'_, '_>,
+    modules: &pnpm_modules_yaml::ModulesLayout,
+) -> Result<(), InstallError> {
+    let config = inputs.tree.config;
+    if config.allow_skills.is_empty()
+        && modules.linked_skills.is_none()
+        && modules.pending_skills.is_none()
+    {
+        return Ok(());
+    }
+    let pending = crate::agent_skills::resync_agent_skills_at(
+        config,
+        inputs.tree.workspace_root,
+        inputs.lockfiles.current,
+    )
+    .map_err(InstallError::ResyncAgentSkills)?;
+    crate::agent_skills::report_pending_skills::<Reporter>(pending);
     Ok(())
 }
 
@@ -113,7 +190,9 @@ async fn report_prepared_up_to_date<Reporter: self::Reporter + 'static>(
     inputs: PrepareModulesStateInputs<'_, '_>,
     wanted_lockfile: &Lockfile,
     modules: &pnpm_modules_yaml::ModulesLayout,
+    carried_state: CarriedWorkspaceState,
 ) -> Result<(), InstallError> {
+    resync_agent_skills_when_up_to_date::<Reporter>(&inputs, modules)?;
     report_up_to_date::<Reporter>(UpToDateInstall {
         tree: crate::install::state_options::ModulesTreeContext {
             config: inputs.tree.config,
@@ -124,7 +203,10 @@ async fn report_prepared_up_to_date<Reporter: self::Reporter + 'static>(
         projects: crate::install::state_options::InstallProjectMetadata {
             catalogs: inputs.projects.catalogs,
             manifests: inputs.projects.manifests,
+            declared_manifests: inputs.projects.declared_manifests,
+            workspace_projects: inputs.projects.workspace_projects,
             prefix: inputs.projects.prefix,
+            workspace_packages: inputs.projects.workspace_packages,
         },
         verification: crate::install::state_options::LockfileVerificationInputs {
             verifiers: inputs.verification.verifiers,
@@ -141,7 +223,7 @@ async fn report_prepared_up_to_date<Reporter: self::Reporter + 'static>(
         modules,
         supported_architectures: inputs.repeat.supported_architectures,
 
-        filtered_install: inputs.repeat.filtered,
+        carried_state,
     })
     .await
 }
@@ -149,6 +231,7 @@ async fn report_prepared_up_to_date<Reporter: self::Reporter + 'static>(
 fn frozen_tree_inputs<'a>(
     inputs: &PrepareModulesStateInputs<'a, '_>,
     modules_manifest: Option<&'a pnpm_modules_yaml::ModulesLayout>,
+    recorded: RecordedWorkspace<'a>,
 ) -> FrozenTreeUpToDate<'a> {
     FrozenTreeUpToDate {
         tree: crate::install::state_options::ModulesTreeContext {
@@ -169,6 +252,10 @@ fn frozen_tree_inputs<'a>(
         lockfile: inputs.lockfiles.wanted,
         current_lockfile: inputs.lockfiles.current,
         modules_manifest,
+        recorded: RecordedWorkspace {
+            bin_projects: inputs.projects.workspace_projects.unwrap_or(recorded.projects),
+            ..recorded
+        },
     }
 }
 
@@ -229,11 +316,18 @@ fn read_previous_modules_metadata(
 /// The purge keys off *layout* drift only, not `included`: an included
 /// (`--prod` <-> full) change is handled by relinking, so it must not wipe the
 /// user's `node_modules` contents. See [`modules_layout_consistent_with`].
+///
+/// A rebuild never purges: it runs the build scripts against the tree as it
+/// is, as `pnpm rebuild` in the TypeScript CLI does, which reads the modules
+/// directory without validating its recorded settings.
 fn modules_layout_drifted(
     modules_manifest: Option<&pnpm_modules_yaml::ModulesLayout>,
-    config: &Config,
-    node_linker: NodeLinker,
+    inputs: &PrepareModulesStateInputs<'_, '_>,
 ) -> bool {
+    if inputs.repeat.rebuild.is_some() {
+        return false;
+    }
+    let config = inputs.tree.config;
     let Some(modules) = modules_manifest else {
         // Treat existence-check errors conservatively as inconsistent.
         return config.modules_dir
@@ -241,5 +335,12 @@ fn modules_layout_drifted(
             .try_exists()
             .unwrap_or(true);
     };
-    !modules_layout_consistent_with(modules, config, node_linker)
+    !modules_layout_consistent_with(modules, config, inputs.tree.node_linker)
+}
+
+fn load_recorded_workspace_state(
+    inputs: &PrepareModulesStateInputs<'_, '_>,
+) -> Option<pnpm_workspace_state::WorkspaceState> {
+    let modules_dir = inputs.tree.config.workspace_state_modules_dir(inputs.tree.workspace_root);
+    load_workspace_state_in_modules(&modules_dir).ok().flatten()
 }

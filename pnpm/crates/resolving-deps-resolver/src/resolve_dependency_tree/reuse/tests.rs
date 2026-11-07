@@ -3,14 +3,26 @@ mod higher_direct_dep_version {
 
     use node_semver::{Range, Version};
 
-    use super::super::{DirectDepVersions, higher_direct_dep_version};
+    use super::super::{DirectDepVersion, DirectDepVersions, higher_direct_dep_version};
 
+    /// `versions` as `<version>` or `<prefix>:<version>`.
     fn direct(name: &str, versions: &[&str]) -> DirectDepVersions {
         let parsed = versions
             .iter()
-            .map(|raw| raw.parse::<Version>().expect("parse version"))
+            .map(|raw| pinned(raw))
             .collect();
         HashMap::from_iter([(name.to_string(), parsed)])
+    }
+
+    /// `raw` as `<version>` from the default registry, or `<registry>:<version>`.
+    fn pinned(raw: &str) -> DirectDepVersion {
+        let (registry, version) = raw
+            .split_once(':')
+            .unwrap_or(("default", raw));
+        DirectDepVersion {
+            registry: format!("https://{registry}.test/"),
+            version: version.parse().expect("parse version"),
+        }
     }
 
     fn ver(raw: &str) -> Version {
@@ -25,7 +37,7 @@ mod higher_direct_dep_version {
     fn picks_the_highest_in_range_version_above_the_pin() {
         let direct = direct("foo", &["1.1.0", "1.5.0", "2.0.0"]);
         assert_eq!(
-            higher_direct_dep_version(Some(&direct), "foo", &ver("1.0.0"), &range("^1.0.0")),
+            higher_direct_dep_version(Some(&direct), "foo", &pinned("1.0.0"), &range("^1.0.0")),
             Some(ver("1.5.0")),
         );
     }
@@ -34,7 +46,7 @@ mod higher_direct_dep_version {
     fn none_when_no_direct_version_is_higher() {
         let direct = direct("foo", &["1.0.0"]);
         assert!(
-            higher_direct_dep_version(Some(&direct), "foo", &ver("1.0.0"), &range("^1.0.0"))
+            higher_direct_dep_version(Some(&direct), "foo", &pinned("1.0.0"), &range("^1.0.0"))
                 .is_none(),
         );
     }
@@ -45,16 +57,50 @@ mod higher_direct_dep_version {
         // satisfy a range that doesn't admit prereleases, so no refresh.
         let direct = direct("foo", &["1.2.0-beta.1"]);
         assert!(
-            higher_direct_dep_version(Some(&direct), "foo", &ver("1.0.0"), &range("^1.0.0"))
+            higher_direct_dep_version(Some(&direct), "foo", &pinned("1.0.0"), &range("^1.0.0"))
                 .is_none(),
         );
+    }
+
+    /// A direct dependency from another registry does not refresh the pin,
+    /// which that registry may not serve.
+    #[test]
+    fn refreshes_only_onto_a_version_from_the_pinned_registry() {
+        let direct = direct("foo", &["1.1.0", "public:1.2.0"]);
+        assert_eq!(
+            higher_direct_dep_version(
+                Some(&direct),
+                "foo",
+                &pinned("public:1.0.0"),
+                &range("^1.0.0")
+            ),
+            Some(ver("1.2.0")),
+        );
+        assert_eq!(
+            higher_direct_dep_version(Some(&direct), "foo", &pinned("1.0.0"), &range("^1.0.0")),
+            Some(ver("1.1.0")),
+        );
+        let other_registry_only = direct_only("foo", "1.1.0");
+        assert!(
+            higher_direct_dep_version(
+                Some(&other_registry_only),
+                "foo",
+                &pinned("public:1.0.0"),
+                &range("^1.0.0")
+            )
+            .is_none(),
+        );
+    }
+
+    fn direct_only(name: &str, version: &str) -> DirectDepVersions {
+        direct(name, &[version])
     }
 
     #[test]
     fn refreshes_a_prerelease_when_the_range_admits_it() {
         let direct = direct("foo", &["1.2.0-beta.1"]);
         assert_eq!(
-            higher_direct_dep_version(Some(&direct), "foo", &ver("1.0.0"), &range(">=1.2.0-0")),
+            higher_direct_dep_version(Some(&direct), "foo", &pinned("1.0.0"), &range(">=1.2.0-0")),
             Some(ver("1.2.0-beta.1")),
         );
     }
@@ -172,9 +218,10 @@ mod real_package_name_of {
 mod is_update_target {
     use pnpm_resolving_resolver_base::WantedDependency;
 
-    use crate::{UpdateTargets, VersionLine};
-
-    use super::super::{UpdateDepth, UpdateReuseScope, UpdateScope, is_update_target};
+    use crate::{
+        UpdateDepth, UpdateReuseScope, UpdateTargets, VersionLine,
+        resolve_dependency_tree::update_scope::{UpdateScope, is_update_target},
+    };
 
     fn wanted_with(alias: Option<&str>, bare_specifier: Option<&str>) -> WantedDependency {
         WantedDependency {
@@ -350,5 +397,34 @@ mod is_update_target {
         let scope = UpdateScope { reuse: &reuse, max_depth: UpdateDepth::new(usize::MAX) };
 
         assert!(is_update_target(scope, &wanted_with(Some("foo"), Some("^1.0.0")), None, i32::MAX));
+    }
+}
+
+mod pinned_specifier {
+    use super::super::snapshot_children::pinned_specifier;
+    use pnpm_lockfile::PkgNameVerPeer;
+
+    fn pinned(alias: &str, key: &str) -> String {
+        pinned_specifier(alias, &key.parse::<PkgNameVerPeer>().expect("parse snapshot key"))
+    }
+
+    #[test]
+    fn an_unaliased_child_pins_the_version_alone() {
+        assert_eq!(pinned("foo", "foo@1.0.0(peer@2.0.0)"), "1.0.0");
+    }
+
+    #[test]
+    fn an_aliased_child_names_its_real_package() {
+        assert_eq!(pinned("vite", "@scope/core@0.3.3(peer@2.0.0)"), "npm:@scope/core@0.3.3");
+    }
+
+    #[test]
+    fn an_unaliased_named_registry_child_keeps_its_registry() {
+        assert_eq!(pinned("foo", "foo@work:1.0.0(peer@2.0.0)"), "work:1.0.0");
+    }
+
+    #[test]
+    fn an_aliased_named_registry_child_names_its_real_package() {
+        assert_eq!(pinned("foo", "@scope/bar@work:1.0.0(peer@2.0.0)"), "work:@scope/bar@1.0.0");
     }
 }

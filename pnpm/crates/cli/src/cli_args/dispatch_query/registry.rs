@@ -1,19 +1,22 @@
 use super::{
-    AccessArgs, CommandFuture, Config, DefaultReporter, DeprecateArgs, DistTagArgs, LoginArgs,
-    LogoutArgs, NdjsonReporter, OwnerArgs, PingArgs, ReporterType, RunCtx, SearchArgs,
-    SilentReporter, StarArgs, StarsArgs, TeamArgs, UndeprecateArgs, UnpublishArgs, UnstarArgs,
-    ViewArgs,
+    AccessArgs, CommandFuture, Config, DeprecateArgs, DistTagArgs, LoginArgs, LogoutArgs,
+    OwnerArgs, PingArgs, ProfileArgs, RunCtx, SearchArgs, StarArgs, StarsArgs, TeamArgs, TokenArgs,
+    UndeprecateArgs, UnpublishArgs, UnstarArgs, ViewArgs, WhoamiArgs,
 };
+use crate::cli_args::reporter::CliReporter;
 
-// `whoami` is a read-only registry query: it resolves the default registry's
+// `whoami` is a read-only registry query: it resolves the target registry's
 // auth header from config and GETs `-/whoami`, with no lockfile or install
-// pipeline. It needs an async future for the request but no reporter-typed
-// fan-out, so it dispatches off `config()` like the other read-only commands.
-pub(in super::super) fn whoami<'a>(ctx: &RunCtx<'a>) -> miette::Result<CommandFuture<'a>> {
+// pipeline. It needs an async future for the request and no reporter, so it
+// dispatches off `config()` like the other read-only commands.
+pub(in super::super) fn whoami<'a>(
+    ctx: &RunCtx<'a>,
+    args: WhoamiArgs,
+) -> miette::Result<CommandFuture<'a>> {
     let cfg: &Config = (ctx.loaders.config)()?;
     Ok(Box::pin(async move {
-        let username = super::super::whoami::whoami(cfg).await?;
-        println!("{}", super::super::sanitize::sanitize(&username));
+        let username = args.run(cfg).await?;
+        pnpm_diagnostics::println!("{}", super::super::sanitize::sanitize(&username));
         Ok(())
     }))
 }
@@ -43,7 +46,7 @@ pub(in super::super) fn stars<'a>(
         if let Some(output) = args.run(cfg).await?
             && !output.is_empty()
         {
-            println!("{output}");
+            pnpm_diagnostics::println!("{output}");
         }
         Ok(())
     }))
@@ -60,7 +63,7 @@ pub(in super::super) fn access<'a>(
             if output.is_empty() {
                 return Ok(());
             }
-            println!("{output}");
+            pnpm_diagnostics::println!("{output}");
         }
         Ok(())
     }))
@@ -72,12 +75,12 @@ pub(in super::super) fn dist_tag<'a>(
 ) -> miette::Result<CommandFuture<'a>> {
     let cfg: &Config = (ctx.loaders.config)()?;
     Ok(Box::pin(async move {
-        if let Some(output) = args.run(cfg).await? {
+        if let Some(output) = args.run::<CliReporter>(cfg).await? {
             let output = super::super::sanitize::sanitize(&output);
             if output.is_empty() {
                 return Ok(());
             }
-            println!("{output}");
+            pnpm_diagnostics::println!("{output}");
         }
         Ok(())
     }))
@@ -94,7 +97,7 @@ pub(in super::super) fn deprecate<'a>(
             if output.is_empty() {
                 return Ok(());
             }
-            println!("{output}");
+            pnpm_diagnostics::println!("{output}");
         }
         Ok(())
     }))
@@ -111,7 +114,7 @@ pub(in super::super) fn undeprecate<'a>(
             if output.is_empty() {
                 return Ok(());
             }
-            println!("{output}");
+            pnpm_diagnostics::println!("{output}");
         }
         Ok(())
     }))
@@ -129,18 +132,12 @@ pub(in super::super) fn unpublish<'a>(
         if let Some(output) = args.run::<Reporter>(cfg).await? {
             let output = super::super::sanitize::sanitize(&output);
             if !output.is_empty() {
-                println!("{output}");
+                pnpm_diagnostics::println!("{output}");
             }
         }
         Ok(())
     }
-    Ok(match ctx.reporter {
-        ReporterType::Default | ReporterType::AppendOnly => {
-            Box::pin(print_output::<DefaultReporter>(args, cfg))
-        }
-        ReporterType::Ndjson => Box::pin(print_output::<NdjsonReporter>(args, cfg)),
-        ReporterType::Silent => Box::pin(print_output::<SilentReporter>(args, cfg)),
-    })
+    Ok(Box::pin(print_output::<CliReporter>(args, cfg)))
 }
 
 pub(in super::super) fn team<'a>(
@@ -154,7 +151,7 @@ pub(in super::super) fn team<'a>(
             if output.is_empty() {
                 return Ok(());
             }
-            println!("{output}");
+            pnpm_diagnostics::println!("{output}");
         }
         Ok(())
     }))
@@ -171,7 +168,24 @@ pub(in super::super) fn owner<'a>(
             if output.is_empty() {
                 return Ok(());
             }
-            println!("{output}");
+            pnpm_diagnostics::println!("{output}");
+        }
+        Ok(())
+    }))
+}
+
+pub(in super::super) fn profile<'a>(
+    ctx: &RunCtx<'a>,
+    args: ProfileArgs,
+) -> miette::Result<CommandFuture<'a>> {
+    let cfg: &Config = (ctx.loaders.config)()?;
+    Ok(Box::pin(async move {
+        if let Some(output) = args.run(cfg).await? {
+            let output = super::super::sanitize::sanitize(&output);
+            if output.is_empty() {
+                return Ok(());
+            }
+            pnpm_diagnostics::println!("{output}");
         }
         Ok(())
     }))
@@ -188,7 +202,7 @@ pub(in super::super) fn ping<'a>(
     let cfg: &Config = (ctx.loaders.config)()?;
     Ok(Box::pin(async move {
         let report = args.run(cfg).await?;
-        println!("{report}");
+        pnpm_diagnostics::println!("{report}");
         Ok(())
     }))
 }
@@ -212,7 +226,7 @@ pub(in super::super) fn view<'a>(
         // match `pnpm view`, which prints whatever truthy string the handler
         // returns.
         if !output.is_empty() {
-            println!("{output}");
+            pnpm_diagnostics::println!("{output}");
         }
         Ok(())
     }))
@@ -228,16 +242,7 @@ pub(in super::super) fn login<'a>(
     args: LoginArgs,
 ) -> miette::Result<CommandFuture<'a>> {
     let config: &Config = (ctx.loaders.config)()?;
-    macro_rules! run_login {
-        ($reporter:ty) => {
-            Box::pin(async move { args.run::<$reporter>(config).await })
-        };
-    }
-    Ok(match ctx.reporter {
-        ReporterType::Default | ReporterType::AppendOnly => run_login!(DefaultReporter),
-        ReporterType::Ndjson => run_login!(NdjsonReporter),
-        ReporterType::Silent => run_login!(SilentReporter),
-    })
+    Ok(Box::pin(async move { args.run::<CliReporter>(config).await }))
 }
 
 // `logout` revokes the registry auth token and removes it from `auth.ini`. It
@@ -251,16 +256,7 @@ pub(in super::super) fn logout<'a>(
 ) -> miette::Result<CommandFuture<'a>> {
     let config: &Config = (ctx.loaders.config)()?;
     let prefix = ctx.locations.dir.to_string_lossy().into_owned();
-    macro_rules! run_logout {
-        ($reporter:ty) => {
-            Box::pin(async move { args.run::<$reporter>(config, &prefix).await })
-        };
-    }
-    Ok(match ctx.reporter {
-        ReporterType::Default | ReporterType::AppendOnly => run_logout!(DefaultReporter),
-        ReporterType::Ndjson => run_logout!(NdjsonReporter),
-        ReporterType::Silent => run_logout!(SilentReporter),
-    })
+    Ok(Box::pin(async move { args.run::<CliReporter>(config, &prefix).await }))
 }
 
 pub(in super::super) fn search<'a>(
@@ -271,7 +267,24 @@ pub(in super::super) fn search<'a>(
     Ok(Box::pin(async move {
         let output = args.run(cfg).await?;
         if !output.is_empty() {
-            println!("{output}");
+            pnpm_diagnostics::println!("{output}");
+        }
+        Ok(())
+    }))
+}
+
+pub(in super::super) fn token<'a>(
+    ctx: &RunCtx<'a>,
+    args: TokenArgs,
+) -> miette::Result<CommandFuture<'a>> {
+    let cfg: &Config = (ctx.loaders.config)()?;
+    Ok(Box::pin(async move {
+        if let Some(output) = args.run(cfg).await? {
+            let output = super::super::sanitize::sanitize(&output);
+            if output.is_empty() {
+                return Ok(());
+            }
+            pnpm_diagnostics::println!("{output}");
         }
         Ok(())
     }))

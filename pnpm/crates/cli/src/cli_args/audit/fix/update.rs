@@ -1,10 +1,11 @@
 use super::{
     Arc, AuditAdvisory, AuditError, BTreeMap, DependencyGroup, HashMap, HashSet, Lockfile,
-    PackageVersionGuard, PackumentPublishInfo, Range, Reporter, ResolutionObserver, State, Update,
-    Version, blue, caret_range_for_patched, color_severity, green, red,
-    resolve_minimum_release_age_excludes, satisfies_including_prerelease, severity_name,
-    severity_number, write_age_excludes,
+    PackageVersionGuard, PackumentPublishInfo, Range, RangeSpecStyle, Reporter, ResolutionObserver,
+    State, Update, Version, blue, color_severity, green, red, resolve_minimum_release_age_excludes,
+    satisfies_including_prerelease, severity_name, severity_number, write_age_excludes,
 };
+use crate::cli_args::audit::patched_range_for_style;
+use pnpm_resolving_deps_resolver::UpdateTargets;
 
 /// The advisories of a `--fix update` run, partitioned by how the update can
 /// act on each: ones with a concrete vulnerable range (guarded against and
@@ -68,10 +69,6 @@ pub(crate) async fn fix_with_update<Reporter: self::Reporter + 'static>(
 ) -> miette::Result<(Vec<u64>, Vec<u64>, Vec<String>)> {
     let classification = classify_for_update(advisories);
 
-    // When `minimumReleaseAge` is set, the patched versions are likely
-    // fresher than the cutoff; record the ones that actually are as
-    // exclusions (persisted to config and injected into this resolve) so the
-    // picker may install them.
     let age_excludes = persist_age_excludes(state, advisories, settings_dir, publish_infos)?;
 
     update_non_vulnerable::<Reporter>(state, &classification, &age_excludes).await?;
@@ -162,8 +159,7 @@ fn installed_packages(updated: &Lockfile) -> InstalledPackages {
     installed
 }
 
-/// The packages present in the post-update lockfile: every name (regardless of
-/// lockfile-key shape) plus, for each, the versions whose key parsed as semver.
+/// The packages present in the post-update lockfile.
 pub(crate) struct InstalledPackages {
     pub(crate) names: HashSet<String>,
     pub(crate) versions: HashMap<String, Vec<Version>>,
@@ -190,9 +186,6 @@ pub(crate) fn report_fixed_remaining(
             fixed.extend(entries.iter().map(|(id, _)| *id));
             continue;
         }
-        // Still installed, but only via non-semver keys
-        // (file:/git/tarball); the range can't be evaluated, so don't
-        // claim it's fixed.
         let Some(versions) = installed.versions.get(name) else {
             remaining.extend(entries.iter().map(|(id, _)| *id));
             continue;
@@ -211,7 +204,6 @@ pub(crate) fn report_fixed_remaining(
         gone.into_iter()
             .flat_map(|(_, ids)| ids.iter().copied()),
     );
-    // Advisories with an unparsable vulnerable range can't be proven fixed.
     remaining.extend(unparsable.iter().copied());
 
     (fixed, remaining)
@@ -320,8 +312,9 @@ pub(crate) struct AuditFixObserver {
     pub(crate) age_excludes: Vec<String>,
 }
 
-pub(super) fn advisory_choices(
+pub(crate) fn advisory_choices(
     advisories: &BTreeMap<String, AuditAdvisory>,
+    range_spec_style: RangeSpecStyle,
 ) -> (Vec<String>, Vec<String>) {
     let mut fixable: Vec<&AuditAdvisory> = advisories
         .values()
@@ -339,7 +332,7 @@ pub(super) fn advisory_choices(
         }
         let patched = advisory.patched_versions
             .as_deref()
-            .map(caret_range_for_patched)
+            .map(|versions| patched_range_for_style(versions, range_spec_style))
             .unwrap_or_default();
         labels.push(format!(
             "[{}] {} {} ❯ {} {}",
@@ -361,9 +354,8 @@ async fn update_non_vulnerable<Reporter: self::Reporter + 'static>(
     age_excludes: &[String],
 ) -> miette::Result<()> {
     let lockfile_path = state.lockfile_path();
-    let lockfile = state.lockfile
-        .get()
-        .map_err(|err| miette::Report::new(err).wrap_err("load the lockfile"))?;
+    let lockfile = crate::state::command_lockfile(&state.lockfile, &lockfile_path)?;
+    let targets = vulnerable_locked_versions(lockfile.document, &classification.vulnerabilities);
     let resources = update_resources(state, classification, age_excludes);
     Update {
         manifest: &mut state.manifest,
@@ -372,17 +364,21 @@ async fn update_non_vulnerable<Reporter: self::Reporter + 'static>(
             http_client: &state.http_client,
             config: state.config,
             lockfile,
-            lockfile_path: Some(&lockfile_path),
             lockfile_only: false,
             selection: pnpm_package_manager::UpdateSelection {
                 packages: &[],
                 depth: usize::MAX,
                 workspace_packages: None,
+                interactive: false,
+                targets: Some(&targets),
             },
             version: pnpm_package_manager::UpdateVersionOptions {
                 latest: false,
                 patches: false,
-                save_exact: false,
+                range_spec_style: RangeSpecStyle::from_save_options(
+                    state.config.save_exact,
+                    state.config.save_prefix.as_deref(),
+                ),
                 save: true,
             },
         },
@@ -394,6 +390,32 @@ async fn update_non_vulnerable<Reporter: self::Reporter + 'static>(
         miette::Report::new(err).wrap_err("update dependencies to fix vulnerabilities")
     })?;
     Ok(())
+}
+
+/// The locked versions an advisory's vulnerable range covers. The update
+/// re-resolves only these, so every other dependency keeps its locked version.
+fn vulnerable_locked_versions(
+    lockfile: Option<&Lockfile>,
+    vulnerabilities: &HashMap<String, Vec<(u64, Range)>>,
+) -> UpdateTargets {
+    let mut targets = UpdateTargets::default();
+    for key in lockfile
+        .and_then(|lockfile| lockfile.snapshots.as_ref())
+        .into_iter()
+        .flatten()
+        .map(|(key, _)| key)
+    {
+        let name = key.name.to_string();
+        let (Some(version), Some(entries)) =
+            (key.suffix.version_semver(), vulnerabilities.get(&name))
+        else {
+            continue;
+        };
+        if entries.iter().any(|(_, range)| satisfies_including_prerelease(version, range)) {
+            targets.insert_version(name, version.clone());
+        }
+    }
+    targets
 }
 
 fn update_resources(
@@ -409,6 +431,7 @@ fn update_resources(
             DependencyGroup::Dev,
             DependencyGroup::Optional,
         ],
+        explicit_groups: pnpm_package_manager::UpdateExplicitGroups::default(),
         supported_architectures: state.config.supported_architectures.clone(),
         resolution_observer: Some(fix_observer(
             &classification.vulnerabilities,

@@ -5,20 +5,21 @@ use super::{
 };
 use base64::Engine as _;
 use p256::{ecdsa::signature::Verifier, pkcs8::DecodePublicKey};
+use pnpm_network::{normalize_registry_url, read_limited_self_delimiting_body};
 
-/// npm's public registry signing keys, mirrored from
-/// <https://registry.npmjs.org/-/npm/v1/keys>. `expires` is `None` for a
-/// key with no expiry.
+/// npm's public registry signing keys, generated from
+/// `.config/npm-signing-keys.json` by the meta-updater. `expires` is `None`
+/// for a key with no expiry.
 pub(super) const NPM_SIGNING_KEYS: &[NpmSigningKey] = &[
-    NpmSigningKey {
-        keyid: "SHA256:jl3bwswu80PjjokCgh0o2w5c2U4LhQAE57gj9cz1kzA",
-        key: "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE1Olb3zMAFFxXKHiIkQO5cJ3Yhl5i6UPp+IhuteBJbuHcA5UogKo0EWtlWwW6KSaKoTNEYL7JlCQiVnkhBktUgg==",
-        expires: Some("2025-01-29T00:00:00.000Z"),
-    },
     NpmSigningKey {
         keyid: "SHA256:DhQ8wR5APBvFHLF/+Tc+AYvPOdTpcIDqOhxsBHRwC7U",
         key: "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEY6Ya7W++7aUPzvMTrezH6Ycx3c+HOKYCcNGybJZSCJq/fd7Qa8uuAKtdIkUQtQiEKERhAmE5lMMJhP8OkDOa2g==",
         expires: None,
+    },
+    NpmSigningKey {
+        keyid: "SHA256:jl3bwswu80PjjokCgh0o2w5c2U4LhQAE57gj9cz1kzA",
+        key: "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE1Olb3zMAFFxXKHiIkQO5cJ3Yhl5i6UPp+IhuteBJbuHcA5UogKo0EWtlWwW6KSaKoTNEYL7JlCQiVnkhBktUgg==",
+        expires: Some("2025-01-29T00:00:00.000Z"),
     },
 ];
 
@@ -217,11 +218,11 @@ fn parse_signatures(raw: Option<&serde_json::Value>) -> Option<Vec<PackageSignat
 /// material, not identity, so they are stripped before comparing for the
 /// same reason.
 fn equal_registries(left: &str, right: &str) -> bool {
-    normalize_registry_url(left).eq_ignore_ascii_case(&normalize_registry_url(right))
+    canonical_registry_url(left).eq_ignore_ascii_case(&canonical_registry_url(right))
 }
 
-fn normalize_registry_url(registry: &str) -> String {
-    let with_slash = redact_and_sanitize(&with_trailing_slash(registry));
+fn canonical_registry_url(registry: &str) -> String {
+    let with_slash = redact_and_sanitize(&normalize_registry_url(registry));
     // URL normalization lowercases the host and drops a default port.
     url::Url::parse(&with_slash).map(String::from).unwrap_or(with_slash)
 }
@@ -320,7 +321,7 @@ async fn fetch_packument(
     config: &Config,
 ) -> Result<Option<Packument>, String> {
     let packument_url =
-        format!("{}{}", with_trailing_slash(registry), encode_package_name(&component.name));
+        format!("{}{}", normalize_registry_url(registry), encode_package_name(&component.name));
     let display_url = redact_and_sanitize(&packument_url);
     // Resolve auth against the request URL *and* the package name so a
     // `@scope:registry`-scoped token applies (plain `for_url` skips the
@@ -361,29 +362,23 @@ async fn read_bounded_body(
     display_url: &str,
 ) -> Result<Vec<u8>, String> {
     if let Some(length) = response.content_length()
-        && length > MAX_PACKUMENT_BYTES
+        && length > MAX_PACKUMENT_BYTES as u64
     {
         return Err(format!("{display_url} returned an oversized packument ({length} bytes)"));
     }
-    use futures_util::StreamExt as _;
-    let mut stream = response.bytes_stream();
-    let mut body_bytes = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|source| {
-            format!("{display_url}: {}", redact_and_sanitize(&source.to_string()))
-        })?;
-        if (body_bytes.len() + chunk.len()) as u64 > MAX_PACKUMENT_BYTES {
-            return Err(format!("{display_url} returned an oversized packument"));
-        }
-        body_bytes.extend_from_slice(&chunk);
+    let body = read_limited_self_delimiting_body(response, MAX_PACKUMENT_BYTES)
+        .await
+        .map_err(|source| format!("{display_url}: {}", redact_and_sanitize(&source.to_string())))?;
+    if body.truncated {
+        return Err(format!("{display_url} returned an oversized packument"));
     }
-    Ok(body_bytes)
+    Ok(body.bytes)
 }
 
 /// Upper bound on a buffered packument response. Generous relative to the
 /// pnpm / `@pnpm/exe` packuments (well under a megabyte) while still
 /// capping a runaway response.
-const MAX_PACKUMENT_BYTES: u64 = 50 * 1024 * 1024;
+const MAX_PACKUMENT_BYTES: usize = 50 * 1024 * 1024;
 
 /// Route a (possibly scoped) engine component to its registry, using the
 /// trusted package-manager bootstrap configuration.
@@ -410,8 +405,4 @@ pub(super) fn build_client(config: &Config) -> Result<ThrottledClient, SelfUpdat
     .map_err(|error| SelfUpdateError::EngineIdentityUnverifiable {
         message: format!("could not build the network client to verify the pnpm release: {error}"),
     })
-}
-
-fn with_trailing_slash(registry: &str) -> String {
-    if registry.ends_with('/') { registry.to_string() } else { format!("{registry}/") }
 }

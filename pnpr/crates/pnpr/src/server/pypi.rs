@@ -18,6 +18,7 @@
 
 pub(super) use publication::{PypiPublication, authorize_upload, verify_upload};
 
+mod management;
 mod publication;
 use publication::post_upload;
 
@@ -36,10 +37,10 @@ use super::{
 use axum::{
     Router,
     body::{Body, Bytes},
-    extract::{Path, Request, State},
+    extract::{DefaultBodyLimit, Path, Request, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post, put},
 };
 use pnpr_error::RegistryError;
 use pnpr_package_name::{CanonicalPackageName, is_safe_path_segment};
@@ -60,15 +61,25 @@ const ECOSYSTEM: Ecosystem = Ecosystem::Pypi;
 /// The largest Simple API page accepted from an upstream.
 const PAGE_LIMIT: usize = 64 * 1024 * 1024;
 
-pub(super) fn routes(prefixed: bool) -> Router<AppState> {
+pub(super) fn routes() -> Router<AppState> {
     let mut router = Router::new();
-    for base in mount_bases(ECOSYSTEM, prefixed) {
+    for base in mount_bases(ECOSYSTEM) {
         router = router
             .route(&format!("{base}/{SIMPLE_PATH}"), get(get_project_list))
             .route(&format!("{base}/{SIMPLE_PATH}/"), get(get_project_list))
             .route(&format!("{base}/{SIMPLE_PATH}/{{project}}"), get(get_project_page))
             .route(&format!("{base}/{SIMPLE_PATH}/{{project}}/"), get(get_project_page))
             .route(&format!("{base}/{FILES_PATH}/{{project}}/{{filename}}"), get(get_file))
+            .route(
+                &format!("{base}/{FILES_PATH}/{{project}}/{{filename}}/yank"),
+                put(management::yank)
+                    .delete(management::unyank)
+                    .layer(DefaultBodyLimit::max(management::MAX_YANK_BODY_BYTES)),
+            )
+            .route(
+                &format!("{base}/{FILES_PATH}/{{project}}/{{filename}}"),
+                delete(management::delete_file),
+            )
             .route(&format!("{base}/{UPLOAD_PATH}"), post(post_upload))
             .route(&format!("{base}/{UPLOAD_PATH}/"), post(post_upload));
     }
@@ -96,6 +107,7 @@ fn html_response(headers: &HeaderMap, html: String) -> Response {
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
+        .header(header::VARY, "Accept")
         .body(Body::from(html))
         .expect("static-shape response always builds")
 }
@@ -104,6 +116,7 @@ fn json_page_response(json: &serde_json::Value) -> Response {
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+        .header(header::VARY, "Accept")
         .body(Body::from(serde_json::to_vec(json).expect("static-shape JSON serializes")))
         .expect("static-shape response always builds")
 }
@@ -122,6 +135,10 @@ struct VisibleName<'a> {
     name: &'a str,
 }
 
+/// `GET simple/` — every hosted project the caller may read through the
+/// addressed registry. Upstream sources are not enumerated: an upstream
+/// index's full project list is not something installers ask for, and
+/// pypi.org's runs to hundreds of thousands of names.
 async fn get_project_list(
     State(state): State<AppState>,
     AuthedCaller(identity): AuthedCaller,
@@ -149,10 +166,6 @@ async fn get_project_list(
     private_no_cache(response)
 }
 
-/// `GET simple/` — every hosted project the caller may read through the
-/// addressed registry. Upstream sources are not enumerated: an upstream
-/// index's full project list is not something installers ask for, and
-/// pypi.org's runs to hundreds of thousands of names.
 /// Every hosted project of the target registry this caller may see, from the
 /// sources the registry routes to.
 async fn visible_project_names(
@@ -163,7 +176,8 @@ async fn visible_project_names(
     let mut names = BTreeSet::new();
     for source in hosted_sources(state, target, ECOSYSTEM) {
         let Some(hosted) = state.inner.config.routing.hosted.get(&source) else { continue };
-        let listed = state.inner.storage.for_hosted(&hosted.org).hosted_package_names().await?;
+        let listed =
+            state.inner.storage.for_hosted(&hosted.org, ECOSYSTEM).hosted_package_names().await?;
         for name in listed {
             if visible_here(state, identity, target, &VisibleName { source: &source, name: &name })
             {

@@ -34,10 +34,7 @@ pub struct RootLog {
 }
 
 /// `pnpm:root` discriminated payload. pnpm's reporter dispatches on
-/// whether `added` or `removed` is present; tag-on-presence matches
-/// that. Pacquet only emits `added` today (no pruning pipeline yet)
-/// — `Removed` is here to pin the wire shape so the channel is
-/// usable when pruning lands.
+/// whether `added` or `removed` is present; tag-on-presence matches that.
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum RootMessage {
@@ -93,27 +90,16 @@ pub enum DependencyType {
 /// `pnpm:skipped-optional-dependency` payload.
 ///
 /// The wire shape is a discriminated union over `reason` with two
-/// distinct `package` shapes: `build_failure` / `unsupported_engine`
-/// / `unsupported_platform` all carry `package: { id, name, version }`;
+/// distinct `package` shapes: `build_failure` / `fetch_failure` /
+/// `unsupported_engine` / `unsupported_platform` all carry
+/// `package: { id, name, version }`;
 /// `resolution_failure` carries `package: { name?, version?,
 /// bareSpecifier }` with no `id`.
 ///
-/// The `reason` and `package` shapes co-vary. The `package` field
-/// below is therefore a `#[serde(untagged)]` enum that picks the
-/// right shape depending on which variant the emit site constructs.
+/// The `reason` and `package` shapes co-vary.
 /// The pairing is not type-enforced against `reason` (a
 /// `BuildFailure` reason with a `ResolutionFailure` package is
-/// constructible in Rust); emit sites live in
-/// `pnpm-package-manager` (`installability.rs` for the
-/// installability skips, `build_modules.rs` for the build-failure
-/// path) and must keep the pairing correct by hand.
-/// `CreateVirtualStore`'s slice 4 fetch-failure path is silent on
-/// the reporter wire — it only swallows the error, no event is
-/// emitted from there — so it isn't a constructor site for this
-/// log. Tightening the pairing into a closed-set builder API
-/// would constrain a future resolver port without adding much
-/// real safety, so it's left to convention until a site actually
-/// pairs the wrong shapes.
+/// constructible in Rust); emit sites must keep the pairing correct by hand.
 ///
 /// `parents` co-varies with `reason` the same way `package` does:
 /// only the resolver-side `resolution_failure` emit carries it
@@ -147,10 +133,8 @@ pub struct SkippedOptionalParent {
 /// Two shapes, depending on `reason`:
 ///
 /// - [`SkippedOptionalPackage::Installed`] — `{ id, name, version }`
-///   for `build_failure` / `unsupported_engine` /
-///   `unsupported_platform`. Used by the slice 1 emit site in
-///   `installability.rs` and the build-failure emit in
-///   `build_modules.rs`.
+///   for `build_failure` / `fetch_failure` / `unsupported_engine` /
+///   `unsupported_platform`.
 /// - [`SkippedOptionalPackage::ResolutionFailure`] —
 ///   `{ name?, version?, bareSpecifier }` for `resolution_failure`.
 ///   Emitted by the deps resolver's skipped-optional sink when an
@@ -161,13 +145,10 @@ pub struct SkippedOptionalParent {
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum SkippedOptionalPackage {
-    /// `{ id, name, version }` shape used by every non-resolver
-    /// emit (installability + build-failure).
+    /// `{ id, name, version }` shape used by every non-resolver emit.
     Installed { id: String, name: String, version: String },
     /// `{ name?, version?, bareSpecifier }` shape used by the
-    /// resolver-side `resolution_failure` emit (the deps resolver's
-    /// skipped-optional sink wired in
-    /// `install_with_fresh_lockfile.rs`). `name` and `version` are
+    /// resolver-side `resolution_failure` emit. `name` and `version` are
     /// optional and stay `None` when the resolver fails before it
     /// could resolve those fields.
     ResolutionFailure {
@@ -187,6 +168,10 @@ pub enum SkippedOptionalPackage {
 #[serde(rename_all = "snake_case")]
 pub enum SkippedOptionalReason {
     BuildFailure,
+    /// The package's files could not be fetched: a failed download,
+    /// an integrity mismatch, or a failed git clone. `details` carries
+    /// the error code and message.
+    FetchFailure,
     UnsupportedEngine,
     UnsupportedPlatform,
     ResolutionFailure,

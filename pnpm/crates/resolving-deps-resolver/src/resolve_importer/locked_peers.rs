@@ -1,21 +1,25 @@
-use super::{Arc, DependencyGroup, HashMap, HashSet, PkgName, TreeCtx};
+use super::{Arc, DependencyGroup, HashMap, HashSet, TreeCtx};
+use hashed_suffix::hashed_peer_keys;
+use pnpm_lockfile::{PeerBindings, PkgName};
 
-/// The peer versions the prior lockfile locked for the importer, and
-/// their names.
+mod hashed_suffix;
+
+/// The peer versions the prior lockfile locked for the importer.
 pub(super) struct LockedPeers {
     pub(super) versions: Arc<HashMap<String, HashSet<String>>>,
-    pub(super) names: Arc<HashSet<String>>,
 }
 
 impl LockedPeers {
     pub(super) fn of(ctx: &TreeCtx, importer_id: &str) -> Self {
-        let versions = Arc::new(importer_locked_peer_versions(
-            ctx.workspace()
-                .wanted_lockfile()
-                .map(AsRef::as_ref),
-            importer_id,
-        ));
-        Self { names: Arc::new(versions.keys().cloned().collect()), versions }
+        let workspace = ctx.workspace();
+        let lockfile = workspace.wanted_lockfile().map(AsRef::as_ref);
+        let versions = match lockfile {
+            Some(lockfile) if !lockfile.importers.contains_key(importer_id) => {
+                workspace.unlisted_importer_locked_peers(|| all_locked_peer_versions(lockfile))
+            }
+            _ => Arc::new(importer_locked_peer_versions(lockfile, importer_id)),
+        };
+        Self { versions }
     }
 }
 
@@ -30,6 +34,7 @@ pub(super) fn importer_locked_peer_versions(
         return all_locked_peer_versions(lockfile);
     };
     let mut versions = HashMap::<String, HashSet<String>>::default();
+    let mut bound_cache = hashed_suffix::BoundCache::default();
     for (alias, dependency) in importer.dependencies_by_groups([
         DependencyGroup::Prod,
         DependencyGroup::Optional,
@@ -41,7 +46,9 @@ pub(super) fn importer_locked_peer_versions(
         let snapshot = lockfile.snapshots
             .as_ref()
             .and_then(|snapshots| snapshots.get(&key));
-        for (name, version) in locked_peer_versions_for_key(lockfile, &key, snapshot) {
+        for (name, version) in
+            locked_peer_versions_for_key_cached(lockfile, &key, snapshot, &mut bound_cache)
+        {
             versions
                 .entry(name)
                 .or_default()
@@ -51,19 +58,17 @@ pub(super) fn importer_locked_peer_versions(
     versions
 }
 
-/// The peer versions the wanted lockfile pinned, by peer name: those on
-/// the importer's direct dependencies, or on every snapshot for an
-/// importer the lockfile does not know yet. The optional-peer hoist
-/// only picks versions from this set, and its names stay eligible for
-/// importer-local hoisting (see [`HoistMissingScope::locked_peer_names`](crate::HoistMissingScope::locked_peer_names)).
 /// Every peer version the lockfile pins anywhere, for an importer it does not
 /// list.
 pub(super) fn all_locked_peer_versions(
     lockfile: &pnpm_lockfile::Lockfile,
 ) -> HashMap<String, HashSet<String>> {
     let mut versions = HashMap::<String, HashSet<String>>::default();
+    let mut bound_cache = hashed_suffix::BoundCache::default();
     for (key, snapshot) in lockfile.snapshots.iter().flatten() {
-        for (name, version) in locked_peer_versions_for_key(lockfile, key, Some(snapshot)) {
+        for (name, version) in
+            locked_peer_versions_for_key_cached(lockfile, key, Some(snapshot), &mut bound_cache)
+        {
             versions
                 .entry(name)
                 .or_default()
@@ -73,48 +78,85 @@ pub(super) fn all_locked_peer_versions(
     versions
 }
 
-/// The peer name/version pairs the wanted lockfile pinned for `key`.
+/// The peer name/version pairs the wanted lockfile pinned for `key`,
+/// including the peers of every peer provider the suffix names.
 ///
 /// An explicit suffix already spells them out, save for the names an
 /// npm alias renamed ([`restore_aliased_peer_names`]). A hashed suffix
-/// spells out nothing, so the pairs are recovered from the package's
-/// declared peers and the snapshot edges that resolved them.
-pub(super) fn locked_peer_versions_for_key(
+/// spells out nothing, so the pairs are recovered from the snapshots
+/// ([`hashed_peer_keys`]). Both spellings of one key must yield the same
+/// pairs: `dedupe` rewrites a long suffix between them, and pins that
+/// depend on the spelling make it flip between two lockfiles.
+/// Nested suffixes need their own provider's snapshot: the outer
+/// snapshot does not name that provider's aliased peers.
+fn locked_peer_versions_for_key_cached(
     lockfile: &pnpm_lockfile::Lockfile,
     key: &pnpm_lockfile::PkgNameVerPeer,
     snapshot: Option<&pnpm_lockfile::SnapshotEntry>,
+    bound_cache: &mut hashed_suffix::BoundCache,
 ) -> Vec<(String, String)> {
+    let mut versions = Vec::new();
+    let mut visited = HashSet::default();
+    let mut pending = vec![(key.clone(), snapshot)];
+    while let Some((key, snapshot)) = pending.pop() {
+        if !visited.insert(key.clone()) {
+            continue;
+        }
+        for (name, peer) in locked_peer_keys(lockfile, &key, snapshot, bound_cache) {
+            versions.push((name, peer.suffix.without_peer().to_string()));
+            pending.extend(provider_with_peers(lockfile, peer));
+        }
+    }
+    versions
+}
+
+/// A provider whose own key carries peers, with its snapshot, so its peers
+/// are read too.
+fn provider_with_peers(
+    lockfile: &pnpm_lockfile::Lockfile,
+    provider: pnpm_lockfile::PkgNameVerPeer,
+) -> Option<(pnpm_lockfile::PkgNameVerPeer, Option<&pnpm_lockfile::SnapshotEntry>)> {
+    if provider.suffix.peer().is_empty() {
+        return None;
+    }
+    let snapshot = lockfile.snapshots
+        .as_ref()
+        .and_then(|snapshots| snapshots.get(&provider));
+    Some((provider, snapshot))
+}
+
+/// The peers `key`'s own suffix pins, each with the snapshot key of its
+/// provider.
+fn locked_peer_keys(
+    lockfile: &pnpm_lockfile::Lockfile,
+    key: &pnpm_lockfile::PkgNameVerPeer,
+    snapshot: Option<&pnpm_lockfile::SnapshotEntry>,
+    bound_cache: &mut hashed_suffix::BoundCache,
+) -> Vec<(String, pnpm_lockfile::PkgNameVerPeer)> {
     let metadata = lockfile.packages
         .as_ref()
         .and_then(|packages| packages.get(&key.without_peer()));
-    let mut explicit = peer_suffix_versions(key.suffix.peer()).collect::<Vec<_>>();
-    if !explicit.is_empty() {
-        if let Some(snapshot) = snapshot {
-            restore_aliased_peer_names(snapshot, metadata, &mut explicit);
+    let peers: Vec<pnpm_lockfile::PkgNameVerPeer> = match PeerBindings::from_key(key) {
+        None => return Vec::new(),
+        Some(PeerBindings::Hashed) => {
+            return hashed_peer_keys(lockfile, key, snapshot, metadata, bound_cache);
         }
-        return explicit;
-    }
-    if !is_hashed_peer_suffix(key.suffix.peer()) {
-        return explicit;
-    }
-    let (Some(snapshot), Some(metadata)) = (snapshot, metadata) else {
-        return Vec::new();
+        Some(bindings) => bindings.providers().collect(),
     };
-    let peer_names = metadata.peer_dependencies
+    if peers.is_empty() {
+        return Vec::new();
+    }
+    let mut explicit: Vec<_> = peers
         .iter()
-        .flatten()
-        .filter_map(|(name, _)| name.parse::<PkgName>().ok())
-        .collect::<HashSet<_>>();
-    snapshot.dependencies
-        .iter()
-        .chain(snapshot.optional_dependencies.iter())
-        .flatten()
-        .filter(|(name, _)| peer_names.contains(*name))
-        .filter_map(|(name, reference)| {
-            reference
-                .ver_peer()
-                .map(|version| (name.to_string(), version.without_peer().to_string()))
-        })
+        .map(|peer| (peer.name.to_string(), peer.suffix.without_peer().to_string()))
+        .collect();
+    if let Some(snapshot) = snapshot {
+        restore_aliased_peer_names(snapshot, metadata, &mut explicit);
+    }
+    explicit
+        .into_iter()
+        .map(|(name, _)| name)
+        .zip(peers)
         .collect()
 }
 
@@ -241,32 +283,4 @@ pub(super) fn dependency_edges(
         .iter()
         .chain(snapshot.optional_dependencies.iter())
         .flatten()
-}
-
-/// Whether the suffix is the opaque hash
-/// [`create_peer_dep_graph_hash`](fn@pnpm_deps_path::create_peer_dep_graph_hash)
-/// emits once the spelled-out peers exceed
-/// [`ResolvePeersOptions::peers_suffix_max_length`](crate::ResolvePeersOptions::peers_suffix_max_length), rather than
-/// segments [`peer_suffix_versions`] can read.
-pub(super) fn is_hashed_peer_suffix(peer_suffix: &str) -> bool {
-    peer_suffix
-        .rsplit_once('(')
-        .and_then(|(_, tail)| tail.strip_suffix(')'))
-        .is_some_and(|hash| {
-            hash.len() == 32 && hash.chars().all(|character| character.is_ascii_hexdigit())
-        })
-}
-
-pub(super) fn peer_suffix_versions(
-    peer_suffix: &str,
-) -> impl Iterator<Item = (String, String)> + '_ {
-    peer_suffix
-        .match_indices('(')
-        .filter_map(|(start, _)| {
-            let segment = peer_suffix[start + 1..]
-                .split(['(', ')'])
-                .next()?;
-            let (name, version) = segment.rsplit_once('@')?;
-            (!name.is_empty()).then(|| (name.to_string(), version.to_string()))
-        })
 }

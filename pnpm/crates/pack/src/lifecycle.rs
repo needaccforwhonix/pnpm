@@ -1,7 +1,6 @@
 use super::{
     Arc, HashMap, HookContext, HookLog, LogEvent, LogFn, LogLevel, PackError, PackScripts, Path,
-    PnpmfileHooks, Reporter, RunPostinstallHooks, ScriptsPrependNodePath, Value, realpath_missing,
-    run_lifecycle_hook,
+    PnpmfileHooks, Reporter, RunPostinstallHooks, Value, realpath_missing, run_lifecycle_hook,
 };
 
 /// Chain every configured pnpmfile's `beforePacking` hook over the
@@ -49,8 +48,7 @@ fn before_packing_logger<Reporter: self::Reporter>(pnpmfile: &Path, prefix: &str
 
 impl PackScripts {
     /// Run the named lifecycle scripts that the manifest actually declares,
-    /// in order. Mirrors upstream's `runScriptsIfPresent`; the Rust port is
-    /// a plain loop rather than upstream's bound partial application.
+    /// in order. Mirrors upstream's `runScriptsIfPresent`.
     pub(super) fn run_if_present<Reporter: self::Reporter>(
         &self,
         dir: &Path,
@@ -72,16 +70,16 @@ impl PackScripts {
                 init_cwd: dir,
                 node_execpath: None,
                 npm_execpath: None,
-                node_gyp_path: None,
+                node_gyp_path: pnpm_executor::bundled_node_gyp_entry(),
                 user_agent: Some(&self.user_agent),
                 extra_env: &self.extra_env,
             },
             execution: pnpm_executor::ScriptExecutionOptions {
                 extra_bin_paths: &self.extra_bin_paths,
                 node_gyp_bin: pnpm_executor::bundled_node_gyp_bin(),
-                prepend_node_path: ScriptsPrependNodePath::default(),
                 shell: None,
                 shell_emulator: false,
+                wd_bin_dir: None,
             },
             dep_path: &dep_path,
             pkg_root: dir,

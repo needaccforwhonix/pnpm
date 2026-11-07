@@ -1,12 +1,18 @@
 //! Inspect GitHub Actions dependencies and update their commit pins while preserving workflow formatting.
 
+pub(crate) use pnpm_process as process;
+
+pub use release_age::ReleaseAge;
+pub use selectors::{is_selector, normalize_selector, selector_matcher};
+
 use edits::{apply_workflow_edits, planned_edits};
 use futures_util::{StreamExt, stream};
 use node_semver::{Range as SemverRange, Version};
-use pnpm_matcher::{Matcher, create_matcher};
+use pnpm_matcher::Matcher;
 use pnpm_network::{redact_and_sanitize, redact_url_for_display};
 use pnpm_reporter::{GlobalLog, LogEvent, LogLevel, Reporter};
 use pnpm_resolving_git_resolver::{GitCommandRunner, RealGitRunner, get_repo_refs};
+use release_age::{GitTagDates, ReleaseAgeCheck, ReleaseDates};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     ops::Range,
@@ -24,36 +30,6 @@ pub struct OutdatedGitHubAction {
     pub latest: Version,
     pub name: String,
     pub wanted: Version,
-}
-
-#[must_use]
-pub fn is_selector(selector: &str) -> bool {
-    let pattern = selector.strip_prefix('!').unwrap_or(selector);
-    !pattern.starts_with('@') && pattern.contains('/')
-}
-
-#[must_use]
-pub fn normalize_selector(selector: &str) -> String {
-    if !is_selector(selector) {
-        return selector.to_string();
-    }
-    selector
-        .rsplit_once('@')
-        .map_or(selector, |(name, _)| name)
-        .to_string()
-}
-
-#[must_use]
-pub fn selector_matcher(selectors: &[String]) -> Option<Matcher> {
-    if selectors.is_empty() {
-        return None;
-    }
-    Some(create_matcher(
-        &selectors
-            .iter()
-            .map(|selector| normalize_selector(selector))
-            .collect::<Vec<_>>(),
-    ))
 }
 
 #[derive(Clone)]
@@ -95,6 +71,7 @@ pub async fn find_outdated<Reporter: self::Reporter>(
     compatible: bool,
     matcher: Option<&Matcher>,
     server_url: Option<&str>,
+    release_age: Option<&ReleaseAge>,
 ) -> miette::Result<Vec<OutdatedGitHubAction>> {
     find_outdated_with_runner::<Reporter, _>(
         root,
@@ -102,6 +79,7 @@ pub async fn find_outdated<Reporter: self::Reporter>(
         matcher,
         &resolve_server_url(server_url)?,
         &RealGitRunner::new(),
+        release_age.map(|policy| ReleaseAgeCheck { policy, dates: &GitTagDates }),
     )
     .await
 }
@@ -112,8 +90,9 @@ async fn find_outdated_with_runner<Reporter: self::Reporter, Runner: GitCommandR
     matcher: Option<&Matcher>,
     server_url: &str,
     runner: &Runner,
+    release_age: Option<ReleaseAgeCheck<'_>>,
 ) -> miette::Result<Vec<OutdatedGitHubAction>> {
-    let plans = create_plan::<Reporter, _>(root, matcher, server_url, runner).await?;
+    let plans = create_plan::<Reporter, _>(root, matcher, server_url, runner, release_age).await?;
     Ok(to_outdated(plans, !compatible, server_url))
 }
 
@@ -122,6 +101,7 @@ pub async fn update<Reporter: self::Reporter>(
     latest: bool,
     matcher: Option<&Matcher>,
     server_url: Option<&str>,
+    release_age: Option<&ReleaseAge>,
 ) -> miette::Result<Vec<OutdatedGitHubAction>> {
     update_with_runner::<Reporter, _>(
         root,
@@ -129,6 +109,7 @@ pub async fn update<Reporter: self::Reporter>(
         matcher,
         &resolve_server_url(server_url)?,
         &RealGitRunner::new(),
+        release_age.map(|policy| ReleaseAgeCheck { policy, dates: &GitTagDates }),
     )
     .await
 }
@@ -139,8 +120,9 @@ async fn update_with_runner<Reporter: self::Reporter, Runner: GitCommandRunner +
     matcher: Option<&Matcher>,
     server_url: &str,
     runner: &Runner,
+    release_age: Option<ReleaseAgeCheck<'_>>,
 ) -> miette::Result<Vec<OutdatedGitHubAction>> {
-    let plans = create_plan::<Reporter, _>(root, matcher, server_url, runner).await?;
+    let plans = create_plan::<Reporter, _>(root, matcher, server_url, runner, release_age).await?;
     let updates = plans
         .into_iter()
         .filter(|plan| plan_is_outdated(plan, latest))
@@ -169,6 +151,7 @@ async fn create_plan<Reporter: self::Reporter, Runner: GitCommandRunner + Sync>(
     matcher: Option<&Matcher>,
     server_url: &str,
     runner: &Runner,
+    release_age: Option<ReleaseAgeCheck<'_>>,
 ) -> miette::Result<Vec<PlannedUpdate>> {
     let actions = discover(root).await?
         .into_iter()
@@ -182,11 +165,13 @@ async fn create_plan<Reporter: self::Reporter, Runner: GitCommandRunner + Sync>(
         .iter()
         .map(|action| action.repo.clone())
         .collect::<BTreeSet<_>>();
-    let refs_by_repo = versions_by_repo::<Reporter, Runner>(repos, server_url, runner).await;
+    let mut refs_by_repo = versions_by_repo::<Reporter, Runner>(repos, server_url, runner).await;
+    let release_dates =
+        ReleaseDates::read::<Reporter>(release_age, &actions, &mut refs_by_repo, server_url).await;
     let mut plans = Vec::new();
     for action in actions {
         let Some(versions) = refs_by_repo.get(&action.repo) else { continue };
-        if let Some(plan) = plan_action_update(action, versions)? {
+        if let Some(plan) = plan_action_update(action, versions, &release_dates)? {
             plans.push(plan);
         }
     }
@@ -230,6 +215,7 @@ async fn versions_by_repo<Reporter: self::Reporter, Runner: GitCommandRunner + S
 fn plan_action_update(
     action: ActionReference,
     versions: &[RepoVersion],
+    release_dates: &ReleaseDates<'_>,
 ) -> miette::Result<Option<PlannedUpdate>> {
     let Some(current) = find_current(&action, versions) else { return Ok(None) };
     let wanted_range = SemverRange::parse(format!("^{}", current.version))
@@ -242,8 +228,10 @@ fn plan_action_update(
     let candidates = versions
         .iter()
         .filter(|candidate| {
-            !current.version.pre_release.is_empty()
-                || candidate.version.pre_release.is_empty()
+            (!current.version.pre_release.is_empty()
+                || candidate.version.pre_release.is_empty())
+                && (candidate.version <= current.version
+                    || release_dates.admits(&action, candidate))
         })
         .collect::<Vec<_>>();
     let Some(latest) = candidates.last() else { return Ok(None) };
@@ -428,4 +416,6 @@ fn global_warn<Reporter: self::Reporter>(message: String) {
 mod tests;
 
 mod edits;
+mod release_age;
+mod selectors;
 mod workflow;

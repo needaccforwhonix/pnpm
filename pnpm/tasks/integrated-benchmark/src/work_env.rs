@@ -1,4 +1,4 @@
-pub(crate) use fixtures::seed_peer_heavy_registry;
+pub(crate) use peer_heavy::seed_peer_heavy_registry;
 
 mod scripts;
 use scripts::{
@@ -7,14 +7,23 @@ use scripts::{
 };
 
 mod fixtures;
+mod peer_heavy;
 
-use fixtures::{create_npmrc, create_package_json, create_pnpm_workspace, save_pristine_copies};
+use fixtures::{
+    create_generated_projects, create_npmrc, create_package_json, create_pnpm_workspace,
+    save_pristine_copies,
+};
+
+mod cargo_workspace;
+mod injected_workspace;
+mod linked_workspace;
+mod unlocked_deps;
 
 mod server_config;
 use server_config::{
     PnprServer, PnprServerPaths, RevisionMockRegistry, append_pnpr_auth_to_npmrc,
-    cold_mock_config_yaml, distinct_public_route_registries, mint_pnpr_token, seed_pnpr_auth,
-    wait_for_pnpr_ready, write_pnpr_benchmark_config,
+    cold_revision_mock_command, distinct_public_route_registries, mint_pnpr_token, seed_pnpr_auth,
+    serves_npm_under_base_path, wait_for_pnpr_ready, write_pnpr_benchmark_config,
 };
 
 mod measurements;
@@ -27,6 +36,7 @@ use measurements::{
 
 mod diagnostics;
 
+mod mock_home;
 mod servers;
 
 mod build;
@@ -49,6 +59,9 @@ const BENCHMARK_OUTPUT_LOG: &str = "BENCHMARK_OUTPUT.ndjson";
 const PREWARM_SCRIPT: &str = "prewarm.bash";
 const BENCHMARK_DIAGNOSTICS_JSON: &str = "BENCHMARK_DIAGNOSTICS.json";
 const BENCHMARK_DIAGNOSTICS_MD: &str = "BENCHMARK_DIAGNOSTICS.md";
+// Two traced runs per target let the comparison tell a count that moved
+// between revisions from one that moves between identical runs.
+const SYSCALL_COUNT_ROUNDS: usize = 2;
 const PNPR_DIRECT_RATIO_MAX: f64 = 1.05;
 // Absolute slack for the pnpr-vs-direct gate: the repeat-install
 // scenarios finish in tens of milliseconds, where run-to-run noise
@@ -72,7 +85,13 @@ const PEER_HEAVY_DEPTH: usize = 5;
 const PEER_HEAVY_WIDTH: usize = 80;
 const PEER_HEAVY_PROVIDER: &str = "@pnpmtest/peer-benchmark-provider";
 const PEER_HEAVY_VERSION: &str = "1.0.0";
-const PEER_HEAVY_INTEGRITY: &str = "sha512-z6pI0F3yfz8Zl3R0+g1pwMbdY12h7Osj5UYSTh6Rcpd7UtO7nxeIzf+7gPDOAH4mgxi7BXaTyBDS0hBFgZVssQ==";
+// 7 x 32 projects with a shared peer provider, so the generated workspace
+// holds 225 importers joined by 6,369 `workspace:*` edges. Sized to keep
+// fixture generation instant while leaving a walk that re-traverses shared
+// subgraphs per importer ~100x more edges to visit than one that does not.
+const LINKED_WORKSPACE_DEPTH: usize = 7;
+const LINKED_WORKSPACE_WIDTH: usize = 32;
+const LINKED_WORKSPACE_VERSION: &str = "1.0.0";
 const PNPM_BUNDLE_PATHS: [&str; 4] = [
     "pnpm11/pnpm/dist/pnpm.mjs",
     "pnpm11/pnpm/dist/pnpm.cjs",
@@ -192,6 +211,12 @@ impl WorkEnv {
         self.bench_dir(id).join("install.bash")
     }
 
+    /// Path of one traced run's `strace --summary-only` table.
+    fn syscall_counts_path(&self, id: BenchId, round: usize) -> PathBuf {
+        self.bench_dir(id)
+            .join(format!("SYSCALL_COUNTS.{round}.txt"))
+    }
+
     /// Path of the untimed online priming script, written only for
     /// scenarios with [`crate::cli_args::BenchmarkScenario::prewarm_install_args`].
     fn prewarm_script_path(&self, id: BenchId) -> PathBuf {
@@ -200,11 +225,7 @@ impl WorkEnv {
 
     fn bash_command(&self, id: BenchId) -> String {
         // Hyperfine runs each command through a shell, so the script
-        // path needs to survive shell-tokenization. `maybe_quote()`
-        // wraps the path in single quotes (and escapes any embedded
-        // quotes) when it contains a metacharacter — leaves it bare
-        // when the path is alphanumeric/slash/dash only, which is the
-        // common case.
+        // path needs to survive shell-tokenization.
         format!("bash {}", self.script_path(id).maybe_quote())
     }
 
@@ -242,10 +263,7 @@ impl WorkEnv {
                 // `pnpm.cjs`, and the `pnpm11/` layout (where the
                 // TypeScript CLI lives) over the pre-move root layout
                 // (still produced by revisions that predate the move,
-                // e.g. a `pnpm@v10` target). Resolved at script runtime
-                // so the existence check sees the bundle produced by
-                // `pnpm run compile-only`, not the empty tree visible
-                // during `init()`.
+                // e.g. a `pnpm@v10` target).
                 let candidates = PNPM_BUNDLE_PATHS
                     .map(|path| format!("./pnpm-source/{path}"))
                     .join(" ");
@@ -263,13 +281,14 @@ impl WorkEnv {
         eprintln!("Initializing...");
         // The proxy-cache populator only runs against a local
         // verdaccio/virtual registry to warm its on-disk cache. With
-        // `--registry=npm`, no proxy exists. The peer-heavy fixture is
-        // already seeded into hosted storage, so it needs no population
-        // pass either.
+        // `--registry=npm`, no proxy exists. A generated fixture needs no
+        // population pass either: the peer-heavy one is already seeded into
+        // hosted storage, and the linked-workspace one names no registry
+        // package at all.
         let populate_proxy_cache = matches!(
             self.options.network.registry,
             RegistryMode::Verdaccio | RegistryMode::Virtual,
-        ) && !scenario.uses_peer_heavy_fixture();
+        ) && !scenario.uses_generated_fixture();
         let id_list = self
             .target_ids()
             .chain(populate_proxy_cache.then_some(WorkEnv::INIT_PROXY_CACHE))
@@ -280,14 +299,9 @@ impl WorkEnv {
             let registry = self.registry_for(id, direct_registry, revision_mocks);
             fs::create_dir_all(&dir).expect("create directory for the revision");
             create_package_json(&dir, self.options.selection.fixture_dir.as_deref(), scenario);
-            create_pnpm_workspace(
-                &dir,
-                self.options.selection.fixture_dir.as_deref(),
-                registry,
-                scenario,
-            );
+            create_generated_projects(&dir, scenario);
+            self.write_registry_config(&dir, registry);
             create_install_script(&dir, scenario, &WorkEnv::install_command(id), id);
-            create_npmrc(&dir, registry, scenario);
             may_create_lockfile(&dir, scenario, self.options.selection.fixture_dir.as_deref());
             save_pristine_copies(&dir);
         }
@@ -300,6 +314,19 @@ impl WorkEnv {
         }
     }
 
+    /// Write the `pnpm-workspace.yaml` and `.npmrc` that point a bench dir at
+    /// `registry`.
+    fn write_registry_config(&self, dir: &Path, registry: &str) {
+        let scenario = self.options.selection.scenario.expect("scenario set before writing config");
+        create_pnpm_workspace(
+            dir,
+            self.options.selection.fixture_dir.as_deref(),
+            registry,
+            scenario,
+        );
+        create_npmrc(dir, registry, scenario);
+    }
+
     fn benchmark(
         &self,
         pnpr_server_registry: &str,
@@ -308,8 +335,6 @@ impl WorkEnv {
         let scenario =
             self.options.selection.scenario.expect("scenario set when benchmark() is reached");
 
-        // Pre-benchmark wipe of `node_modules`, `store-dir`, and
-        // `cache-dir` for every benchmark target, regardless of scenario.
         // The hot-cache scenario's per-iteration `--prepare` intentionally
         // preserves `store-dir` / `cache-dir` so subsequent iterations can
         // reuse them, which means whatever a previous run / scenario /
@@ -319,9 +344,7 @@ impl WorkEnv {
         // what state the work-env was in. For cold-cache scenarios this is
         // redundant with the per-iteration wipe but harmless (Copilot
         // review on <https://github.com/pnpm/pacquet/pull/296>).
-        // `cache-dir` is the client's packument-metadata mirror; wiping it
-        // keeps cold-cache scenarios genuinely cold for *resolution*, not
-        // just for the CAS. `pnpr-storage` is the per-target pnpr server's
+        // `pnpr-storage` is the per-target pnpr server's
         // store + cache (only present for `pnpr@<rev>` targets) — wiping it
         // upfront (but never per-iteration) makes the hyperfine warmup the
         // run that primes the server, so timed runs measure a warm
@@ -335,55 +358,25 @@ impl WorkEnv {
             wipe_bench_dir(&dir);
         }
 
-        // Spawn each revision's own tarball-serving mock (see
-        // `plan_revision_mocks`). Done after `build()` produced the
+        // Done after `build()` produced the
         // per-revision binaries and after `init()` warmed the shared storage
-        // they serve from; the guards kill the mocks (and their latency
-        // proxies) on drop at the end of this method.
+        // they serve from.
         let _revision_mocks = self.start_revision_mocks(revision_mocks);
 
-        // Start a pnpr server per `pnpr@<rev>` target and keep the guards
-        // alive for the whole benchmark; they kill the servers on drop at
-        // the end of this method. Empty (no-op) when there are no pnpr
-        // targets. Spawned before the GVS pre-warm below so a pnpr target
+        // Spawned before the GVS pre-warm below so a pnpr target
         // would have its server up if a scenario ever combines the two.
         let _pnpr_servers = self.start_pnpr_servers(pnpr_server_registry);
 
-        // For GVS-warm and repeat-install scenarios we need a pre-warm
-        // pass: hyperfine's `--warmup` would otherwise time-from-empty
-        // for the first run since the pre-benchmark wipe above just
-        // emptied `store-dir` (and `node_modules`). Their contracts are
-        // "GVS already populated" / "`node_modules` already up to date",
-        // so prime them by running the install once per target before
-        // hyperfine starts measuring.
         if scenario.enables_gvs() || scenario.prewarms_node_modules() {
             self.prewarm_install_state();
         }
 
         // hyperfine runs `--prepare` before *each* timed invocation, so
         // cleanup must cover every bench dir we're about to measure.
-        //
-        // Per-iteration cleanup paths come from the scenario: cold-cache
-        // scenarios wipe `node_modules` and `store-dir`, hot-cache wipes
-        // only `node_modules` so the warmup-populated store survives
-        // into the timed runs. Scenarios that mutate `package.json` or
-        // the lockfile (the add-dep variant and the no-lockfile install
-        // variants) restore a pristine copy saved during `init()` so the
-        // next iteration sees the same starting state.
         let cleanup = scenario.cleanup();
         let cleanup_command =
             build_cleanup_command(&cleanup, self.benchmarked_ids(), |id| self.bench_dir(id));
 
-        // Offline scenarios can't let hyperfine's warmup prime the caches —
-        // the measured `--offline` command fails against the mirror the
-        // pre-benchmark wipe above just emptied — so run the online priming
-        // script once per target first. The per-iteration cleanup runs
-        // before the priming too: a reused work-env can carry a lockfile or
-        // `node_modules` from a previous scenario, and either would let the
-        // priming install skip the full resolution that populates the
-        // metadata mirror (a locked install fetches tarballs, not
-        // packuments; an up-to-date `node_modules` short-circuits the
-        // install outright).
         if scenario.prewarm_install_args().is_some() {
             self.prewarm_caches(&cleanup_command);
         }
@@ -393,6 +386,17 @@ impl WorkEnv {
             self.install_for_lockfile_comparison(&cleanup_command);
         }
         self.write_benchmark_diagnostics();
+        // After the diagnostics are written: the traced runs append their
+        // events to `BENCHMARK_OUTPUT.ndjson` like the timed runs, and only
+        // the timed runs' events may reach the diagnostics.
+        if self.options.count_syscalls {
+            self.count_syscalls(&cleanup_command);
+            // The traced runs' cleanup removed the lockfiles the parity
+            // check reads, so write them again.
+            if scenario.uses_peer_heavy_fixture() {
+                self.install_for_lockfile_comparison(&cleanup_command);
+            }
+        }
     }
 
     fn run_hyperfine(&self, cleanup_command: &str) {
@@ -420,6 +424,32 @@ impl WorkEnv {
         executor("hyperfine")(&mut command);
     }
 
+    /// Trace every benchmarked install from the state a timed run starts
+    /// from. Each round traces every target once, so drift across rounds
+    /// reaches both revisions alike. A `pnpr@*` target's server was started
+    /// before the trace, so its counts cover the client only.
+    fn count_syscalls(&self, cleanup_command: &str) {
+        for round in 0..SYSCALL_COUNT_ROUNDS {
+            for id in self.benchmarked_ids() {
+                Command::new("bash")
+                    .current_dir(self.root())
+                    .arg("-c")
+                    .arg(cleanup_command)
+                    .pipe_mut(executor("syscall count cleanup"));
+                eprintln!("Counting syscalls for {id}, round {round}...");
+                Command::new("strace")
+                    .current_dir(self.root())
+                    .arg("--follow-forks")
+                    .arg("--summary-only")
+                    .arg("--output")
+                    .arg(self.syscall_counts_path(id, round))
+                    .arg("bash")
+                    .arg(self.script_path(id))
+                    .pipe_mut(executor("strace install"));
+            }
+        }
+    }
+
     /// Prime the install state for the scenarios whose contract is "GVS
     /// already populated" / "`node_modules` already up to date": hyperfine's
     /// `--warmup` would otherwise time-from-empty for the first run, since
@@ -445,16 +475,24 @@ impl WorkEnv {
     /// fetches tarballs, not packuments; an up-to-date `node_modules`
     /// short-circuits the install outright).
     fn prewarm_caches(&self, cleanup_command: &str) {
+        let scenario =
+            self.options.selection.scenario.expect("scenario set when prewarm_caches() is reached");
         Command::new("bash")
             .current_dir(self.root())
             .arg("-c")
             .arg(cleanup_command)
             .pipe_mut(executor("prewarm cleanup"));
         for id in self.benchmarked_ids() {
+            if scenario.uses_cargo_workspace_fixture() {
+                cargo_workspace::seed_store(&self.bench_dir(id));
+            }
             eprintln!("Pre-warming caches for {id}...");
             Command::new("bash")
                 .arg(self.prewarm_script_path(id))
                 .pipe_mut(executor(PREWARM_SCRIPT));
+            if scenario.uses_cargo_workspace_fixture() {
+                cargo_workspace::verify_materialized_crates(&self.bench_dir(id));
+            }
         }
     }
 
@@ -476,25 +514,16 @@ impl WorkEnv {
 }
 impl WorkEnv {
     pub fn run(&self) {
-        // The client registry URL is baked into every target's config
-        // during `init`. Direct pnpm/pnpm and the pnpr client tarball
-        // materialization go through this URL. The pnpr server receives a
-        // separate resolve-registry URL so server-side metadata access can
-        // be measured independently.
         let registry_proxy = self.start_client_registry_proxy();
-        let client_registry = registry_proxy
-            .as_ref()
-            .map_or_else(
-                || self.registry.client.clone(),
-                |proxy| format!("http://{}/", proxy.addr),
-            );
+        let client_registry = match &registry_proxy {
+            Some(proxy) => self.proxied_registry_url(proxy),
+            None => self.registry.client.clone(),
+        };
         let pnpr_server_registry_proxy = self.start_pnpr_server_registry_proxy();
-        let pnpr_server_registry = pnpr_server_registry_proxy
-            .as_ref()
-            .map_or_else(
-                || self.registry.cache_populator.clone(),
-                |proxy| format!("http://{}/", proxy.addr),
-            );
+        let pnpr_server_registry = match &pnpr_server_registry_proxy {
+            Some(proxy) => self.proxied_registry_url(proxy),
+            None => self.registry.cache_populator.clone(),
+        };
 
         let revision_mocks = self.plan_revision_mocks();
         self.init(&client_registry, &revision_mocks);

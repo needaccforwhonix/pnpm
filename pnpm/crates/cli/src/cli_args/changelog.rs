@@ -4,14 +4,19 @@
 //! already builds a registry client for publish. Mirrors the TypeScript
 //! `releasing/commands/src/publish/previousChangelog.ts`.
 
-use crate::cli_args::registry_client::build_registry_client;
+use crate::cli_args::{
+    registry_client::{
+        apply_auth_and_otp, auth_header_for_package, build_registry_client, package_endpoint_url,
+        resolve_registries_with_override, resolve_registry_for_package,
+    },
+    release_notes::{ComposedNotes, notes_registry_of_manifest, registry_holds_notes},
+};
 use flate2::read::GzDecoder;
 use futures_util::StreamExt;
 use miette::IntoDiagnostic;
 use pnpm_config::Config;
-use pnpm_network::{ThrottledClient, encode_package_name, redact_url_credentials};
-use pnpm_registry::Package;
-use pnpm_resolving_npm_resolver::pick_registry_for_package;
+use pnpm_network::{ThrottledClient, redact_url_credentials};
+use pnpm_registry::{Package, PackageVersion};
 use pnpm_versioning::{
     ChangelogStorage, ReleasePlan, changelog_storage, list_pending_changelogs,
     read_pending_changelog, render_changelog,
@@ -24,6 +29,13 @@ use std::{
 use tar::Archive;
 
 const CHANGELOG_ENTRY: &str = "package/CHANGELOG.md";
+
+/// The inputs [`unpublished_release_dirs`] probes the registry with.
+pub struct ReleaseRegistryOptions<'a> {
+    pub config: &'a Config,
+    pub published_names: &'a HashMap<String, String>,
+    pub private_dirs: &'a HashSet<String>,
+}
 
 /// Caps the previous tarball we buffer and decompress to compose the changelog.
 /// The bytes come from a registry/proxy, so an unbounded read or a highly
@@ -50,6 +62,9 @@ pub async fn compose_registry_changelog(
     let Some((name, published, version)) = read_name_version(project_dir) else {
         return Ok(None);
     };
+    if notes_registry_of_dir(config, project_dir).is_some() {
+        return Ok(None);
+    }
     let Some(section) = read_pending_changelog(workspace_dir, &name, &version)? else {
         return Ok(None);
     };
@@ -65,30 +80,146 @@ pub async fn compose_registry_changelog(
 /// is confirmed too. Every parked file belongs to an as-yet-unpublished
 /// release, so the cost is bounded by the release backlog, not by history. The
 /// checks run concurrently. Empty in `repository` storage.
+///
+/// A release bound for a registry that stores release notes, a key of
+/// `notes_registries`, is confirmed by its notes instead of its tarball.
 pub async fn confirmed_published_versions(
     config: &Config,
     workspace_dir: &Path,
     published_names: &HashMap<String, String>,
+    notes_registries: &HashMap<String, String>,
 ) -> miette::Result<HashSet<String>> {
     if changelog_storage(Some(&config.versioning)) != ChangelogStorage::Registry {
         return Ok(HashSet::new());
     }
+    let probe = ReleaseProbe {
+        config,
+        workspace_dir,
+        client: build_registry_client(config)?,
+        publications: pnpm_versioning::read_parked_publications(workspace_dir)?,
+        ledger: pnpm_versioning::read_ledger(workspace_dir)?,
+        published_names,
+        notes_registries,
+    };
     let checks = list_pending_changelogs(workspace_dir)?
         .into_iter()
-        .map(|(name, version)| async move {
-            let section = read_pending_changelog(workspace_dir, &name, &version).ok()??;
-            // The parked file is keyed by the manifest name, which is what the
-            // ledger joins on; the registry only knows the published one.
-            let probe = published_names.get(&name).map_or(name.as_str(), String::as_str);
-            let changelog = fetch_changelog(config, probe, VersionPick::Exact(&version)).await?;
-            changelog
-                .contains(section.trim())
-                .then(|| format!("{name}@{version}"))
-        });
+        .map(|(name, version)| probe.confirm(name, version));
     Ok(futures_util::future::join_all(checks).await
         .into_iter()
         .flatten()
         .collect())
+}
+
+/// What [`confirmed_published_versions`] checks each parked release with.
+struct ReleaseProbe<'a> {
+    config: &'a Config,
+    workspace_dir: &'a Path,
+    client: ThrottledClient,
+    publications: Vec<pnpm_versioning::ParkedPublication>,
+    ledger: pnpm_versioning::Ledger,
+    published_names: &'a HashMap<String, String>,
+    notes_registries: &'a HashMap<String, String>,
+}
+
+impl ReleaseProbe<'_> {
+    /// The name the release of `name` (`key` is its `name@version`) was
+    /// published under, and the registry that stores its notes, if one does.
+    /// The parked file is keyed by the manifest name, which is what the
+    /// ledger joins on; the registry only knows the published one. The
+    /// ledger names the project that released, whose manifest answers both:
+    /// same-named projects on different version lines may rename themselves
+    /// or publish to different registries. A hand-written entry without a
+    /// dir falls back to the name.
+    fn release_target(&self, name: &str, key: &str) -> (String, Option<String>) {
+        let manifest = self.ledger
+            .get(key)
+            .and_then(pnpm_versioning::LedgerEntry::dir)
+            .and_then(|dir| {
+                let path =
+                    pnpm_package_manifest::project_manifest_path(&self.workspace_dir.join(dir));
+                pnpm_package_manifest::PackageManifest::from_path(path).ok()
+            });
+        match manifest {
+            Some(manifest) => {
+                let manifest = manifest.value();
+                let published = published_name(manifest).unwrap_or(name).to_owned();
+                (published, notes_registry_of_manifest(self.config, manifest))
+            }
+            None => (
+                self.published_names
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| name.to_owned()),
+                self.notes_registries.get(name).cloned(),
+            ),
+        }
+    }
+
+    /// `name@version` when the registry holds its parked section: in its
+    /// notes on a registry that stores them, else in its tarball.
+    async fn confirm(&self, name: String, version: String) -> Option<String> {
+        let section = read_pending_changelog(self.workspace_dir, &name, &version).ok()??;
+        let key = format!("{name}@{version}");
+        let (probe, registry) = self.release_target(&name, &key);
+        let probe = probe.as_str();
+        let confirmed = match registry {
+            Some(registry) => {
+                let publication_note = self.publications
+                    .iter()
+                    .find(|publication| publication.members.contains(&key))
+                    .map(|publication| publication.notes.as_str());
+                let composed = ComposedNotes { version_note: &section, publication_note };
+                notes_confirmed(&self.client, self.config, (&registry, probe, &version), &composed)
+                    .await
+            }
+            None => fetch_changelog(self.config, probe, VersionPick::Exact(&version))
+                .await?
+                .contains(section.trim()),
+        };
+        confirmed.then_some(key)
+    }
+}
+
+/// [`registry_holds_notes`], except that a release composed no notes for
+/// needs only to be published.
+async fn notes_confirmed(
+    client: &ThrottledClient,
+    config: &Config,
+    (registry, name, version): (&str, &str, &str),
+    composed: &ComposedNotes<'_>,
+) -> bool {
+    let has_notes = !composed.version_note.trim().is_empty()
+        || composed.publication_note.is_some_and(|note| !note.trim().is_empty());
+    if has_notes {
+        return registry_holds_notes(client, config, (registry, name, version), composed).await;
+    }
+    is_version_published(client, config, name, version).await.unwrap_or(false)
+}
+
+/// Manifest name → the registry that stores release notes it publishes to,
+/// for every workspace project bound for one.
+pub fn notes_registries_by_name(
+    config: &Config,
+    projects: &[pnpm_workspace::Project],
+) -> HashMap<String, String> {
+    projects
+        .iter()
+        .filter_map(|project| {
+            let manifest = project.manifest.value();
+            let name = manifest.get("name")?.as_str()?;
+            Some((name.to_string(), notes_registry_of_manifest(config, manifest)?))
+        })
+        .collect()
+}
+
+/// The registry that stores notes the project in `project_dir` publishes
+/// to, read from its manifest.
+pub fn notes_registry_of_dir(config: &Config, project_dir: &Path) -> Option<String> {
+    let manifest = pnpm_package_manifest::PackageManifest::from_path(
+        pnpm_package_manifest::project_manifest_path(project_dir),
+    )
+    .ok()?;
+    notes_registry_of_manifest(config, manifest.value())
 }
 
 /// Manifest name → published name, for every workspace project that renames
@@ -114,12 +245,12 @@ pub fn published_names(projects: &[pnpm_workspace::Project]) -> HashMap<String, 
 /// `AssembleReleasePlanOptions::unpublished_dirs`. Probe failures propagate.
 /// A release is keyed by its manifest name, so [`published_names`] translates it
 /// for the probe; without that a renamed project reads as never published and
-/// debuts at its manifest version on every release. Mirrors the TypeScript
-/// `resolveUnpublishedDirs`.
+/// debuts at its manifest version on every release. A release in
+/// `private_dirs` is never probed and counts as published. Mirrors the
+/// TypeScript `resolveUnpublishedDirs`.
 pub async fn unpublished_release_dirs(
-    config: &Config,
     plan: &ReleasePlan,
-    published_names: &HashMap<String, String>,
+    options: &ReleaseRegistryOptions<'_>,
 ) -> miette::Result<HashSet<String>> {
     // Debug-only test seam, compiled out of release builds: the engine tests
     // advance manifests without publishing, so they force "all published".
@@ -127,17 +258,26 @@ pub async fn unpublished_release_dirs(
     if std::env::var_os("PACQUET_ASSUME_VERSIONS_PUBLISHED").is_some() {
         return Ok(HashSet::new());
     }
-    // One client for the batch; its per-origin semaphore bounds the fan-out.
-    let client = build_registry_client(config)?;
-    let checks = plan.releases
+    let releases: Vec<_> = plan.releases
         .iter()
+        .filter(|release| !options.private_dirs.contains(&release.dir))
+        .collect();
+    if releases.is_empty() {
+        return Ok(HashSet::new());
+    }
+    // One client for the batch; its per-origin semaphore bounds the fan-out.
+    let client = build_registry_client(options.config)?;
+    let checks = releases
+        .into_iter()
         .map(|release| {
             let client = &client;
-            let probe =
-                published_names.get(&release.name).map_or(release.name.as_str(), String::as_str);
+            let probe = options.published_names
+                .get(&release.name)
+                .map_or(release.name.as_str(), String::as_str);
             async move {
                 let published =
-                    is_version_published(client, config, probe, &release.version.current).await?;
+                    is_version_published(client, options.config, probe, &release.version.current)
+                        .await?;
                 Ok::<_, miette::Report>((release.dir.clone(), published))
             }
         });
@@ -157,18 +297,17 @@ async fn is_version_published(
     version: &str,
 ) -> miette::Result<bool> {
     let registry = registry_for(config, name);
-    let url = format!("{registry}{}", encode_package_name(name));
+    let url = package_endpoint_url(&registry, name).unwrap_or_else(|_| format!("{registry}{name}"));
     let guard = client.acquire_for_url(&url).await;
-    let mut request = guard
+    let request = guard
         .get(&url)
         .header(
             "accept",
             "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*",
         );
-    if let Some(value) = config.auth_headers.for_url_with_package(&url, Some(name)) {
-        request = request.header("authorization", value);
-    }
-    let response = request.send().await.into_diagnostic()?;
+    let auth_header = auth_header_for_package(config, &url, name);
+    let response =
+        apply_auth_and_otp(request, auth_header.as_deref(), None).send().await.into_diagnostic()?;
     let status = response.status();
     if status.as_u16() == 404 {
         return Ok(false);
@@ -204,16 +343,12 @@ async fn fetch_changelog(config: &Config, name: &str, pick: VersionPick<'_>) -> 
         }
         VersionPick::PreviousTo(version) => previous_version(&package, version)?,
     };
-    let tarball_url = package.versions
-        .get(&version)?
-        .as_tarball_url()
-        .to_string();
+    let tarball_url =
+        tarball_url_of(config, &registry, name, &version, &*package.versions.get(&version)?);
     let guard = client.acquire_for_url(&tarball_url).await;
-    let mut request = guard.get(&tarball_url);
-    if let Some(value) = config.auth_headers.for_url_with_package(&tarball_url, Some(name)) {
-        request = request.header("authorization", value);
-    }
-    let response = request.send().await.ok()?;
+    let request = guard.get(&tarball_url);
+    let auth_header = auth_header_for_package(config, &tarball_url, name);
+    let response = apply_auth_and_otp(request, auth_header.as_deref(), None).send().await.ok()?;
     if !response.status().is_success() {
         return None;
     }
@@ -229,6 +364,31 @@ async fn fetch_changelog(config: &Config, name: &str, pick: VersionPick<'_>) -> 
         body.extend_from_slice(&chunk);
     }
     extract_entry(&body, CHANGELOG_ENTRY)
+}
+
+/// The version's tarball URL. A registry with a declared layout, such as a
+/// pnpr tar registry, may name none.
+fn tarball_url_of(
+    config: &Config,
+    registry: &str,
+    name: &str,
+    version: &str,
+    distribution: &PackageVersion,
+) -> String {
+    match distribution.as_tarball_url() {
+        "" => pnpm_lockfile::npm_tarball_url(
+            name,
+            version,
+            pnpm_lockfile::TarballUrlOptions {
+                registry,
+                server_type: pnpm_lockfile::registry_server_type(
+                    &config.registry_options_by_url,
+                    registry,
+                ),
+            },
+        ),
+        tarball_url => tarball_url.to_string(),
+    }
 }
 
 /// Highest published version of the package that is semver-lower than `version`.
@@ -249,19 +409,22 @@ fn previous_version(package: &Package, version: &str) -> Option<String> {
 /// The registry a package's metadata is read from, with the trailing slash
 /// the request paths are joined onto.
 fn registry_for(config: &Config, name: &str) -> String {
-    let registries: HashMap<String, String> = config
-        .resolved_registries()
-        .into_iter()
-        .collect();
-    let registry = pick_registry_for_package(&registries, name, None);
-    if registry.ends_with('/') { registry } else { format!("{registry}/") }
+    let registries = resolve_registries_with_override(config, None);
+    resolve_registry_for_package(&registries, name, None)
 }
 
 /// Reads one entry's contents out of a gzipped tarball buffer. Decompression is
 /// capped (see [`MAX_TARBALL_BYTES`]) by reading at most that many inflated
-/// bytes; a gzip bomb truncates past the cap and simply yields no entry.
-fn extract_entry(gzipped_tarball: &[u8], entry_name: &str) -> Option<String> {
-    let mut archive = Archive::new(GzDecoder::new(gzipped_tarball).take(MAX_TARBALL_BYTES));
+/// bytes; a gzip bomb truncates past the cap and yields no entry.
+/// `tarball` is a `.tgz`, or the plain tar a tar registry serves.
+pub(crate) fn extract_entry(tarball: &[u8], entry_name: &str) -> Option<String> {
+    let reader: Box<dyn std::io::Read + '_> = if tarball.starts_with(&[0x1f, 0x8b]) {
+        Box::new(GzDecoder::new(tarball))
+    } else {
+        Box::new(tarball)
+    };
+    let mut archive = Archive::new(reader.take(MAX_TARBALL_BYTES));
+    archive.set_max_metadata_size(Some(pnpm_tarball::MAX_TARBALL_METADATA_BYTES));
     for entry in archive.entries().ok()? {
         let mut entry = entry.ok()?;
         if entry.path().ok()?.to_str() == Some(entry_name) {

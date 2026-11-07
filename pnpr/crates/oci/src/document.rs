@@ -1,6 +1,6 @@
 use crate::Digest;
 use serde::{Deserialize, Serialize};
-use std::{cmp::Ordering, collections::HashSet};
+use std::cmp::Ordering;
 
 /// One manifest the repository holds, keyed by the digest of its bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,9 +34,9 @@ pub struct TagEntry {
     ///
     /// A tag is the one mutable thing in a repository, so "what is already
     /// here wins" — the rule that makes an immutable version safe to
-    /// re-apply — would let a transaction recovered after a crash drag a tag
-    /// back to an older manifest. Comparing when instead makes the merge
-    /// monotonic, so re-applying an old write is a no-op.
+    /// re-apply — would let a write that lands late drag a tag back to an
+    /// older manifest. Comparing when instead makes the merge monotonic, so
+    /// re-applying an old write is a no-op.
     ///
     /// A number rather than a formatted date, because the comparison is the
     /// whole point of the field: two spellings of one instant would otherwise
@@ -52,6 +52,12 @@ pub struct TagEntry {
     pub updated: u64,
 }
 
+pub const IMAGE_DOCUMENT_FORMAT_VERSION: u32 = 1;
+
+const fn default_format_version() -> u32 {
+    IMAGE_DOCUMENT_FORMAT_VERSION
+}
+
 /// The stored shape, which [`ImageDocument`] sorts on the way in.
 ///
 /// It is a separate type so that the ordering that document guarantees is
@@ -60,29 +66,26 @@ pub struct TagEntry {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StoredImageDocument {
+    #[serde(default = "default_format_version")]
+    format_version: u32,
     name: String,
     #[serde(default)]
     manifests: Vec<ManifestEntry>,
     #[serde(default)]
     tags: Vec<TagEntry>,
-    #[serde(default)]
-    generation: u64,
-    #[serde(default)]
-    deleting_blob: Option<Digest>,
 }
 
 impl From<StoredImageDocument> for ImageDocument {
     fn from(stored: StoredImageDocument) -> Self {
         let StoredImageDocument {
+            format_version,
             name,
             mut manifests,
             mut tags,
-            generation,
-            deleting_blob,
         } = stored;
         manifests.sort_by(|left, right| left.digest.hex().cmp(right.digest.hex()));
         tags.sort_by(|left, right| left.tag.cmp(&right.tag));
-        Self { name, manifests, tags, generation, deleting_blob }
+        Self { format_version, name, manifests, tags }
     }
 }
 
@@ -96,20 +99,27 @@ impl From<StoredImageDocument> for ImageDocument {
 /// lookup here is a binary search: a document whose entries reached storage
 /// in another order would hide entries it holds. The ordering holds however
 /// a document was built, not only on the paths that maintain it.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", from = "StoredImageDocument")]
 pub struct ImageDocument {
+    #[serde(default = "default_format_version")]
+    pub format_version: u32,
     pub name: String,
     #[serde(default)]
     manifests: Vec<ManifestEntry>,
     #[serde(default)]
     tags: Vec<TagEntry>,
-    /// Fences journaled publishes prepared before an explicit blob deletion.
-    #[serde(default)]
-    pub generation: u64,
-    /// Blocks new publishes until the deletion completes or offline collection recovers it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deleting_blob: Option<Digest>,
+}
+
+impl Default for ImageDocument {
+    fn default() -> Self {
+        Self {
+            format_version: IMAGE_DOCUMENT_FORMAT_VERSION,
+            name: String::new(),
+            manifests: Vec::new(),
+            tags: Vec::new(),
+        }
+    }
 }
 
 impl ImageDocument {
@@ -213,43 +223,28 @@ impl ImageDocument {
     }
 
     /// Take on everything in `addition` this document does not already hold,
-    /// skipping whatever points at a blob in `lost_blobs`, and report
-    /// whether that changed anything.
+    /// and report whether that changed anything.
     ///
     /// Manifests are content-addressed, so one already here is the same
     /// bytes and is left alone. Tags reach the same result whichever order
-    /// the two documents arrive in, which is what lets a journaled write be
-    /// replayed after the one that superseded it.
-    ///
-    /// A generation mismatch or pending blob deletion refuses the addition
-    /// and returns `false`, just like an unchanged document. Older generations
-    /// cannot be replayed after deletion advances the stored generation.
-    pub fn merge(&mut self, addition: Self, lost_blobs: &HashSet<String>) -> bool {
-        if self.generation != addition.generation || self.deleting_blob.is_some() {
-            return false;
-        }
+    /// the two documents arrive in, so a write that lands after the one that
+    /// superseded it changes nothing.
+    pub fn merge(&mut self, addition: Self) -> bool {
         let mut changed = false;
         if self.name.is_empty() && !addition.name.is_empty() {
             self.name.clone_from(&addition.name);
             changed = true;
         }
-        changed |= self.merge_manifests(addition.manifests, lost_blobs);
-        changed |= self.merge_tags(addition.tags, lost_blobs);
+        changed |= self.merge_manifests(addition.manifests);
+        changed |= self.merge_tags(addition.tags);
         changed
     }
 
-    /// Take every manifest this document does not already hold and whose blob
-    /// the transaction did not lose.
-    fn merge_manifests(
-        &mut self,
-        manifests: Vec<ManifestEntry>,
-        lost_blobs: &HashSet<String>,
-    ) -> bool {
+    /// Take every manifest this document does not already hold.
+    fn merge_manifests(&mut self, manifests: Vec<ManifestEntry>) -> bool {
         let mut changed = false;
         for entry in manifests {
-            if lost_blobs.contains(&entry.digest.blob_filename())
-                || self.manifest(&entry.digest).is_some()
-            {
+            if self.manifest(&entry.digest).is_some() {
                 continue;
             }
             self.insert_manifest(entry);
@@ -260,13 +255,10 @@ impl ImageDocument {
 
     /// Take every tag mapping that supersedes the one held, skipping any whose
     /// manifest this document does not have.
-    fn merge_tags(&mut self, tags: Vec<TagEntry>, lost_blobs: &HashSet<String>) -> bool {
+    fn merge_tags(&mut self, tags: Vec<TagEntry>) -> bool {
         let mut changed = false;
         for entry in tags {
-            if lost_blobs.contains(&entry.digest.blob_filename())
-                || self.manifest(&entry.digest).is_none()
-                || !self.tag_supersedes(&entry)
-            {
+            if self.manifest(&entry.digest).is_none() || !self.tag_supersedes(&entry) {
                 continue;
             }
             self.set_tag(entry);
@@ -277,8 +269,8 @@ impl ImageDocument {
 
     /// A newer write always wins, even where it names the digest the tag
     /// already holds: dropping it would leave the older timestamp in place,
-    /// and a stale journaled write replayed later would then compare as newer
-    /// and move the tag backward. On a tie only a different digest is a
+    /// and a stale write that lands later would then compare as newer and
+    /// move the tag backward. On a tie only a different digest is a
     /// change, so re-applying the mapping already held costs no document
     /// write.
     fn tag_supersedes(&self, entry: &TagEntry) -> bool {

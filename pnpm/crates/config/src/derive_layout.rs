@@ -1,6 +1,6 @@
 use super::{
     Config, EnvVar, EnvVarOs, ExplicitPaths, GLOBAL_LAYOUT_VERSION, GetCurrentDir, GetHomeDir,
-    LinkProbe, LoadWorkspaceYamlError, NodeLinker, NpmrcAuth, default_pnpm_home_dir,
+    HashMap, LinkProbe, LoadWorkspaceYamlError, NodeLinker, NpmrcAuth, default_pnpm_home_dir,
     esm_node_path_loader,
 };
 
@@ -32,26 +32,24 @@ impl Config {
             });
 
         // Inside a workspace, scripts and `pnpm exec` also get the
-        // workspace root's `node_modules/.bin` on PATH — pnpm's
-        // `extraBinPaths = [join(workspaceDir, 'node_modules', '.bin')]`.
-        self.extra_bin_paths = self.workspace_dir
-            .as_deref()
-            .map(|dir| vec![dir.join("node_modules").join(".bin")])
-            .unwrap_or_default();
+        // workspace root's modules `.bin` on PATH, pnpm's
+        // `extraBinPaths = [join(workspaceDir, modulesDir, '.bin')]`.
+        // The root is a project like any other, so a `packageConfigs`
+        // entry naming it moves those executables too.
+        self.extra_bin_paths = self.workspace_root_bin_paths();
 
         // With `preferSymlinkedExecutables`, `.bin` entries are plain
         // symlinks with no shim to carry a `NODE_PATH` block, so the
         // resolution help moves to the environment: expose the virtual
         // store's hidden `node_modules` to every spawned child process.
-        // `virtual_store_dir` is already anchored at the workspace root
+        // `install_state_dir` is already anchored at the workspace root
         // by the re-anchor above — pnpm builds this from
         // `lockfileDir ?? dir` to the same effect
         // (pnpm/pnpm#13912). Unix only, like pnpm; and only an explicit
-        // `true` fires — the hoisted-linker derivation below runs after
-        // this block, mirroring pnpm's config-reader ordering.
-        if cfg!(unix) && self.prefer_symlinked_executables == Some(true) {
+        // `true` fires.
+        if cfg!(any(unix, target_os = "wasi")) && self.prefer_symlinked_executables == Some(true) {
             let hidden_modules_dir =
-                pnpm_fs::lexical_normalize(&self.virtual_store_dir.join("node_modules"));
+                pnpm_fs::lexical_normalize(&self.install_state_dir.join("node_modules"));
             self.extra_env.insert(
                 "NODE_PATH".to_string(),
                 hidden_modules_dir.display().to_string(),
@@ -69,7 +67,7 @@ impl Config {
     /// process pnpm spawns, and register the ESM loader that restores
     /// `NODE_PATH` lookups for ESM imports. Mirrors the pnpm config reader
     /// (`pnpm11/config/reader/src/index.ts`).
-    pub(super) fn apply_global_virtual_store_node_path<Sys>(&mut self)
+    pub fn apply_global_virtual_store_node_path<Sys>(&mut self)
     where
         Sys: EnvVar,
     {
@@ -89,8 +87,8 @@ impl Config {
                     .collect()
             })
             .unwrap_or_default();
-        for dir in [self.virtual_store_dir.join("node_modules"), self.modules_dir.clone()] {
-            // `virtual_store_dir` is built by joining a multi-segment
+        for dir in [self.install_state_dir.join("node_modules"), self.modules_dir.clone()] {
+            // `install_state_dir` is built by joining a multi-segment
             // literal, which keeps `/` separators on Windows; normalize
             // so NODE_PATH carries native separators like the shims do.
             let dir = pnpm_fs::lexical_normalize(&dir).display().to_string();
@@ -121,13 +119,19 @@ impl Config {
     where
         Sys: EnvVar + EnvVarOs + GetCurrentDir + GetHomeDir + LinkProbe,
     {
+        if !self.explicit_settings.contains_key("lockfile") {
+            self.lockfile = self.package_lock;
+        }
+
         // A pinned `lockfileDir` moves the root `node_modules` and the
         // virtual store with it. Applied after every source has had its
         // say so the anchor uses the final value, and before the
-        // global-virtual-store derivation, which may re-point
-        // `virtual_store_dir` at the store.
+        // global-virtual-store derivation, which separates the shared
+        // package store from the project's internal directory.
         if let Some(lockfile_dir) = self.lockfile_dir.clone() {
             self.anchor_lockfile_paths(&lockfile_dir);
+        } else if self.explicit_settings.contains_key("modulesDir") {
+            self.follow_modules_dir_with_install_state_dir();
         }
 
         // Build the per-URI auth-header lookup. Credentials were already
@@ -139,26 +143,16 @@ impl Config {
 
         // Re-resolve `store_dir` against the project's volume when no
         // explicit source (global config.yaml, pnpm-workspace.yaml,
-        // `PNPM_CONFIG_STORE_DIR`) set it. The SmartDefault picks
-        // `<pnpm_home>/store` unconditionally; the store-path resolution
-        // probes whether `pkg_root` can hardlink into the home volume
-        // and falls back to `<mountpoint>/.pnpm-store` when it can't,
-        // so a workspace on a separate (case-sensitive) volume gets a
-        // store on that same volume rather than the home volume.
-        // Without this, typescript-eslint's case-folded path cache
-        // diverges from TypeScript's case-sensitive program when the
-        // workspace is case-sensitive and the home is not.
-        if !explicit.store_dir {
+        // `PNPM_CONFIG_STORE_DIR`) set it.
+        if explicit.store_dir {
+            self.store_dir_placement_skipped = false;
+        } else {
             self.resolve_default_store_dir::<Sys>(start_dir);
         }
 
         // Derive `global_virtual_store_dir` last so it sees the final
-        // `store_dir` / `virtual_store_dir` after yaml has been
-        // applied. An explicit `globalVirtualStoreDir` in yaml wins
-        // over the derivation; otherwise the field falls back to the
-        // user's pinned `virtualStoreDir` (under GVS-on) or to
-        // `<store_dir>/links`. See
-        // [`Self::apply_global_virtual_store_derivation`].
+        // `store_dir` / `virtualStoreDir` after yaml has been
+        // applied. See [`Self::apply_global_virtual_store_derivation`].
         self.apply_global_virtual_store_derivation(
             explicit.virtual_store_dir,
             explicit.global_virtual_store_dir,
@@ -168,5 +162,57 @@ impl Config {
         self.apply_shamefully_hoist_derivation();
         self.apply_virtual_store_only_derivation();
         Ok(())
+    }
+
+    /// Make `workspace_dir` the workspace root of a config that was loaded
+    /// outside any workspace, for a `pnpm-workspace.yaml` created after
+    /// loading. The layout that follows the workspace root follows it too.
+    pub fn anchor_to_created_workspace(
+        &mut self,
+        workspace_dir: std::path::PathBuf,
+        package_patterns: Vec<String>,
+    ) {
+        self.workspace_dir = Some(workspace_dir);
+        self.workspace_package_patterns = Some(package_patterns);
+        self.extra_bin_paths = self.workspace_root_bin_paths();
+    }
+
+    fn workspace_root_bin_paths(&self) -> Vec<std::path::PathBuf> {
+        self.workspace_dir
+            .as_deref()
+            .map_or_else(Vec::new, |dir| {
+                let root_name = self
+                    .applies_package_configs()
+                    .then(|| pnpm_workspace::read_project_name(dir))
+                    .flatten();
+                vec![
+                    dir.join(self.modules_dir_name_for(dir, root_name.as_deref()))
+                        .join(".bin"),
+                ]
+            })
+    }
+
+    /// The `nodeOptions` setting to export as `NODE_OPTIONS`. An empty value
+    /// only overrides lower-priority settings, so it yields `None` and the
+    /// child keeps the `NODE_OPTIONS` it inherits.
+    pub fn exported_node_options(&self) -> Option<&str> {
+        self.node_options
+            .as_deref()
+            .filter(|value| !value.is_empty())
+    }
+
+    /// [`Config::extra_env`] with the `nodeOptions` setting applied as
+    /// `NODE_OPTIONS`, preserving the ESM `NODE_PATH` loader flag the
+    /// `extra_env` carries under a global virtual store.
+    pub fn extra_env_with_node_options(&self) -> HashMap<String, String> {
+        let mut extra_env = self.extra_env.clone();
+        if let Some(node_options) = self.exported_node_options() {
+            let node_options = esm_node_path_loader::keep_esm_node_path_loader_option(
+                node_options,
+                self.extra_env.get("NODE_OPTIONS").map(String::as_str),
+            );
+            extra_env.insert("NODE_OPTIONS".to_string(), node_options);
+        }
+        extra_env
     }
 }

@@ -1,42 +1,198 @@
 use super::{
-    Config, Context, EnvLockfile, PackageManifest, Path, Value, infer_range_spec_style,
-    range_satisfies, version_lt,
+    Config, Context, EnvLockfile, PackageManifest, Path, Value, infer_range_spec_style, version_lt,
 };
-use crate::config_deps;
+use crate::{
+    cli_args::{
+        package_manager::{
+            PinRoots, WantedPackageManager, version_satisfies, wanted_package_manager,
+        },
+        pre_command::{
+            Invocation, PinDecision, PinInput, SwitchProcessState, decide, read_pin_lockfile,
+        },
+    },
+    config_deps,
+};
 
-/// Update the project's `packageManager` / `devEngines.packageManager`
-/// pin to `target_version`.
-pub(super) async fn update_project_pin(
+/// The message refusing an implicit-`latest` update that would downgrade a
+/// project pinned to a newer pnpm than the registry's `latest`. `env_root`
+/// holds the env lockfile that records the pinned version.
+pub(super) async fn project_pin_refusal(
     config: &'static Config,
-    dir: &Path,
+    env_root: &Path,
     pm: &super::super::package_manager::WantedPackageManager,
     target_version: &str,
     is_implicit_latest: bool,
 ) -> miette::Result<Option<String>> {
+    if !is_implicit_latest || pm.version.as_deref() == Some(target_version) {
+        return Ok(None);
+    }
+    let Some(current) = read_project_pinned_pnpm_version(env_root, pm.version.as_deref()) else {
+        return Ok(None);
+    };
+    if !version_lt(target_version, &current) {
+        return Ok(None);
+    }
+    let registry_latest = registry_latest_ignoring_maturity(config).await?;
+    Ok(Some(implicit_latest_no_upgrade_message(
+        NoUpgradeKind::Project,
+        &current,
+        target_version,
+        registry_latest.as_deref(),
+    )))
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum NoUpgradeKind {
+    Active,
+    Project,
+}
+
+/// The no-upgrade message for implicit `pnpm self-update`.
+///
+/// When `registry_latest` is at least `current`, the pick is older only
+/// because `minimumReleaseAge` held the real `latest` tag back. Do not
+/// suggest a downgrade (pnpm/pnpm#12006).
+pub(super) fn implicit_latest_no_upgrade_message(
+    kind: NoUpgradeKind,
+    current: &str,
+    target: &str,
+    registry_latest: Option<&str>,
+) -> String {
+    match registry_latest {
+        Some(registry_latest) if !version_lt(registry_latest, current) => {
+            age_hold_message(kind, current, target, registry_latest)
+        }
+        Some(registry_latest) if registry_latest != target => {
+            lagging_latest_behind_cutoff_message(kind, current, target, registry_latest)
+        }
+        _ => lagging_latest_message(kind, current, target),
+    }
+}
+
+pub(super) async fn registry_latest_ignoring_maturity(
+    config: &'static Config,
+) -> miette::Result<Option<String>> {
+    if config.resolved_minimum_release_age().is_none() {
+        return Ok(None);
+    }
+    let resolved =
+        Box::pin(config_deps::resolve_engine_version_ignoring_maturity(config, "pnpm", "latest"))
+            .await?;
+    Ok(resolved.map(|resolved| resolved.version))
+}
+
+fn age_hold_message(
+    kind: NoUpgradeKind,
+    current: &str,
+    target: &str,
+    registry_latest: &str,
+) -> String {
+    match kind {
+        NoUpgradeKind::Active => format!(
+            "The currently active pnpm v{current} is newer than the latest version that meets minimumReleaseAge (v{target}). v{registry_latest} on the registry is still within the cutoff. No update performed.",
+        ),
+        NoUpgradeKind::Project => format!(
+            "The current project is set to use pnpm v{current}. The latest version that meets minimumReleaseAge is v{target}. v{registry_latest} on the registry is still within the cutoff. No update performed.",
+        ),
+    }
+}
+
+fn lagging_latest_behind_cutoff_message(
+    kind: NoUpgradeKind,
+    current: &str,
+    target: &str,
+    registry_latest: &str,
+) -> String {
+    match kind {
+        NoUpgradeKind::Active => format!(
+            r#"The currently active pnpm v{current} is newer than the "latest" version on the registry (v{registry_latest}). The latest version that meets minimumReleaseAge is v{target}. No update performed. Run "pnpm self-update latest" to downgrade."#,
+        ),
+        NoUpgradeKind::Project => format!(
+            r#"The current project is set to use pnpm v{current}, which is newer than the "latest" version on the registry (v{registry_latest}). The latest version that meets minimumReleaseAge is v{target}. No update performed. Run "pnpm self-update latest" to downgrade."#,
+        ),
+    }
+}
+
+fn lagging_latest_message(kind: NoUpgradeKind, current: &str, target: &str) -> String {
+    match kind {
+        NoUpgradeKind::Active => format!(
+            r#"The currently active pnpm v{current} is newer than the "latest" version on the registry (v{target}). No update performed. Run "pnpm self-update latest" to downgrade."#,
+        ),
+        NoUpgradeKind::Project => format!(
+            r#"The current project is set to use pnpm v{current}, which is newer than the "latest" version on the registry (v{target}). No update performed. Run "pnpm self-update latest" to downgrade."#,
+        ),
+    }
+}
+
+/// Update `manifest`'s `packageManager` / `devEngines.packageManager` pin
+/// to `target_version`. Callers check [`project_pin_refusal`] first.
+pub(super) async fn update_project_pin(
+    config: &'static Config,
+    roots: &PinRoots,
+    mut manifest: PackageManifest,
+    pm: &WantedPackageManager,
+    target_version: &str,
+) -> miette::Result<String> {
     if pm.version.as_deref() == Some(target_version) {
-        return Ok(Some(format!(
-            "The current project is already set to use pnpm v{target_version}",
-        )));
+        if write_engines_pnpm(manifest.value_mut(), target_version) {
+            manifest
+                .save()
+                .map_err(miette::Report::new)
+                .wrap_err("write the project manifest")?;
+        }
+        return Ok(format!("The current project is already set to use pnpm v{target_version}"));
     }
 
-    // Implicit `latest` must not downgrade a project pinned to a newer
-    // version than the registry's `latest`. The env lockfile lives at the
-    // workspace root, not necessarily the command's `--dir`.
-    let lockfile_dir = config.workspace_dir.as_deref().unwrap_or(dir);
-    if is_implicit_latest
-        && let Some(current) = read_project_pinned_pnpm_version(lockfile_dir, pm.version.as_deref())
-        && version_lt(target_version, &current)
+    if let PinDecision::Record { at, package_manager } =
+        update_manifest_pin_and_decide(config, roots, &mut manifest, target_version)?
     {
-        return Ok(Some(format!(
-            r#"The current project is set to use pnpm v{current}, which is newer than the "latest" version on the registry (v{target_version}). No update performed. Run "pnpm self-update latest" to downgrade."#,
-        )));
+        Box::pin(config_deps::sync_package_manager_dependencies(
+            config,
+            &at,
+            &package_manager.specifier,
+            &package_manager.version,
+            false,
+            false,
+        ))
+        .await?;
     }
 
-    let manifest_path = dir.join("package.json");
-    let mut manifest = PackageManifest::from_path(manifest_path)
-        .map_err(miette::Report::new)
-        .wrap_err("read the project manifest")?;
+    Ok(format!("The current project has been updated to use pnpm v{target_version}"))
+}
 
+pub(crate) fn update_manifest_pin_and_decide(
+    config: &Config,
+    roots: &PinRoots,
+    manifest: &mut PackageManifest,
+    target_version: &str,
+) -> miette::Result<PinDecision> {
+    write_updated_manifest_pin(manifest, target_version)?;
+    let wanted = wanted_package_manager(manifest.value());
+    let invocation = Invocation::for_self_update(roots.manifest.clone());
+    let process_state = SwitchProcessState::current();
+    let locked_env = read_pin_lockfile(
+        wanted.as_ref(),
+        config,
+        &invocation,
+        &roots.env,
+        target_version,
+        process_state,
+    )?;
+    let pin = PinInput {
+        roots,
+        manifest: Some(manifest.value()),
+        wanted: wanted.as_ref(),
+        locked_env,
+        running_version: target_version,
+        process_state,
+    };
+    decide(&pin, config, &invocation)
+}
+
+fn write_updated_manifest_pin(
+    manifest: &mut PackageManifest,
+    target_version: &str,
+) -> miette::Result<()> {
     let has_dev_engines = manifest
         .value()
         .get("devEngines")
@@ -44,19 +200,19 @@ pub(super) async fn update_project_pin(
         .is_some();
 
     if has_dev_engines {
-        update_dev_engines_pin(config, dir, pm, &mut manifest, target_version).await?;
+        write_dev_engines_pin(manifest, target_version)?;
     } else if let Some(object) = manifest.value_mut().as_object_mut() {
         object.insert(
             "packageManager".to_string(),
             Value::String(format!("pnpm@{target_version}")),
         );
+        write_engines_pnpm(manifest.value_mut(), target_version);
         manifest
             .save()
             .map_err(miette::Report::new)
             .wrap_err("write the project manifest")?;
     }
-
-    Ok(Some(format!("The current project has been updated to use pnpm v{target_version}")))
+    Ok(())
 }
 
 /// The `pnpm` entry of `devEngines.packageManager` (which can be a single
@@ -89,6 +245,7 @@ fn write_dev_engines_pin(
         let new_legacy = format!("pnpm@{target_version}");
         changed |= insert_string_if_changed(manifest.value_mut(), "packageManager", &new_legacy);
     }
+    changed |= write_engines_pnpm(manifest.value_mut(), target_version);
     if changed {
         manifest
             .save()
@@ -96,6 +253,26 @@ fn write_dev_engines_pin(
             .wrap_err("write the project manifest")?;
     }
     Ok(pin_specifier)
+}
+
+/// Rewrite the manifest's `engines.pnpm` range the way
+/// [`update_version_constraint`] rewrites the `devEngines` pin, keeping a
+/// range such as `*` or `12.2` that accepts the target as is, and report
+/// whether that changed the manifest.
+fn write_engines_pnpm(manifest: &mut Value, target_version: &str) -> bool {
+    let Some(engines) = manifest.get_mut("engines") else {
+        return false;
+    };
+    let Some(current) = engines.get("pnpm").and_then(Value::as_str) else {
+        return false;
+    };
+    let names_full_version =
+        node_semver::Version::parse(current.trim_start_matches(['^', '~', '='])).is_ok();
+    if !names_full_version && version_satisfies(target_version, current) {
+        return false;
+    }
+    let updated = update_version_constraint(Some(current), target_version);
+    insert_string_if_changed(engines, "pnpm", &updated)
 }
 
 /// Set `key` to `value`, reporting whether that changed the object.
@@ -124,24 +301,10 @@ fn dev_engines_pnpm_entry_mut(manifest: &mut Value) -> Option<&mut Value> {
     None
 }
 
-/// A [`super::super::package_manager::WantedPackageManager`] flagged as `fromDevEngines` so
-/// [`super::super::package_manager::should_persist_package_manager_lockfile`] decides persistence
-/// the way it does for a devEngines pin.
-fn pm_for_persist(
-    pm: &super::super::package_manager::WantedPackageManager,
-) -> super::super::package_manager::WantedPackageManager {
-    super::super::package_manager::WantedPackageManager {
-        name: pm.name.clone(),
-        version: pm.version.clone(),
-        from_dev_engines: true,
-        on_fail: pm.on_fail.clone(),
-    }
-}
-
 /// The specifier to record in `packageManagerDependencies` after
 /// `self-update` rewrites the `devEngines.packageManager` pin. It must equal
 /// the constraint a later install reads back from the manifest (see
-/// [`super::super::package_manager::package_manager_to_sync`]) — the updated
+/// [`super::super::package_manager::package_manager_to_sync_for_version`]) — the updated
 /// devEngines constraint, never the CLI dist-tag or range passed to
 /// `self-update` — so a subsequent `--frozen-lockfile` install does not
 /// reject the lockfile as outdated. A legacy `packageManager` pin is always
@@ -170,7 +333,7 @@ pub(super) fn update_version_constraint(current: Option<&str>, new_version: &str
     };
     match infer_range_spec_style(current) {
         Some(pinned) => format!("{}{new_version}", pinned.range_prefix()),
-        None if range_satisfies(current, new_version) => current.to_string(),
+        None if version_satisfies(new_version, current) => current.to_string(),
         None => format!("^{new_version}"),
     }
 }
@@ -200,27 +363,4 @@ pub(super) fn read_project_pinned_pnpm_version(
         }
         (lockfile, spec) => lockfile.or(spec),
     }
-}
-
-async fn update_dev_engines_pin(
-    config: &'static Config,
-    dir: &Path,
-    pm: &super::super::package_manager::WantedPackageManager,
-    manifest: &mut PackageManifest,
-    target_version: &str,
-) -> miette::Result<()> {
-    let pin_specifier = write_dev_engines_pin(manifest, target_version)?;
-    if super::super::package_manager::should_persist_package_manager_lockfile(&pm_for_persist(pm)) {
-        let root_dir = config.workspace_dir.clone().unwrap_or_else(|| dir.to_path_buf());
-        Box::pin(config_deps::sync_package_manager_dependencies(
-            config,
-            &root_dir,
-            &pin_specifier,
-            target_version,
-            false,
-            false,
-        ))
-        .await?;
-    }
-    Ok(())
 }

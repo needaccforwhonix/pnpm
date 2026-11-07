@@ -120,6 +120,25 @@ fn non_silent_loglevels_keep_the_selected_reporter() {
 }
 
 #[test]
+fn configured_silent_loglevel_selects_silent_reporter_when_cli_loglevel_unset() {
+    let parsed = CliArgs::try_parse_from(["pacquet", "install"]).expect("parses");
+    assert!(matches!(
+        parsed.effective_reporter_with_config(Some(pnpm_config::LogLevel::Silent), None),
+        ReporterType::Silent
+    ));
+}
+
+#[test]
+fn cli_loglevel_takes_precedence_over_configured_silent_loglevel() {
+    let parsed =
+        CliArgs::try_parse_from(["pacquet", "--loglevel", "warn", "install"]).expect("parses");
+    assert!(matches!(
+        parsed.effective_reporter_with_config(Some(pnpm_config::LogLevel::Silent), None),
+        ReporterType::Default
+    ));
+}
+
+#[test]
 fn loglevel_rejects_unknown_values() {
     CliArgs::try_parse_from(["pacquet", "install", "--loglevel", "verbose"])
         .expect_err("unknown loglevel value must be rejected");
@@ -232,6 +251,18 @@ fn script_scoped_global_flags_parse_before_script_commands() {
 }
 
 #[test]
+fn install_test_accepts_no_bail_before_and_after_the_command() {
+    for argv in [
+        ["pacquet", "-r", "--no-bail", "install-test"].as_slice(),
+        ["pacquet", "install-test", "--no-bail"].as_slice(),
+    ] {
+        let parsed = CliArgs::try_parse_from(argv).expect("parses install-test with --no-bail");
+        assert!(parsed.workspace.execution.no_bail, "argv: {argv:?}");
+        parsed.validate_command_scoped_global_options().expect("install-test accepts --no-bail");
+    }
+}
+
+#[test]
 fn if_present_flag_parses_before_script_commands() {
     for argv in [
         ["pacquet", "--if-present", "run", "build"].as_slice(),
@@ -284,6 +315,37 @@ fn if_present_flag_rejects_non_script_commands() {
     // parse time instead of validation.
     CliArgs::try_parse_from(["pacquet", "install", "--if-present"])
         .expect_err("install rejects --if-present at parse time");
+}
+
+/// <https://github.com/pnpm/pnpm/issues/16446>
+#[test]
+fn sequential_flag_parses_before_run_and_fallback_scripts() {
+    for argv in [
+        ["pacquet", "-s", "lint"].as_slice(),
+        ["pacquet", "--sequential", "lint"].as_slice(),
+        ["pacquet", "-r", "-s", "lint"].as_slice(),
+        ["pacquet", "-s", "run", "lint"].as_slice(),
+    ] {
+        let parsed = CliArgs::try_parse_from(argv).expect("parses top-level --sequential");
+        assert!(parsed.workspace.execution.sequential);
+        parsed.validate_command_scoped_global_options().expect("script command accepts flag");
+    }
+}
+
+#[test]
+fn sequential_flag_rejects_other_commands() {
+    for argv in [
+        ["pacquet", "--sequential", "install"].as_slice(),
+        ["pacquet", "--sequential", "exec", "ls"].as_slice(),
+        ["pacquet", "--sequential", "test"].as_slice(),
+    ] {
+        let parsed =
+            CliArgs::try_parse_from(argv).expect("global parser accepts compatibility flag");
+        let err = parsed
+            .validate_command_scoped_global_options()
+            .expect_err("non-run command rejects flag");
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
 }
 
 #[test]
@@ -339,6 +401,14 @@ fn workspace_concurrency_parses_as_global_option() {
     let negative = CliArgs::try_parse_from(["pacquet", "install", "--workspace-concurrency=-1"])
         .expect("parses --workspace-concurrency=-1 after subcommand");
     assert_eq!(negative.workspace.ordering.concurrency, Some(-1));
+
+    let infinite =
+        CliArgs::try_parse_from(["pacquet", "--workspace-concurrency=Infinity", "install"])
+            .expect("parses --workspace-concurrency=Infinity");
+    assert_eq!(infinite.workspace.ordering.concurrency, Some(i32::MAX));
+
+    CliArgs::try_parse_from(["pacquet", "--workspace-concurrency=many", "install"])
+        .expect_err("rejects a non-numeric --workspace-concurrency");
 }
 
 #[test]
@@ -382,7 +452,7 @@ fn recursive_by_default_command_is_promoted_inside_workspace() {
     let workspace = tempfile::tempdir().expect("creates workspace");
     std::fs::write(workspace.path().join("pnpm-workspace.yaml"), "packages: []\n")
         .expect("writes workspace manifest");
-    for command in ["install", "dedupe", "import", "list", "why", "peers"] {
+    for command in ["install", "dedupe", "prune", "import", "list", "why", "peers"] {
         let mut parsed = CliArgs::try_parse_from([
             "pacquet",
             "--dir",
@@ -397,6 +467,34 @@ fn recursive_by_default_command_is_promoted_inside_workspace() {
         parsed.promote_recursive_by_default();
 
         assert!(parsed.workspace.recursive, "{command} should be recursive inside a workspace");
+    }
+}
+
+#[test]
+fn list_stays_non_recursive_in_workspace_subdirectory() {
+    let workspace = tempfile::tempdir().expect("creates workspace");
+    std::fs::write(workspace.path().join("pnpm-workspace.yaml"), "packages:\n  - 'packages/*'\n")
+        .expect("writes workspace manifest");
+    let pkg_dir = workspace.path().join("packages/pkg");
+    std::fs::create_dir_all(&pkg_dir).expect("creates package dir");
+    std::fs::write(pkg_dir.join("package.json"), r#"{"name": "pkg", "version": "1.0.0"}"#)
+        .expect("writes package.json");
+
+    for command in ["list", "ll"] {
+        let mut parsed = CliArgs::try_parse_from([
+            "pacquet",
+            "--dir",
+            pkg_dir.to_str().expect("UTF-8 path"),
+            command,
+        ])
+        .expect("parses");
+
+        parsed.promote_recursive_by_default();
+
+        assert!(
+            !parsed.workspace.recursive,
+            "{command} should not be promoted to recursive in a workspace subdirectory",
+        );
     }
 }
 
@@ -422,7 +520,8 @@ fn color_accepts_modes_and_boolean_spellings() {
 #[test]
 fn recursive_by_default_command_stays_non_recursive_outside_workspace() {
     let project = tempfile::tempdir().expect("creates project");
-    for command in ["dedupe", "list", "why", "peers"] {
+    std::fs::write(project.path().join("package.json"), "{}\n").expect("writes package.json");
+    for command in ["dedupe", "prune", "list", "why", "peers"] {
         let mut parsed = CliArgs::try_parse_from([
             "pacquet",
             "--dir",
@@ -650,4 +749,23 @@ fn workspace_root_tolerates_a_dir_that_does_not_exist() {
 
     assert_eq!(args.paths.dir, canonical);
     drop(root); // cleanup
+}
+
+#[test]
+fn configured_reporter_applies_when_cli_reporter_unset() {
+    let parsed = CliArgs::try_parse_from(["pacquet", "install"]).expect("parses");
+    assert!(matches!(
+        parsed.effective_reporter_with_config(None, Some(pnpm_config::ReporterType::Ndjson)),
+        ReporterType::Ndjson
+    ));
+}
+
+#[test]
+fn cli_reporter_takes_precedence_over_configured_reporter() {
+    let parsed = CliArgs::try_parse_from(["pacquet", "--reporter", "append-only", "install"])
+        .expect("parses");
+    assert!(matches!(
+        parsed.effective_reporter_with_config(None, Some(pnpm_config::ReporterType::Silent)),
+        ReporterType::AppendOnly
+    ));
 }

@@ -1,6 +1,75 @@
-//! npm package-name validation using the `validForOldPackages` rules.
+//! npm package-name validation for dependencies and new publications.
 
 pub use is_valid_old_npm_package_name as is_valid_dependency_alias;
+
+/// Whether `version` is a valid package version component for the filesystem.
+/// Rejects path traversal (`..`), path separators (`/`, `\`), current directory (`.`),
+/// and empty strings.
+#[must_use]
+pub fn is_valid_package_version(version: &str) -> bool {
+    let mut components = std::path::Path::new(version).components();
+    !version.is_empty()
+        && !version.contains(['/', '\\'])
+        && matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none()
+}
+
+/// Whether npm's `validate-npm-package-name` v7 accepts `name` for new packages.
+#[must_use]
+pub fn is_valid_new_npm_package_name(name: &str) -> bool {
+    let basename = name.rsplit('/').next().unwrap_or(name);
+    is_valid_old_npm_package_name(name)
+        && name.len() <= 214
+        && !name.bytes().any(|byte| byte.is_ascii_uppercase())
+        && !basename.contains(['~', '\'', '!', '(', ')', '*'])
+        && !BUILTIN_MODULES.contains(&name)
+}
+
+// validate-npm-package-name's built-ins that can pass the old-name grammar.
+const BUILTIN_MODULES: &[&str] = &[
+    "assert",
+    "async_hooks",
+    "buffer",
+    "child_process",
+    "cluster",
+    "console",
+    "constants",
+    "crypto",
+    "dgram",
+    "diagnostics_channel",
+    "dns",
+    "domain",
+    "events",
+    "fs",
+    "http",
+    "http2",
+    "https",
+    "inspector",
+    "module",
+    "net",
+    "os",
+    "path",
+    "perf_hooks",
+    "process",
+    "punycode",
+    "querystring",
+    "readline",
+    "repl",
+    "stream",
+    "string_decoder",
+    "sys",
+    "timers",
+    "tls",
+    "trace_events",
+    "tty",
+    "url",
+    "util",
+    "v8",
+    "vm",
+    "wasi",
+    "worker_threads",
+    "zlib",
+];
 
 /// Whether npm's `validate-npm-package-name` v7 accepts `name` for old packages.
 /// Warning-only names remain valid, including uppercase names and legacy lengths.

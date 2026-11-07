@@ -3,7 +3,7 @@ use pnpm_config::{Config, NeedsFullMetadataFor};
 use pnpm_lockfile::Lockfile;
 use pnpm_network::{AuthHeaders, ThrottledClient};
 use pnpm_resolving_npm_resolver::InMemoryPackageMetaCache;
-use pnpm_resolving_resolver_base::PreferredVersions;
+use pnpm_resolving_resolver_base::{PreferredVersions, PreferredVersionsOverlay};
 use pnpm_store_dir::{
     SharedReadonlyStoreIndex, SharedVerifiedFilesCache, StoreDir, StoreIndexWriter,
 };
@@ -22,9 +22,16 @@ pub(crate) struct WorkspaceLifecycleHooks {
     pub finalized_package: Option<pnpm_resolving_deps_resolver::FinalizedPackageFn>,
 }
 
+/// Each importer's root preference layer of the specifiers its manifest
+/// declares, keyed by importer id.
+pub(crate) type OwnManifestSpecifiers = BTreeMap<String, Arc<PreferredVersionsOverlay>>;
+
 pub(crate) struct ImporterVersionSeeds<'a> {
     pub shared: &'a Arc<PreferredVersions>,
     pub by_importer: &'a BTreeMap<String, Arc<PreferredVersions>>,
+    /// Each importer's own manifest specifiers, when the seeds leave out other
+    /// projects' specifiers. `None` when those steer every project.
+    pub own_manifest_specifiers: Option<&'a OwnManifestSpecifiers>,
     /// See [`crate::resolution_policy::PickPolicy`].
     pub pick_lowest: bool,
     pub published_by: Option<chrono::DateTime<chrono::Utc>>,
@@ -46,11 +53,15 @@ pub(crate) struct ResolverFetchContext<'a> {
     /// Whether a resolved tarball is prefetched — `false` for a run
     /// whose install pass will never ask for those bytes.
     pub prefetch: bool,
+    /// Where a run that fetches into the store keeps the download tasks
+    /// the prefetch spawns, to wait for them.
+    pub tracked: Option<&'a Arc<crate::PrefetchDownloads>>,
 }
 
 pub(crate) struct ResolverRegistryContext<'a> {
     pub named: &'a HashMap<String, String>,
     pub by_prefix: &'a HashMap<String, String>,
+    pub declared: &'a pnpm_lockfile::DeclaredRegistryPrefixes,
     pub cache: &'a Arc<InMemoryPackageMetaCache>,
     /// See `NpmResolver::full_metadata` — forced on when `time-based`
     /// resolution or the `no-downgrade` trust policy needs the
@@ -82,6 +93,16 @@ pub(crate) struct ReuseLockfileInputs<'a> {
     /// the reuse-verbatim path shares it instead of deep-copying.
     pub shared: Option<&'a Arc<Lockfile>>,
     pub extensions_checksum: Option<&'a str>,
+    /// The `pnpmfileChecksum` this install would record, against the one
+    /// the candidate holds. A pnpmfile's `readPackage` rewrites the
+    /// manifests the recorded subtrees were resolved from, so a drifted
+    /// checksum means they describe manifests this install no longer sees
+    /// (<https://github.com/pnpm/pnpm/issues/3735>). That holds for an
+    /// `ignorePnpmfile` run as well: it answers `None`, so it resolves
+    /// without the snapshots the pnpmfile shaped even though the freshness
+    /// gates leave the checksum uncompared.
+    pub pnpmfile_checksum: Option<&'a str>,
+    pub untracked_pnpmfile_read_package_hook: Option<bool>,
     pub parsed_overrides: Option<&'a [pnpm_config_parse_overrides::VersionOverride]>,
     pub resolved_overrides: Option<&'a IndexMap<String, String>>,
 }
@@ -90,20 +111,16 @@ impl<'a> ImporterVersionSeeds<'a> {
     pub(super) fn for_importer(&self, id: &str) -> &'a Arc<PreferredVersions> {
         self.by_importer.get(id).unwrap_or(self.shared)
     }
+
+    pub(super) fn own_manifest_specifiers_of(
+        &self,
+        id: &str,
+    ) -> Option<Arc<PreferredVersionsOverlay>> {
+        self.own_manifest_specifiers?.get(id).map(Arc::clone)
+    }
 }
 
 pub(crate) struct FreshLockfilePrior<'a> {
-    /// The previous run's lockfile importer entries, threaded into the
-    /// pnpm/pnpm#10433 guard so an untouched workspace dependency keeps
-    /// its prior `link:` entry. `None` on a first install.
-    pub importers: Option<&'a HashMap<String, pnpm_lockfile::ProjectSnapshot>>,
-    /// How this install reuses the prior resolution (from the `pacquet
-    /// update` seed policy), also consumed by the pnpm/pnpm#10433 guard.
-    pub scope: pnpm_resolving_deps_resolver::UpdateReuseScope,
-    /// Per-importer update scopes (the `ByImporter` policy of a recursive
-    /// update), so the guard honors `pacquet update <name> --recursive`
-    /// targeting per importer rather than the workspace-wide default.
-    pub scopes_by_importer: BTreeMap<String, pnpm_resolving_deps_resolver::UpdateReuseScope>,
     /// The previous run's lockfile: its `packages:` seed the reuse and its
     /// `time:` is layered under this run's. `None` on a first install.
     pub lockfile: Option<&'a Lockfile>,
@@ -114,6 +131,7 @@ pub(crate) struct FreshLockfileResolution<'a> {
     pub direct_by_importer:
         &'a BTreeMap<String, BTreeMap<String, pnpm_resolving_deps_resolver::DepPath>>,
     pub overrides: Option<IndexMap<String, String>>,
+    pub include_peer_dependencies: bool,
     /// Publish dates this run resolved for the direct dependencies,
     /// layered over the ones [`FreshLockfilePrior::lockfile`] recorded. Empty
     /// unless the install resolved `time-based`.
@@ -125,6 +143,9 @@ pub(crate) struct LockfilePersistenceOptions<'a> {
     pub dir: &'a Path,
     pub dry_run: bool,
     pub save: bool,
+    /// Receives the wanted lockfile's text in place of the file. See
+    /// [`crate::Install::run_lockfile_check`].
+    pub check_sink: Option<&'a crate::LockfileCheckSink>,
     pub hook: Option<&'a Arc<dyn pnpm_hooks::PnpmfileHooks>>,
     pub log: Option<pnpm_hooks::LogFn>,
 }

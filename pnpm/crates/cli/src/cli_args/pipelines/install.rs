@@ -1,14 +1,46 @@
 use super::{
-    Arc, Config, Context, DedicatedProjectRuns, InstallArgs, InstallFamilyPlan, Path, PathBuf,
-    Reporter, State, ThrottledClient, config_deps, dedicated_project_name,
-    discover_workspace_projects, ecosystem_install, init_dedicated_project_state, project_names,
-    select_install_family_plan,
+    Arc, Config, Context, DedicatedProjectRuns, DedicatedProjects, IndexMap, InstallArgs,
+    InstallFamily, InstallFamilyPlan, Path, PathBuf, Reporter, RuntimePolicy, State,
+    ThrottledClient, dedicated_project_name, discover_workspace_projects, ecosystem_install,
+    injected_source_dirs, pipelined_runs::early_starts, prepare_root_config, project_dependencies,
+    project_names, select_install_family,
 };
+use crate::cli_args::recursive::{AutoExcludeRoot, select_recursive_projects};
+use derive_more::{Display, Error};
+use miette::Diagnostic;
+use tracing::Instrument as _;
+
+/// A plain install outside a workspace found no project manifest. Only
+/// `pnpm add` and `pnpm link` create one.
+#[derive(Debug, Display, Error, Diagnostic)]
+#[display("No package.json found in {}", dir.display())]
+#[diagnostic(code(ERR_PNPM_NO_PKG_MANIFEST))]
+pub(crate) struct NoPkgManifest {
+    #[error(not(source))]
+    pub(crate) dir: PathBuf,
+}
+
+/// Fail a non-recursive install outside a workspace that has no manifest
+/// to install from. A workspace root may lack a manifest.
+///
+/// Call it before anything the command writes, removes, or fetches.
+pub(crate) fn ensure_project_manifest(
+    cfg: &Config,
+    manifest_path: &Path,
+) -> Result<(), NoPkgManifest> {
+    let dir = manifest_path.parent().expect("manifest path always has a parent dir");
+    if cfg.recursive
+        || cfg.workspace_dir.is_some()
+        || pnpm_package_manifest::project_manifest_path(dir).is_file()
+    {
+        return Ok(());
+    }
+    Err(NoPkgManifest { dir: dir.to_path_buf() })
+}
 
 /// The reporter-generic body of `pacquet install`: it threads one `Reporter`
 /// type through config-dependency sync, the `updateConfig` hooks, and the
-/// install itself. Lifting it out of the dispatch keeps the three
-/// `ReporterType` arms to a single line each.
+/// install itself.
 pub(crate) struct InstallPipeline {
     pub(crate) args: InstallArgs,
     pub(crate) cfg: &'static mut Config,
@@ -29,15 +61,19 @@ impl InstallPipeline {
     pub(crate) async fn run_with_config<Reporter: self::Reporter + 'static>(
         self,
     ) -> miette::Result<&'static Config> {
-        config_deps::prepare::<Reporter>(self.cfg, &self.config_root, self.frozen_lockfile).await?;
+        let root_config = (&*self.manifest_path, &mut *self.cfg, &*self.config_root);
+        prepare_root_config::<Reporter>(
+            root_config,
+            (self.frozen_lockfile, RuntimePolicy::Config(self.args.materialization.no_runtime)),
+        )
+        .instrument(tracing::debug_span!(target: "pacquet::install", "prepare_config"))
+        .await?;
+        if self.args.finished_from_records_after_config(&self.prefix, self.cfg, Reporter::emit) {
+            return Ok(self.cfg);
+        }
         // Built ahead of project discovery so a run that is certain to
         // read the wanted lockfile parses it on a background thread
-        // while discovery walks the workspace. Certain means the fast
-        // "Already up to date" return cannot fire: it is off under
-        // `--frozen-lockfile` / `--force`, and it requires a workspace
-        // state from a previous install — a workspace with none on
-        // disk (a lockfile-only workflow never writes one) always
-        // reaches the full pipeline. A `--fix-lockfile` run reads
+        // while discovery walks the workspace. A `--fix-lockfile` run reads
         // through the separate repair loader, which this prefetch does
         // not feed. Only the shared-lockfile arms consume this
         // lockfile; the per-project arms load their own.
@@ -51,36 +87,55 @@ impl InstallPipeline {
         {
             lockfile.prefetch();
         }
-        let plan = select_install_family_plan::<Reporter>(
+        let family = self.select_install_family::<Reporter>(certain_full_install)?;
+        let installs_node = match &family.plan {
+            InstallFamilyPlan::PerProject(projects) => !projects.is_empty(),
+            InstallFamilyPlan::Shared(selection) => !selection.selected_dirs.is_empty(),
+            InstallFamilyPlan::Single => true,
+        };
+        if !ecosystem_install::is_enabled(self.cfg) {
+            if let Some(unmatched) = family.unmatched {
+                return Err(unmatched.report());
+            }
+            if !installs_node {
+                return Ok(self.cfg);
+            }
+        }
+
+        self.run_prepared::<Reporter>(family, lockfile).await
+    }
+
+    /// [`select_install_family`] inside the `discover_workspace_projects`
+    /// span.
+    fn select_install_family<Reporter: self::Reporter>(
+        &self,
+        certain_full_install: bool,
+    ) -> miette::Result<InstallFamily> {
+        let _span = tracing::debug_span!(target: "pacquet::install", "discover_workspace_projects")
+            .entered();
+        select_install_family::<Reporter>(
             self.cfg,
             &self.prefix,
             &self.manifest_path,
             self.recursive_sort,
             false,
             certain_full_install,
-        )?;
-        let installs_node = match &plan {
-            InstallFamilyPlan::PerProject(projects) => !projects.is_empty(),
-            InstallFamilyPlan::Shared(selection) => !selection.selected_dirs.is_empty(),
-            InstallFamilyPlan::Single => true,
-        };
-        if !installs_node && !ecosystem_install::is_enabled(self.cfg) {
-            return Ok(self.cfg);
-        }
-
-        self.run_prepared::<Reporter>(plan, lockfile).await
+        )
     }
 
     async fn run_prepared<Reporter: self::Reporter + 'static>(
         self,
-        plan: InstallFamilyPlan,
+        family: InstallFamily,
         lockfile: Option<pnpm_lockfile::LazyLockfile>,
     ) -> miette::Result<&'static Config> {
-        let http_client =
-            State::new_http_client(self.cfg).wrap_err("initialize the install network")?;
+        let http_client = {
+            let _span =
+                tracing::debug_span!(target: "pacquet::install", "build_http_client").entered();
+            State::new_http_client(self.cfg).wrap_err("initialize the install network")?
+        };
         if !ecosystem_install::is_enabled(self.cfg) {
             run_node_install::<Reporter>(
-                plan,
+                family.plan,
                 self.args,
                 self.cfg,
                 self.manifest_path,
@@ -91,7 +146,16 @@ impl InstallPipeline {
             .await?;
             return Ok(self.cfg);
         }
-        let ecosystem_plan = ecosystem_install::plan::<Reporter>(
+        self.run_with_ecosystems::<Reporter>(family, lockfile, http_client).await
+    }
+
+    async fn run_with_ecosystems<Reporter: self::Reporter + 'static>(
+        self,
+        family: InstallFamily,
+        lockfile: Option<pnpm_lockfile::LazyLockfile>,
+        http_client: Arc<ThrottledClient>,
+    ) -> miette::Result<&'static Config> {
+        let ecosystem = ecosystem_install::plan::<Reporter>(
             ecosystem_install::InstallContext {
                 config: self.cfg,
                 http_client: Arc::clone(&http_client),
@@ -99,11 +163,19 @@ impl InstallPipeline {
                 frozen_lockfile: self.frozen_lockfile,
             },
             self.config_root,
+            &self.prefix,
             &self.args.dependency_options,
+            family.scope.as_ref(),
         )
         .await?;
+        // A selector that named no npm project may have named a Python one.
+        if let Some(unmatched) = family.unmatched
+            && ecosystem.python.selected == 0
+        {
+            return Err(unmatched.counting(ecosystem.python.discovered).report());
+        }
         let node_install = run_node_install::<Reporter>(
-            plan,
+            family.plan,
             self.args,
             self.cfg,
             self.manifest_path,
@@ -111,7 +183,7 @@ impl InstallPipeline {
             lockfile,
             http_client,
         );
-        ecosystem_plan
+        ecosystem.plan
             .with_task(pnpm_install_coordinator::InstallTask::in_place(Vec::new(), node_install))
             .run()
             .await?;
@@ -145,11 +217,14 @@ async fn run_node_install<Reporter: self::Reporter + 'static>(
         InstallFamilyPlan::PerProject(projects) => {
             DedicatedProjectRuns {
                 config: cfg,
-                projects,
+                projects: *projects,
                 require_lockfile,
                 http_client: Some(Arc::clone(&http_client)),
+                prune_excludes: !args.materialization.dry_run,
+                sync_injected_deps: !(args.lockfile.only || args.materialization.dry_run),
+                pipelined: true,
             }
-            .run(|state| Box::pin(args.clone().run::<Reporter>(state)))
+            .run::<Reporter, _, _>(|state| Box::pin(args.clone().run::<Reporter>(state)))
             .await
         }
         InstallFamilyPlan::Shared(selection) => {
@@ -200,7 +275,11 @@ pub(super) fn init_shared_state(
 /// pnpm's dedicated-lockfile per-project loop in its recursive
 /// dispatch. The workspace root participates when it has a manifest,
 /// matching the project set a shared-lockfile workspace install covers.
-pub(super) async fn run_dedicated_lockfile_workspace_install<Reporter: self::Reporter + 'static>(
+/// Projects whose workspace dependencies have finished run concurrently
+/// under `workspaceConcurrency`, as a recursive install does.
+pub(in crate::cli_args) async fn run_dedicated_lockfile_workspace_install<
+    Reporter: self::Reporter + 'static,
+>(
     args: &super::super::install::InstallArgs,
     cfg: &Config,
     workspace_root: &Path,
@@ -210,37 +289,70 @@ pub(super) async fn run_dedicated_lockfile_workspace_install<Reporter: self::Rep
     let (projects, _patterns) = discover_workspace_projects(workspace_root, cfg)?;
     let mut names = project_names(cfg, &projects);
     let normalized_root = pnpm_fs::lexical_normalize(workspace_root);
-    let mut project_dirs: Vec<PathBuf> = Vec::with_capacity(projects.len() + 1);
-    if workspace_root.join("package.json").is_file()
+    let mut dependencies = IndexMap::with_capacity(projects.len() + 1);
+    let mut other_dirs = Vec::new();
+    if pnpm_package_manifest::project_manifest_path(workspace_root).is_file()
         && !projects
             .iter()
             .any(|project| pnpm_fs::lexical_normalize(&project.root_dir) == normalized_root)
     {
-        project_dirs.push(workspace_root.to_path_buf());
+        dependencies.insert(workspace_root.to_path_buf(), Vec::new());
+        other_dirs.push(workspace_root.to_path_buf());
         // The root is installed alongside the discovered projects but is
         // not one of them, so its name is not in the map yet.
         if let Some(name) = dedicated_project_name(cfg, workspace_root) {
             names.insert(workspace_root.to_path_buf(), name);
         }
     }
-    project_dirs.extend(projects.into_iter().map(|project| project.root_dir));
-    // One `Config::leak` per project: `State::init` needs a
-    // `&'static Config`, and a leaked shared reference can't be
-    // reclaimed for the next iteration. The leak is bounded by the
-    // project count, happens once per CLI invocation, and is
-    // reclaimed at process exit — the same lifetime deploy's derived
-    // install config has.
-    for project_dir in project_dirs {
-        let state = init_dedicated_project_state(
-            cfg,
-            &project_dir,
-            names.get(&project_dir).map(String::as_str),
-            require_lockfile,
-            Some(Arc::clone(&http_client)),
-        )?;
-        Box::pin(args.clone().run::<Reporter>(state)).await?;
+    let injected_source_dirs = dedicated_injected_source_dirs(&projects, &other_dirs)?;
+    let selection =
+        select_recursive_projects(&projects, cfg, workspace_root, AutoExcludeRoot::Disabled)?;
+    dependencies.extend(project_dependencies(&selection, cfg.sort));
+    DedicatedProjectRuns {
+        config: cfg,
+        projects: DedicatedProjects {
+            dependencies,
+            names,
+            covers_workspace: true,
+            injected_source_dirs,
+            early_starts: early_starts(cfg, &projects),
+            workspace: pnpm_package_manager::DiscoveredWorkspace::new(projects),
+        },
+        require_lockfile,
+        http_client: Some(http_client),
+        prune_excludes: !args.materialization.dry_run,
+        sync_injected_deps: !(args.lockfile.only || args.materialization.dry_run),
+        pipelined: true,
     }
-    Ok(())
+    .run::<Reporter, _, _>(|state| Box::pin(args.clone().run::<Reporter>(state)))
+    .await
+}
+
+/// See [`injected_source_dirs`]. `other_dirs` are the directories installed
+/// alongside `projects` without being discovered, such as the workspace
+/// root. Their manifests are read here, before any lifecycle script runs.
+fn dedicated_injected_source_dirs(
+    projects: &[pnpm_workspace::Project],
+    other_dirs: &[PathBuf],
+) -> miette::Result<std::collections::HashSet<PathBuf>> {
+    let other_manifests = other_dirs
+        .iter()
+        .map(|dir| {
+            pnpm_package_manifest::safe_read_project_manifest_from_dir(dir)
+                .map_err(miette::Report::new)
+        })
+        .collect::<miette::Result<Vec<_>>>()?;
+    Ok(injected_source_dirs(
+        projects
+            .iter()
+            .map(|project| (project.root_dir.as_path(), Some(project.manifest.value())))
+            .chain(
+                other_dirs
+                    .iter()
+                    .map(PathBuf::as_path)
+                    .zip(other_manifests.iter().map(Option::as_ref)),
+            ),
+    ))
 }
 
 async fn run_single_node_install<Reporter: self::Reporter + 'static>(
@@ -272,3 +384,7 @@ async fn run_single_node_install<Reporter: self::Reporter + 'static>(
     )?;
     Box::pin(args.run::<Reporter>(state)).await
 }
+
+#[cfg(test)]
+#[path = "install_tests.rs"]
+mod install_tests;

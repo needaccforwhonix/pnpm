@@ -1,4 +1,4 @@
-use crate::{StoreDir, register_project};
+use crate::{InUse, StoreDir, register_project};
 use pnpm_fs::symlink_dir;
 use std::{fs, path::PathBuf};
 use tempfile::tempdir;
@@ -29,7 +29,9 @@ fn make_slot(
 fn prune_is_noop_without_links_dir() {
     let store = tempdir().unwrap();
     let store_dir = StoreDir::new(store.path().to_path_buf());
-    store_dir.prune().expect("missing links/ must be a silent no-op");
+    store_dir
+        .prune(&store_dir.root().join("cache"), &[])
+        .expect("missing links/ must be a silent no-op");
 }
 
 /// `prune()` does nothing destructive when no projects are
@@ -41,8 +43,46 @@ fn prune_keeps_everything_when_no_projects() {
     let store = tempdir().unwrap();
     let store_dir = StoreDir::new(store.path().to_path_buf());
     let slot = make_slot(&store_dir.links(), "@", "left-pad", "1.0.0", "deadbeef");
-    store_dir.prune().expect("prune");
+    store_dir
+        .prune(&store_dir.root().join("cache"), &[])
+        .expect("prune");
     assert!(slot.exists(), "no-project prune must leave slots intact");
+}
+
+#[test]
+fn prune_keeps_everything_when_no_registered_project_uses_the_links() {
+    let store = tempdir().unwrap();
+    let store_dir = StoreDir::new(store.path().to_path_buf());
+    let slot = make_slot(&store_dir.links(), "@", "left-pad", "1.0.0", "deadbeef");
+    let project = tempdir().unwrap();
+    fs::create_dir_all(project.path().join("node_modules/left-pad")).unwrap();
+    register_project(&store_dir, project.path()).expect("register");
+
+    store_dir
+        .prune(&store_dir.root().join("cache"), &[])
+        .expect("prune");
+
+    assert!(slot.exists());
+}
+
+#[test]
+fn prune_keeps_slots_linked_from_a_configured_modules_dir() {
+    let store = tempdir().unwrap();
+    let store_dir = StoreDir::new(store.path().join("store"));
+    let slot = make_slot(&store_dir.links(), "@", "custom", "1.0.0", "custom1");
+    let project = tempdir().unwrap();
+    let modules_dir = project.path().join("custom_modules");
+    fs::create_dir_all(&modules_dir).unwrap();
+    symlink_dir(&slot.join("node_modules/custom"), &modules_dir.join("custom")).unwrap();
+    register_project(&store_dir, project.path()).expect("register");
+
+    store_dir
+        .prune_keeping(&store_dir.root().join("cache"), &[], || {
+            Ok(InUse { modules_dirs: vec![modules_dir], ..InUse::default() })
+        })
+        .expect("prune");
+
+    assert!(slot.exists(), "slot linked from the configured modules dir must survive");
 }
 
 #[test]
@@ -81,7 +121,9 @@ fn prune_removes_dead_project_slots_and_keeps_live_slots() {
     drop(dead_project);
     assert!(!dead_path.exists());
 
-    store_dir.prune().expect("prune");
+    store_dir
+        .prune(&store_dir.root().join("cache"), &[])
+        .expect("prune");
 
     assert!(live_slot.exists(), "slot referenced by live project must survive");
     assert!(!dead_slot.exists(), "slot only referenced by dead project must be swept");
@@ -129,7 +171,9 @@ fn prune_keeps_slot_referenced_by_any_surviving_project() {
     drop(b_project);
     assert!(!b_path.exists());
 
-    store_dir.prune().expect("prune");
+    store_dir
+        .prune(&store_dir.root().join("cache"), &[])
+        .expect("prune");
     assert!(shared_slot.exists(), "shared slot survives when one referencer remains");
 }
 
@@ -153,7 +197,9 @@ fn prune_removes_orphan_slot_unreferenced_by_any_project() {
     .unwrap();
     register_project(&store_dir, project.path()).expect("register");
 
-    store_dir.prune().expect("prune");
+    store_dir
+        .prune(&store_dir.root().join("cache"), &[])
+        .expect("prune");
     assert!(referenced.exists(), "referenced slot survives");
     assert!(!orphan.exists(), "orphan slot must be swept");
 }
@@ -181,7 +227,101 @@ fn prune_marks_transitive_slot_reachable() {
     .unwrap();
     register_project(&store_dir, project.path()).expect("register");
 
-    store_dir.prune().expect("prune");
+    store_dir
+        .prune(&store_dir.root().join("cache"), &[])
+        .expect("prune");
     assert!(foo.exists(), "direct dep slot survives");
     assert!(bar.exists(), "transitive dep slot also survives");
+}
+
+#[test]
+fn nonexistent_loader_roots_cannot_escape_links_through_parent_components() {
+    let temporary = tempdir().unwrap();
+    let links = temporary.path().join("links");
+    fs::create_dir_all(&links).unwrap();
+    let links = dunce::canonicalize(links).unwrap();
+    for target in [
+        links.join("../outside/node_modules/missing"),
+        links.join("scope/name/../../../../outside/node_modules/missing"),
+        links.join("node_modules/missing"),
+    ] {
+        assert_eq!(super::mark::store_slot_from_target(&target, &links), None);
+    }
+    let slot = PathBuf::from("scope/name/1/hash");
+    assert_eq!(
+        super::mark::store_slot_from_target(
+            &links.join(&slot).join("node_modules/missing"),
+            &links
+        ),
+        Some(slot),
+    );
+}
+
+#[test]
+fn loaded_project_with_nonhidden_local_store_does_not_mark_unused_store_slots() {
+    for store_path in ["store", "node_modules/store"] {
+        let project = tempdir().unwrap();
+        let store = StoreDir::new(project.path().join(store_path));
+        let live = make_slot(&store.links(), "@", "live", "1", "hash");
+        let dead_parent = make_slot(&store.links(), "@", "dead-parent", "1", "hash");
+        let dead_child = make_slot(&store.links(), "@", "dead-child", "1", "hash");
+        symlink_dir(
+            &dead_child.join("node_modules/dead-child"),
+            &dead_parent.join("node_modules/dead-child"),
+        )
+        .unwrap();
+        crate::register_loaded_project(&store, project.path()).unwrap();
+        fs::write(
+            project.path().join(crate::CAS_MANIFEST_FILENAME),
+            serde_json::json!({
+                "version": 1, "storeDir": store.root(),
+                "packages": {"live": {"root": live.join("node_modules/live"), "resolution": "node"}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        store
+            .prune(&store.root().join("cache"), &[])
+            .unwrap();
+        assert!(live.is_dir());
+        assert!(!dead_parent.exists());
+        assert!(!dead_child.exists());
+    }
+}
+
+#[test]
+fn prune_keeping_keeps_in_use_files_and_their_rows() {
+    let root = tempdir().unwrap();
+    let store = StoreDir::new(root.path().join("store"));
+    let digest = |head: &str| format!("{head}{}", "a".repeat(126));
+    let in_use = store.file_path_by_hex_str(&digest("01"), "");
+    let unused = store.file_path_by_hex_str(&digest("02"), "");
+    let index = crate::StoreIndex::open_in(&store).unwrap();
+    for (key, path, digest) in
+        [("in-use", &in_use, digest("01")), ("unused", &unused, digest("02"))]
+    {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "{}").unwrap();
+        let file = crate::CafsFileInfo { digest, mode: 0o644, size: 2, checked_at: None };
+        let row = crate::PackageFilesIndex {
+            files: std::iter::once(("package.json".to_string(), file)).collect(),
+            ..crate::PackageFilesIndex::default()
+        };
+        index.set(key, &row).unwrap();
+    }
+    drop(index);
+
+    store
+        .prune_keeping(&store.root().join("cache"), &[], || {
+            Ok(InUse { files: std::iter::once(in_use.clone()).collect(), ..InUse::default() })
+        })
+        .unwrap();
+
+    assert!(in_use.exists());
+    assert!(!unused.exists());
+    let keys = crate::StoreIndex::open_in(&store)
+        .unwrap()
+        .keys()
+        .unwrap();
+    assert_eq!(keys, ["in-use"]);
 }

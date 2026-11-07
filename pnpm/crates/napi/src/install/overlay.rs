@@ -55,7 +55,9 @@ fn build_layout_overlay(
         cache_dir: options.cache_dir.as_ref().map(PathBuf::from),
         pnpm_home_dir: options.pnpm_home_dir.as_ref().map(PathBuf::from),
         virtual_store_only: fetch_shaped.then_some(true),
-        enable_modules_dir: fetch_shaped.then_some(true),
+        // The engine reads `enableModulesDir: false` from the config: no
+        // `node_modules`, every package fetched into the store.
+        enable_modules_dir: if fetch_shaped { Some(true) } else { options.enable_modules_dir },
         registry: None,
         registries: options.registries
             .as_ref()
@@ -124,6 +126,8 @@ fn build_dependencies_overlay(
         prefer_frozen_lockfile: options.prefer_frozen_lockfile,
         dedupe_peer_dependents: options.dedupe_peer_dependents,
         dedupe_peers: options.dedupe_peers,
+        add_missing_peer_types: options.add_missing_peer_types,
+        project_scoped_optional_peers: options.project_scoped_optional_peers,
         dedupe_direct_deps: options.dedupe_direct_deps,
         dedupe_injected_deps: options.dedupe_injected_deps,
         resolve_peers_from_workspace_root: options.resolve_peers_from_workspace_root,
@@ -306,6 +310,7 @@ fn parse_node_linker(value: &str) -> Option<pnpm_config::NodeLinker> {
         "hoisted" => Some(pnpm_config::NodeLinker::Hoisted),
         "isolated" => Some(pnpm_config::NodeLinker::Isolated),
         "pnp" => Some(pnpm_config::NodeLinker::Pnp),
+        "loaded" => Some(pnpm_config::NodeLinker::Loaded),
         _ => None,
     }
 }

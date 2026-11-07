@@ -2,12 +2,7 @@
 //! the registry.
 //!
 //! Ported from the upstream suite `registry-access/commands/test/unpublish.ts`
-//! plus the error paths its handler defines: the missing-name / not-found /
-//! no-versions / no-matching-versions errors, the `--force` protection for a
-//! full unpublish (also when a range matches every version), the partial
-//! unpublish `PUT` (versions removed, dist-tags re-pointed, `latest`
-//! reassigned), tolerated tarball-delete 404s, the 405/401 registry
-//! answers, and the OTP challenge handling a 2FA-enforced account needs.
+//! plus the error paths its handler defines.
 //!
 //! The registry is a `mockito` server; an empty `--npmrc-auth-file` keeps the
 //! developer's real `~/.npmrc` from influencing the test.
@@ -15,7 +10,7 @@
 use assert_cmd::prelude::*;
 use command_extra::CommandExtra;
 use mockito::Matcher;
-use pnpm_testing_utils::bin::CommandTempCwd;
+use pnpm_testing_utils::{bin::CommandTempCwd, diagnostics::assert_diagnostic_contains};
 use serde_json::json;
 use std::{
     fs,
@@ -200,6 +195,12 @@ fn a_range_matching_every_version_is_a_full_unpublish() {
     assert!(!output.status.success(), "removing every version needs --force too");
     let stderr = stderr_of(&output);
     assert!(stderr.contains("ERR_PNPM_UNPUBLISH_CONFIRM"), "{stderr}");
+    assert_diagnostic_contains(
+        &stderr,
+        "test-pkg@>=0.0.1 matches every published version (0.0.1, 0.0.2).",
+    );
+    assert_diagnostic_contains(&stderr, r#"Run pnpm unpublish "test-pkg@>=0.0.1" --force"#);
+    assert!(!stderr.contains("@<version>"), "the range was a specific version request: {stderr}");
     drop((root, server));
 }
 

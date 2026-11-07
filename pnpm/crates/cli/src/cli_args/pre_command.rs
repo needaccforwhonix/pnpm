@@ -3,59 +3,57 @@
 //! running. A pnpm pin with `onFail: "download"` switches the CLI to the
 //! wanted version; every other pin is validated in place and fails or warns.
 //! A pin that persists to the lockfile is also recorded there, whatever the
-//! command — see [`env_lockfile_sync`].
+//! command — see [`env_lockfile_sync_from_loaded`].
 //!
 //! Mirrors the block at the top of pnpm's `pnpm/src/main.ts`.
 
-pub(crate) use execute::execute_plan;
+pub(crate) use execute::{PlanExecution, execute_plan, execute_plan_reusing_config};
+pub(crate) use input::{EntryPoint, Invocation, is_global, should_skip_command};
+pub(in crate::cli_args) use load_config::{apply_cli_layers, seed_config};
+pub(crate) use pin::{PinDecision, PinInput, decide};
 
 mod system_runtime_version;
 
 use super::{
-    cli_command::{CliArgs, CliCommand},
-    config::{ConfigLocation, ConfigSubcommand},
-    install::{InstallArgs, resolve_bool_override},
-    lockfile_dir::LockfileDirArg,
+    cli_command::{CliCommand, CliNetworkArgs},
     package_manager::{
-        PACKAGE_MANAGER_SWITCH_ENV_VARS, PackageManagerToSync, WantedPackageManager,
-        package_manager_to_sync, read_manifest_json, should_persist_package_manager_lockfile,
-        version_satisfies, wanted_package_manager,
+        PACKAGE_MANAGER_SWITCH_ENV_VARS, PackageManagerToSync, PinRoots, WantedPackageManager,
+        package_manager_to_sync_for_version, read_root_manifest,
+        should_persist_package_manager_lockfile, version_satisfies, wanted_package_manager,
     },
-    reporter::reporter_emit,
+    reporter::{ReporterFlags, ReporterType, reporter_emit},
     sanitize::sanitize_inline,
     self_update::install_pnpm::{assert_release_is_installable, pnpm_package_to_install},
     with::{PackageManagerCheck, spawn_pnpm},
 };
 use crate::{
-    cli_args::config_warnings::report_workspace_key_issues,
+    cli_args::config_warnings::emit_config_warning,
     config_deps,
-    config_overrides::{ConfigOverrides, apply_state_dir_override},
+    config_overrides::ConfigOverrides,
     engine_pm::{
         channel::PackageManager,
-        install::{install_engine_from_env, install_engine_to_store},
+        install::{InstalledEngine, install_engine_from_env, install_engine_to_store},
     },
     flag_relocation::ArgTable,
 };
 use derive_more::{Display, Error};
 
-use input::{
-    KeyIssueReporting, PreCommandInput, SwitchInput, is_global, key_issue_reporting,
-    package_manager_switch_disabled, should_skip_command, should_skip_command_name,
-    should_skip_pm_handling,
-};
+use input::should_skip_command_name;
+use load_config::{ConfigLoad, load_pre_command_config, try_load_record_config};
 use lockfile::{
-    ReadEnvLockfile, env_lockfile_sync, env_lockfile_sync_plan, locked_package_manager_version,
-    locked_switch_source, read_env_lockfile, switch_env_root,
+    env_lockfile_sync_from_loaded, env_lockfile_sync_plan, locked_package_manager_to_fetch,
+    locked_package_manager_version, locked_switch_source, read_env_lockfile, switch_env_root,
 };
 use miette::{Context, Diagnostic, IntoDiagnostic};
-use pin::{PinOutcome, PinResolution, resolve_input_pin, switch_target};
-use pnpm_config::{ColorMode, Config, Host, PNPM_VERSION, PmOnFail};
-use pnpm_default_reporter::DefaultReporter;
+use pin::{package_manager_switch_disabled, should_read_pin_lockfile};
+use pnpm_config::{ColorMode, Config, ConfigLoadFailure, Host, PNPM_VERSION, PmOnFail};
+use pnpm_default_reporter::MaxLogLevel;
 use pnpm_env_installer::is_package_manager_resolved;
 use pnpm_lockfile::{EnvLockfile, LockfileResolution, PackageKey, PackageMetadata, VersionPart};
+use pnpm_network::redact_and_sanitize;
 use pnpm_package_manifest::{apply_runtime_on_fail_override, is_runtime_alias};
-use pnpm_reporter::{GlobalLog, LogEvent, LogLevel, Reporter, SilentReporter};
-use runtime::{RUNTIME_ON_FAIL_HINT, check_runtimes};
+use pnpm_reporter::{GlobalLog, LogEvent, LogLevel};
+use runtime::{RUNTIME_ON_FAIL_HINT, check_runtimes, declares_runtime};
 use serde_json::Value;
 use std::{
     collections::HashSet,
@@ -65,28 +63,18 @@ use std::{
 };
 use system_runtime_version::system_runtime_version;
 
-/// Run the pre-command checks and return the work they ask for, if any. The
-/// checks themselves report through `args.reporter` and fail the command by
-/// returning an error.
+pub(crate) struct PreCommandOutcome {
+    pub(crate) plan: Option<PreCommandPlan>,
+    pub(crate) preloaded_config: Option<Result<Config, ConfigLoadFailure>>,
+}
+
+/// Run the pre-command checks for `invocation` and return the work they ask
+/// for, if any, along with any full [`Config`] loaded along the way.
 pub(crate) fn pre_command_plan(
-    args: &CliArgs,
+    invocation: &Invocation,
     config_overrides: &ConfigOverrides,
-) -> miette::Result<Option<PreCommandPlan>> {
-    if should_skip_command(&args.command) {
-        return Ok(None);
-    }
-    pre_command_plan_from_input(
-        &PreCommandInput {
-            switch: SwitchInput::from_cli_args(args),
-            global: is_global(&args.command),
-            skip_pm_handling: should_skip_pm_handling(&args.command),
-            check_runtimes: true,
-            emit: reporter_emit(args.output.presentation.reporter),
-            key_issues: key_issue_reporting(&args.command),
-        },
-        config_overrides,
-        SwitchProcessState::current(),
-    )
+) -> miette::Result<PreCommandOutcome> {
+    pre_command_plan_with_state(invocation, config_overrides, SwitchProcessState::current())
 }
 
 /// The `pnpm --version` path, which clap answers before a command is
@@ -97,149 +85,197 @@ pub(crate) fn pre_command_plan_for_version_flag(
     argv: &[OsString],
     config_overrides: &ConfigOverrides,
 ) -> miette::Result<Option<PreCommandPlan>> {
-    pre_command_plan_from_input(
-        &PreCommandInput {
-            switch: SwitchInput::from_version_argv(argv),
-            global: false,
-            skip_pm_handling: false,
-            check_runtimes: false,
-            emit: DefaultReporter::emit,
-            // Printing the version must work in a project whose
-            // `pnpm-workspace.yaml` is broken, like the runtime checks above.
-            key_issues: KeyIssueReporting::WarnOnly,
-        },
-        config_overrides,
-        SwitchProcessState::current(),
-    )
+    let invocation = Invocation::from_argv(argv, EntryPoint::Version);
+    Ok(pre_command_plan(&invocation, config_overrides)?.plan)
 }
 
-fn pre_command_plan_from_input(
-    input: &PreCommandInput,
+/// A command line clap rejected for an argument this pnpm does not know.
+/// The pnpm the project pins may know it, so the command goes to that pnpm
+/// when the pin calls for a switch. Anything short of a switch leaves the
+/// rejection to stand, and records nothing for a command that is not run.
+pub(crate) fn switch_plan_for_unparsed_argv(
+    argv: &[OsString],
+    config_overrides: &ConfigOverrides,
+) -> miette::Result<Option<PreCommandPlan>> {
+    let invocation = Invocation::from_argv(argv, EntryPoint::UnknownFlag);
+    Ok(pre_command_plan(&invocation, config_overrides)?.plan)
+}
+
+pub(crate) fn read_pin_lockfile(
+    wanted: Option<&WantedPackageManager>,
+    config: &Config,
+    invocation: &Invocation,
+    env_root: &Path,
+    running_version: &str,
+    process_state: SwitchProcessState,
+) -> miette::Result<Option<EnvLockfile>> {
+    if should_read_pin_lockfile(wanted, config, invocation, running_version, process_state) {
+        read_env_lockfile(env_root)
+    } else {
+        Ok(None)
+    }
+}
+
+/// The settings are read in tiers, each only when the one before it calls
+/// for it: none when the manifest pins nothing these checks act on, the
+/// [`PIN_DECISION_SETTINGS`](pnpm_config::PIN_DECISION_SETTINGS) to decide,
+/// and every readable setting to switch or to record the pin. Validating the
+/// configuration and reporting its warnings is left to the command, which
+/// reuses the loaded configuration.
+fn pre_command_plan_with_state(
+    invocation: &Invocation,
     config_overrides: &ConfigOverrides,
     process_state: SwitchProcessState,
-) -> miette::Result<Option<PreCommandPlan>> {
-    if input.switch.command.as_deref().is_some_and(should_skip_command_name) {
-        return Ok(None);
+) -> miette::Result<PreCommandOutcome> {
+    if invocation.skip_pm_handling
+        || (invocation.entry_point != EntryPoint::SelfUpdate
+            && invocation.command.as_deref().is_some_and(should_skip_command_name))
+    {
+        return Ok(PreCommandOutcome { plan: None, preloaded_config: None });
     }
-    let dir = dunce::canonicalize(&input.switch.dir)
-        .into_diagnostic()
-        .wrap_err_with(|| {
-            format!("canonicalizing the `--dir` argument: {}", input.switch.dir.display())
-        })?;
-    let config = load_pre_command_config(&input.switch, config_overrides, &dir)?;
-
-    let roots = PinRoots {
-        manifest: config.workspace_dir.clone().unwrap_or_else(|| dir.clone()),
-        env: config.root_project_manifest_dir(&dir).to_path_buf(),
-    };
-    let manifest = read_manifest_json(&roots.manifest.join("package.json"))?;
-
+    let dir = canonicalize_dir(&invocation.paths.dir)?;
+    if pins_nothing_to_check(invocation, &dir) {
+        return Ok(PreCommandOutcome { plan: None, preloaded_config: None });
+    }
+    let config =
+        load_pre_command_config(invocation, config_overrides, &dir, ConfigLoad::PIN_DECISION)?;
+    let roots = PinRoots::of(&config, &dir);
+    let manifest = read_root_manifest(&roots.manifest);
     let wanted_pm = manifest.as_ref().and_then(wanted_package_manager);
-    let running_matches_pin = pin_matches_running(wanted_pm.as_ref());
-    let package_manager_to_sync = match resolve_input_pin(
-        input,
+    let locked_env = read_pin_lockfile(
+        wanted_pm.as_ref(),
         &config,
-        &roots,
+        invocation,
+        &roots.env,
+        PNPM_VERSION,
         process_state,
-        manifest.as_ref(),
-        wanted_pm,
-    )? {
-        PinOutcome::Switch(target) => {
-            return Ok(Some(PreCommandPlan::Switch(SwitchPlan { config, target })));
-        }
-        PinOutcome::Sync(sync) => sync,
+    )?;
+    let pin_input = PinInput {
+        roots: &roots,
+        manifest: manifest.as_ref(),
+        wanted: wanted_pm.as_ref(),
+        locked_env,
+        running_version: PNPM_VERSION,
+        process_state,
     };
+    let decision = decide(&pin_input, &config, invocation)?;
+    execute_pin_decision(decision, invocation, config_overrides, &dir, &config, manifest)
+}
 
-    report_key_issues(input, &config, running_matches_pin)?;
+fn execute_pin_decision(
+    decision: PinDecision,
+    invocation: &Invocation,
+    config_overrides: &ConfigOverrides,
+    dir: &Path,
+    config: &Config,
+    manifest: Option<Value>,
+) -> miette::Result<PreCommandOutcome> {
+    match decision {
+        PinDecision::Switch(target) => {
+            let mut config =
+                load_pre_command_config(invocation, config_overrides, dir, ConfigLoad::SWITCH)?;
+            if !invocation.global {
+                config.target_workspace_dir =
+                    Some(config.workspace_dir.clone().unwrap_or_else(|| dir.to_path_buf()));
+            }
+            Ok(PreCommandOutcome {
+                plan: Some(PreCommandPlan::Switch(SwitchPlan { config, target })),
+                preloaded_config: None,
+            })
+        }
+        PinDecision::Record { at, package_manager } => {
+            check_manifest_runtimes(invocation, config, manifest)?;
+            let record_result = try_load_record_config(invocation, config_overrides, dir)?;
+            match record_result {
+                Ok(record_config) if !invocation.warnings.fail(&record_config, dir) => {
+                    Ok(PreCommandOutcome {
+                        plan: Some(env_lockfile_sync_plan(
+                            invocation,
+                            record_config,
+                            at,
+                            package_manager,
+                        )),
+                        preloaded_config: None,
+                    })
+                }
+                other => Ok(PreCommandOutcome { plan: None, preloaded_config: Some(other) }),
+            }
+        }
+        PinDecision::Nothing => {
+            check_manifest_runtimes(invocation, config, manifest)?;
+            Ok(PreCommandOutcome { plan: None, preloaded_config: None })
+        }
+    }
+}
 
-    if input.check_runtimes
-        && !input.skip_pm_handling
-        && !input.global
+/// Whether no manifest the pin could be read from pins pnpm or a runtime
+/// these checks act on, so no setting can change what they do.
+fn pins_nothing_to_check(invocation: &Invocation, dir: &Path) -> bool {
+    if invocation.skip_pm_handling {
+        return true;
+    }
+    let mut candidates = vec![dir.to_path_buf()];
+    if !invocation.paths.ignore_workspace {
+        candidates.extend(pnpm_workspace::find_workspace_dir_from_env());
+        candidates.push(pnpm_config::workspace_root_or(dir));
+    }
+    candidates.sort();
+    candidates.dedup();
+    let checks_runtimes = invocation.check_runtimes && !invocation.global;
+    candidates
+        .iter()
+        .filter_map(|candidate| read_root_manifest(candidate))
+        .all(|manifest| {
+            wanted_package_manager(&manifest).is_none()
+                && !(checks_runtimes && declares_runtime(&manifest))
+        })
+}
+
+fn canonicalize_dir(path: &Path) -> miette::Result<PathBuf> {
+    pnpm_fs::canonicalize_preserving_mapped_drive(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("canonicalizing the `--dir` argument: {}", path.display()))
+}
+
+fn check_manifest_runtimes(
+    invocation: &Invocation,
+    config: &Config,
+    manifest: Option<Value>,
+) -> miette::Result<()> {
+    if invocation.check_runtimes
+        && !invocation.skip_pm_handling
+        && !invocation.global
         && let Some(manifest) = manifest
     {
-        check_runtimes(manifest, &config, input.emit)?;
+        check_runtimes(manifest, config, invocation.emit(config))?;
     }
-    Ok(package_manager_to_sync.map(|package_manager| {
-        env_lockfile_sync_plan(input, config, roots.env, package_manager)
-    }))
-}
-
-/// Whether the manifest's pin names the pnpm that is running.
-fn pin_matches_running(wanted_pm: Option<&WantedPackageManager>) -> bool {
-    wanted_pm.is_some_and(|pm| {
-        pm.name == "pnpm"
-            && pm.version.as_deref().is_some_and(|version| version_satisfies(PNPM_VERSION, version))
-    })
-}
-
-/// A `--global` invocation does not act on the project, so a satisfied
-/// pin does not harden its unrecognized-key report into an error.
-fn report_key_issues(
-    input: &PreCommandInput,
-    config: &Config,
-    running_matches_pin: bool,
-) -> miette::Result<()> {
-    if input.key_issues == KeyIssueReporting::Skip {
-        return Ok(());
-    }
-    let strict =
-        input.key_issues == KeyIssueReporting::Enforce && running_matches_pin && !input.global;
-    report_workspace_key_issues(&config.workspace_key_issues, strict)?;
     Ok(())
 }
 
-/// Load the configuration the pre-command pass reads, with the global
-/// CLI flags that reach it applied.
-fn load_pre_command_config(
-    switch: &SwitchInput,
-    config_overrides: &ConfigOverrides,
-    dir: &Path,
-) -> miette::Result<Config> {
-    let mut config =
-        Config { npmrc_auth_file: switch.npmrc_auth_file.clone(), ..Config::default() }
-            .current::<Host>(dir)
-            .map_err(miette::Report::new)
-            .wrap_err("load configuration")?;
-    config_overrides.apply(&mut config, dir);
-    if let Some(color) = switch.color {
-        config.color = color;
-    }
-    super::reporter::configure_color(config.color);
-    if config.ci {
-        pnpm_default_reporter::force_append_only();
-    }
-    if let Some(state_dir) = switch.state_dir.as_deref() {
-        apply_state_dir_override::<Host>(&mut config, state_dir, dir);
-    }
-    // `--lockfile-dir` moves the lockfile the pin is recorded in, and
-    // `--offline` governs how that record is resolved. Both are
-    // install-family flags, and the record below is made for every
-    // command.
-    switch.pin_flags.apply_to(&mut config, dir);
-    Ok(config)
-}
-
-/// Switch to the pinned pnpm, unless the running one already is it — in
-/// which case the pin still has to reach the lockfile, which the switch
-/// would otherwise have written on its way to the wanted version.
-fn switch_or_sync(
-    resolution: &PinResolution<'_>,
-    root_manifest: &Value,
-    on_fail: PmOnFail,
-) -> miette::Result<PinOutcome> {
-    let PinResolution { config, roots, switch, .. } = *resolution;
-    let frozen_lockfile = switch.frozen_lockfile.or(config.frozen_lockfile).unwrap_or(false);
-    let Some(target) = switch_target(config, roots, frozen_lockfile)? else {
-        return Ok(PinOutcome::Sync(None));
+/// Install the pnpm that the env lockfile in `env_root` pins into the store,
+/// when a command in the project would switch to it. `pnpm fetch` reads only
+/// the lockfile, and a later `pnpm install --offline` that switches to the
+/// pinned pnpm finds it there instead of in the registry (pnpm/pnpm#11808).
+pub(crate) async fn fetch_locked_package_manager<Reporter: pnpm_reporter::Reporter + 'static>(
+    config: &'static Config,
+    env_root: &Path,
+) -> miette::Result<()> {
+    let Some((env, version)) =
+        locked_package_manager_to_fetch(config, env_root, SwitchProcessState::current())?
+    else {
+        return Ok(());
     };
-    if target.switches_away_from_the_running_pnpm() {
-        return Ok(PinOutcome::Switch(target));
+    assert_release_is_installable(&version)?;
+    let engine =
+        Box::pin(install_engine_from_env::<Reporter>(config, PackageManager::Pnpm, &env, &version))
+            .await
+            .wrap_err_with(|| format!("fetch pnpm v{version}, which the lockfile pins"))?;
+    if engine.private_install.is_some() {
+        miette::bail!(
+            "could not install pnpm v{version} into the shared store because another process held the install lock",
+        );
     }
-    let read_lockfile = match &target.source {
-        SwitchSource::LockedEnv { env, .. } => ReadEnvLockfile::Already(env),
-        SwitchSource::Resolve { .. } => ReadEnvLockfile::NotYet,
-    };
-    Ok(PinOutcome::Sync(env_lockfile_sync(config, root_manifest, roots, on_fail, read_lockfile)?))
+    Ok(())
 }
 
 /// Every warning here quotes the project's manifest, which is untrusted
@@ -248,6 +284,60 @@ fn switch_or_sync(
 fn global_warn(emit: fn(&LogEvent), message: &str) {
     let message = sanitize_inline(message).into_owned();
     emit(&LogEvent::Global(GlobalLog { level: LogLevel::Warn, message }));
+}
+
+/// The sink for the warnings the checks here raise. They are not the
+/// command's output, so the default reporter's go to stderr: a command such
+/// as `pnpm cache path` or `pnpm list --json` prints a value a script reads
+/// from stdout.
+fn pre_command_emit(reporter: ReporterType) -> fn(&LogEvent) {
+    match reporter {
+        ReporterType::Default | ReporterType::AppendOnly => emit_warning_on_stderr,
+        ReporterType::Ndjson | ReporterType::Silent => reporter_emit(reporter),
+    }
+}
+
+/// The default reporter's rendering of a [`global_warn`] event, on stderr.
+fn emit_warning_on_stderr(event: &LogEvent) {
+    let LogEvent::Global(GlobalLog { level: LogLevel::Warn, message }) = event else {
+        unreachable!("the pre-command checks emit only global warnings");
+    };
+    if pnpm_default_reporter::max_log_level() >= MaxLogLevel::Warn {
+        emit_config_warning(message);
+    }
+}
+
+/// Report a pinned pnpm that `pnpm --version` could not act on. Why the
+/// command carries on afterwards is documented on its caller in `lib.rs`.
+pub(crate) fn warn_pinned_pnpm_unusable(error: &miette::Report) {
+    global_warn(emit_warning_on_stderr, &warning_for_unusable_pin(error));
+}
+
+fn warning_for_unusable_pin(error: &miette::Report) -> String {
+    let code = error
+        .code()
+        .map(|code| format!("{code}: "))
+        .unwrap_or_default();
+    let help = error
+        .help()
+        .map(|help| format!(". {}", redact_and_sanitize(&help.to_string())))
+        .unwrap_or_default();
+    format!("Cannot use the pnpm version this project pins: {code}{}{help}", error_causes(error))
+}
+
+fn error_causes(error: &miette::Report) -> String {
+    let mut causes = String::new();
+    for cause in error.chain() {
+        let cause = redact_and_sanitize(&cause.to_string());
+        if causes.contains(cause.as_str()) {
+            continue;
+        }
+        if !causes.is_empty() {
+            causes.push_str(": ");
+        }
+        causes.push_str(&cause);
+    }
+    causes
 }
 
 #[derive(Debug, Display, Error, Diagnostic)]
@@ -267,13 +357,13 @@ pub(crate) enum PreCommandError {
 }
 
 #[derive(Clone, Copy)]
-struct SwitchProcessState {
-    package_manager_switch_disabled: bool,
-    executed_by_corepack: bool,
+pub(crate) struct SwitchProcessState {
+    pub(crate) package_manager_switch_disabled: bool,
+    pub(crate) executed_by_corepack: bool,
 }
 
 impl SwitchProcessState {
-    fn current() -> Self {
+    pub(crate) fn current() -> Self {
         Self {
             package_manager_switch_disabled: package_manager_switch_disabled(),
             executed_by_corepack: std::env::var_os("COREPACK_ROOT").is_some(),
@@ -282,40 +372,22 @@ impl SwitchProcessState {
 }
 
 #[derive(Debug)]
-struct SwitchTarget {
-    spec: String,
-    source: SwitchSource,
+pub(crate) struct SwitchTarget {
+    pub(crate) spec: String,
+    pub(crate) source: SwitchSource,
 }
 
 impl SwitchTarget {
-    /// Whether reaching the pinned pnpm means running another one.
-    ///
-    /// A resolution recorded in the env lockfile is the pnpm the project
-    /// runs, whatever else its specifier would have allowed, so that
-    /// resolution — not the specifier — answers this. Only without one does
-    /// the specifier decide: the switch resolves it, and a running pnpm the
-    /// specifier already accepts is spared the round trip. A recorded
-    /// resolution that has to be repaired is always carried out, because the
-    /// repairing write happens there.
-    fn switches_away_from_the_running_pnpm(&self) -> bool {
+    /// Whether reaching the pinned pnpm means running another one than
+    /// `running_version`.
+    pub(crate) fn switches_away_from(&self, running_version: &str) -> bool {
         match &self.source {
-            SwitchSource::LockedEnv { version, .. } => version != PNPM_VERSION,
+            SwitchSource::LockedEnv { version, .. } => version != running_version,
             SwitchSource::Resolve { locked_version, .. } => {
-                locked_version.is_some() || !version_satisfies(PNPM_VERSION, &self.spec)
+                locked_version.is_some() || !version_satisfies(running_version, &self.spec)
             }
         }
     }
-}
-
-/// The two directories the package-manager pin is read from and written to.
-///
-/// They differ when `lockfileDir` moves `pnpm-lock.yaml` off the workspace
-/// root: the manifest declaring the pin stays at the workspace root, while
-/// the env lockfile is the first document of the lockfile and follows it.
-#[derive(Debug, Clone)]
-struct PinRoots {
-    manifest: PathBuf,
-    env: PathBuf,
 }
 
 #[derive(Debug)]
@@ -343,26 +415,15 @@ pub(crate) struct EnvLockfileSync {
 }
 
 #[derive(Debug)]
-enum SwitchSource {
+pub(crate) enum SwitchSource {
     LockedEnv {
         env: EnvLockfile,
         version: String,
     },
     Resolve {
         env_root: PathBuf,
-        /// Refuse to record the resolution instead of writing it. Only set
-        /// when `env_root` is the project itself: a global env lockfile is
-        /// not what `--frozen-lockfile` freezes.
         frozen_lockfile: bool,
-        /// Discard the recorded `packageManagerDependencies` and re-resolve
-        /// them even when they look up to date — set when the recorded
-        /// entries failed the bootstrap validation, so the resync heals the
-        /// env lockfile instead of no-op'ing on the invalid entries.
         force_resync: bool,
-        /// The version those invalid entries record. A frozen lockfile
-        /// cannot record a fresh pick, so the repair re-resolves this
-        /// version rather than the range around it — the switch then runs
-        /// the pnpm the lockfile pins, which is what the flag is for.
         locked_version: Option<String>,
     },
 }
@@ -379,3 +440,5 @@ mod runtime;
 mod pin;
 
 mod execute;
+
+mod load_config;

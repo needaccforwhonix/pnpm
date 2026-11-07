@@ -34,12 +34,7 @@ pub struct ArchiveStoreContext<'a> {
     /// index is trusted and the import fails lazily if a blob is
     /// missing — trades the per-file stat / optional rehash for the
     /// risk that a mutated or corrupt store serves stale content until
-    /// the next integrity-full install. Whether that translates into a
-    /// wall-time win depends on the workload; the per-snapshot stat
-    /// isn't the bottleneck on the benchmarks this repo tracks (see
-    /// [#273]), but cutting the syscall count is still correct.
-    ///
-    /// [#273]: https://github.com/pnpm/pacquet/issues/273
+    /// the next integrity-full install.
     pub verify_integrity: bool,
     /// Mirrors pnpm's `strictStorePkgContentCheck` setting (default
     /// `true`). A store row whose bundled manifest names a package other
@@ -52,9 +47,7 @@ pub struct ArchiveStoreContext<'a> {
     /// lookup. Ports pnpm's `verifiedFilesCache: Set<string>`: a CAFS
     /// path that one snapshot's verify pass has already stat'ed (and
     /// optionally re-hashed) gets skipped when the next snapshot
-    /// touches the same blob. Without it pacquet was paying the
-    /// per-file stat in `check_pkg_files_integrity` once per
-    /// (snapshot × file) instead of once per (file). Allocate one
+    /// touches the same blob. Allocate one
     /// `Arc<DashSet<PathBuf>>` at install bootstrap and pass the same
     /// handle to every [`crate::IngestTarballToStore`].
     pub verified_files_cache: SharedVerifiedFilesCache,
@@ -65,6 +58,14 @@ pub struct ArchiveStoreContext<'a> {
     pub prefetched_cas_paths: Option<&'a PrefetchedCasPaths>,
 }
 
+impl ArchiveStoreContext<'_> {
+    /// The part of this context a resolution-time read writes to.
+    #[must_use]
+    pub fn resolution_store(&self) -> crate::ResolutionStore {
+        crate::ResolutionStore { dir: self.dir, index_writer: self.index_writer.clone() }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct ArchiveFetchOptions<'a> {
     pub http_client: &'a ThrottledClient,
@@ -73,10 +74,9 @@ pub struct ArchiveFetchOptions<'a> {
     /// different host than the registry still picks up its own header.
     pub auth_headers: &'a AuthHeaders,
     /// Per-attempt retry budget for the tarball pipeline, driven by
-    /// pnpm's `fetch-retries*` knobs: every failure retries except
-    /// HTTP 401, 403, 404 — including arbitrary 4xx / 5xx, network
-    /// resets, timeouts, mid-stream body errors, integrity mismatches,
-    /// and gzip / tar parse failures ([#259]).
+    /// pnpm's `fetch-retries*` knobs. Network resets, timeouts, integrity
+    /// mismatches, and archive decode errors retry ([#259]). HTTP 401,
+    /// 403, 404, untrusted certificates, and a full local store do not.
     ///
     /// [#259]: https://github.com/pnpm/pacquet/issues/259
     pub retry_opts: RetryOpts,
@@ -84,12 +84,11 @@ pub struct ArchiveFetchOptions<'a> {
     /// prefetch (`prefetched_cas_paths`) and the `SQLite` `index.db`
     /// lookup (`load_cached_cas_paths`) miss, the fetcher fails fast
     /// with [`crate::TarballError::NoOfflineTarball`] rather than hitting
-    /// the registry. The `--offline` flag gates the metadata-fetch
-    /// path in pnpm; pacquet has no metadata-fetch path on the
-    /// frozen-install flow (the lockfile pins every resolution), so
-    /// this gate is pacquet's most useful interpretation of the flag
-    /// for frozen installs.
+    /// the registry.
     pub offline: bool,
+    /// The decoded-output budget each archive is extracted under, before a
+    /// package's own `dist.unpackedSize` tightens it.
+    pub tar_limits: crate::TarLimits,
 }
 
 #[derive(Clone, Copy)]
@@ -107,6 +106,9 @@ pub struct TarballPackage<'a> {
     /// [`crate::IngestTarballToStore::fetch_and_extract`] can instead index a plain archive by
     /// its computed integrity.
     pub integrity: Option<&'a Integrity>,
+    /// Which hash of the archive `integrity` names. A revision-addressed
+    /// fetch always checks the tar, whatever this says.
+    pub integrity_kind: crate::IntegrityKind,
     pub unpacked_size: Option<usize>,
     /// `dist.fileCount` when the registry published one. Combined with
     /// `unpacked_size` into the download's queueing priority —
@@ -123,6 +125,8 @@ pub struct TarballPackage<'a> {
 
 #[derive(Clone, Copy)]
 pub struct ZipArchivePackage<'a> {
+    /// Reject an advertised or streamed ZIP body above this limit. `None` leaves it unrestricted.
+    pub max_bytes: Option<usize>,
     pub integrity: &'a Integrity,
     pub url: &'a str,
     pub id: &'a str,

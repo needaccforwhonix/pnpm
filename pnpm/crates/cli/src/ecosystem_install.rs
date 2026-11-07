@@ -1,17 +1,51 @@
+pub(crate) mod python;
+
 pub(crate) use workspace_inventory::{EcosystemManifest, EcosystemWorkspaceInventory};
 
 mod workspace_inventory;
 
-use crate::{cargo_deps, cli_args::install::InstallDependencyOptions};
+use crate::{
+    cargo_deps,
+    cli_args::{install::InstallDependencyOptions, pipelines::WorkspaceScope},
+};
 use pnpm_config::Config;
 use pnpm_install_coordinator::InstallPlan;
 use pnpm_network::ThrottledClient;
 use pnpm_package_manifest::DependencyGroup;
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    borrow::Cow,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 /// Report whether a non-Node.js ecosystem participates in this install.
 pub(crate) fn is_enabled(config: &Config) -> bool {
     config.cargo.enabled || config.python.enabled
+}
+
+/// The directories a script or command run for the project in `dir` finds
+/// executables in before `PATH`: the toolchains pnpm installed for it, then
+/// `extraBinPaths`.
+pub(crate) fn execution_paths<'a>(config: &'a Config, dir: &Path) -> Cow<'a, [PathBuf]> {
+    let paths = pnpm_python_installer::execution_paths(config, dir);
+    match rust_bin_dir(config, dir) {
+        Some(rust) => Cow::Owned(
+            std::iter::once(rust)
+                .chain(paths.iter().cloned())
+                .collect(),
+        ),
+        None => paths,
+    }
+}
+
+/// The `bin` directory of the Rust toolchain pnpm linked for the project in
+/// `dir`.
+pub(crate) fn rust_bin_dir(config: &Config, dir: &Path) -> Option<PathBuf> {
+    if !config.cargo.enabled || !cargo_deps::installs_toolchains(config) {
+        return None;
+    }
+    let workspace = config.workspace_dir.as_deref().unwrap_or(dir);
+    pnpm_rust_toolchain::linked_bin_dir(config, dir, workspace)
 }
 
 #[derive(Clone)]
@@ -22,29 +56,59 @@ pub(crate) struct InstallContext {
     pub(crate) frozen_lockfile: bool,
 }
 
+pub(crate) struct EcosystemPlan {
+    pub(crate) plan: InstallPlan<'static>,
+    pub(crate) python: PythonProjects,
+}
+
+/// How many Python projects the workspace holds, and how many of them the
+/// selection asked for. Together they decide an empty `--filter`
+/// selection: selectors that matched no npm project may still have named a
+/// Python one, and a workspace whose projects are all Python is not one
+/// that holds no project at all.
+#[derive(Default)]
+pub(crate) struct PythonProjects {
+    pub(crate) discovered: usize,
+    pub(crate) selected: usize,
+}
+
 pub(crate) async fn plan<Reporter: pnpm_reporter::Reporter + 'static>(
     context: InstallContext,
     root: PathBuf,
+    prefix: &Path,
     dependencies: &InstallDependencyOptions,
-) -> miette::Result<InstallPlan<'static>> {
-    let inventory = EcosystemWorkspaceInventory::new(root.clone(), context.config);
+    scope: Option<&WorkspaceScope>,
+) -> miette::Result<EcosystemPlan> {
     let config = context.config;
+    // The workspace the npm selection reads, so a project of another
+    // ecosystem is discovered where that selection would name it.
+    // `lockfileDir` moves the lockfile, not the projects.
+    let workspace_root = config.workspace_dir.clone().unwrap_or_else(|| prefix.to_path_buf());
+    let inventory = EcosystemWorkspaceInventory::new(workspace_root, config);
     let mut plan = InstallPlan::new(config.workspace_dir.clone().unwrap_or(root));
+    let mut python = PythonProjects::default();
     if config.cargo.enabled {
         plan = plan.with_task(cargo_deps::plan::<Reporter>(context.clone(), &inventory).await?);
     }
     if config.python.enabled {
         let groups = dependencies.dependency_groups(config.optional).collect::<Vec<_>>();
+        let discovery = python::discover(config, &inventory).await?;
+        let selected = python::selected_projects(config, prefix, &discovery, scope)?;
+        python = PythonProjects {
+            discovered: discovery.project_roots().count(),
+            selected: selected.len(),
+        };
         plan = plan.with_task(pnpm_python_installer::plan::<Reporter>(
             context.into(),
-            inventory.manifests(EcosystemManifest::Python).await?.to_vec(),
+            discovery,
             pnpm_python_installer::DependencySelection {
                 production: groups.contains(&DependencyGroup::Prod),
                 development: groups.contains(&DependencyGroup::Dev),
             },
+            selected,
         ));
     }
-    Ok(plan)
+    Ok(EcosystemPlan { plan, python })
 }
 
 impl From<InstallContext> for pnpm_python_installer::InstallOptions {

@@ -1,7 +1,7 @@
 use super::{
-    Arc, BlobFinalize, Body, CanonicalPackageName, DocumentWrite, HostedBackend,
-    HostedDocumentForUpdate, HostedDocumentVersion, HostedRevisionRefWrite, ObjectPath,
-    ObjectStoreExt, Path, PathBuf, Result, S3Store, StreamExt, async_trait, fs,
+    Arc, Body, CanonicalPackageName, DocumentWrite, Ecosystem, HostedBackend,
+    HostedDocumentForUpdate, HostedDocumentVersion, ObjectPath, ObjectStoreExt, Path, PathBuf,
+    Result, S3Store, async_trait, fs,
 };
 
 /// The S3-compatible object-store backend. Document writes are
@@ -16,6 +16,31 @@ impl HostedBackend for S3Store {
             &self.prefix,
             self.cache_root.join(crate::upload::UPLOADS_DIR),
         ))
+    }
+
+    async fn check_readiness(&self) -> Result<()> {
+        fs::create_dir_all(&self.staging_dir).await
+            .map_err(|err| super::RegistryError::StorageUnavailable {
+                reason: format!(
+                    "s3 staging directory '{}' is not accessible: {err}",
+                    self.staging_dir.display(),
+                ),
+            })?;
+        let prefix_path = if self.prefix.is_empty() {
+            None
+        } else {
+            Some(ObjectPath::from(self.prefix.as_str()))
+        };
+        let check = self.store.list_with_delimiter(prefix_path.as_ref());
+        match tokio::time::timeout(std::time::Duration::from_secs(5), check).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(err)) => Err(super::RegistryError::StorageUnavailable {
+                reason: format!("S3 store check failed: {err}"),
+            }),
+            Err(_) => Err(super::RegistryError::StorageUnavailable {
+                reason: "S3 store check timed out after 5s".to_string(),
+            }),
+        }
     }
 
     async fn read_document(&self, name: &CanonicalPackageName) -> Result<Option<Vec<u8>>> {
@@ -42,6 +67,9 @@ impl HostedBackend for S3Store {
         let version = match version {
             Some(HostedDocumentVersion::ObjectVersion(version)) => Some(version),
             Some(HostedDocumentVersion::Unversioned) | None => None,
+            // The object store never hands one out, so the document it names
+            // is not the one stored here.
+            Some(HostedDocumentVersion::Generation(_)) => return Ok(DocumentWrite::Conflict),
         };
         if S3Store::write_document_if_current(self, name, bytes, version).await? {
             Ok(DocumentWrite::Written)
@@ -50,21 +78,16 @@ impl HostedBackend for S3Store {
         }
     }
 
-    async fn open_blob(
-        &self,
-        name: &CanonicalPackageName,
-        filename: &str,
-    ) -> Result<Option<(Body, Option<u64>)>> {
-        S3Store::open_blob(self, name, filename).await
+    async fn open_archive(&self, key: &str) -> Result<Option<(Body, Option<u64>)>> {
+        S3Store::open_archive(self, key).await
     }
 
-    async fn open_blob_range(
+    async fn open_archive_range(
         &self,
-        name: &CanonicalPackageName,
-        filename: &str,
+        key: &str,
         requested: &object_store::GetRange,
     ) -> Result<Option<crate::RangedBlob>> {
-        let key = self.blob_key(name, filename);
+        let key = self.archive_key(key);
         let meta = match self.store.head(&key).await {
             Ok(meta) => meta,
             Err(object_store::Error::NotFound { .. }) => return Ok(None),
@@ -91,93 +114,38 @@ impl HostedBackend for S3Store {
         Ok(Some(crate::RangedBlob::Read { body, range, size }))
     }
 
-    async fn reserve_blob_tmp(
-        &self,
-        name: &CanonicalPackageName,
-        filename: &str,
-    ) -> Result<PathBuf> {
-        self.staging_tmp_path(name, filename).await
+    async fn reserve_archive_tmp(&self) -> Result<PathBuf> {
+        self.staging_tmp_path().await
     }
 
-    async fn finalize_blob(
-        &self,
-        tmp_path: &Path,
-        name: &CanonicalPackageName,
-        filename: &str,
-    ) -> Result<BlobFinalize> {
-        let outcome = self.upload_blob(tmp_path, name, filename).await?;
-        // Keep the staged tmp on a Conflict so journal roll-forward can
-        // re-detect it and exclude the version whose bytes we don't own;
-        // once the object is ours there is nothing left to promote.
-        if outcome != BlobFinalize::Conflict {
-            let _ = fs::remove_file(tmp_path).await;
-        }
-        Ok(outcome)
+    fn archive_tmp_base(&self) -> PathBuf {
+        self.staging_tmp_base()
     }
 
-    async fn remove_blob(&self, name: &CanonicalPackageName, filename: &str) -> Result<bool> {
-        S3Store::remove_blob(self, name, filename).await
+    async fn put_archive(&self, tmp_path: &Path, key: &str) -> Result<()> {
+        let uploaded = self.upload_archive(tmp_path, key).await;
+        let _ = fs::remove_file(tmp_path).await;
+        uploaded
     }
 
-    async fn remove_package(&self, name: &CanonicalPackageName) -> Result<bool> {
-        S3Store::remove_package(self, name).await
+    async fn remove_archive(&self, key: &str) -> Result<bool> {
+        S3Store::remove_archive(self, key).await
     }
 
-    fn list_blob_files(
-        &self,
-    ) -> futures_util::stream::BoxStream<'_, Result<crate::HostedBlobFile>> {
-        let prefix = ObjectPath::from(self.prefix.trim_end_matches('/'));
-        self.store
-            .list(Some(&prefix))
-            .filter_map(move |result| async move {
-                let meta = match result {
-                    Ok(meta) => meta,
-                    Err(error) => return Some(Err(error.into())),
-                };
-                let path = meta.location.as_ref().strip_prefix(&self.prefix)?;
-                if path
-                    .split('/')
-                    .any(|part| part.starts_with('.'))
-                {
-                    return None;
-                }
-                Some(Ok(crate::HostedBlobFile {
-                    path: path.to_string(),
-                    modified: meta.last_modified.into(),
-                    size: meta.size,
-                }))
-            })
-            .boxed()
+    fn list_archives(&self) -> futures_util::stream::BoxStream<'_, Result<crate::StoredArchive>> {
+        self.list_archive_objects()
     }
 
-    async fn list_package_names(&self) -> Result<Vec<String>> {
-        S3Store::list_package_names(self).await
-    }
-
-    async fn read_revision_refs(&self, digest: &str) -> Result<Vec<Vec<u8>>> {
-        S3Store::read_revision_refs(self, digest).await
-    }
-
-    async fn write_revision_ref(
-        &self,
-        digest: &str,
-        ref_id: &str,
-        owner: &str,
-        bytes: &[u8],
-    ) -> Result<HostedRevisionRefWrite> {
-        S3Store::write_revision_ref(self, digest, ref_id, owner, bytes).await
-    }
-
-    async fn remove_revision_ref(&self, digest: &str, ref_id: &str, owner: &str) -> Result<()> {
-        S3Store::remove_revision_ref(self, digest, ref_id, owner).await
-    }
-
-    async fn commit_revision_ref(&self, digest: &str, ref_id: &str, owner: &str) -> Result<()> {
-        S3Store::commit_revision_ref(self, digest, ref_id, owner).await
+    async fn list_top_level_dirs(&self) -> Result<Vec<String>> {
+        S3Store::list_top_level_dirs(self).await
     }
 
     fn namespaced(&self, segment: &str) -> Arc<dyn HostedBackend> {
         Arc::new(S3Store::namespaced(self, segment))
+    }
+
+    fn with_ecosystem(&self, ecosystem: Ecosystem) -> Arc<dyn HostedBackend> {
+        Arc::new(S3Store::with_ecosystem(self, ecosystem))
     }
 
     fn namespace(&self) -> String {

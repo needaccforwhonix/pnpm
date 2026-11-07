@@ -1,6 +1,7 @@
 use super::{
     Config, ConfigError, ConfigFlags, DEFAULT_JSR_REGISTRY, GLOBAL_CONFIG_YAML_FILENAME, IndexMap,
     Map, Path, Segment, Value, config_types, naming_cases, property_path, protected_settings,
+    refused_keys,
 };
 
 /// `castField`: coerce a string value per its key's type. Booleans, `null`,
@@ -67,6 +68,12 @@ pub(super) fn validate_workspace_key(key: &str) -> Result<String, ConfigError> {
     if config_types::is_type_key(key) || config_types::is_config_file_key(key) {
         return Ok(naming_cases::to_camel_case(key));
     }
+    // A key the project manifest refuses is still one a hand-edited manifest
+    // may already carry, so `pnpm config delete` has to name it. Only the
+    // write path rejects setting one.
+    if refused_keys::is_refused_by_a_project_manifest(key) {
+        return Ok(naming_cases::to_camel_case(key));
+    }
     if !naming_cases::is_camel_case(key) {
         return Err(ConfigError::SetUnsupportedWorkspaceKey {
             key: key.to_string(),
@@ -108,7 +115,7 @@ pub(super) fn is_string_only_ini_key(key: &str) -> bool {
 // config get / list
 // ---------------------------------------------------------------------------
 
-/// `configGet`: resolve and render the value at `key`. Port of `configGet`.
+/// `configGet`: resolve and render the value at `key`.
 pub(super) fn config_get(
     config: &Config,
     flags: ConfigFlags,
@@ -169,7 +176,7 @@ fn merge_default_catalog(result: &mut Map<String, Value>) {
     }
 }
 
-/// `configList`: the full config record as pretty JSON. Port of `configList`.
+/// `configList`: the full config record as pretty JSON.
 pub(super) fn config_list(config: &Config) -> String {
     serde_json::to_string_pretty(&Value::Object(config_to_record(config)))
         .expect("serializing the config record to JSON never fails")

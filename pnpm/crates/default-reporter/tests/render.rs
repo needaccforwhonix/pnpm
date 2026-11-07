@@ -13,9 +13,9 @@ use pnpm_reporter::{
     AddedRoot, ContextLog, DedupeCheckLog, DependencyType, DeprecationLog, ExecutionTimeLog,
     FetchingProgressLog, FetchingProgressMessage, GlobalLog, HookLog, IgnoredScriptsLog,
     LifecycleLog, LifecycleMessage, LifecycleStdio, LockfileVerificationLog,
-    LockfileVerificationMessage, LogEvent, LogLevel, PackageImportMethod, PackageImportMethodLog,
-    PackageManifestLog, PackageManifestMessage, PnpmErrorLog, PnpmLog, ProgressLog,
-    ProgressMessage, RootLog, RootMessage, ScopeLog, SkippedOptionalDependencyLog,
+    LockfileVerificationMessage, LogEvent, LogLevel, NonDeprecatedAlternative, PackageImportMethod,
+    PackageImportMethodLog, PackageManifestLog, PackageManifestMessage, PnpmErrorLog, PnpmLog,
+    ProgressLog, ProgressMessage, RootLog, RootMessage, ScopeLog, SkippedOptionalDependencyLog,
     SkippedOptionalPackage, SkippedOptionalParent, SkippedOptionalReason, Stage, StageLog,
     StatsLog, StatsMessage, SummaryLog, UpdateCheckLog,
 };
@@ -164,14 +164,24 @@ fn pnpm_log(level: LogLevel, message: &str) -> LogEvent {
 }
 
 fn deprecation(name: &str, version: &str, depth: i32, prefix: &str) -> LogEvent {
+    deprecation_with_alternative(name, version, depth, prefix, None)
+}
+
+fn deprecation_with_alternative(
+    name: &str,
+    version: &str,
+    depth: i32,
+    prefix: &str,
+    non_deprecated_alternative: Option<NonDeprecatedAlternative>,
+) -> LogEvent {
     LogEvent::Deprecation(DeprecationLog {
         level: LogLevel::Debug,
         pkg_name: name.to_string(),
         pkg_version: version.to_string(),
         pkg_id: format!("{name}@{version}"),
         prefix: prefix.to_string(),
-        deprecated: "no longer supported".to_string(),
         depth,
+        non_deprecated_alternative,
     })
 }
 
@@ -341,6 +351,9 @@ mod security;
 #[path = "render/streaming.rs"]
 mod streaming;
 
+#[path = "render/quiet.rs"]
+mod quiet;
+
 #[path = "render/dependencies.rs"]
 mod dependencies;
 
@@ -355,3 +368,9 @@ mod workspace_settings;
 
 #[path = "render/files.rs"]
 mod files;
+
+#[path = "render/script_output.rs"]
+mod script_output;
+
+#[path = "render/peers.rs"]
+mod peers;

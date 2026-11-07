@@ -1,144 +1,63 @@
-pub use discovery::check_deps_status_before_run_at;
 pub(super) use projects::{
-    ProjectScriptsInputs, build_project_manifests_list, build_root_importer_project_manifests_list,
-    build_selected_project_manifests_list, projects_running_own_scripts,
+    ProjectScriptsInputs, build_root_importer_project_manifests_list,
+    build_selected_project_manifests_list, mutated_project_dirs, projects_running_own_scripts,
     selected_manifest_freshness_inputs,
 };
+pub(crate) use projects::{build_project_manifests_list, replace_project_manifest};
+pub(crate) use write::{CarriedSettings, StateProjects, StateWrite, recorded_workspace_state};
 
 mod projects;
 
-mod discovery;
+mod write;
 
 use super::{
-    BTreeMap, Catalogs, Clock, Config, DependencyGroup, Host, IncludedDependencies, LazyLockfile,
-    MaybeLazyLockfile, NodeLinker, OptimisticRepeatInstallCheck, OptimisticRepeatInstallDecision,
-    PackageManifest, Path, PathBuf, ProjectEntry, WorkspaceState, check_optimistic_repeat_install,
-    get_catalogs_from_workspace_manifest, gvs_build_marker_present,
-    gvs_build_markers_may_require_recovery, load_workspace_projects, manifest_string_field,
-    unapproved_recorded_ignored_builds,
+    BTreeMap, Catalogs, Clock, Config, IncludedDependencies, NodeLinker, PackageManifest, Path,
+    PathBuf, ProjectEntry, WorkspaceState, manifest_string_field,
 };
-use crate::optimistic_repeat_install::{refreshed_validation_baseline_ms, validation_baseline_ms};
+use crate::install_state::last_validated_timestamp;
+use pnpm_reporter::Reporter;
+use pnpm_workspace_state::update_workspace_state_in_modules;
 
-/// Inputs for [`install_already_up_to_date`].
-pub struct UpToDateFastPathCheck<'a> {
-    pub config: &'a Config,
-    pub manifest: &'a PackageManifest,
-    pub dependency_groups: Vec<DependencyGroup>,
-    pub node_linker: NodeLinker,
-    /// The CLI-merged effective `supportedArchitectures` (yaml plus
-    /// `--cpu` / `--os` / `--libc`) — the fast path must not report
-    /// "Already up to date" when a flag changed the target platforms.
-    pub supported_architectures: Option<pnpm_package_is_installable::SupportedArchitectures>,
-}
-
-/// Pre-runtime twin of the repeat-install short-circuit inside
-/// [`super::Install::run`]: same workspace discovery, same
-/// What an up-to-date install reports about the workspace it covered.
-#[derive(Debug, PartialEq, Eq)]
-pub struct UpToDateWorkspace {
-    /// The workspace root — the reporter `prefix` for the "Already up to
-    /// date" emission.
-    pub root: PathBuf,
-    /// How many projects the workspace has, or `None` when there is no
-    /// `pnpm-workspace.yaml`. Feeds the `pnpm:scope` report, which the
-    /// full install path derives from the same walk.
-    pub project_count: Option<usize>,
-}
-
-/// [`check_optimistic_repeat_install`] inputs, callable from a
-/// synchronous context so the CLI can finish an up-to-date install
-/// before paying for the async runtime, the HTTP client, and the
-/// state setup. Returns what the short-circuit covered when the install
-/// can take it.
+/// Persist `.pnpm-workspace-state-v1.json`, warning instead of failing
+/// the command when the write is lost.
 ///
-/// Failures deliberately collapse to `None`: the caller falls through
-/// to the full install path, which reproduces the failure with its
-/// established error shape.
-#[must_use]
-pub fn install_already_up_to_date(check: &UpToDateFastPathCheck<'_>) -> Option<UpToDateWorkspace> {
-    let manifest_dir = check.manifest.path().parent()?;
-    let workspace_dir_opt =
-        configured_or_discovered_workspace_dir(check.config, manifest_dir).ok()?;
-    let workspace_root = workspace_dir_opt.clone().unwrap_or_else(|| manifest_dir.to_path_buf());
-    let (workspace_manifest, catalogs) =
-        fast_path_workspace_context(check.config, workspace_dir_opt.as_deref())?;
-    let workspace_projects =
-        load_workspace_projects(&workspace_root, workspace_manifest.as_ref()).ok()?;
-    let project_manifests =
-        build_project_manifests_list(check.manifest, workspace_projects.as_deref());
-    // The lockfile the install wrote sits at its `lockfileDir`, which
-    // both `sharedWorkspaceLockfile: false` and an explicit pin move away
-    // from the discovered workspace root. The workspace *state* keeps its
-    // own root, which only a pin moves — `state_root` below.
-    let lockfile_root = lockfile_root_for(check.config, workspace_dir_opt.as_deref(), manifest_dir);
-    let state_root = check.config.lockfile_dir.clone().unwrap_or_else(|| workspace_root.clone());
-    let lockfile = lazy_wanted_lockfile(check.config, &lockfile_root);
-    if strict_dep_builds_blocks_fast_path(check.config) {
-        return None;
-    }
-    if check_optimistic_repeat_install(&OptimisticRepeatInstallCheck {
-        workspace_root: &state_root,
-        config: check.config,
-        project_manifests: &project_manifests,
-        is_workspace_install: workspace_manifest.is_some(),
-        lockfile: MaybeLazyLockfile::Lazy(&lockfile),
-        catalogs: &catalogs,
-        layout: crate::RepeatInstallLayout {
-            node_linker: check.node_linker,
-            included: super::included_dependencies(&check.dependency_groups),
-            supported_architectures: check.supported_architectures.as_ref(),
-        },
-    }) != OptimisticRepeatInstallDecision::UpToDate
-    {
-        return None;
-    }
-    ensure_gvs_builds_complete(check, &lockfile, &lockfile_root)?;
-    Some(UpToDateWorkspace {
-        root: state_root,
-        project_count: workspace_projects.as_ref().map(Vec::len),
-    })
-}
-
-fn fast_path_workspace_context(
+/// The state file is a cache: the next command's content check
+/// re-derives everything in it, so a lost write must not fail an
+/// install whose `node_modules` and lockfile are already committed
+/// ([#14550](https://github.com/pnpm/pnpm/issues/14550)).
+pub(crate) fn update_workspace_state_or_warn<Reporter: self::Reporter>(
+    workspace_root: &Path,
+    state: &WorkspaceState,
     config: &Config,
-    workspace_dir: Option<&Path>,
-) -> Option<(Option<pnpm_workspace::WorkspaceManifest>, super::Catalogs)> {
-    let workspace_manifest = workspace_dir
-        .map(pnpm_workspace::read_workspace_manifest)
-        .transpose()
-        .ok()?
-        .flatten();
-    let catalogs = match config.catalogs.clone() {
-        Some(catalogs) => catalogs,
-        None => get_catalogs_from_workspace_manifest(workspace_manifest.as_ref()).ok()?,
-    };
-    Some((workspace_manifest, catalogs))
-}
-
-fn ensure_gvs_builds_complete(
-    check: &UpToDateFastPathCheck<'_>,
-    lockfile: &pnpm_lockfile::LazyLockfile,
-    lockfile_root: &Path,
-) -> Option<()> {
-    if gvs_build_markers_may_require_recovery(check.config)
-        && gvs_build_marker_present(
-            lockfile.get().ok().flatten()?,
-            check.config,
-            lockfile_root,
-            super::effective_node_version(check.config, check.manifest).as_deref(),
-        )
-    {
-        return None;
+) {
+    let modules_dir = config.workspace_state_modules_dir(workspace_root);
+    if let Err(error) = update_workspace_state_in_modules(&modules_dir, state) {
+        tracing::warn!(
+            target: "pacquet::install",
+            ?error,
+            "Failed to write the workspace state",
+        );
+        pnpm_reporter::emit_global_warning::<Reporter>(&format!(
+            "Failed to write the workspace state: {error}",
+        ));
     }
-    Some(())
 }
 
+/// The workspace root the run belongs to: the configured one, else the
+/// nearest ancestor carrying a `pnpm-workspace.yaml`.
+///
+/// Yields `None` under [`Config::workspace_search_skipped`], where the
+/// ancestor walk would re-adopt the very `pnpm-workspace.yaml` that
+/// `--ignore-workspace` asked to ignore. Only that walk is suppressed:
+/// a caller that pinned [`Config::workspace_dir`] keeps it, which is how a
+/// global install anchors itself under the global packages dir.
 pub(crate) fn configured_or_discovered_workspace_dir(
     config: &Config,
     manifest_dir: &Path,
 ) -> Result<Option<PathBuf>, pnpm_workspace::FindWorkspaceDirError> {
-    match config.workspace_dir.clone() {
-        Some(workspace_dir) => Ok(Some(workspace_dir)),
+    match &config.workspace_dir {
+        Some(workspace_dir) => Ok(Some(workspace_dir.clone())),
+        None if config.workspace_search_skipped => Ok(None),
         None => pnpm_workspace::find_workspace_dir(manifest_dir),
     }
 }
@@ -160,8 +79,8 @@ pub(crate) fn lockfile_root_dir(
     config: &Config,
     manifest_dir: &Path,
 ) -> Result<PathBuf, pnpm_workspace::FindWorkspaceDirError> {
-    if let Some(lockfile_dir) = config.lockfile_dir.clone() {
-        return Ok(lockfile_dir);
+    if let Some(lockfile_dir) = &config.lockfile_dir {
+        return Ok(lockfile_dir.clone());
     }
     if !config.shared_workspace_lockfile {
         return Ok(manifest_dir.to_path_buf());
@@ -172,13 +91,13 @@ pub(crate) fn lockfile_root_dir(
 
 /// [`lockfile_root_dir`] for a caller that has already resolved the
 /// workspace dir, so the ancestor walk is not repeated.
-pub(super) fn lockfile_root_for(
+pub(crate) fn lockfile_root_for(
     config: &Config,
     workspace_dir: Option<&Path>,
     manifest_dir: &Path,
 ) -> PathBuf {
-    if let Some(lockfile_dir) = config.lockfile_dir.clone() {
-        return lockfile_dir;
+    if let Some(lockfile_dir) = &config.lockfile_dir {
+        return lockfile_dir.clone();
     }
     if !config.shared_workspace_lockfile {
         return manifest_dir.to_path_buf();
@@ -196,11 +115,6 @@ pub(super) fn lockfile_root_for(
 /// entries (`{ rootDir, manifest }`) consumed by the resolver.
 /// Projects whose manifest lacks a name are skipped. A missing or null
 /// version is indexed as `0.0.0`; malformed non-string versions are skipped.
-/// Index the workspace projects by package name and version — the
-/// resolver's view of what the workspace publishes, and the link
-/// targets `pacquet update --workspace` re-points dependencies at. A
-/// project without a name publishes nothing; a missing or null version
-/// reads as `0.0.0`, matching pnpm.
 #[must_use]
 pub fn build_workspace_packages_map(
     projects: Option<&[pnpm_workspace::Project]>,
@@ -209,34 +123,74 @@ pub fn build_workspace_packages_map(
     let mut map: pnpm_resolving_resolver_base::WorkspacePackages =
         std::collections::BTreeMap::new();
     for project in projects {
-        let Some(name) = manifest_string_field(&project.manifest, "name") else { continue };
-        let version = match project.manifest.value().get("version") {
-            None => "0.0.0".to_string(),
-            Some(value) if value.is_null() => "0.0.0".to_string(),
-            Some(value) => {
-                let Some(version) = value.as_str() else { continue };
-                version.to_string()
-            }
-        };
-        map.entry(name)
-            .or_default()
-            .insert(
-                version,
-                pnpm_resolving_resolver_base::WorkspacePackage {
-                    root_dir: project.root_dir.clone(),
-                    // The map feeds workspace picks resolved as *dependencies*
-                    // (injected instances), so a project that splits its two
-                    // views contributes its dependency manifest here — see
-                    // `pnpm_workspace::Project::dependency_manifest`.
-                    manifest: project.dependency_manifest
-                        .as_ref()
-                        .unwrap_or(&project.manifest)
-                        .value()
-                        .clone(),
-                },
-            );
+        insert_workspace_package(
+            &mut map,
+            &project.root_dir,
+            &project.manifest,
+            project.dependency_manifest.as_ref().unwrap_or(&project.manifest),
+        );
     }
     Some(map)
+}
+
+/// [`build_workspace_packages_map`] over `(root_dir, manifest)` pairs, with
+/// the projects' dependency manifests (see
+/// [`super::dependency_manifests_by_dir`]) in place of their importer
+/// manifests where they have one.
+pub(crate) fn build_workspace_packages_map_from_manifests(
+    projects: &[(PathBuf, &PackageManifest)],
+    dependency_manifests: Option<&super::ProjectManifestsByDir<'_>>,
+) -> pnpm_resolving_resolver_base::WorkspacePackages {
+    let mut map = std::collections::BTreeMap::new();
+    for (root_dir, manifest) in projects {
+        let dependency_manifest = dependency_manifests
+            .and_then(|by_dir| {
+                by_dir
+                    .get(&pnpm_fs::lexical_normalize(root_dir))
+                    .copied()
+            })
+            .unwrap_or(manifest);
+        insert_workspace_package(&mut map, root_dir, manifest, dependency_manifest);
+    }
+    map
+}
+
+pub(crate) fn workspace_packages_for_freshness(
+    config: &Config,
+    is_workspace_install: bool,
+    projects: &[(PathBuf, &PackageManifest)],
+    dependency_manifests: Option<&super::ProjectManifestsByDir<'_>>,
+) -> Option<pnpm_resolving_resolver_base::WorkspacePackages> {
+    (is_workspace_install
+        && config.exclude_links_from_lockfile
+        && config.link_workspace_packages.enabled_at_depth(0))
+    .then(|| build_workspace_packages_map_from_manifests(projects, dependency_manifests))
+}
+
+fn insert_workspace_package(
+    map: &mut pnpm_resolving_resolver_base::WorkspacePackages,
+    root_dir: &Path,
+    identity_manifest: &PackageManifest,
+    dependency_manifest: &PackageManifest,
+) {
+    let Some(name) = manifest_string_field(identity_manifest, "name") else { return };
+    let version = match identity_manifest.value().get("version") {
+        None => "0.0.0".to_string(),
+        Some(value) if value.is_null() => "0.0.0".to_string(),
+        Some(value) => {
+            let Some(version) = value.as_str() else { return };
+            version.to_string()
+        }
+    };
+    map.entry(name)
+        .or_default()
+        .insert(
+            version,
+            pnpm_resolving_resolver_base::WorkspacePackage {
+                root_dir: root_dir.to_path_buf(),
+                manifest: dependency_manifest.value().clone(),
+            },
+        );
 }
 
 /// Build the `projects` map for [`WorkspaceState`] from the
@@ -256,6 +210,7 @@ pub(super) fn build_projects_map(
             let entry = ProjectEntry {
                 name: manifest_string_field(manifest, "name"),
                 version: manifest_string_field(manifest, "version"),
+                has_modules_dir: false,
             };
             (project_dir.to_string_lossy().into_owned(), entry)
         })
@@ -263,13 +218,12 @@ pub(super) fn build_projects_map(
 }
 
 /// Assemble the [`WorkspaceState`] payload for
-/// [`pnpm_workspace_state::update_workspace_state`].
+/// [`pnpm_workspace_state::update_workspace_state`], for
+/// [`crate::install_state::validation::record_validation`] to
+/// complete once the caller has settled its settings.
 ///
 /// Records the projects pacquet just materialized plus the resolved
-/// settings the install used. `lastValidatedTimestamp` is the
-/// [`validation_baseline_ms`] of the lockfile and manifests raised to
-/// `filesystem_now_ms`, per [`refreshed_validation_baseline_ms`]; the
-/// wall clock stands in only when nothing can be stat'd.
+/// settings the install used, and the [`last_validated_timestamp`].
 /// Settings pacquet does not track yet (e.g. `peersSuffixMaxLength`)
 /// are omitted; pnpm's `checkDepsStatus`
 /// only iterates fields present in the serialized object, so an
@@ -285,62 +239,85 @@ pub(crate) fn build_workspace_state<Sys: Clock>(
     included: IncludedDependencies,
     supported_architectures: Option<&pnpm_package_is_installable::SupportedArchitectures>,
     catalogs: &Catalogs,
-    project_manifests: &[(std::path::PathBuf, &PackageManifest)],
-    filtered_install: bool,
+    project_manifests: crate::DeclaredManifests<'_>,
     filesystem_now_ms: Option<i64>,
 ) -> WorkspaceState {
-    WorkspaceState {
-        last_validated_timestamp: refreshed_validation_baseline_ms(
-            validation_baseline_ms(workspace_root, config, project_manifests)
-                .unwrap_or_else(|| pnpm_workspace_state::millis_since_epoch(Sys::now())),
+    let project_manifests = project_manifests.as_slice();
+    let mut state = WorkspaceState {
+        last_validated_timestamp: last_validated_timestamp::<Sys>(
+            workspace_root,
+            config,
+            project_manifests,
             filesystem_now_ms,
         ),
         projects: build_projects_map(project_manifests),
-        pnpmfiles: crate::optimistic_repeat_install::current_pnpmfiles(workspace_root, config),
-        filtered_install,
+        pnpmfiles: crate::install_state::current_pnpmfiles(workspace_root, config),
+        filtered_install: false,
         config_dependencies: config.config_dependencies.clone(),
+        validation: None,
         // Settings construction is shared with
-        // `optimistic_repeat_install::current_settings` so the
+        // `install_state::current_settings` so the
         // freshness check sees the same byte shape this writer
         // produces. Keeping the construction in one place guarantees
         // adding a field on one side doesn't silently flip the other
         // into "drift" on the next install.
-        settings: crate::optimistic_repeat_install::current_settings_with_catalogs(
+        settings: crate::install_state::current_settings_with_catalogs(
             config,
             node_linker,
             included,
             supported_architectures,
             catalogs,
         ),
+    };
+    // Frozen installs share this builder and cannot establish a deduplication
+    // baseline, nor vouch for the lockfile's registry keys, nor say which
+    // routes its plain keys resolved through.
+    state.settings.auto_dedupe = None;
+    state.settings.registry_prefixes = None;
+    state.settings.default_registry = None;
+    state.settings.registry_routes = None;
+    if node_linker == NodeLinker::Hoisted {
+        record_hoisted_modules_dirs(&mut state.projects, project_manifests);
     }
+    state
 }
 
-/// The wanted lockfile, read on first use — or a stand-in that never reads
-/// one when the install is configured without a lockfile.
-fn lazy_wanted_lockfile(config: &Config, lockfile_root: &Path) -> LazyLockfile {
-    if config.lockfile {
-        LazyLockfile::deferred(lockfile_root.to_path_buf(), config.wanted_lockfile_selection())
-    } else {
-        LazyLockfile::disabled()
-    }
+/// Whether every `packages:` key of `lockfile` is the one the declared
+/// registry prefixes call for, so the state may record them. A missing
+/// lockfile verifies nothing.
+pub(crate) fn registry_keys_current(
+    config: &Config,
+    lockfile: Option<&pnpm_lockfile::Lockfile>,
+) -> bool {
+    lockfile.is_some_and(|lockfile| {
+        pnpm_lockfile::check_lockfile_registry_keys(lockfile, &config.registry_context()).is_ok()
+    })
 }
 
-/// Under `strictDepBuilds`, a recorded-and-still-unapproved ignored build must
-/// keep the install failing — never let the pre-runtime fast path report
-/// up-to-date and exit 0. `true` falls through to the full `Install::run`,
-/// whose optimistic branch raises `ERR_PNPM_IGNORED_BUILDS`. A corrupt or
-/// unreadable `.modules.yaml` is treated conservatively the same way: its
-/// `Err` cannot prove the absence of recorded ignored builds.
-fn strict_dep_builds_blocks_fast_path(config: &Config) -> bool {
-    if !config.strict_dep_builds {
-        return false;
+/// The `autoDedupe` an install records in the workspace state.
+///
+/// With `lockfile.includeResolutionSettings`, the lockfile records
+/// `autoDedupe` and its freshness check holds that value to the config, so
+/// every install that kept the lockfile records the config's value.
+/// Otherwise only a resolving install establishes the dedupe baseline, and
+/// `established` is what this write knows of it.
+pub(crate) fn recorded_auto_dedupe(config: &Config, established: Option<bool>) -> Option<bool> {
+    if config.lockfile && config.lockfile_include_resolution_settings {
+        return config.auto_dedupe.then_some(true);
     }
-    match pnpm_modules_yaml::read_modules_layout::<Host>(&config.modules_dir) {
-        Ok(Some(modules)) => match unapproved_recorded_ignored_builds(&modules, config) {
-            Ok(Some(_)) | Err(_) => true,
-            Ok(None) => false,
-        },
-        Ok(None) => false,
-        Err(_) => true,
+    established
+}
+
+/// Set [`ProjectEntry::has_modules_dir`] for each project the hoisted
+/// install left with its own modules directory.
+fn record_hoisted_modules_dirs(
+    projects: &mut BTreeMap<String, ProjectEntry>,
+    project_manifests: &[(PathBuf, &PackageManifest)],
+) {
+    for (root_dir, _) in project_manifests {
+        if let Some(entry) = projects.get_mut(&*root_dir.to_string_lossy()) {
+            entry.has_modules_dir =
+                crate::install_state::hoisted_project_modules_dir(root_dir).is_dir();
+        }
     }
 }

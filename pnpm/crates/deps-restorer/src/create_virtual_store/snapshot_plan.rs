@@ -82,11 +82,6 @@ pub(super) fn plan_snapshots<'a, Reporter: self::Reporter>(
 
 /// The snapshots this install materializes, and whether any of them is
 /// git-hosted.
-///
-/// The slot probe goes through `layout.slot_dir` because under GVS the
-/// slot lives at `<global_virtual_store_dir>/...`, and probing
-/// `<virtual_store_dir>/<flat-name>` would find nothing and report
-/// every warm slot as broken.
 fn survivors<'a, Reporter: self::Reporter>(
     snapshots: &'a HashMap<PackageKey, SnapshotEntry>,
     probe: &WarmSlotProbe<'a, '_>,
@@ -221,7 +216,7 @@ fn warm_slot_is_current<Reporter: self::Reporter>(
     // A global-virtual-store slot path is content-addressed: the graph
     // hash covers the snapshot's wiring, integrity, and engine, so an
     // existing slot is current even when no current lockfile survives —
-    // a wiped `node_modules` takes `<virtual_store_dir>/lock.yaml` with
+    // a wiped `node_modules` takes `<install_state_dir>/lock.yaml` with
     // it, and without this probe such a restore re-links every slot the
     // store already holds (pnpm/pnpm#14510). Mirrors the GVS fast path
     // in pnpm's `lockfileToDepGraph`.
@@ -237,6 +232,13 @@ fn warm_slot_is_current<Reporter: self::Reporter>(
         current_entry_unchanged,
         markers,
     )? {
+        return Ok(false);
+    }
+    if super::linked_archives::slot_holds_other_variant(
+        probe.layout,
+        (snapshot_key, probe.packages),
+        probe.policy.supported_architectures,
+    ) {
         return Ok(false);
     }
     let needs_rebuild =
@@ -315,16 +317,22 @@ fn slot_contents_complete<Reporter: self::Reporter>(
         markers.keys.insert(snapshot_key.clone());
         return Ok(false);
     }
+    // A current-lockfile record is only written by a completed install,
+    // so it vouches for a slot only this project writes. A global
+    // virtual-store slot is shared: another project's install may have
+    // re-created it after the record was written and been interrupted
+    // halfway (pnpm/pnpm#16642).
+    let record_vouches_for_slot =
+        current_entry_unchanged && !probe.layout.enable_global_virtual_store();
     // The importer populates shared GVS slots in place, so an existing
     // directory may be an import another install is still filling or
     // died halfway through (see `import_into_shared_dir`). Without a
-    // current-lockfile record vouching that a previous install completed
-    // the slot, require the importer's own completion invariant —
-    // pnpm's `pkgExistsAtTargetDir` probes `package.json`, which the
-    // import places last. A rare package whose file map lacks
-    // `package.json` merely re-materializes, and the import then
-    // short-circuits on its actual marker.
-    if !current_entry_unchanged && !probe_slot_entry(&dir.join("package.json"), EntryKind::File)? {
+    // record vouching for the slot, require the importer's own
+    // completion invariant — pnpm's `pkgExistsAtTargetDir` probes
+    // `package.json`, which the import places last. A rare package whose
+    // file map lacks `package.json` merely re-materializes, and the
+    // import then short-circuits on its actual marker.
+    if !record_vouches_for_slot && !probe_slot_entry(&dir.join("package.json"), EntryKind::File)? {
         return Ok(false);
     }
     if !optional_children_match(
@@ -340,11 +348,10 @@ fn slot_contents_complete<Reporter: self::Reporter>(
     // The completion marker only covers the file import: the slot's
     // child symlinks are written concurrently with it (`rayon::join` in
     // `CreateVirtualDirBySnapshot::run`), so a crash can leave a
-    // marker-complete slot with links missing. A current-lockfile record
-    // is only written by a completed install and so vouches for the
-    // links too; without one, probe every child the symlink layout would
-    // have created.
-    if current_entry_unchanged {
+    // marker-complete slot with links missing. Without a record vouching
+    // for the slot, probe every child the symlink layout would have
+    // created.
+    if record_vouches_for_slot {
         return Ok(true);
     }
     regular_children_match(
@@ -364,11 +371,12 @@ pub(crate) struct SnapshotReusePolicy<'b> {
     /// Snapshots the installability pass ruled out on this host.
     pub skipped: &'b SkippedSnapshots,
     pub link_dependencies: bool,
-    /// `--force` re-materializes every slot, so both skip paths — the
-    /// current-lockfile comparison and the global-virtual-store
-    /// existence probe — are disabled here, whether or not the caller
-    /// also emptied `current_entries`.
+    /// Disable both the current-lockfile reuse check and the global-store
+    /// existence probe to re-materialize every slot.
     pub force: bool,
     pub is_hoisted: bool,
     pub include_optional: bool,
+    /// What a package with platform variants links, so a slot holding
+    /// another of its archives is not current.
+    pub supported_architectures: Option<&'b pnpm_package_is_installable::SupportedArchitectures>,
 }

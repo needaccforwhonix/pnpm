@@ -1,5 +1,5 @@
 use super::{
-    super::{Install, InstallError, ProjectMutation},
+    super::{Install, InstallError, ProjectMutation, workspace_state::build_workspace_state},
     InstallDirs, PARTIAL_INSTALL_LOCKFILE, seed_placeholder_virtual_store_slot,
 };
 use crate::PolicyExcludes;
@@ -9,7 +9,7 @@ use pnpm_modules_yaml::{Host, LayoutVersion, Modules, NodeLinker, write_modules_
 use pnpm_package_manifest::{DependencyGroup, PackageManifest};
 use pnpm_reporter::{LogEvent, Reporter, SilentReporter, Stage};
 use pnpm_testing_utils::registry::TestRegistry;
-use pnpm_workspace_state::load_workspace_state;
+use pnpm_workspace_state::{load_workspace_state, update_workspace_state};
 use std::{fs, sync::Mutex, time::Duration};
 use text_block_macros::text_block;
 
@@ -20,10 +20,6 @@ use text_block_macros::text_block;
 /// from the cold-batch dispatcher. Variant selection happens
 /// before any network fetch, so the bogus URL on the variant is
 /// never read — the test stays hermetic.
-///
-/// Closes the variant-mismatch checkbox of [#437] slice F.
-///
-/// [#437]: https://github.com/pnpm/pacquet/issues/437
 #[tokio::test]
 async fn frozen_lockfile_install_errors_when_no_variant_matches_host() {
     let dirs = InstallDirs::new();
@@ -36,7 +32,7 @@ async fn frozen_lockfile_install_errors_when_no_variant_matches_host() {
     let mut config = Config::new();
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
     let config = config.leak();
 
     // Lockfile with a runtime entry whose variants only target a
@@ -116,6 +112,8 @@ async fn frozen_lockfile_install_errors_when_no_variant_matches_host() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -141,10 +139,6 @@ async fn frozen_lockfile_install_errors_when_no_variant_matches_host() {
 /// adds the snapshot to the skip set — so variant selection
 /// never runs and the unmatchable-platform variant doesn't fail
 /// the install.
-///
-/// Closes the `--no-runtime` checkbox of [#437] slice F.
-///
-/// [#437]: https://github.com/pnpm/pacquet/issues/437
 #[tokio::test]
 async fn frozen_lockfile_install_skips_runtime_when_skip_runtimes_set() {
     let dirs = InstallDirs::new();
@@ -157,7 +151,7 @@ async fn frozen_lockfile_install_skips_runtime_when_skip_runtimes_set() {
     let mut config = Config::new();
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
     let config = config.leak();
 
     let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
@@ -196,7 +190,7 @@ ignore_manifest_check: false,
 trust: false,
 update_checksums: false,
 excludes: PolicyExcludes::Persist,
-disable_optimistic_repeat: false
+disable_optimistic_repeat: false,
 },
 execution: crate::InstallExecution {
 skip_runtimes: true,
@@ -232,7 +226,9 @@ dependency_groups: [DependencyGroup::Prod, DependencyGroup::Optional],
 supported_architectures: None,
 catalogs_override: None,
 pnpmfile_hook_override: None,
-workspace_projects_override: None
+workspace_projects_override: None,
+dedicated: None,
+discovered_workspace: None
 },
 }
     .run::<SilentReporter>()
@@ -296,8 +292,8 @@ async fn frozen_lockfile_gate_rejects_under_huge_minimum_release_age() {
     let mut config = Config::new();
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
-    config.registry = mock_instance.url();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
+    config.registry = mock_instance.url().to_string();
     // 100 years in minutes. Anything the registry has shipped to
     // date is inside the cutoff, so the publish-time check rejects
     // every lockfile entry regardless of what the mocked packument's
@@ -370,6 +366,8 @@ async fn frozen_lockfile_gate_rejects_under_huge_minimum_release_age() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -415,8 +413,8 @@ async fn prefer_frozen_install_writes_missing_current_lockfile() {
     let mut config = Config::new();
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
-    config.registry = mock_instance.url();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
+    config.registry = mock_instance.url().to_string();
     let config = config.leak();
 
     Install {
@@ -468,6 +466,8 @@ async fn prefer_frozen_install_writes_missing_current_lockfile() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -529,6 +529,8 @@ async fn prefer_frozen_install_writes_missing_current_lockfile() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -567,7 +569,7 @@ async fn prefer_frozen_lockfile_takes_frozen_path_when_lockfile_is_fresh() {
     config.enable_global_virtual_store = false;
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
     let config = config.leak();
 
     let lockfile: Lockfile = serde_saphyr::from_str(PARTIAL_INSTALL_LOCKFILE)
@@ -575,7 +577,7 @@ async fn prefer_frozen_lockfile_takes_frozen_path_when_lockfile_is_fresh() {
 
     std::fs::create_dir_all(&dirs.virtual_store_dir).unwrap();
     lockfile
-        .save_current_to_virtual_store_dir(&dirs.virtual_store_dir)
+        .save_current_to_install_state_dir(&dirs.virtual_store_dir)
         .expect("seed current lockfile");
     seed_placeholder_virtual_store_slot(&dirs.virtual_store_dir);
 
@@ -627,6 +629,8 @@ async fn prefer_frozen_lockfile_takes_frozen_path_when_lockfile_is_fresh() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -642,7 +646,7 @@ async fn prefer_frozen_lockfile_takes_frozen_path_when_lockfile_is_fresh() {
 /// `Install::prefer_frozen_lockfile = Some(false)` (the CLI's
 /// `--no-prefer-frozen-lockfile` opt-out). The dispatch must route to
 /// the fresh-resolve path even though the frozen fast path would have
-/// applied. We prove it by pointing at an unreachable registry: the
+/// applied. We prove it by pointing at a failing registry: the
 /// fresh-resolve path will hit the resolver and fail, whereas the
 /// frozen fast path would short-circuit the network entirely via the
 /// skip cache.
@@ -655,15 +659,25 @@ async fn no_prefer_frozen_lockfile_flag_forces_fresh_resolve() {
     manifest.add_dependency("placeholder", "1.0.0", DependencyGroup::Prod).unwrap();
     manifest.save().unwrap();
 
+    let mut registry = mockito::Server::new_async().await;
+    let failed_request = registry
+        .mock("GET", "/placeholder")
+        .with_status(503)
+        .expect(3)
+        .create_async()
+        .await;
     let mut config = Config::new();
-    // Force the resolver onto an unreachable registry so the
-    // fresh-resolve path errors out clearly; the frozen path would
-    // never consult the registry at all.
-    config.registry = "http://invalid.local/".to_string();
+    config.registry = format!("{}/", registry.url());
+    config.fetch_retry_mintimeout = 1;
+    config.fetch_retry_maxtimeout = 1;
+    // The default cache dir is shared by every test. Another test's mock can
+    // get the same port and leave this package's metadata there, and an
+    // exact version found in cached metadata never reaches the registry.
+    config.cache_dir = dirs.path().join("cache");
     config.enable_global_virtual_store = false;
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
     let config = config.leak();
 
     let lockfile: Lockfile = serde_saphyr::from_str(PARTIAL_INSTALL_LOCKFILE)
@@ -673,7 +687,7 @@ async fn no_prefer_frozen_lockfile_flag_forces_fresh_resolve() {
     // frozen, the skip cache would carry the install to success.
     std::fs::create_dir_all(&dirs.virtual_store_dir).unwrap();
     lockfile
-        .save_current_to_virtual_store_dir(&dirs.virtual_store_dir)
+        .save_current_to_install_state_dir(&dirs.virtual_store_dir)
         .expect("seed current lockfile");
     seed_placeholder_virtual_store_slot(&dirs.virtual_store_dir);
 
@@ -724,13 +738,16 @@ async fn no_prefer_frozen_lockfile_flag_forces_fresh_resolve() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
     .await;
 
+    failed_request.assert_async().await;
     let err = result.expect_err(
-        "fresh-resolve dispatch must consult the unreachable registry and fail; \
+        "fresh-resolve dispatch must consult the failing registry and fail; \
          a success would mean the dispatch silently took the frozen fast path",
     );
     assert!(
@@ -738,10 +755,10 @@ async fn no_prefer_frozen_lockfile_flag_forces_fresh_resolve() {
         "fresh-resolve fall-through must not surface as OutdatedLockfile, got {err:?}",
     );
 }
-/// End-to-end: when `.modules.yaml`, `<virtual_store_dir>/lock.yaml`,
-/// and the wanted lockfile all agree — and the tree those files
-/// describe is still on disk (the short-circuit probes it; a missing
-/// entry must fall through to the repairing full path) —
+/// End-to-end: when `.modules.yaml`, `<install_state_dir>/lock.yaml`,
+/// and the wanted lockfile agree, workspace state records the current root,
+/// and the tree those files describe is still on disk (the short-circuit
+/// probes it; a missing entry falls through to the repairing full path),
 /// [`Install::run`] must emit the `name: "pnpm"` "Lockfile is up to
 /// date" log and return without running materialization (the
 /// `allProjectsAreUpToDate` + `validateModules` short-circuit).
@@ -776,7 +793,7 @@ async fn frozen_install_short_circuits_when_modules_and_lockfile_are_consistent(
     config.lockfile = false;
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
     let config = config.leak();
 
     let lockfile: Lockfile = serde_saphyr::from_str(text_block! {
@@ -807,7 +824,7 @@ async fn frozen_install_short_circuits_when_modules_and_lockfile_are_consistent(
         public_hoist_pattern: config.public_hoist_pattern.clone(),
         store_dir: config.store_dir.display().to_string(),
         virtual_store_dir: config
-            .effective_virtual_store_dir()
+            .virtual_store_dir()
             .to_string_lossy()
             .into_owned(),
         virtual_store_dir_max_length: config.virtual_store_dir_max_length,
@@ -815,8 +832,19 @@ async fn frozen_install_short_circuits_when_modules_and_lockfile_are_consistent(
     };
     write_modules_manifest::<Host>(&dirs.modules_dir, seed_modules).expect("seed .modules.yaml");
     lockfile
-        .save_current_to_virtual_store_dir(&dirs.virtual_store_dir)
+        .save_current_to_install_state_dir(&dirs.virtual_store_dir)
         .expect("seed current lockfile");
+    let seed_state = build_workspace_state::<Host>(
+        &dirs.project_root,
+        config,
+        pnpm_config::NodeLinker::Isolated,
+        included,
+        None,
+        &Default::default(),
+        crate::DeclaredManifests::new(&[(dirs.project_root.clone(), &manifest)]),
+        None,
+    );
+    update_workspace_state(&dirs.project_root, &seed_state).expect("seed workspace state");
     // Date the manifest inside a millisecond after the lockfile, as a
     // sub-millisecond filesystem leaves a manifest edited after the last
     // lockfile write: the manifest's truncated mtime alone would read as
@@ -880,6 +908,8 @@ async fn frozen_install_short_circuits_when_modules_and_lockfile_are_consistent(
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<RecordingReporter>()
@@ -929,14 +959,14 @@ async fn frozen_install_short_circuits_when_modules_and_lockfile_are_consistent(
     let written = load_workspace_state(&dirs.project_root)
         .expect("read workspace state")
         .expect("workspace state must be written");
-    let manifest_mtime = crate::optimistic_repeat_install::file_mtime(manifest.path())
-        .expect("manifest should have an mtime");
+    let manifest_mtime =
+        crate::install_state::file_mtime(manifest.path()).expect("manifest should have an mtime");
     assert_eq!(
         manifest_mtime.ns, 1_700_000_000_000_500_000,
         "the short-circuit must leave the manifest untouched",
     );
     assert!(
-        !crate::optimistic_repeat_install::modified_at_or_after(
+        !crate::install_state::modified_at_or_after(
             manifest_mtime,
             written.last_validated_timestamp,
         ),

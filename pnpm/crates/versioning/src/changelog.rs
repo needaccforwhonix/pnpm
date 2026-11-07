@@ -8,7 +8,7 @@ use crate::{
     settings::ReleaseBumpType,
 };
 
-fn section_title(bump_type: ReleaseBumpType) -> &'static str {
+pub(crate) fn section_title(bump_type: ReleaseBumpType) -> &'static str {
     match bump_type {
         ReleaseBumpType::Major => "Major Changes",
         ReleaseBumpType::Minor => "Minor Changes",
@@ -61,7 +61,7 @@ pub fn compose_changelog_section(release: &PlannedRelease) -> String {
 /// The bump an intent declares for this release, whichever way the intent
 /// references the project — by name (sound only when unambiguous, which plan
 /// assembly guarantees) or by directory.
-fn release_bump_for(
+pub(crate) fn release_bump_for(
     releases: &indexmap::IndexMap<String, IntentBumpType>,
     release: &PlannedRelease,
 ) -> Option<ReleaseBumpType> {
@@ -75,7 +75,7 @@ fn release_bump_for(
     None
 }
 
-fn format_list_item(summary: &str) -> String {
+pub(crate) fn format_list_item(summary: &str) -> String {
     let mut lines = summary.split('\n');
     let first_line = lines.next().unwrap_or_default();
     let mut item = format!("- {first_line}");
@@ -91,9 +91,7 @@ fn format_list_item(summary: &str) -> String {
 
 /// Places `section` at the top of a package's changelog: under the existing
 /// `# <name>` title when `existing` is `Some`, or under a freshly created
-/// title when `existing` is `None`. Used both to write a committed
-/// CHANGELOG.md (`repository` storage) and to build the changelog packed into
-/// a published tarball on top of the previous version's (`registry` storage).
+/// title when `existing` is `None`.
 #[must_use]
 pub fn render_changelog(existing: Option<&str>, pkg_name: &str, section: &str) -> String {
     let Some(existing) = existing else {

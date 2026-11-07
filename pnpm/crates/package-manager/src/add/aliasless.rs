@@ -24,6 +24,8 @@ use std::{collections::HashMap, sync::Arc};
 pub(super) struct AliaslessDependency {
     pub(super) package_name: String,
     pub(super) manifest_specifier: String,
+    /// The directory's own manifest, for a selector saved as `link:`.
+    pub(super) linked_manifest: Option<Arc<serde_json::Value>>,
 }
 /// Resolve an alias-less add selector, or `None` to leave it to
 /// [`split_name_spec`](crate::add::specifier::split_name_spec), which reads it as a registry `<name>[@<spec>]`.
@@ -40,9 +42,13 @@ pub(super) async fn resolve_aliasless_specifier(
         return resolve_aliasless_git(specifier, inputs).await.map(Some);
     }
     if specifier.starts_with("http:") || specifier.starts_with("https:") {
-        return resolve_aliasless_tarball(specifier, inputs.add.config, inputs.http_client_arc)
-            .await
-            .map(Some);
+        return resolve_aliasless_tarball(
+            specifier,
+            inputs.add.config,
+            &inputs.owned.http_client_arc,
+        )
+        .await
+        .map(Some);
     }
     resolve_aliasless_local(specifier, manifest).await
 }
@@ -60,7 +66,9 @@ pub(super) async fn resolve_aliasless_local(
         return Ok(None);
     }
     let wanted = WantedLocalDependency { bare_specifier: specifier.to_string(), injected: false };
-    let ctx = LocalResolverContext { preserve_absolute_paths: false };
+    // Only the package name is read here; the install resolves the
+    // dependency again through the full chain.
+    let ctx = LocalResolverContext::default();
     let opts = LocalResolverOptions {
         project_dir: manifest
             .path()
@@ -72,6 +80,9 @@ pub(super) async fn resolve_aliasless_local(
         lockfile_dir: None,
         current_pkg: None,
         update: LocalResolverUpdate::On,
+        // `is_local_filesystem_specifier` above never claims a `workspace:`
+        // spec, so this setting has nothing to apply to here.
+        inject_workspace_packages: false,
     };
     let mut claimed =
         resolve_from_local_scheme(&ctx, &wanted, &opts).await.map_err(AddError::ResolveLocal)?;
@@ -85,7 +96,8 @@ pub(super) async fn resolve_aliasless_local(
     let manifest_specifier =
         resolved.normalized_bare_specifier.unwrap_or_else(|| normalized_save_specifier(specifier));
     let package_name = aliasless_package_name(resolved.manifest.as_deref(), specifier)?;
-    Ok(Some(AliaslessDependency { package_name, manifest_specifier }))
+    let linked_manifest = resolved.manifest.filter(|_| manifest_specifier.starts_with("link:"));
+    Ok(Some(AliaslessDependency { package_name, manifest_specifier, linked_manifest }))
 }
 /// Resolve a remote (non-registry) tarball URL by downloading and
 /// extracting it: a tarball's name lives in the `package.json` it bundles,
@@ -99,24 +111,7 @@ pub(super) async fn resolve_aliasless_tarball(
     config: &'static Config,
     http_client: &Arc<ThrottledClient>,
 ) -> Result<AliaslessDependency, AddError> {
-    let resolver = TarballResolver {
-        http_client: Arc::clone(http_client),
-        fetch_context: Some(TarballFetchContext {
-            mem_cache: None,
-            auth_headers: Arc::clone(&config.auth_headers),
-            retry_opts: crate::retry_config::retry_opts_from_config(config),
-            prior_tarball_entries: Arc::new(HashMap::new()),
-            store: pnpm_tarball::ArchiveStoreContext {
-                strict_pkg_content_check: false,
-                prefetched_cas_paths: None,
-                dir: &config.store_dir,
-                index_writer: None,
-                index: None,
-                verify_integrity: config.verify_store_integrity,
-                verified_files_cache: SharedVerifiedFilesCache::default(),
-            },
-        }),
-    };
+    let resolver = aliasless_tarball_resolver(config, http_client);
     let wanted = pnpm_resolving_resolver_base::WantedDependency {
         bare_specifier: Some(specifier.to_string()),
         ..pnpm_resolving_resolver_base::WantedDependency::default()
@@ -138,7 +133,34 @@ pub(super) async fn resolve_aliasless_tarball(
     let manifest_specifier =
         result.normalized_bare_specifier.unwrap_or_else(|| normalized_save_specifier(specifier));
     let package_name = aliasless_package_name(result.package.manifest.as_deref(), specifier)?;
-    Ok(AliaslessDependency { package_name, manifest_specifier })
+    Ok(AliaslessDependency { package_name, manifest_specifier, linked_manifest: None })
+}
+
+fn aliasless_tarball_resolver(
+    config: &'static Config,
+    http_client: &Arc<ThrottledClient>,
+) -> TarballResolver {
+    TarballResolver {
+        http_client: Arc::clone(http_client),
+        fetch_context: Some(TarballFetchContext {
+            mem_cache: None,
+            auth_headers: Arc::clone(&config.auth_headers),
+            retry_opts: config.retry_opts(),
+            tar_limits: config.tar_limits(),
+            prior_tarball_entries: Arc::new(HashMap::new()),
+            cache_dir: Some(config.cache_dir.clone()),
+            integrity_target: config.lockfile_integrity_target,
+            store: pnpm_tarball::ArchiveStoreContext {
+                strict_pkg_content_check: false,
+                prefetched_cas_paths: None,
+                dir: &config.store_dir,
+                index_writer: None,
+                index: None,
+                verify_integrity: config.verify_store_integrity,
+                verified_files_cache: SharedVerifiedFilesCache::default(),
+            },
+        }),
+    }
 }
 /// Flatten an error chain into one line, with every URL in it cut back to
 /// its display-safe form.
@@ -260,6 +282,23 @@ pub(super) fn aliasless_package_name(
     }
     Ok(name.to_string())
 }
+/// The name an alias-less git selector's package is added under: the one
+/// its own manifest declares, or — for a repository that ships no manifest
+/// — one synthesized from the repository's host identity.
+///
+/// `None` when neither is available: the repository declares no name and
+/// its URL names a host pacquet cannot read an owner and project out of.
+pub(super) fn git_package_name(
+    manifest: Option<&serde_json::Value>,
+    specifier: &str,
+) -> Option<String> {
+    manifest
+        .and_then(|manifest| manifest.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .or_else(|| HostedGit::from_url(specifier).map(|hosted| hosted.synthesized_package_name()))
+}
 pub(super) async fn resolve_aliasless_git(
     specifier: &str,
     inputs: &AddResolveInputs<'_, '_>,
@@ -282,12 +321,7 @@ pub(super) async fn resolve_aliasless_git(
         Err(source) => AddError::ResolveGit { specifier: redact_and_sanitize(specifier), source },
     })?
     .ok_or_else(|| AddError::GitPackageName { specifier: redact_and_sanitize(specifier) })?;
-    let package_name = result.package.manifest
-        .as_ref()
-        .and_then(|manifest| manifest.get("name"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
-        .or_else(|| HostedGit::from_url(specifier).map(|hosted| hosted.project))
+    let package_name = git_package_name(result.package.manifest.as_deref(), specifier)
         .ok_or_else(|| AddError::GitPackageName { specifier: redact_and_sanitize(specifier) })?;
     if !is_valid_dependency_alias(&package_name) {
         return Err(AddError::InvalidGitPackageName {
@@ -297,16 +331,16 @@ pub(super) async fn resolve_aliasless_git(
     }
     let manifest_specifier =
         result.normalized_bare_specifier.unwrap_or_else(|| normalized_save_specifier(specifier));
-    Ok(AliaslessDependency { package_name, manifest_specifier })
+    Ok(AliaslessDependency { package_name, manifest_specifier, linked_manifest: None })
 }
 pub(super) fn aliasless_git_resolver(
     inputs: &AddResolveInputs<'_, '_>,
 ) -> GitResolver<RealGitProbe, RealGitRunner> {
     let config = inputs.add.config;
-    let http_client = inputs.http_client_arc;
+    let http_client = &inputs.owned.http_client_arc;
     GitResolver::new(
         Arc::new(RealGitProbe::new(Arc::clone(http_client))),
-        Arc::new(RealGitRunner::new()),
+        Arc::new(RealGitRunner::new().with_connect_guard(config.auth_headers.connect_guard())),
     )
     .with_fetch_context(GitFetchContext {
         source_cache: Arc::clone(inputs.git_source_cache),
@@ -314,7 +348,8 @@ pub(super) fn aliasless_git_resolver(
         store_dir: &config.store_dir,
         store_index_writer: None,
         auth_headers: Arc::clone(&config.auth_headers),
-        retry_opts: crate::retry_config::retry_opts_from_config(config),
+        retry_opts: config.retry_opts(),
+        tar_limits: config.tar_limits(),
         git_shallow_hosts: config.git_shallow_hosts.clone(),
     })
 }

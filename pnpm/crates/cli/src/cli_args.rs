@@ -14,6 +14,7 @@ pub mod ci;
 pub mod clean;
 pub(crate) mod cli_command;
 pub mod completion;
+pub(crate) mod concurrency_group;
 pub mod config;
 pub(crate) mod config_warnings;
 pub mod create;
@@ -25,10 +26,13 @@ pub mod dist_tag;
 pub mod dlx;
 pub mod docs;
 pub mod doctor;
+pub(crate) mod ecosystem_deps;
+pub(crate) mod engine_deps;
 pub mod env;
 pub mod exec;
 pub mod fetch;
 pub mod find_hash;
+pub mod fund;
 pub mod global;
 pub(crate) mod global_bin_lock;
 pub mod ignored_builds;
@@ -42,6 +46,7 @@ pub(crate) mod legacy_pnpm_field;
 pub mod licenses;
 pub mod link;
 pub mod list;
+pub(crate) mod listed_projects;
 pub mod lockfile_dir;
 pub mod login;
 pub mod logout;
@@ -52,21 +57,26 @@ pub mod owner;
 pub mod pack;
 pub mod pack_app;
 pub(crate) mod package_manager;
+pub mod package_spec;
 pub mod patch;
 pub mod patch_commit;
 pub mod patch_remove;
 pub(crate) mod patch_state;
 pub mod peers;
+pub mod permissions;
 pub mod ping;
 pub mod pipeline;
+pub(crate) mod pipelines;
 pub mod pkg;
 pub(crate) mod pre_command;
 pub mod prefix;
+pub mod profile;
 pub mod prune;
 pub mod publish;
 pub mod rebuild;
 pub mod recursive;
 pub mod registry_client;
+pub(crate) mod release_notes;
 pub mod remove;
 pub mod repo;
 pub(crate) mod reporter;
@@ -76,6 +86,7 @@ pub mod run;
 pub mod runtime;
 pub mod sanitize;
 pub mod sbom;
+pub(crate) mod script_override;
 pub mod script_shortcut;
 pub mod search;
 pub mod self_update;
@@ -88,7 +99,9 @@ pub mod stars;
 pub mod store;
 pub mod sudo_guard;
 pub mod supported_architectures;
+pub mod tasks;
 pub mod team;
+pub mod token;
 pub mod undeprecate;
 pub mod unlink;
 pub mod unpublish;
@@ -101,18 +114,16 @@ pub mod view;
 pub mod whoami;
 pub mod why;
 pub mod with;
+pub(crate) mod workspace_packages;
 pub(crate) mod yarn_workspaces_field;
 
 pub(crate) use cli_command::CliArgs;
 pub(crate) use pnpm_deps_inspection as deps_tree;
 
-/// The extracted dependency-inspection crate, aliased so the command
-/// modules keep addressing it as `cli_args::deps_tree`.
 mod dispatch;
 mod dispatch_install;
 mod dispatch_query;
 mod dispatch_script;
-mod pipelines;
 mod task_run_state;
 mod update_changeset;
 mod verify_deps;
@@ -125,6 +136,16 @@ mod workspace_option;
 pub(crate) fn grammar() -> &'static clap::Command {
     static GRAMMAR: std::sync::OnceLock<clap::Command> = std::sync::OnceLock::new();
     GRAMMAR.get_or_init(<CliArgs as clap::CommandFactory>::command)
+}
+
+/// Parses a `--depth` value: a non-negative integer, or `Infinity` for no
+/// limit.
+pub(crate) fn parse_depth_limit(text: &str) -> Result<usize, String> {
+    if text.eq_ignore_ascii_case("Infinity") {
+        return Ok(usize::MAX);
+    }
+    text.parse()
+        .map_err(|_| format!("expected a non-negative integer or Infinity, got `{text}`"))
 }
 
 #[cfg(test)]

@@ -1,11 +1,39 @@
 use super::{
-    Colors, DedupeCheckLog, DeprecationLog, ExecutionTimeLog, Frame, HookLog, IgnoredScriptsLog,
-    InstallingConfigDepsLog, InstallingConfigDepsStatus, LockfileVerificationMessage, LogLevel,
-    MAX_SHOWN_WARNINGS, MaxLogLevel, NoticeState, ReporterState, RequestRetryLog,
-    SkippedOptionalDependencyLog, SkippedOptionalPackage, UpdateCheckLog, Utc, cached_verdict,
+    BlockPlacement, Colors, DedupeCheckLog, DeprecationLog, ExecutionTimeLog, Frame, HookLog,
+    IgnoredScriptsLog, InstallingConfigDepsLog, InstallingConfigDepsStatus,
+    LockfileVerificationMessage, LogLevel, MAX_SHOWN_WARNINGS, MaxLogLevel, NoticeState,
+    PendingSkillsLog, ReporterState, RequestRetryLog, SkippedOptionalDependencyLog,
+    SkippedOptionalPackage, SkippedOptionalReason, UpdateCheckLog, Utc, cached_verdict,
     detect_install_source, entries_label, is_strictly_newer, normalize, pretty_ms, relative,
     update_command, zoom_out,
 };
+
+/// `name@version` as a deprecation warning prints it.
+///
+/// Both halves come from the resolved manifest, which a git or tarball
+/// dependency writes itself, so neither is a validated npm package name.
+fn pkg_label(log: &DeprecationLog) -> String {
+    pnpm_text_sanitize::sanitize_inline(&format!("{}@{}", log.pkg_name, log.pkg_version))
+        .into_owned()
+}
+
+/// What to move to, when the resolver found a version that is not deprecated.
+///
+/// The version is pnpm's own reading of the packument rather than anything the
+/// publisher wrote, so unlike the notice it is safe to print. Empty when every
+/// published version is deprecated, or when the resolution came from the
+/// lockfile and no packument was fetched.
+fn alternative_hint(log: &DeprecationLog) -> String {
+    let Some(alternative) = log.non_deprecated_alternative.as_ref() else {
+        return String::new();
+    };
+    let version = pnpm_text_sanitize::sanitize_inline(&alternative.version);
+    if alternative.outside_declared_range {
+        format!(". {version} is not deprecated, outside the range you declared.")
+    } else {
+        format!(". {version} is not deprecated.")
+    }
+}
 
 impl ReporterState {
     // --- misc one-liners --------------------------------------------------
@@ -16,8 +44,7 @@ impl ReporterState {
         }
         // Suppress the warning box under `strictDepBuilds` — the install
         // fails with `ERR_PNPM_IGNORED_BUILDS` instead, so the box would
-        // only duplicate the error. The box is gated on
-        // `!strictDepBuilds`; the structured event still carries the
+        // only duplicate the error. The structured event still carries the
         // names for NDJSON consumers.
         if log.strict_dep_builds {
             return;
@@ -27,6 +54,16 @@ impl ReporterState {
             r#"Run "pnpm approve-builds" to pick which dependencies should be allowed to run scripts."#,
         );
         self.display.frame.push_block(format!("Ignored build scripts: {list}.\n{instruction}"));
+    }
+
+    pub(super) fn on_pending_skills(&mut self, log: &PendingSkillsLog) {
+        if log.package_names.is_empty() {
+            return;
+        }
+        self.display.frame.push_block(format!(
+            "Agent skills awaiting approval: {}.\nRun \"pnpm approve\" to review them.",
+            log.package_names.join(", "),
+        ));
     }
 
     /// pnpm's `reportUpdateCheck`: tell the user a newer pnpm exists and
@@ -59,7 +96,7 @@ impl ReporterState {
             }
         };
         let mut slot = std::mem::take(&mut self.display.config_deps_slot);
-        self.display.frame.emit(&mut slot, msg, false);
+        self.display.frame.emit(&mut slot, msg, BlockPlacement::Scrolling);
         self.display.config_deps_slot = slot;
     }
 
@@ -101,7 +138,7 @@ impl ReporterState {
             }
         };
         let mut slot = std::mem::take(&mut self.display.lockfile_verification_slot);
-        self.display.frame.emit(&mut slot, msg, false);
+        self.display.frame.emit(&mut slot, msg, BlockPlacement::Scrolling);
         self.display.lockfile_verification_slot = slot;
     }
 
@@ -183,62 +220,86 @@ impl ReporterState {
         let msg =
             format!("Done in {} using pnpm v{}", pretty_ms(elapsed), crate::package_version());
         let mut slot = std::mem::take(&mut self.display.exec_slot);
-        self.display.frame.emit(&mut slot, msg, true);
+        self.display.frame.emit(&mut slot, msg, BlockPlacement::Pinned);
         self.display.exec_slot = slot;
     }
 
-    /// Mirrors pnpm's `reportSkippedOptionalDependencies`: only a skip
-    /// whose `parents` chain is present and empty (a direct optional
-    /// dependency of the current project) renders; transitive and
+    /// Mirrors pnpm's `reportSkippedOptionalDependencies`: a package that
+    /// could not be fetched renders as a warning wherever it sits in the
+    /// graph and whichever project the install runs from, since it is
+    /// missing for the whole install. Any other skip renders only when it
+    /// belongs to the current project and its `parents` chain is present
+    /// and empty (a direct optional dependency); transitive and
     /// parent-less skips stay debug-only.
     pub(super) fn on_skipped_optional(&mut self, log: &SkippedOptionalDependencyLog) {
+        if log.reason == SkippedOptionalReason::FetchFailure {
+            self.on_skipped_optional_fetch_failure(log);
+            return;
+        }
         if log.prefix != self.rendering.cwd || !log.parents.as_ref().is_some_and(Vec::is_empty) {
             return;
         }
+        let message = match &log.package {
+            SkippedOptionalPackage::Installed { id, .. } => format!(
+                "info: {id} is an optional dependency and failed compatibility check. Excluding it from installation.",
+            ),
+            SkippedOptionalPackage::ResolutionFailure { name, bare_specifier, .. } => {
+                let pkg = match name {
+                    Some(name) => format!("{name}@{bare_specifier}"),
+                    None => bare_specifier.clone(),
+                };
+                format!(
+                    "info: {pkg} is an optional dependency that could not be resolved. Excluding it from installation.",
+                )
+            }
+        };
+        self.display.frame.push_block(message);
+    }
+
+    fn on_skipped_optional_fetch_failure(&mut self, log: &SkippedOptionalDependencyLog) {
+        if self.options.max_log_level < MaxLogLevel::Warn {
+            return;
+        }
         let pkg = match &log.package {
-            SkippedOptionalPackage::Installed { id, .. } => id.clone(),
-            SkippedOptionalPackage::ResolutionFailure {
-                name: Some(name),
-                version: Some(version),
-                ..
-            } => format!("{name}@{version}"),
+            SkippedOptionalPackage::Installed { name, version, .. } => format!("{name}@{version}"),
             SkippedOptionalPackage::ResolutionFailure { bare_specifier, .. } => {
                 bare_specifier.clone()
             }
         };
-        self.display.frame.push_block(format!(
-            "info: {pkg} is an optional dependency and failed compatibility check. Excluding it from installation.",
-        ));
+        let mut message = format!(
+            "{pkg} is an optional dependency that could not be fetched. Excluding it from installation.",
+        );
+        if let Some(details) = &log.details {
+            message.push('\n');
+            message.push_str(details);
+        }
+        self.notices.push_warning(
+            self.rendering.colors,
+            &mut self.display.frame,
+            self.options.append_only,
+            &message,
+        );
     }
 
     /// Matches pnpm's `reportDeprecations.ts`: only direct-dependency
     /// deprecations render immediately; transitive ones wait for the
     /// `resolution_done` summary.
     pub(super) fn on_deprecation(&mut self, log: &DeprecationLog) {
-        if log.depth == 0 {
-            if !self.options.scope.recursive && log.prefix == self.rendering.cwd {
-                self.display.frame.push_block(format!(
-                    "{} {} {}@{}: {}",
-                    self.rendering.colors.warn_label(),
-                    self.rendering.colors.red("deprecated"),
-                    log.pkg_name,
-                    log.pkg_version,
-                    log.deprecated,
-                ));
-            } else {
-                // The zoomed line drops the deprecation text, as
-                // `reportDeprecations.ts` does.
-                let msg = format!(
-                    "{} {} {}@{}",
-                    self.rendering.colors.warn_label(),
-                    self.rendering.colors.red("deprecated"),
-                    log.pkg_name,
-                    log.pkg_version,
-                );
-                self.display.frame.push_block(zoom_out(&self.rendering.cwd, &log.prefix, &msg));
-            }
-        } else {
+        if log.depth != 0 {
             self.notices.deprecated_subdeps.push(log.clone());
+            return;
+        }
+        let msg = format!(
+            "{} {} {}{}",
+            self.rendering.colors.warn_label(),
+            self.rendering.colors.red("deprecated"),
+            pkg_label(log),
+            alternative_hint(log),
+        );
+        if !self.options.scope.recursive && log.prefix == self.rendering.cwd {
+            self.display.frame.push_block(msg);
+        } else {
+            self.display.frame.push_block(zoom_out(&self.rendering.cwd, &log.prefix, &msg));
         }
     }
 
@@ -248,7 +309,7 @@ impl ReporterState {
         }
         let mut names: Vec<String> = self.notices.deprecated_subdeps
             .iter()
-            .map(|log| format!("{}@{}", log.pkg_name, log.pkg_version))
+            .map(pkg_label)
             .collect();
         names.sort();
         let count = names.len();
@@ -258,7 +319,7 @@ impl ReporterState {
             self.rendering.colors.red(&format!("{count} deprecated subdependencies found:")),
             names.join(", "),
         );
-        self.display.frame.emit(&mut self.notices.deprecated_slot, msg, false);
+        self.display.frame.emit(&mut self.notices.deprecated_slot, msg, BlockPlacement::Scrolling);
         self.notices.deprecated_subdeps.clear();
     }
 
@@ -287,7 +348,11 @@ impl ReporterState {
             self.rendering.colors,
             &mut self.display.frame,
             self.options.append_only,
-            r#"Issues with peer dependencies found. Run "pnpm peers check" to list them."#,
+            if self.options.scope.is_global {
+                r#"Issues with peer dependencies found. Run "pnpm peers check -g" to list them."#
+            } else {
+                r#"Issues with peer dependencies found. Run "pnpm peers check" to list them."#
+            },
         );
     }
 }
@@ -310,7 +375,7 @@ impl NoticeState {
         let extra = self.warnings - MAX_SHOWN_WARNINGS;
         let msg = format!("{} {extra} other warnings", colors.warn_label());
         let mut slot = std::mem::take(&mut self.collapsed_slot);
-        frame.emit(&mut slot, msg, false);
+        frame.emit(&mut slot, msg, BlockPlacement::Scrolling);
         self.collapsed_slot = slot;
     }
 }

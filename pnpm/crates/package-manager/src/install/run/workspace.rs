@@ -1,14 +1,18 @@
 use super::{
     super::{
-        HashSet, InstallError, InstallRunOptions, LogEvent, LogLevel, PackageManifest, Path,
-        PathBuf, Reporter, ScopeLog, build_project_manifests_list,
+        InstallError, InstallRunOptions, LogEvent, LogLevel, PackageManifest, Path, PathBuf,
+        ProjectManifestsByDir, Reporter, ScopeLog, build_project_manifests_list,
         build_root_importer_project_manifests_list, build_selected_project_manifests_list,
-        configured_or_discovered_workspace_dir, get_catalogs_from_workspace_manifest,
-        load_workspace_projects, lockfile_root_dir,
+        build_workspace_packages_map, configured_or_discovered_workspace_dir,
+        dependency_manifests_by_dir, get_catalogs_from_workspace_manifest, lockfile_root_dir,
     },
-    InstallOwned, InstallView, RunMode, UpToDateCheck, install_is_already_up_to_date,
+    InstallOwned, InstallView, RepeatInstallVerdict, RunMode, UpToDateCheck,
+    importer_selection::ImporterSelection,
+    repeat_install_verdict,
 };
 use pnpm_config::Config;
+
+mod loaded_workspace;
 
 /// The directories the run anchors on.
 pub(super) struct WorkspaceDirs<'a> {
@@ -66,7 +70,9 @@ pub(super) struct InstallWorkspace<'a> {
     pub(super) catalogs: super::super::Catalogs,
     pub(super) prefix: String,
     pub(super) workspace_projects_are_overridden: bool,
-    pub(super) loaded_workspace_projects: Option<Vec<pnpm_workspace::Project>>,
+    pub(super) loaded_workspace: loaded_workspace::LoadedWorkspace,
+    pub(super) workspace_packages:
+        Option<std::sync::Arc<pnpm_resolving_resolver_base::WorkspacePackages>>,
     pub(super) dirs: WorkspaceDirs<'a>,
 }
 /// The projects the run installs, and how a selection narrows them.
@@ -74,48 +80,14 @@ pub(super) struct InstallScope<'w> {
     pub(super) project_manifests: Vec<(PathBuf, &'w PackageManifest)>,
     pub(super) importers: ImporterSelection,
     pub(super) prune_stale_importers: bool,
-}
-/// The importers a selection narrows the run to.
-pub(super) struct ImporterSelection {
-    pub(super) real_importer_ids: HashSet<String>,
-    pub(super) filtered_install: bool,
-    pub(super) requested_importer_ids: Option<HashSet<String>>,
-}
-impl ImporterSelection {
-    fn select(
-        selection: Option<&crate::WorkspaceInstallSelection<'_>>,
-        workspace_root: &Path,
-        project_manifests: &[(PathBuf, &PackageManifest)],
-    ) -> Self {
-        let real_importer_ids = importer_ids(
-            workspace_root,
-            project_manifests.iter().map(|(project_dir, _)| project_dir.as_path()),
-        );
-        let filtered_install = selection.is_some_and(|selection| {
-            importer_ids(workspace_root, selection.selected_dirs.iter().map(PathBuf::as_path))
-                != real_importer_ids
-        });
-        Self {
-            requested_importer_ids: filtered_install
-                .then_some(selection)
-                .flatten()
-                .map(|selection| {
-                    importer_ids(
-                        workspace_root,
-                        selection.install_dirs.iter().map(PathBuf::as_path),
-                    )
-                }),
-            real_importer_ids,
-            filtered_install,
-        }
-    }
-}
-pub(super) fn importer_ids<'d>(
-    workspace_root: &Path,
-    dirs: impl Iterator<Item = &'d Path>,
-) -> HashSet<String> {
-    dirs.map(|project_dir| pnpm_workspace::importer_id_from_root_dir(workspace_root, project_dir))
-        .collect()
+    /// A `--frozen-lockfile` repeat install found nothing changed, so an
+    /// up-to-date tree runs no project lifecycle scripts.
+    pub(super) project_scripts_current: bool,
+    /// See [`crate::install::dependency_manifests_by_dir`]. The freshness
+    /// checks compare an injected project's lockfile snapshot with these.
+    pub(super) dependency_manifests: Option<ProjectManifestsByDir<'w>>,
+    /// See [`crate::RepeatInstallManifests::workspace_projects`].
+    pub(super) workspace_projects: Option<Vec<(PathBuf, &'w PackageManifest)>>,
 }
 impl<'a> InstallWorkspace<'a> {
     /// Consumes the catalogs and workspace-projects overrides off `owned`.
@@ -136,33 +108,23 @@ impl<'a> InstallWorkspace<'a> {
             owned.projects.catalogs_override.take(),
             workspace_manifest.as_ref(),
         )?;
-        // Walk every workspace project's `package.json` once. The
-        // resulting `Vec` feeds both the up-to-date short-circuit
-        // below and the fresh-install path's `workspace:`-spec lookup
-        // / per-importer manifest list further down. `None` when no
-        // `pnpm-workspace.yaml` exists in or above `workspace_root` —
-        // single-project installs only have the root manifest, which
-        // the short-circuit and the install paths both reach via
-        // `manifest` directly.
-        //
-        // An embedder that supplies its importers in memory
-        // (`workspace_projects_override`) bypasses the on-disk walk
-        // entirely; the override's `Vec` is used verbatim.
         let workspace_projects_are_overridden = owned.projects
             .workspace_projects_override
             .is_some();
-        let loaded_workspace_projects = discovered_workspace_projects(
-            options.selection.is_some(),
-            owned.projects.workspace_projects_override.take(),
-            dirs.workspace_dir.as_deref().unwrap_or(&dirs.workspace_root),
-            workspace_manifest.as_ref(),
+        let loaded_workspace = loaded_workspace::LoadedWorkspace::load(
+            install,
+            owned,
+            options,
+            (&dirs, workspace_manifest.as_ref()),
         )?;
         report_discovered_scope::<Reporter>(
             install,
             options,
             &dirs,
-            loaded_workspace_projects.as_deref(),
+            loaded_workspace.projects.as_deref(),
         );
+        let workspace_packages =
+            workspace_packages_for_install(install, &loaded_workspace, options);
         Ok(Self {
             // Use `to_string_lossy` rather than `to_str().expect(...)` so a
             // valid filesystem path with non-UTF-8 bytes (possible on Unix)
@@ -175,10 +137,27 @@ impl<'a> InstallWorkspace<'a> {
             catalog_context_present,
             catalogs,
             workspace_projects_are_overridden,
-            loaded_workspace_projects,
+            loaded_workspace,
+            workspace_packages,
             dirs,
         })
     }
+}
+fn workspace_packages_for_install(
+    install: InstallView<'_>,
+    loaded_workspace: &loaded_workspace::LoadedWorkspace,
+    options: &InstallRunOptions<'_, '_>,
+) -> Option<std::sync::Arc<pnpm_resolving_resolver_base::WorkspacePackages>> {
+    (install.context.config.exclude_links_from_lockfile
+        && install.context.config.link_workspace_packages.enabled_at_depth(0))
+    .then(|| {
+        let projects =
+            workspace_projects(loaded_workspace.projects.as_deref(), options.selection.as_ref());
+        loaded_workspace
+            .packages_of(projects)
+            .or_else(|| build_workspace_packages_map(projects).map(std::sync::Arc::new))
+    })
+    .flatten()
 }
 // In-memory mutation catalogs take precedence over hooked configuration and the workspace file.
 // Filtered and dedicated-lockfile installs have already reported their own scope.
@@ -220,6 +199,10 @@ pub(super) fn workspace_projects<'s>(
     selection.map_or(loaded, |selection| Some(selection.all_projects))
 }
 impl<'w> InstallScope<'w> {
+    pub(super) fn declared_manifests(&self) -> crate::DeclaredManifests<'_> {
+        crate::DeclaredManifests::new(&self.project_manifests)
+    }
+
     pub(super) fn select(
         install: InstallView<'w>,
         workspace_root: &Path,
@@ -238,87 +221,105 @@ impl<'w> InstallScope<'w> {
         });
         let importers = ImporterSelection::select(
             options.selection.as_ref(),
+            !install.context.config.filter.is_empty()
+                || !install.context.config.filter_prod.is_empty(),
             workspace_root,
             &project_manifests,
         );
-        // Only an install that covers a whole workspace sees the complete
-        // project list, so only it may conclude that an importer the
-        // lockfile records belongs to a project that is gone. This is
-        // pnpm's `pruneLockfileImporters`, which its recursive install
-        // defaults to the same condition (`pkgs.length ===
-        // allProjects.length`) — outside a workspace there is no project
-        // list to compare against.
-        // A `NodeApiProject[]` handed in by an API consumer carries no
-        // promise of listing every workspace project, so it cannot stand
-        // in for the project list either.
         let prune_stale_importers = may_prune_stale_importers(&StaleImporterPrune {
-            filtered_install: importers.filtered_install,
+            filtered_install: importers.requested_importer_ids.is_some(),
             mutation: install.execution.mutation,
             workspace_projects,
             workspace_projects_are_overridden,
             config: install.context.config,
         });
-        Self { project_manifests, importers, prune_stale_importers }
+        let bin_projects = crate::install_state::validation::dedicated_bin_projects(
+            install.context.config,
+            &project_manifests,
+            workspace_projects,
+        );
+        Self {
+            project_manifests,
+            importers,
+            prune_stale_importers,
+            project_scripts_current: false,
+            dependency_manifests: dependency_manifests_by_dir(workspace_projects),
+            workspace_projects: bin_projects,
+        }
     }
 
-    // Optimistic repeat-install short-circuit. When nothing has
-    // changed since the previous successful install (settings,
-    // workspace structure, manifest mtimes), skip the entire
-    // install pipeline and emit pnpm's "Already up to date" log.
-    // The fast path runs before any of the install setup (no
-    // lockfile reads, no verifier fan-out, no `getContext`).
-    //
-    // Disabled when `--frozen-lockfile` is requested: an explicit
-    // headless install should always go through the dispatch so a
-    // `NoLockfile` or `OutdatedLockfile` error still fires when
-    // the lockfile is missing or stale.
+    /// The directories of the projects a filtered install requested.
+    fn requested_project_dirs(&self, workspace_root: &Path) -> Option<Vec<&Path>> {
+        let requested = self.importers.requested_importer_ids.as_ref()?;
+        let dirs = self.project_manifests
+            .iter()
+            .map(|(project_dir, _)| project_dir.as_path())
+            .filter(|project_dir| {
+                requested.contains(&pnpm_workspace::importer_id_from_root_dir(
+                    workspace_root,
+                    project_dir,
+                ))
+            })
+            .collect();
+        Some(dirs)
+    }
 
-    // Only a full `pacquet install` may short-circuit. `add` and
-    // `remove` mutate the manifest in memory and persist it after
-    // this run returns, so the on-disk mtimes the check reads still
-    // describe the pre-mutation project — without this gate a fresh
-    // workspace state would read as "nothing changed → already up
-    // to date" and the mutation would never be resolved or
-    // materialized. `pacquet update` is
-    // excluded through its seed policy: a compatible bump leaves
-    // the manifest byte-identical, which the check would likewise
-    // read as up to date and skip the registry re-resolution.
-    //
-    // A `--filter` narrowing does not disqualify the run: the check
-    // validates the whole workspace (`project_manifests` covers every
-    // project even when only a subset is selected), and it refuses a
-    // workspace state a filtered install wrote, so "nothing changed"
-    // still means every selected project is materialized.
-    pub(super) fn is_already_up_to_date<Reporter: self::Reporter>(
+    /// The manifests the repeat-install check reads besides the importers'.
+    fn repeat_install_manifests<'s>(
+        &'s self,
+        owned: &'s InstallOwned,
+    ) -> crate::RepeatInstallManifests<'s> {
+        crate::RepeatInstallManifests {
+            dependency_manifests: self.dependency_manifests.as_ref(),
+            workspace_projects: self.workspace_projects.as_deref(),
+            hooks: owned.projects.pnpmfile_hook_override
+                .as_ref()
+                .map_or(crate::ManifestHooks::Pnpmfiles, crate::ManifestHooks::InMemory),
+        }
+    }
+
+    pub(super) fn repeat_install_verdict(
         &self,
         install: InstallView<'_>,
         owned: &InstallOwned,
         mode: &RunMode,
         workspace: &InstallWorkspace<'_>,
-    ) -> Result<bool, InstallError> {
-        install_is_already_up_to_date::<Reporter>(&UpToDateCheck {
-            workspace: super::super::OptimisticRepeatInstallCheck {
-                config: install.context.config,
-                workspace_root: &workspace.dirs.workspace_root,
-                project_manifests: &self.project_manifests,
-                is_workspace_install: workspace.workspace_manifest.is_some(),
-                lockfile: install.context.lockfile,
-                catalogs: &workspace.catalogs,
-                layout: crate::RepeatInstallLayout {
-                    node_linker: install.execution.node_linker,
-                    included: mode.included,
-                    supported_architectures: owned.projects
-                        .supported_architectures
-                        .as_ref(),
+        repeat_install: crate::install_state::RepeatInstallCheck,
+    ) -> Result<RepeatInstallVerdict, InstallError> {
+        let selected_dirs = self.requested_project_dirs(&workspace.dirs.workspace_root);
+        repeat_install_verdict(
+            &UpToDateCheck {
+                scope: selected_dirs
+                    .as_deref()
+                    .map_or(crate::install_state::Scope::Workspace, |selected| {
+                        crate::install_state::Scope::Selected(selected)
+                    }),
+                workspace: super::super::OptimisticRepeatInstallCheck {
+                    config: install.context.config,
+                    workspace_root: &workspace.dirs.workspace_root,
+                    project_manifests: self.declared_manifests(),
+                    is_workspace_install: workspace.workspace_manifest.is_some(),
+                    lockfile: install.context.lockfile,
+                    catalogs: &workspace.catalogs,
+                    layout: crate::RepeatInstallLayout {
+                        node_linker: install.execution.node_linker,
+                        included: mode.included,
+                        supported_architectures: owned.projects
+                            .supported_architectures
+                            .as_ref(),
+                    },
+                    manifests: self.repeat_install_manifests(owned),
                 },
+                mutation: install.execution.mutation,
+                update_seed_policy: &owned.resolution.update_seed_policy,
+                frozen_lockfile: install.lockfile_policy.frozen,
+                resolve_only: mode.resolve_only,
+                disable_optimistic_repeat_install: install.lockfile_policy
+                    .disable_optimistic_repeat,
+                effective_node_version: mode.effective_node_version.as_deref(),
             },
-            mutation: install.execution.mutation,
-            update_seed_policy: &owned.resolution.update_seed_policy,
-            frozen_lockfile: install.lockfile_policy.frozen,
-            disable_optimistic_repeat_install: install.lockfile_policy.disable_optimistic_repeat,
-            effective_node_version: mode.effective_node_version.as_deref(),
-            prefix: &workspace.prefix,
-        })
+            repeat_install,
+        )
     }
 }
 /// Whether anything could declare a catalog this install has to resolve
@@ -331,24 +332,6 @@ pub(super) fn catalog_context_present(
     catalogs_override.is_some()
         || config.catalogs.is_some()
         || (!config.ignore_workspace && workspace_dir.is_some())
-}
-/// Walk every workspace project's `package.json` once, unless the caller
-/// supplied the list. A selection carries its own projects, so it walks
-/// nothing.
-pub(super) fn discovered_workspace_projects(
-    has_selection: bool,
-    workspace_projects_override: Option<Vec<pnpm_workspace::Project>>,
-    workspace_dir: &Path,
-    workspace_manifest: Option<&pnpm_workspace::WorkspaceManifest>,
-) -> Result<Option<Vec<pnpm_workspace::Project>>, InstallError> {
-    if has_selection {
-        return Ok(None);
-    }
-    if let Some(projects) = workspace_projects_override {
-        return Ok(Some(projects));
-    }
-    load_workspace_projects(workspace_dir, workspace_manifest)
-        .map_err(InstallError::FindWorkspaceProjects)
 }
 /// A full install (pnpm's `mutation: "install"`) is the workspace-wide one and
 /// counts every project; a partial one (`add`, `update`, `remove`, ...)
@@ -446,14 +429,14 @@ pub(super) fn may_prune_stale_importers(prune: &StaleImporterPrune<'_>) -> bool 
 /// for.
 pub(super) fn report_install_scope_cycles<Reporter: self::Reporter>(
     config: &Config,
-    workspace_dir: Option<&Path>,
+    workspace: &InstallWorkspace<'_>,
     selection: Option<&crate::WorkspaceInstallSelection<'_>>,
     scope: (crate::ProjectMutation, Option<&[pnpm_workspace::Project]>),
 ) -> Result<(), InstallError> {
     if config.ignore_workspace_cycles {
         return Ok(());
     }
-    let Some(workspace_dir) = workspace_dir else { return Ok(()) };
+    let Some(workspace_dir) = workspace.dirs.workspace_dir.as_deref() else { return Ok(()) };
     let (mutation, workspace_projects) = scope;
     let scope = match selection {
         // A plan that already sequenced this very graph hands its cycle report
@@ -477,7 +460,11 @@ pub(super) fn report_install_scope_cycles<Reporter: self::Reporter>(
             .map(|projects| (projects, None)),
     };
     let Some((projects, selected_dirs)) = scope else { return Ok(()) };
-    let cycles = crate::install_scope_cycles(config, projects, selected_dirs);
+    let catalogs = pnpm_workspace_projects_graph::WorkspaceCatalogs {
+        catalogs: &workspace.catalogs,
+        workspace_dir,
+    };
+    let cycles = crate::install_scope_cycles(config, projects, selected_dirs, Some(catalogs));
     crate::report_workspace_cycles::<Reporter>(config, workspace_dir, cycles.as_deref())
         .map_err(InstallError::CyclicWorkspaceDependencies)
 }

@@ -1,8 +1,29 @@
 use super::{
-    ArchiveStoreProjection, GlobalLog, HashMap, LogEvent, LogLevel, PackageContentCheck,
-    PackageFilesIndex, PathBuf, PkgContentMismatch, SharedReadonlyStoreIndex,
-    SharedVerifiedFilesCache, StoreDir, TarballError,
+    Arc, ArchiveStoreProjection, GlobalLog, LogEvent, LogLevel, PackageContentCheck,
+    PackageFilesIndex, PkgContentMismatch, SharedReadonlyStoreIndex, SharedVerifiedFilesCache,
+    StoreDir, TarballError,
 };
+use pnpm_package_manifest::PackageBin;
+use std::collections::BTreeMap;
+
+/// Files reconstructed from a store-index row, plus the bundled
+/// manifest, build-trigger verdict, and precalculated bins the row or
+/// extraction recorded.
+#[derive(Debug, Clone)]
+pub struct CachedCasPaths {
+    /// Shared with the prefetch and the in-memory tarball cache, so every
+    /// snapshot of the package imports from one map.
+    pub files: Arc<pnpm_fs::CasPaths>,
+    pub manifest: Option<serde_json::Value>,
+    pub requires_build: Option<bool>,
+    pub bins: Option<Arc<BTreeMap<String, PackageBin>>>,
+}
+
+impl CachedCasPaths {
+    pub(crate) fn files_only(files: Arc<pnpm_fs::CasPaths>) -> Self {
+        Self { files, manifest: None, requires_build: None, bins: None }
+    }
+}
 
 /// What the store-index lookup found for one row.
 enum CachedRow {
@@ -13,7 +34,13 @@ enum CachedRow {
     Rejected(PkgContentMismatch),
     /// A usable row's per-file CAS map, carrying the identity
     /// disagreement the caller warns about when the check is not strict.
-    Hit { cas_paths: HashMap<String, PathBuf>, mismatch: Option<PkgContentMismatch> },
+    Hit {
+        cas_paths: pnpm_fs::CasPaths,
+        manifest: Option<serde_json::Value>,
+        requires_build: bool,
+        bins: Option<Arc<BTreeMap<String, PackageBin>>>,
+        mismatch: Option<PkgContentMismatch>,
+    },
 }
 
 /// Reconstruct a package's `{filename → CAFS path}` map from the
@@ -33,9 +60,6 @@ enum CachedRow {
 /// rejects an identity mismatch, [`PackageContentCheck::Warn`] reports
 /// and uses the row, and [`PackageContentCheck::Skip`] omits this
 /// npm-specific check for a raw archive projection.
-///
-/// `index` is opened once per install and passed in repeatedly, so the
-/// `Connection::open` + PRAGMA cost is not paid per package.
 pub(crate) async fn load_cached_cas_paths<Reporter: crate::Reporter>(
     index: Option<SharedReadonlyStoreIndex>,
     store_dir: &'static StoreDir,
@@ -43,10 +67,8 @@ pub(crate) async fn load_cached_cas_paths<Reporter: crate::Reporter>(
     verify_store_integrity: bool,
     package_content_check: PackageContentCheck,
     verified_files_cache: SharedVerifiedFilesCache,
-) -> Result<Option<HashMap<String, PathBuf>>, TarballError> {
+) -> Result<Option<CachedCasPaths>, TarballError> {
     let Some(index) = index else { return Ok(None) };
-    // Hold on to a copy of the cache key for the outer `JoinError` log,
-    // since the task body moves the original in.
     let outer_cache_key = cache_key.clone();
     let result = tokio::task::spawn_blocking(move || {
         cached_row(
@@ -81,13 +103,19 @@ pub(crate) async fn load_cached_cas_paths<Reporter: crate::Reporter>(
 
 fn cached_row_paths<Reporter: crate::Reporter>(
     row: CachedRow,
-) -> Result<Option<HashMap<String, PathBuf>>, TarballError> {
+) -> Result<Option<CachedCasPaths>, TarballError> {
     match row {
         CachedRow::Miss => Ok(None),
         CachedRow::Rejected(mismatch) => {
             Err(TarballError::UnexpectedPkgContentInStore { hint: mismatch.hint() })
         }
-        CachedRow::Hit { cas_paths, mismatch } => {
+        CachedRow::Hit {
+            cas_paths,
+            manifest,
+            requires_build,
+            bins,
+            mismatch,
+        } => {
             if let Some(mismatch) = mismatch {
                 Reporter::emit(&LogEvent::Global(GlobalLog {
                     level: LogLevel::Warn,
@@ -97,7 +125,12 @@ fn cached_row_paths<Reporter: crate::Reporter>(
                     ),
                 }));
             }
-            Ok(Some(cas_paths))
+            Ok(Some(CachedCasPaths {
+                files: Arc::new(cas_paths),
+                manifest,
+                requires_build: Some(requires_build),
+                bins,
+            }))
         }
     }
 }
@@ -111,7 +144,7 @@ fn cached_row(
     package_content_check: PackageContentCheck,
     verified_files_cache: &SharedVerifiedFilesCache,
 ) -> CachedRow {
-    let Some(entry) = read_row(index, cache_key) else {
+    let Some(mut entry) = read_row(index, cache_key) else {
         return CachedRow::Miss;
     };
 
@@ -127,6 +160,9 @@ fn cached_row(
         return CachedRow::Rejected(mismatch);
     }
 
+    let stored_requires_build = entry.requires_build;
+    let stored_requires_prepare = entry.requires_prepare;
+    let manifest = entry.manifest.take();
     let verify_result = if verify_store_integrity {
         pnpm_store_dir::check_pkg_files_integrity(store_dir, entry, verified_files_cache)
     } else {
@@ -147,7 +183,25 @@ fn cached_row(
         );
         return CachedRow::Miss;
     }
-    CachedRow::Hit { cas_paths: verify_result.files_map, mismatch }
+    let requires_build = super::resolve_row_requires_build(
+        stored_requires_build,
+        stored_requires_prepare,
+        manifest.as_ref(),
+        &verify_result.files_map,
+    );
+    let bins = resolve_cached_row_bins(requires_build, manifest.as_ref(), &verify_result.files_map);
+    CachedRow::Hit { cas_paths: verify_result.files_map, manifest, requires_build, bins, mismatch }
+}
+
+fn resolve_cached_row_bins(
+    requires_build: bool,
+    manifest: Option<&serde_json::Value>,
+    cas_paths: &pnpm_fs::CasPaths,
+) -> Option<Arc<BTreeMap<String, PackageBin>>> {
+    if requires_build {
+        return None;
+    }
+    pnpm_package_manifest::resolve_package_bins_from_cas_paths(manifest?, cas_paths).map(Arc::new)
 }
 
 /// The row for `cache_key`, or `None` for a miss.
@@ -158,15 +212,7 @@ fn cached_row(
 /// hint anyway — failing over to a fresh download is the more resilient
 /// default than turning every subsequent snapshot into a crash.
 fn read_row(index: &SharedReadonlyStoreIndex, cache_key: &str) -> Option<PackageFilesIndex> {
-    let Ok(guard) = index.lock() else {
-        tracing::debug!(
-            target: "pacquet::download",
-            ?cache_key,
-            "store-index mutex poisoned; treating cache lookup as a miss",
-        );
-        return None;
-    };
-    guard.get(cache_key).ok().flatten()
+    pnpm_store_dir::StoreIndex::get_shared(index, cache_key).ok().flatten()
 }
 
 /// Reuse a pre-projection-key runtime row only when its synthesized
@@ -181,13 +227,13 @@ pub(crate) async fn load_legacy_synthesized_cas_paths<Reporter: crate::Reporter>
     verify_store_integrity: bool,
     verified_files_cache: SharedVerifiedFilesCache,
     store_projection: ArchiveStoreProjection<'_>,
-) -> Result<Option<HashMap<String, PathBuf>>, TarballError> {
+) -> Result<Option<pnpm_fs::CasPaths>, TarballError> {
     let Some((legacy_key, expected_manifest)) =
         store_projection.legacy_synthesized_store_row(integrity, package_id)
     else {
         return Ok(None);
     };
-    let Some(cas_paths) = load_cached_cas_paths::<Reporter>(
+    let Some(cached) = load_cached_cas_paths::<Reporter>(
         index,
         store_dir,
         legacy_key,
@@ -199,7 +245,7 @@ pub(crate) async fn load_legacy_synthesized_cas_paths<Reporter: crate::Reporter>
     else {
         return Ok(None);
     };
-    let Some(package_json_path) = cas_paths.get("package.json") else {
+    let Some(package_json_path) = cached.files.get("package.json") else {
         return Ok(None);
     };
     let Ok(cached_manifest) = tokio::fs::read(package_json_path).await else {
@@ -213,7 +259,7 @@ pub(crate) async fn load_legacy_synthesized_cas_paths<Reporter: crate::Reporter>
         );
         return Ok(None);
     }
-    Ok(Some(cas_paths))
+    Ok(Some(Arc::unwrap_or_clone(cached.files)))
 }
 
 /// Read every requested row's undecoded bytes, holding the store-index

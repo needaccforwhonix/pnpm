@@ -16,8 +16,10 @@ pnpm-diagnostics = { workspace = true }
 pnpm-executor = { workspace = true }
 pnpm-fs = { workspace = true }
 pnpm-fs-packlist = { workspace = true }
+pnpm-git-utils = { workspace = true }
 pnpm-network = { workspace = true }
 pnpm-package-manifest = { workspace = true }
+pnpm-process = { path = "../process" }
 pnpm-reporter = { workspace = true }
 pnpm-store-dir = { workspace = true }
 
@@ -29,12 +31,18 @@ serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-which = { workspace = true }
 
 [dev-dependencies]
 pnpm-testing-utils = { workspace = true }
 
 pretty_assertions = { workspace = true }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+which = { workspace = true }
+tokio = { workspace = true, features = ["net", "signal"] }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+pnpm-which = { workspace = true }
 
 [lints]
 workspace = true

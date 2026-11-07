@@ -2,7 +2,7 @@ use super::{
     Arc, BTreeMap, BTreeSet, CargoLockfilePolicy, CargoResolveOptions, CargoWorkspaceMetadata,
     Command, Config, FromStr, GitPackage, GitSource, IntoDiagnostic, Path, PathBuf, PnprClient,
     Result, StreamExt, ThrottledClient, TryStreamExt, WORKSPACE_INSTALL_CONCURRENCY,
-    fetch_sparse_index, fs, is_crates_io, stream,
+    fetch_sparse_index, fs, stream,
 };
 use miette::WrapErr;
 
@@ -23,57 +23,142 @@ pub(super) struct LockedPackages {
 }
 
 impl LockedPackages {
+    pub(super) fn merge(self, other: Self) -> Result<Self> {
+        Ok(Self {
+            crates: merge_packages(
+                "registry",
+                self.crates.into_iter().chain(other.crates),
+                LockedCrate::link_name,
+            )?,
+            git: merge_packages(
+                "git",
+                self.git.into_iter().chain(other.git),
+                GitPackage::link_name,
+            )?,
+        })
+    }
+
     /// The git sources the locked packages come from, deduplicated so the
     /// managed Cargo configuration declares each one once.
     pub(super) fn git_sources(&self) -> Vec<GitSource> {
-        self.git
+        let mut sources: Vec<GitSource> = self.git
             .iter()
             .map(|package| GitSource::clone(&package.source))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect()
+            .collect();
+        sources.sort();
+        sources.dedup();
+        sources
     }
 }
 
-pub(crate) async fn workspace_root(manifest_path: &Path) -> Result<PathBuf> {
-    workspace_metadata(manifest_path).await.map(|metadata| metadata.workspace_root)
+fn merge_packages<Package: PartialEq>(
+    kind: &str,
+    packages: impl Iterator<Item = Package>,
+    link_name: impl Fn(&Package) -> String,
+) -> Result<Vec<Package>> {
+    let mut merged = BTreeMap::new();
+    for package in packages {
+        let name = link_name(&package);
+        match merged.entry(name) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(package);
+            }
+            std::collections::btree_map::Entry::Occupied(slot) if *slot.get() == package => {}
+            std::collections::btree_map::Entry::Occupied(slot) => {
+                let name = slot.key();
+                return Err(miette::miette!(
+                    "Cargo lockfiles contain conflicting {kind} package {name}",
+                ));
+            }
+        }
+    }
+    Ok(merged.into_values().collect())
 }
 
-async fn workspace_metadata(manifest_path: &Path) -> Result<CargoWorkspaceMetadata> {
-    let metadata = read_cargo_metadata_for_manifest(manifest_path).await?;
-    serde_json::from_str::<CargoWorkspaceMetadata>(&metadata)
+/// Canonical, as [`discover_workspace_roots`] returns them: a root is
+/// compared against the checkout it belongs to, and Cargo may answer with a
+/// path that still carries a symlink from the manifest it was asked about.
+pub(crate) async fn workspace_root(
+    manifest_path: &Path,
+    checkout: Option<&Path>,
+) -> Result<PathBuf> {
+    let (_, metadata) = workspace_metadata(manifest_path, checkout).await?;
+    canonical_cargo_path(&metadata.workspace_root)
+}
+
+pub(crate) async fn workspace_metadata(
+    manifest_path: &Path,
+    checkout: Option<&Path>,
+) -> Result<(String, CargoWorkspaceMetadata)> {
+    let document = read_cargo_metadata_for_manifest(manifest_path, checkout).await?;
+    let metadata = serde_json::from_str::<CargoWorkspaceMetadata>(&document)
         .into_diagnostic()
-        .wrap_err("read Cargo workspace root from metadata")
+        .wrap_err("read Cargo workspace root from metadata")?;
+    Ok((document, metadata))
 }
 
-pub(super) async fn discover_workspace_roots(manifests: &[PathBuf]) -> Result<Vec<PathBuf>> {
+/// A Cargo workspace together with the `cargo metadata --no-deps` document
+/// that discovered it, so what the install checks against the manifests does
+/// not ask Cargo again.
+pub(super) struct DiscoveredWorkspace {
+    pub(super) root: PathBuf,
+    pub(super) metadata: String,
+}
+
+pub(super) async fn discover_workspace_roots(
+    manifests: &[PathBuf],
+    checkout: Option<&Path>,
+) -> Result<Vec<DiscoveredWorkspace>> {
     let mut pending = manifests
         .iter()
         .map(|manifest| canonical_cargo_path(manifest))
         .collect::<Result<BTreeSet<_>>>()?;
-    let mut roots = BTreeSet::new();
+    let mut roots = BTreeMap::new();
     while !pending.is_empty() {
         let concurrency = if roots.is_empty() { 1 } else { WORKSPACE_INSTALL_CONCURRENCY };
         let batch =
             std::iter::from_fn(|| pending.pop_first()).take(concurrency).collect::<Vec<_>>();
         let metadata = stream::iter(batch)
-            .map(|manifest| async move { workspace_metadata(&manifest).await })
+            .map(|manifest| async move { workspace_metadata(&manifest, checkout).await })
             .buffer_unordered(concurrency)
             .try_collect::<Vec<_>>()
             .await?;
-        for workspace in metadata {
+        for (document, workspace) in metadata {
             let root = canonical_cargo_path(&workspace.workspace_root)?;
             pending.remove(&root.join("Cargo.toml"));
             for package in workspace.packages {
                 pending.remove(&canonical_cargo_path(&package.manifest_path)?);
             }
-            roots.insert(root);
+            roots.entry(root).or_insert(document);
         }
     }
-    Ok(roots.into_iter().collect())
+    Ok(roots
+        .into_iter()
+        .map(|(root, metadata)| DiscoveredWorkspace { root, metadata })
+        .collect())
 }
 
-fn canonical_cargo_path(path: &Path) -> Result<PathBuf> {
+/// Fail a frozen install when an existing `Cargo.lock` does not satisfy the
+/// dependencies its workspace declares. An absent lockfile is left to
+/// [`read_or_resolve_lockfile`].
+pub(super) fn verify_existing_lockfile(workspace: &DiscoveredWorkspace) -> Result<()> {
+    let path = workspace.root.join("Cargo.lock");
+    let lockfile = match fs::read_to_string(&path) {
+        Ok(lockfile) => lockfile,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("read {}", path.display()));
+        }
+    };
+    pnpm_cargo_resolver::verify_lockfile(&workspace.metadata, &lockfile)
+        .wrap_err_with(|| {
+            format!("{} is out of date, but --frozen-lockfile forbids updating it", path.display())
+        })
+}
+
+pub(crate) fn canonical_cargo_path(path: &Path) -> Result<PathBuf> {
     dunce::canonicalize(path)
         .into_diagnostic()
         .wrap_err_with(|| format!("resolve Cargo workspace path {}", path.display()))
@@ -83,6 +168,7 @@ pub(super) async fn read_or_resolve_lockfile(
     config: &Config,
     root_dir: &Path,
     cargo_lock_path: &Path,
+    checkout: Option<&Path>,
     frozen_lockfile: bool,
     lockfile_policy: CargoLockfilePolicy,
     http_client: &Arc<ThrottledClient>,
@@ -103,43 +189,20 @@ pub(super) async fn read_or_resolve_lockfile(
             "Cargo.lock is absent, but --frozen-lockfile forbids generating it"
         ));
     }
-    reject_redirected_workspace(root_dir)?;
-
-    let metadata = read_cargo_metadata(root_dir).await?;
+    let metadata = read_cargo_metadata(root_dir, checkout).await?;
+    let source_overrides = super::resolution::has_source_overrides(root_dir)?;
+    let git_dependencies = super::resolution::has_git_dependencies(&metadata)?;
+    if source_overrides || git_dependencies {
+        return super::resolution::resolve_with_cargo(config, root_dir, checkout).await;
+    }
     if let Some(lockfile) = resolve_via_pnpr(config, &metadata).await? {
         return Ok(lockfile);
     }
     let index_files = fetch_sparse_index(config, &metadata, http_client).await?;
-    let source = pnpm_cargo_resolver::registry_source(&config.cargo.index_url);
+    let source = pnpm_cargo_resolver::registry_source(config.cargo_index_url());
     let lockfile = pnpm_cargo_resolver::resolve_lockfile(&metadata, &index_files, &source)
         .wrap_err("resolve Cargo dependencies")?;
     Ok(lockfile)
-}
-
-/// Refuse to resolve a workspace whose root manifest redirects a dependency
-/// to another source.
-///
-/// `[patch]` and `[replace]` change which package a requirement resolves to,
-/// and `cargo metadata` does not report either, so a lockfile resolved from
-/// it would name the replaced package. An existing `Cargo.lock` is read
-/// rather than resolved, which is how a workspace with a patch installs.
-fn reject_redirected_workspace(root_dir: &Path) -> Result<()> {
-    let manifest_path = root_dir.join("Cargo.toml");
-    let manifest = fs::read_to_string(&manifest_path)
-        .into_diagnostic()
-        .wrap_err_with(|| format!("read {}", manifest_path.display()))?;
-    let document: toml::Table = toml::from_str(&manifest)
-        .into_diagnostic()
-        .wrap_err_with(|| format!("parse {}", manifest_path.display()))?;
-    for table in ["patch", "replace"] {
-        if document.contains_key(table) {
-            let manifest_path = manifest_path.display();
-            return Err(miette::miette!(
-                "{manifest_path} declares [{table}], which pnpm cannot resolve. Commit the Cargo.lock that `cargo generate-lockfile` writes for it.",
-            ));
-        }
-    }
-    Ok(())
 }
 
 /// Resolve through the configured pnpr server, which walks the sparse
@@ -167,7 +230,7 @@ pub(super) async fn resolve_via_pnpr(config: &Config, metadata: &str) -> Result<
     client
         .resolve_cargo(CargoResolveOptions {
             metadata,
-            registry: config.cargo.index_url.clone(),
+            registry: config.cargo_index_url().to_string(),
             authorization: config.auth_headers.for_url(pnpr_server),
         })
         .await
@@ -176,14 +239,22 @@ pub(super) async fn resolve_via_pnpr(config: &Config, metadata: &str) -> Result<
         .map(Some)
 }
 
-async fn read_cargo_metadata(root_dir: &Path) -> Result<String> {
-    read_cargo_metadata_for_manifest(&root_dir.join("Cargo.toml")).await
+async fn read_cargo_metadata(root_dir: &Path, checkout: Option<&Path>) -> Result<String> {
+    read_cargo_metadata_for_manifest(&root_dir.join("Cargo.toml"), checkout).await
 }
 
-async fn read_cargo_metadata_for_manifest(manifest_path: &Path) -> Result<String> {
+async fn read_cargo_metadata_for_manifest(
+    manifest_path: &Path,
+    checkout: Option<&Path>,
+) -> Result<String> {
+    let cargo = super::toolchain::program(
+        "cargo",
+        manifest_path.parent().unwrap_or(manifest_path),
+        checkout,
+    );
     let manifest_path = manifest_path.to_path_buf();
     let output = tokio::task::spawn_blocking(move || {
-        Command::new("cargo")
+        Command::new(cargo)
             .args(["metadata", "--no-deps", "--format-version", "1", "--manifest-path"])
             .arg(&manifest_path)
             .output()
@@ -256,17 +327,15 @@ fn locked_crate_from_package(
     source: &cargo_lock::SourceId,
     index_url: &str,
 ) -> Result<LockedCrate> {
-    // crates.io is spelled two ways in a lockfile — the canonical git
-    // identifier and the sparse index — and `cargo` writes either.
+    // A dependency that names no registry belongs to crates.io even when
+    // the configured registry serves it, and one that names the configured
+    // registry belongs to that. Both spellings of crates.io occur, the
+    // canonical git identifier and the sparse index, and `cargo` writes
+    // either.
     let expected_source = pnpm_cargo_resolver::registry_source(index_url);
-    let matches_registry = if is_crates_io(index_url) {
-        source.is_default_registry()
-    } else {
-        source.to_string() == expected_source
-    };
-    if !matches_registry {
+    if !source.is_default_registry() && source.to_string() != expected_source {
         return Err(miette::miette!(
-            "Cargo source {source:?} does not match the configured Cargo registry {expected_source:?}"
+            "Cargo source {source:?} is neither crates.io nor the configured Cargo registry {expected_source:?}"
         ));
     }
     let name = package.name.to_string();

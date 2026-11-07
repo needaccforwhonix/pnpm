@@ -1,12 +1,15 @@
-#[cfg(unix)]
-use super::render_recursive_json;
 use super::{
-    DependentProject, OutdatedDependencyOptions, OutdatedInWorkspace, OutdatedPackage, render_json,
-    render_recursive_table, sort_outdated,
+    OutdatedDependencyOptions, OutdatedInWorkspace, OutdatedPackage, render_json,
+    render_recursive_json, render_recursive_table, sort_outdated, workspace::DependentProject,
 };
-use crate::cli_args::outdated::{
-    query::current_versions_from_importer,
-    render::{Change, DEPENDENTS_COLUMN_WIDTH, classify, render_dependents, render_latest},
+use crate::cli_args::{
+    outdated::{
+        OutdatedFormat,
+        notes::with_notes,
+        query::current_versions_from_importer,
+        render::{Change, DEPENDENTS_COLUMN_WIDTH, classify, render_dependents, render_latest},
+    },
+    release_notes::{UpgradeNotes, reader::VersionNote},
 };
 use node_semver::Version;
 use pnpm_lockfile::Lockfile;
@@ -29,11 +32,7 @@ fn pkg(name: &str, current: &str, target: &str, group: DependencyGroup) -> Outda
         target: v(target),
         wanted: v(current),
         github_action: false,
-        metadata: crate::cli_args::outdated::query::OutdatedMetadata {
-            deprecated: None,
-            homepage: None,
-            workspace: None,
-        },
+        metadata: crate::cli_args::outdated::query::OutdatedMetadata::default(),
     }
 }
 
@@ -358,4 +357,176 @@ fn recursive_json_replaces_invalid_utf8_in_locations() {
     let value: serde_json::Value =
         serde_json::from_str(&render_recursive_json(&[entry], false)).expect("valid JSON");
     assert_eq!(value["foo"]["dependentPackages"][0]["location"], "packages/�-app");
+}
+
+#[test]
+fn recursive_json_preserves_multiple_entries_for_same_package() {
+    let entries = vec![
+        OutdatedInWorkspace {
+            package: pkg("is-negative", "1.0.0", "2.1.0", DependencyGroup::Prod),
+            dependents: vec![DependentProject {
+                name: "project-2".to_string(),
+                location: PathBuf::from("/path/to/project-2"),
+            }],
+        },
+        OutdatedInWorkspace {
+            package: pkg("is-negative", "1.0.0", "2.1.0", DependencyGroup::Dev),
+            dependents: vec![DependentProject {
+                name: "project-3".to_string(),
+                location: PathBuf::from("/path/to/project-3"),
+            }],
+        },
+        OutdatedInWorkspace {
+            package: pkg("is-positive", "1.0.0", "3.1.0", DependencyGroup::Prod),
+            dependents: vec![
+                DependentProject {
+                    name: "project-1".to_string(),
+                    location: PathBuf::from("/path/to/project-1"),
+                },
+                DependentProject {
+                    name: "project-3".to_string(),
+                    location: PathBuf::from("/path/to/project-3"),
+                },
+            ],
+        },
+        OutdatedInWorkspace {
+            package: pkg("is-positive", "2.0.0", "3.1.0", DependencyGroup::Prod),
+            dependents: vec![DependentProject {
+                name: "project-2".to_string(),
+                location: PathBuf::from("/path/to/project-2"),
+            }],
+        },
+        OutdatedInWorkspace {
+            package: pkg("single-dep", "1.0.0", "2.0.0", DependencyGroup::Prod),
+            dependents: vec![DependentProject {
+                name: "project-1".to_string(),
+                location: PathBuf::from("/path/to/project-1"),
+            }],
+        },
+    ];
+
+    let value: serde_json::Value =
+        serde_json::from_str(&render_recursive_json(&entries, false)).expect("valid JSON");
+
+    assert!(value.get("single-dep").is_some());
+    assert_eq!(value["single-dep"]["current"], "1.0.0");
+
+    assert!(value.get("is-negative@1.0.0").is_some());
+    assert_eq!(value["is-negative@1.0.0"]["dependencyType"], "dependencies");
+
+    assert!(value.get("is-negative@1.0.0 (dev)").is_some());
+    assert_eq!(value["is-negative@1.0.0 (dev)"]["dependencyType"], "devDependencies");
+
+    assert!(value.get("is-positive@1.0.0").is_some());
+    assert_eq!(value["is-positive@1.0.0"]["current"], "1.0.0");
+
+    assert!(value.get("is-positive@2.0.0").is_some());
+    assert_eq!(value["is-positive@2.0.0"]["current"], "2.0.0");
+}
+
+#[test]
+fn notes_go_into_the_json_entry_of_their_package() {
+    let packages = [
+        pkg("a", "1.0.0", "2.0.0", DependencyGroup::Prod),
+        pkg("b", "1.0.0", "1.1.0", DependencyGroup::Prod),
+    ];
+    let refs: Vec<&OutdatedPackage> = packages.iter().collect();
+    let notes = [
+        None,
+        Some(UpgradeNotes {
+            versions: vec![VersionNote {
+                version: "1.1.0".into(),
+                text: Some("B.\u{1b}".into()),
+                publication: None,
+            }],
+            publications: Vec::new(),
+        }),
+    ];
+    let output =
+        with_notes(r#"{"a": {}, "b": {}}"#.to_owned(), OutdatedFormat::Json, &refs, &notes);
+    let report: serde_json::Value = serde_json::from_str(&output).expect("JSON");
+
+    assert_eq!(report["a"].get("releaseNotes"), None);
+    assert_eq!(report["b"]["releaseNotes"]["versions"][0]["notes"], "B.");
+
+    let text = with_notes("table".to_owned(), OutdatedFormat::Table, &refs, &notes);
+    assert_eq!(text, "table\n\nb 1.0.0 => 1.1.0\n  1.1.0:\n    B.");
+}
+
+/// Two aliases of one package at one version render as one JSON entry, so
+/// the notes of a later package still go into its own entry.
+#[test]
+fn notes_find_their_json_entry_when_two_packages_share_one() {
+    let mut alias_a = pkg("foo", "1.0.0", "2.0.0", DependencyGroup::Prod);
+    alias_a.alias = "a".to_owned();
+    let mut alias_b = pkg("foo", "1.0.0", "2.0.0", DependencyGroup::Prod);
+    alias_b.alias = "b".to_owned();
+    let packages = [alias_a, alias_b, pkg("bar", "1.0.0", "1.1.0", DependencyGroup::Prod)];
+    let refs: Vec<&OutdatedPackage> = packages.iter().collect();
+    let output = render_json(&packages, false);
+    let entries = serde_json::from_str::<serde_json::Value>(&output).expect("JSON");
+    assert_eq!(entries.as_object().map(serde_json::Map::len), Some(2), "{output}");
+    let notes = [
+        None,
+        None,
+        Some(UpgradeNotes {
+            versions: vec![VersionNote {
+                version: "1.1.0".into(),
+                text: Some("Bar.".into()),
+                publication: None,
+            }],
+            publications: Vec::new(),
+        }),
+    ];
+
+    let report: serde_json::Value =
+        serde_json::from_str(&with_notes(output, OutdatedFormat::Json, &refs, &notes))
+            .expect("JSON");
+
+    assert_eq!(report["bar"]["releaseNotes"]["versions"][0]["notes"], "Bar.");
+    let foo = report
+        .as_object()
+        .expect("object")
+        .iter()
+        .find(|(key, _)| key.starts_with("foo"))
+        .map(|(_, entry)| entry)
+        .expect("foo entry");
+    assert_eq!(foo.get("releaseNotes"), None);
+}
+
+/// The entry two packages share shows the last of them, so the notes of
+/// the earlier one, for another target, do not go into it.
+#[test]
+fn a_shared_json_entry_gets_only_the_notes_of_the_package_it_shows() {
+    let mut alias_a = pkg("foo", "1.0.0", "1.1.0", DependencyGroup::Prod);
+    alias_a.alias = "a".to_owned();
+    let mut alias_b = pkg("foo", "1.0.0", "2.0.0", DependencyGroup::Prod);
+    alias_b.alias = "b".to_owned();
+    let packages = [alias_a, alias_b];
+    let refs: Vec<&OutdatedPackage> = packages.iter().collect();
+    let output = render_json(&packages, false);
+    let notes = [
+        Some(UpgradeNotes {
+            versions: vec![VersionNote {
+                version: "1.1.0".into(),
+                text: Some("Only a.".into()),
+                publication: None,
+            }],
+            publications: Vec::new(),
+        }),
+        None,
+    ];
+
+    let report: serde_json::Value =
+        serde_json::from_str(&with_notes(output, OutdatedFormat::Json, &refs, &notes))
+            .expect("JSON");
+
+    let entries = report.as_object().expect("object");
+    assert_eq!(entries.len(), 1, "{report}");
+    let (_, entry) = entries
+        .iter()
+        .next()
+        .expect("one entry");
+    assert_eq!(entry["latest"], "2.0.0", "the entry shows the later package: {report}");
+    assert_eq!(entry.get("releaseNotes"), None, "{report}");
 }

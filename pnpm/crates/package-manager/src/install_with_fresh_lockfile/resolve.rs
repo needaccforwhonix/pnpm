@@ -5,7 +5,9 @@
 //! [`super::manifest_transforms`]; the resolver chain it walks is built
 //! by [`super::resolver_setup`].
 
-pub(super) use reuse::{ReuseSeedInputs, lockfile_reuse_seed, preferred_versions_seeds};
+pub(super) use reuse::{
+    ReuseSeedInputs, lockfile_reuse_seed, preferred_versions_seeds, stale_override_targets,
+};
 
 mod reuse;
 
@@ -13,11 +15,9 @@ use super::InstallWithFreshLockfileError;
 use crate::VersionsOverrider;
 use pnpm_catalogs_types::Catalogs;
 use pnpm_config::Config;
-use pnpm_lockfile::Lockfile;
 use pnpm_package_manifest::{DependencyGroup, PackageManifest};
-use pnpm_reporter::LogLevel;
 use pnpm_resolving_deps_resolver::{
-    DependencyOverrider, ResolveImporterError, ResolveImporterOptions,
+    DependencyOverrider, PeerDependentsDedupe, ResolveImporterError, ResolveImporterOptions,
 };
 use pnpm_resolving_resolver_base::{PreferredVersions, ResolveOptions, Resolver};
 use std::{
@@ -26,49 +26,11 @@ use std::{
     sync::Arc,
 };
 
-/// Call the pnpmfile's `preResolution` hook before resolution starts.
-pub(super) async fn run_pre_resolution_hook<Reporter: pnpm_reporter::Reporter>(
-    hook: &Arc<dyn pnpm_hooks::PnpmfileHooks>,
-    config: &Config,
-    lockfile_dir: &Path,
-    wanted_lockfile: Option<&Lockfile>,
-) {
-    let wanted_lockfile_json = wanted_lockfile.map_or_else(
-        || serde_json::json!({}),
-        |lf| serde_json::to_value(lf).unwrap_or_else(|_| serde_json::json!({})),
-    );
-    let current_lockfile =
-        Lockfile::load_current_from_virtual_store_dir(&config.virtual_store_dir).ok().flatten();
-    let exists_current_lockfile = current_lockfile.is_some();
-    let current_lockfile_json = current_lockfile.map_or_else(
-        || serde_json::json!({}),
-        |lf| serde_json::to_value(lf).unwrap_or_else(|_| serde_json::json!({})),
-    );
-    let ctx = pnpm_hooks::PreResolutionHookContext {
-        wanted_lockfile: wanted_lockfile_json,
-        current_lockfile: current_lockfile_json,
-        exists_current_lockfile,
-        exists_non_empty_wanted_lockfile: wanted_lockfile
-            .as_ref()
-            .is_some_and(|lf| !lf.snapshots.as_ref().is_none_or(HashMap::is_empty)),
-        lockfile_dir: lockfile_dir.to_string_lossy().to_string(),
-        store_dir: config.store_dir.display().to_string(),
-        registries: serde_json::json!(config.resolved_registries()),
-    };
-    hook.pre_resolution(
-        ctx,
-        pnpm_hooks::PreResolutionHookLogger {
-            info: super::pre_resolution_log_fn::<Reporter>(lockfile_dir, LogLevel::Info),
-            warn: super::pre_resolution_log_fn::<Reporter>(lockfile_dir, LogLevel::Warn),
-        },
-    )
-    .await;
-}
-
 /// The [`ResolveOptions`] fields that are the same for every importer and
 /// for the fast-override pre-pass. Only the consuming project's directory
 /// and its preferred-versions seed vary — see [`Self::build`].
 pub(super) struct SharedResolveOptions<'a> {
+    pub locked_package_policy: pnpm_resolving_resolver_base::LockedPackagePolicy,
     pub policy: pnpm_resolving_resolver_base::ResolutionPolicyOptions,
     pub config: &'a Config,
     pub lockfile_dir: &'a Path,
@@ -76,6 +38,7 @@ pub(super) struct SharedResolveOptions<'a> {
     /// See [`super::FreshInputs::update_checksums`].
     pub update_checksums: bool,
     pub update_behavior: pnpm_resolving_resolver_base::UpdateBehavior,
+    pub refresh_metadata: bool,
 }
 
 impl SharedResolveOptions<'_> {
@@ -95,15 +58,18 @@ impl SharedResolveOptions<'_> {
             },
             version: pnpm_resolving_resolver_base::VersionSelectionOptions {
                 preferred_versions,
-                default_tag: Some("latest".to_string()),
+                default_tag: Some(self.config.default_tag().to_string()),
                 ..Default::default()
             },
             refresh: pnpm_resolving_resolver_base::ResolutionRefreshOptions {
                 update_checksums: self.update_checksums,
                 update: self.update_behavior,
+                refresh_metadata: self.refresh_metadata,
                 ..Default::default()
             },
+            locked_package_policy: self.locked_package_policy,
             policy: pnpm_resolving_resolver_base::ResolutionPolicyOptions {
+                fallback_published_by: None,
                 published_by: self.policy.published_by,
                 published_by_exclude: self.policy.published_by_exclude.clone(),
                 trust_policy: self.policy.trust_policy,
@@ -184,6 +150,9 @@ pub(super) struct WorkspaceWalk {
     pub time_based: bool,
     pub registries: HashMap<String, String>,
     pub registries_by_prefix: HashMap<String, String>,
+    pub declared_prefixes: pnpm_lockfile::DeclaredRegistryPrefixes,
+    /// See [`pnpm_lockfile::RegistryContext::locked_registries`].
+    pub locked_registries: Option<HashMap<String, String>>,
 }
 
 /// What every importer's resolve reads, and the walk reads alongside.
@@ -205,6 +174,19 @@ impl ImporterInputs<'_> {
         usize::try_from(self.config.peers_suffix_max_length).unwrap_or(usize::MAX)
     }
 
+    fn importer_base_opts(
+        &self,
+        importer_id: &str,
+        project_dir: std::path::PathBuf,
+        preferred_versions: &Arc<PreferredVersions>,
+    ) -> ResolveOptions {
+        let mut base_opts =
+            self.shared_resolve_options.build(project_dir, Arc::clone(preferred_versions));
+        base_opts.version.preferred_versions_overlay =
+            self.versions.own_manifest_specifiers_of(importer_id);
+        base_opts
+    }
+
     fn resolve_importer_options(
         &self,
         importer: &pnpm_resolving_deps_resolver::WorkspaceImporter<'_>,
@@ -218,10 +200,7 @@ impl ImporterInputs<'_> {
             .to_path_buf();
         let modules_dir = Some(project_dir.join(modules_basename));
         ResolveImporterOptions {
-            base_opts: self.shared_resolve_options.build(
-                project_dir,
-                Arc::clone(preferred_versions),
-            ),
+            base_opts: self.importer_base_opts(&importer.id, project_dir, preferred_versions),
             peers_suffix_max_length: self.peers_suffix_max_length(),
             peers: pnpm_resolving_deps_resolver::ImporterPeerOptions {
                 auto_install_peers: self.config.auto_install_peers,
@@ -229,7 +208,7 @@ impl ImporterInputs<'_> {
                     .auto_install_peers_from_highest_match,
                 resolve_peers_from_workspace_root: self.config.resolve_peers_from_workspace_root,
                 dedupe_peers: self.config.dedupe_peers,
-                dedupe_peer_dependents: self.config.dedupe_peer_dependents,
+                dedupe_peer_dependents: peer_dependents_dedupe(self.config),
             },
             links: pnpm_resolving_deps_resolver::PeerLinkOptions {
                 modules_dir,
@@ -246,6 +225,7 @@ impl ImporterInputs<'_> {
                 pick_lowest_direct: self.versions.pick_lowest,
                 subdep_published_by: self.versions.published_by,
                 catalogs: self.catalogs.clone(),
+                catalogs_dir: self.config.workspace_dir.clone(),
                 catalog_server: false,
             },
             hooks: self.hooks.clone(),
@@ -263,14 +243,16 @@ impl WorkspaceWalk {
             registry_context: pnpm_lockfile::RegistryContext {
                 registries: self.registries,
                 registries_by_prefix: self.registries_by_prefix,
+                declared_prefixes: self.declared_prefixes,
                 registry_options_by_url: config.registry_options_by_url.clone(),
+                locked_registries: self.locked_registries,
             },
             share_workspace_resolutions: self.share_workspace_resolutions,
             allowed_deprecated_versions: config.allowed_deprecated_versions.clone(),
             peers: pnpm_resolving_deps_resolver::WorkspacePeerResolutionOptions {
                 dedupe_peers: config.dedupe_peers,
                 dedupe_injected_deps: config.dedupe_injected_deps,
-                dedupe_peer_dependents: config.dedupe_peer_dependents,
+                dedupe_peer_dependents: peer_dependents_dedupe(config),
                 resolve_peers_from_workspace_root: config.resolve_peers_from_workspace_root,
                 exclude_links_from_lockfile: config.exclude_links_from_lockfile,
                 lockfile_dir: shared.lockfile_dir.to_path_buf(),
@@ -297,17 +279,12 @@ impl WorkspaceWalk {
     }
 }
 
-/// Walk every importer's dependencies through the resolver chain.
-///
-/// Each importer resolves with its own `project_dir` so `workspace:` /
-/// `link:` resolutions compute paths relative to the consuming project,
-/// while the resolver chain's shared packument, fetch-locker, and
-/// picked-manifest caches keep the metadata and version-pick work
-/// amortized across importers. `resolve_workspace` then runs the
-/// cross-importer peer pass and applies `dedupeInjectedDeps`.
-pub(super) async fn run_resolve_pass<Reporter: pnpm_reporter::Reporter>(
+pub(super) async fn run_dependency_pass<Reporter: pnpm_reporter::Reporter>(
     inputs: ResolvePassInputs<'_>,
-) -> Result<pnpm_resolving_deps_resolver::ResolveWorkspaceResult, InstallWithFreshLockfileError> {
+) -> Result<
+    pnpm_resolving_deps_resolver::ResolvedWorkspaceDependencies,
+    InstallWithFreshLockfileError,
+> {
     let ResolvePassInputs {
         resolver,
         importer_manifests,
@@ -326,7 +303,7 @@ pub(super) async fn run_resolve_pass<Reporter: pnpm_reporter::Reporter>(
     let modules_basename = per_importer.config.modules_dir
         .file_name()
         .map_or_else(|| std::ffi::OsString::from("node_modules"), std::ffi::OsStr::to_os_string);
-    pnpm_resolving_deps_resolver::resolve_workspace(
+    pnpm_resolving_deps_resolver::resolve_workspace_dependencies(
         resolver,
         &workspace_importers,
         dependency_groups,
@@ -334,12 +311,27 @@ pub(super) async fn run_resolve_pass<Reporter: pnpm_reporter::Reporter>(
         |importer| per_importer.resolve_importer_options(importer, &modules_basename),
     )
     .await
-    .map_err(|err| match err {
+    .map_err(resolve_error)
+}
+
+pub(super) fn resolve_error(err: ResolveImporterError) -> InstallWithFreshLockfileError {
+    match err {
         ResolveImporterError::Resolve(err) => {
             InstallWithFreshLockfileError::ResolveDependencyTree(err)
         }
         ResolveImporterError::RootDepManifest(err) => {
             InstallWithFreshLockfileError::RootDepManifest(err)
         }
-    })
+    }
+}
+
+/// The resolver's view of `dedupePeerDependents` and
+/// `projectScopedOptionalPeers`. With deduplication off, optional peers
+/// are project-scoped regardless of the second setting.
+fn peer_dependents_dedupe(config: &Config) -> PeerDependentsDedupe {
+    match (config.dedupe_peer_dependents, config.project_scoped_optional_peers) {
+        (false, _) => PeerDependentsDedupe::Off,
+        (true, false) => PeerDependentsDedupe::On,
+        (true, true) => PeerDependentsDedupe::OnWithProjectScopedOptionalPeers,
+    }
 }

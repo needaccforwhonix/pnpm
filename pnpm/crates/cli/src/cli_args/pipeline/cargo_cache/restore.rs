@@ -24,7 +24,15 @@ pub(super) fn clone_file(source: &Path, target: &Path) -> io::Result<()> {
     options
         .open(target)?
         .set_times(FileTimes::new().set_modified(metadata.modified()?))?;
-    fs::set_permissions(target, metadata.permissions())
+    #[cfg(not(target_os = "wasi"))]
+    {
+        pnpm_fs::CopyPermissions::of_metadata(&metadata).apply_to_path(target)
+    }
+    #[cfg(target_os = "wasi")]
+    {
+        let file = pnpm_fs::open_file_without_following(target)?;
+        pnpm_fs::copy_permissions(source)?.apply_to_file(&file)
+    }
 }
 
 /// Content changes can retain mtimes, and relocated build scripts can retain

@@ -1,16 +1,20 @@
 use super::{
-    dependencies_graph_to_lockfile, make_named_registry_node, make_node, make_node_with_optional,
-    make_resolve_result, single_importer_opts, write_manifest,
+    FAKE_INTEGRITY, dependencies_graph_to_lockfile, make_named_registry_node, make_node,
+    make_node_with_optional, make_resolve_result, single_importer_opts, write_manifest,
 };
 use pnpm_deps_path::DepPath;
-use pnpm_lockfile::{ImporterDepVersion, LockfileResolution, PackageKey, PkgName};
+use pnpm_lockfile::{
+    ImporterDepVersion, LockfileResolution, PackageKey, PkgName, TarballResolution,
+};
 use pnpm_resolving_deps_resolver::{
     ChildEdge, DependenciesGraph, DependenciesGraphNode, DependenciesTreeNode, DirectDep, NodeId,
-    PeerDep, ResolvePeersOptions, ResolvedPackage, ResolvedTree, TreeChildren, resolve_peers,
+    PeerDep, ResolvePeersOptions, ResolvedPackage, ResolvedPackageInput, ResolvedTree,
+    TreeChildren, resolve_peers,
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use serde_json::json;
-use std::{collections::BTreeMap, sync::Arc};
+use ssri::Integrity;
+use std::{collections::BTreeMap, str::FromStr, sync::Arc};
 
 #[test]
 fn peer_suffixed_dep_path_splits_into_distinct_snapshot_and_package_keys() {
@@ -53,13 +57,12 @@ fn peer_suffixed_dep_path_splits_into_distinct_snapshot_and_package_keys() {
             }),
         )),
         depth: 1,
-        installable: true,
         is_pure: false,
         optional: false,
         edges: pnpm_resolving_deps_resolver::ResolvedDependencyEdges {
             children: react_dom_children,
             optional_children: HashSet::default(),
-            peer_dependencies: react_dom_peers,
+            peer_set: pnpm_resolving_deps_resolver::PeerSet::taking_all(react_dom_peers),
             transitive_peer_dependencies: HashSet::default(),
             resolved_peer_names: std::iter::once("react".to_string()).collect(),
         },
@@ -114,46 +117,41 @@ fn snapshot_preserves_optional_child_edges_from_resolved_tree() {
         direct: vec![DirectDep {
             alias: "outer".to_string(),
             node_id: outer_node_id.clone(),
-            id: outer_id.to_string(),
+            id: Arc::<str>::clone(&outer_id),
         }],
         packages: HashMap::from_iter([
             (
                 Arc::<str>::clone(&outer_id),
-                ResolvedPackage {
+                ResolvedPackage::new(ResolvedPackageInput {
                     id: Arc::<str>::clone(&outer_id),
                     result: Arc::new(make_resolve_result(
                         "outer",
                         "1.0.0",
                         json!({ "name": "outer", "version": "1.0.0" }),
                     )),
-                    peer_dependencies: BTreeMap::new(),
+                    peer_set: pnpm_resolving_deps_resolver::PeerSet::default(),
                     optional: false,
                     is_leaf: false,
-                },
+                }),
             ),
             (
                 Arc::<str>::clone(&inner_id),
-                ResolvedPackage {
+                ResolvedPackage::new(ResolvedPackageInput {
                     id: Arc::<str>::clone(&inner_id),
                     result: Arc::new(make_resolve_result(
                         "inner",
                         "1.0.0",
                         json!({ "name": "inner", "version": "1.0.0" }),
                     )),
-                    peer_dependencies: BTreeMap::new(),
+                    peer_set: pnpm_resolving_deps_resolver::PeerSet::default(),
                     optional: true,
                     is_leaf: true,
-                },
+                }),
             ),
         ]),
         dependencies_tree: HashMap::from_iter([(
             outer_node_id,
-            DependenciesTreeNode::new(
-                Arc::<str>::clone(&outer_id),
-                TreeChildren::Lazy { parent_ids: Arc::new(Vec::new()).into() },
-                0,
-                true,
-            ),
+            DependenciesTreeNode::new(Arc::<str>::clone(&outer_id), TreeChildren::Lazy, 0),
         )]),
         all_peer_dep_names: HashSet::default(),
         policy_violations: Vec::new(),
@@ -280,6 +278,77 @@ fn auto_installed_peer_not_declared_in_manifest_is_skipped_from_pruner_seeds() {
         "auto-installed peer reachable only via parent's optional path stays optional",
     );
 }
+#[test]
+fn auto_installed_peer_declared_in_manifest_is_not_optional() {
+    assert!(
+        !declared_peer_snapshot_is_optional(true),
+        "the importer depends on its auto-installed peer, whatever the consumer's optional peer says",
+    );
+}
+#[test]
+fn declared_peer_stays_optional_when_peers_are_not_auto_installed() {
+    assert!(
+        declared_peer_snapshot_is_optional(false),
+        "a peer the importer does not record is reached only through the consumer's optional peer",
+    );
+}
+/// Whether `peer`'s snapshot is optional when the importer declares it in
+/// `peerDependencies` and its prod dependency `consumer` has it as an
+/// optional peer.
+fn declared_peer_snapshot_is_optional(auto_install_peers: bool) -> bool {
+    let (_tmp, manifest) = write_manifest(json!({
+        "name": "fixture",
+        "version": "1.0.0",
+        "dependencies": { "consumer": "1.0.0" },
+        "peerDependencies": { "peer": "^1.0.0" },
+    }));
+    let peer = make_node(
+        "peer",
+        "1.0.0",
+        json!({ "name": "peer", "version": "1.0.0" }),
+        BTreeMap::new(),
+        BTreeMap::new(),
+        HashSet::default(),
+    );
+    let consumer = make_node(
+        "consumer",
+        "1.0.0",
+        json!({
+            "name": "consumer",
+            "version": "1.0.0",
+            "peerDependencies": { "peer": "^1.0.0" },
+            "peerDependenciesMeta": { "peer": { "optional": true } },
+        }),
+        BTreeMap::from([("peer".to_string(), peer.dep_path.clone())]),
+        BTreeMap::from([(
+            "peer".to_string(),
+            PeerDep { version: "^1.0.0".to_string(), optional: true },
+        )]),
+        HashSet::default(),
+    );
+    let mut graph = DependenciesGraph::default();
+    for node in [peer, consumer] {
+        graph.insert(node.dep_path.clone(), node);
+    }
+    let direct = BTreeMap::from([
+        ("consumer".to_string(), DepPath::from("consumer@1.0.0".to_string())),
+        ("peer".to_string(), DepPath::from("peer@1.0.0".to_string())),
+    ]);
+
+    let lockfile = dependencies_graph_to_lockfile(single_importer_opts(
+        &manifest,
+        &graph,
+        direct,
+        auto_install_peers,
+        false,
+        None,
+        None,
+    ));
+
+    let snapshots = lockfile.snapshots.as_ref().expect("snapshots map");
+    let peer_key: PackageKey = "peer@1.0.0".parse().unwrap();
+    snapshots[&peer_key].optional
+}
 /// An alias the writer can't resolve must never drop the tarball URL:
 /// testing it against the default registry could classify it as
 /// reconstructible and leave an entry no install can fetch.
@@ -313,4 +382,127 @@ fn an_unresolvable_alias_keeps_the_tarball_url() {
         LockfileResolution::Tarball(resolution) => assert_eq!(resolution.tarball, tarball),
         other => panic!("an unresolvable alias must keep its tarball URL, got {other:?}"),
     }
+}
+
+/// A scoped package is written against the registry its scope routes to,
+/// the one an install rebuilds the URL from.
+/// See <https://github.com/pnpm/pnpm/issues/16866>.
+#[test]
+fn a_scoped_package_tarball_url_is_tested_against_its_scope_registry() {
+    let lockfile_resolution = |tarball: &str| {
+        let (_tmp, manifest) = write_manifest(json!({
+            "name": "fixture",
+            "version": "1.0.0",
+            "dependencies": { "@types/ms": "0.7.34" },
+        }));
+        let mut node = make_node(
+            "@types/ms",
+            "0.7.34",
+            json!({ "name": "@types/ms", "version": "0.7.34" }),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            HashSet::default(),
+        );
+        let mut resolve_result = make_resolve_result(
+            "@types/ms",
+            "0.7.34",
+            json!({ "name": "@types/ms", "version": "0.7.34" }),
+        );
+        resolve_result.resolution = LockfileResolution::Tarball(TarballResolution {
+            tarball: tarball.to_string(),
+            integrity: Some(Integrity::from_str(FAKE_INTEGRITY).unwrap()),
+            revision: None,
+            git_hosted: None,
+            path: None,
+        });
+        node.resolve_result = Arc::new(resolve_result);
+        let mut graph = DependenciesGraph::default();
+        graph.insert(node.dep_path.clone(), node);
+        let direct = BTreeMap::from([(
+            "@types/ms".to_string(),
+            DepPath::from("@types/ms@0.7.34".to_string()),
+        )]);
+        let registries = std::collections::HashMap::from([
+            ("default".to_string(), "https://registry.npmjs.org/".to_string()),
+            ("@types".to_string(), "https://registry.npmmirror.com/".to_string()),
+        ]);
+        let mut opts = single_importer_opts(&manifest, &graph, direct, true, false, None, None);
+        opts.metadata_sources.registries = &registries;
+        let lockfile = dependencies_graph_to_lockfile(opts);
+        let key: PackageKey = "@types/ms@0.7.34".parse().unwrap();
+        lockfile.packages.expect("packages map")[&key].resolution.clone()
+    };
+
+    let from_scope_registry =
+        lockfile_resolution("https://registry.npmmirror.com/@types/ms/-/ms-0.7.34.tgz");
+    assert!(
+        matches!(from_scope_registry, LockfileResolution::Registry(_)),
+        "a URL the scope registry rebuilds is dropped: {from_scope_registry:?}",
+    );
+
+    let tarball = "https://registry.npmjs.org/@types/ms/-/ms-0.7.34.tgz";
+    match lockfile_resolution(tarball) {
+        LockfileResolution::Tarball(resolution) => assert_eq!(resolution.tarball, tarball),
+        other => panic!("a URL only the default registry rebuilds is kept, got {other:?}"),
+    }
+}
+
+#[test]
+fn tarball_manifest_with_traversal_version_is_not_recorded_in_lockfile() {
+    let (_tmp, manifest) = write_manifest(json!({
+        "name": "fixture",
+        "version": "1.0.0",
+        "dependencies": { "tar-dep": "https://example.com/tar-dep.tgz" },
+    }));
+
+    let dep_path = DepPath::from("tar-dep@https://example.com/tar-dep.tgz");
+    let resolve_result = super::ResolveResult {
+        id: super::PkgResolutionId::from("https://example.com/tar-dep.tgz"),
+        resolution: LockfileResolution::Tarball(super::TarballResolution {
+            tarball: "https://example.com/tar-dep.tgz".to_string(),
+            integrity: None,
+            revision: None,
+            git_hosted: None,
+            path: None,
+        }),
+        resolved_via: "remote-tarball".to_string(),
+        normalized_bare_specifier: None,
+        alias: Some("tar-dep".to_string()),
+        policy_violation: None,
+        package: pnpm_resolving_resolver_base::ResolvedPackageInfo {
+            name_ver: None,
+            latest: None,
+            published_at: None,
+            manifest: Some(Arc::new(json!({ "name": "tar-dep", "version": "../../escaped" }))),
+            non_deprecated_alternative: None,
+        },
+    };
+    let node = DependenciesGraphNode {
+        dep_path: dep_path.clone(),
+        resolved_package_id: dep_path.to_string(),
+        resolve_result: Arc::new(resolve_result),
+        depth: 1,
+        is_pure: true,
+        optional: false,
+        edges: pnpm_resolving_deps_resolver::ResolvedDependencyEdges {
+            children: BTreeMap::new(),
+            optional_children: HashSet::default(),
+            peer_set: pnpm_resolving_deps_resolver::PeerSet::default(),
+            transitive_peer_dependencies: HashSet::default(),
+            resolved_peer_names: HashSet::default(),
+        },
+    };
+    let mut graph = DependenciesGraph::default();
+    graph.insert(dep_path.clone(), node);
+    let direct = BTreeMap::from([("tar-dep".to_string(), dep_path)]);
+
+    let lockfile = dependencies_graph_to_lockfile(single_importer_opts(
+        &manifest, &graph, direct, true, false, None, None,
+    ));
+
+    let package_key: PackageKey =
+        "tar-dep@https://example.com/tar-dep.tgz".parse().expect("package key");
+    let packages = lockfile.packages.expect("packages map");
+    let metadata = packages.get(&package_key).expect("package metadata");
+    assert_eq!(metadata.version, None);
 }

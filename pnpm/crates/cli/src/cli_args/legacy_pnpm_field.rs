@@ -7,9 +7,7 @@ use super::config_warnings::emit_config_warning;
 use serde_json::Value;
 
 /// Keys pnpm reads from `pnpm-workspace.yaml` and never from the `pnpm`
-/// field of `package.json` — either because they moved there in v11, or
-/// because (like `update`) they were introduced later and only ever
-/// lived there. Keys outside this set (`app`, or anything third-party
+/// field of `package.json`. Keys outside this set (`app`, or anything third-party
 /// tooling piggybacks on the `pnpm` namespace for) are left alone so the
 /// warning can't fire on something pnpm never owned.
 const MIGRATED_PNPM_FIELD_KEYS: &[&str] = &[
@@ -34,6 +32,12 @@ const MIGRATED_PNPM_FIELD_KEYS: &[&str] = &[
     "updateConfig",
 ];
 
+/// The migrated keys whose values the lockfile records. An install that
+/// ignores one of them rewrites the lockfile without it, silently dropping,
+/// for example, the version floors the overrides set.
+const LOCKFILE_RECORDED_PNPM_FIELD_KEYS: &[&str] =
+    &["ignoredOptionalDependencies", "overrides", "packageExtensions", "patchedDependencies"];
+
 /// Warn about every migrated key the root project manifest still
 /// declares under `pnpm`.
 pub(crate) fn warn_ignored_pnpm_manifest_fields(manifest: Option<&Value>) {
@@ -51,6 +55,14 @@ pub(crate) fn warn_ignored_pnpm_manifest_fields(manifest: Option<&Value>) {
          The following keys were ignored: {keys}. \
          See https://pnpm.io/settings for the new home of each setting.",
     ));
+}
+
+/// The migrated keys the root project manifest still declares under `pnpm`
+/// whose values the lockfile records.
+pub(crate) fn ignored_lockfile_pnpm_field_keys(manifest: Option<&Value>) -> Vec<String> {
+    let mut keys = ignored_pnpm_field_keys(manifest);
+    keys.retain(|key| LOCKFILE_RECORDED_PNPM_FIELD_KEYS.contains(&key.as_str()));
+    keys
 }
 
 fn ignored_pnpm_field_keys(manifest: Option<&Value>) -> Vec<String> {

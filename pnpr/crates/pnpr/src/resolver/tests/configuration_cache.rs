@@ -1,7 +1,7 @@
 use super::{
-    BTreeMap, HashMap, HashSet, Lockfile, Mutex, PacquetConfig, PathBuf, RegistryDeclaration,
-    ResolutionMode, ResolveRequest, ResolveRequestProject, RouteContext, config, deps, lockfile,
-    registry_config, reject_off_allowlist_fetches, resolution_cache_key,
+    HashMap, HashSet, Lockfile, Mutex, PacquetConfig, PathBuf, RegistryDeclaration, ResolutionMode,
+    ResolveRequest, ResolveRequestProject, RouteContext, config, deps, lockfile, registry_config,
+    reject_off_allowlist_fetches, resolution_cache_key,
 };
 
 #[test]
@@ -79,6 +79,38 @@ fn resolution_cache_key_changes_with_project_identity() {
     let base_key = resolution_cache_key(&config, &base);
     assert_ne!(base_key, resolution_cache_key(&config, &renamed));
     assert_ne!(base_key, resolution_cache_key(&config, &reversioned));
+}
+
+#[test]
+fn resolution_cache_key_changes_with_the_project_publish_config() {
+    let request = |publish_config: serde_json::Value| {
+        serde_json::from_value::<ResolveRequest>(serde_json::json!({
+            "projects": [{
+                "dir": "packages/lib",
+                "name": "lib",
+                "version": "1.0.0",
+                "publishConfig": publish_config
+            }]
+        }))
+        .expect("resolve request parses")
+    };
+    let config = config();
+    // An absent publish directory and an explicit one resolve differently, and
+    // the two halves of the config are independent: only `linkDirectory`
+    // changing must also miss the cache, or a toggled project keeps the link it
+    // was resolved with.
+    let absent = resolution_cache_key(&config, &request(serde_json::Value::Null));
+    let dist = resolution_cache_key(&config, &request(serde_json::json!({ "directory": "dist" })));
+    let build =
+        resolution_cache_key(&config, &request(serde_json::json!({ "directory": "build" })));
+    let unlinked = resolution_cache_key(
+        &config,
+        &request(serde_json::json!({ "directory": "dist", "linkDirectory": false })),
+    );
+
+    assert_ne!(absent, dist);
+    assert_ne!(dist, build);
+    assert_ne!(dist, unlinked);
 }
 
 #[test]
@@ -207,7 +239,7 @@ fn reject_off_allowlist_fetches_blocks_unconfigured_hosts() {
     // reaches. `RouteHook::allows_fetch` refuses the ones it does reach.
     let declared = ResolveRequest {
         registry: Some("https://registry.npmjs.org/".to_string()),
-        registries: BTreeMap::from([(
+        registries: indexmap::IndexMap::from([(
             "http://169.254.169.254/".to_string(),
             RegistryDeclaration {
                 scopes: Some(vec!["@acme".to_string()]),
@@ -226,7 +258,7 @@ fn reject_off_allowlist_fetches_blocks_unconfigured_hosts() {
     };
     assert!(reject_off_allowlist_fetches(&ranges, &context).is_none());
 
-    // A direct http(s) tarball dependency pointing at an off-allowlist host is
+    // A direct HTTP or HTTPS tarball dependency pointing at an off-allowlist host is
     // rejected before the tarball resolver issues a HEAD/GET.
     let tarball_dep = ResolveRequest {
         registry: Some("https://registry.npmjs.org/".to_string()),
@@ -252,7 +284,7 @@ fn reject_off_allowlist_fetches_blocks_unconfigured_hosts() {
     };
     assert!(reject_off_allowlist_fetches(&scp_dep, &context).is_some());
 
-    // Every git transport is gated by origin, not just http(s)/git/ssh — and
+    // Every git transport is gated by origin, not just HTTP, HTTPS, git, and ssh — and
     // `file://` (a server-local read) nerf-darts to no host and is rejected.
     for spec in [
         "git+rsync://169.254.169.254/repo",
@@ -338,17 +370,20 @@ fn intern_config_uses_lockfile_settings_for_a_legacy_frozen_request() {
         auto_install_peers: false,
         dedupe_peers: Some(true),
         exclude_links_from_lockfile: true,
+        add_missing_peer_types: Some(true),
         ..pnpm_lockfile::LockfileSettings::default()
     };
     let adopted = intern(&request(Some(client_settings)));
     assert!(!adopted.auto_install_peers);
     assert!(adopted.dedupe_peers);
     assert!(adopted.exclude_links_from_lockfile);
+    assert!(adopted.add_missing_peer_types);
 
     let defaults = intern(&request(None));
     assert!(defaults.auto_install_peers);
     assert!(!defaults.dedupe_peers);
     assert!(!defaults.exclude_links_from_lockfile);
+    assert!(!defaults.add_missing_peer_types);
 }
 
 #[test]
@@ -646,5 +681,91 @@ fn intern_config_resolves_in_the_client_s_resolution_mode() {
             .expect("config cache")
             .len(),
         3,
+    );
+}
+
+#[test]
+fn intern_config_keys_add_missing_peer_types() {
+    use super::super::intern_config;
+    use pnpm_store_dir::StoreDir;
+
+    let configs = Mutex::new(HashMap::new());
+    let store_dir = StoreDir::new(PathBuf::from("/tmp/pnpr-peer-types-store"));
+    let cache_dir = PathBuf::from("/tmp/pnpr-peer-types-cache");
+    let intern = |add_missing_peer_types| {
+        let request = ResolveRequest {
+            registry: Some("https://a.test/".to_string()),
+            add_missing_peer_types: Some(add_missing_peer_types),
+            ..ResolveRequest::default()
+        };
+        intern_config(&configs, &store_dir, &cache_dir, &request, 10, usize::MAX)
+            .expect("intern config")
+    };
+
+    let on = intern(true);
+    let off = intern(false);
+
+    assert!(on.add_missing_peer_types);
+    assert!(!off.add_missing_peer_types);
+    let cache_request = ResolveRequest::default();
+    assert_ne!(
+        resolution_cache_key(on, &cache_request).expect("resolution cache key"),
+        resolution_cache_key(off, &cache_request).expect("resolution cache key"),
+    );
+}
+
+#[test]
+fn the_server_keys_a_registry_by_the_client_s_prefix() {
+    use super::super::intern_config;
+    use pnpm_store_dir::StoreDir;
+
+    const REGISTRY: &str = "https://npm.corp.example/";
+    let mut client = PacquetConfig::new();
+    for prefix in ["zeta", "work"] {
+        client.registries_by_prefix.insert(prefix.to_string(), REGISTRY.to_string());
+    }
+    let request = serde_json::from_value::<ResolveRequest>(serde_json::json!({
+        "registries": client.registry_declarations(),
+    }))
+    .expect("resolve request parses");
+
+    let configs = Mutex::new(HashMap::new());
+    let store_dir = StoreDir::new(PathBuf::from("/tmp/pnpr-registry-prefix-store"));
+    let cache_dir = PathBuf::from("/tmp/pnpr-registry-prefix-cache");
+    let server = intern_config(&configs, &store_dir, &cache_dir, &request, 10, usize::MAX)
+        .expect("intern config");
+
+    assert_eq!(client.declared_registry_prefixes().prefix_for(REGISTRY), Some("work"));
+    assert_eq!(server.declared_registry_prefixes().prefix_for(REGISTRY), Some("work"));
+    assert_eq!(server.registries_by_prefix, client.registries_by_prefix);
+}
+
+#[test]
+fn intern_config_keys_project_scoped_optional_peers() {
+    use super::super::intern_config;
+    use pnpm_store_dir::StoreDir;
+
+    let configs = Mutex::new(HashMap::new());
+    let store_dir = StoreDir::new(PathBuf::from("/tmp/pnpr-scoped-peers-store"));
+    let cache_dir = PathBuf::from("/tmp/pnpr-scoped-peers-cache");
+    let intern = |project_scoped_optional_peers| {
+        let request = ResolveRequest {
+            registry: Some("https://a.test/".to_string()),
+            project_scoped_optional_peers: Some(project_scoped_optional_peers),
+            ..ResolveRequest::default()
+        };
+        intern_config(&configs, &store_dir, &cache_dir, &request, 10, usize::MAX)
+            .expect("intern config")
+    };
+
+    let on = intern(true);
+    let off = intern(false);
+
+    assert!(on.project_scoped_optional_peers);
+    assert!(!off.project_scoped_optional_peers);
+    let cache_request = ResolveRequest::default();
+    assert_ne!(
+        resolution_cache_key(on, &cache_request).expect("resolution cache key"),
+        resolution_cache_key(off, &cache_request).expect("resolution cache key"),
     );
 }

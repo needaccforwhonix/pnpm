@@ -83,29 +83,31 @@ fn publish_puts_the_package_document_with_dist_tag_and_attachment() {
 
 #[test]
 fn publish_sends_the_readme_to_the_registry_as_metadata() {
-    let dir = tempfile::tempdir().expect("workspace");
-    let mut server = mockito::Server::new();
-    let registry = format!("{}/", server.url());
-    write_project(
-        dir.path(),
-        &registry,
-        &json!({ "name": "test-publish-readme", "version": "1.0.0" }),
-    );
-    fs::write(dir.path().join("README.md"), "# Hello").expect("write README");
+    for filename in ["README.md", "README", "readme.markdown"] {
+        let dir = tempfile::tempdir().expect("workspace");
+        let mut server = mockito::Server::new();
+        let registry = format!("{}/", server.url());
+        write_project(
+            dir.path(),
+            &registry,
+            &json!({ "name": "test-publish-readme", "version": "1.0.0" }),
+        );
+        fs::write(dir.path().join(filename), "# Hello").expect("write README");
 
-    // The readme rides the version metadata even though `embed-readme` defaults to false.
-    let mock = server
-        .mock("PUT", "/test-publish-readme")
-        .match_body(Matcher::PartialJsonString(
-            r##"{"versions":{"1.0.0":{"readme":"# Hello"}}}"##.to_owned(),
-        ))
-        .with_status(200)
-        .with_body(r#"{"ok":true}"#)
-        .expect(1)
-        .create();
+        // The readme rides the version metadata even though `embed-readme` defaults to false.
+        let mock = server
+            .mock("PUT", "/test-publish-readme")
+            .match_body(Matcher::PartialJsonString(
+                r##"{"versions":{"1.0.0":{"readme":"# Hello"}}}"##.to_owned(),
+            ))
+            .with_status(200)
+            .with_body(r#"{"ok":true}"#)
+            .expect(1)
+            .create();
 
-    assert_success(&publish(dir.path(), &[]));
-    mock.assert();
+        assert_success(&publish(dir.path(), &[]));
+        mock.assert();
+    }
 }
 
 #[test]
@@ -178,6 +180,58 @@ fn publish_config_registry_overrides_the_default() {
 }
 
 #[test]
+fn publish_config_scoped_registry_overrides_the_npmrc_scoped_registry() {
+    let dir = tempfile::tempdir().expect("workspace");
+    let mut default_registry = mockito::Server::new();
+    let mut npmrc_scoped_registry = mockito::Server::new();
+    let mut unscoped_publish_registry = mockito::Server::new();
+    let mut publish_registry = mockito::Server::new();
+    fs::write(
+        dir.path().join(".npmrc"),
+        format!(
+            "registry={}/\n@scope:registry={}/\n//{}/:_authToken=t\n",
+            default_registry.url(),
+            npmrc_scoped_registry.url(),
+            publish_registry.host_with_port(),
+        ),
+    )
+    .expect("write .npmrc");
+    let manifest = json!({
+        "name": "@scope/pkg",
+        "version": "1.0.0",
+        "publishConfig": {
+            "registry": format!("{}/", unscoped_publish_registry.url()),
+            "@other:registry": format!("{}/", default_registry.url()),
+            "@scope:registry": format!("{}/", publish_registry.url()),
+        },
+    });
+    fs::write(dir.path().join("package.json"), manifest.to_string()).expect("write package.json");
+
+    let unexpected =
+        [&mut default_registry, &mut npmrc_scoped_registry, &mut unscoped_publish_registry].map(
+            |server| {
+                server
+                    .mock("PUT", Matcher::Any)
+                    .expect(0)
+                    .create()
+            },
+        );
+    let publish_mock = publish_registry
+        .mock("PUT", "/@scope%2fpkg")
+        .match_header("authorization", "Bearer t")
+        .with_status(200)
+        .with_body("{}")
+        .expect(1)
+        .create();
+
+    assert_success(&publish(dir.path(), &[]));
+    for mock in unexpected {
+        mock.assert();
+    }
+    publish_mock.assert();
+}
+
+#[test]
 fn tag_flag_registers_the_version_under_that_dist_tag() {
     let dir = tempfile::tempdir().expect("workspace");
     let mut server = mockito::Server::new();
@@ -231,7 +285,6 @@ fn publish_from_a_prebuilt_tarball() {
         &json!({ "name": "test-publish-tgz", "version": "1.0.0" }),
     );
 
-    // Build a tarball with `pacquet pack`, then publish it by path.
     let pack = pacquet(dir.path())
         .with_arg("pack")
         .output()
@@ -519,3 +572,216 @@ fn ignore_scripts_skips_the_publish_lifecycle_scripts() {
     );
     mock.assert();
 }
+
+/// A positional package path is resolved against the command directory
+/// before the pack reads it. Left relative, it cannot be related to the
+/// absolute workspace directory, and a `file:` / `link:` catalog entry
+/// re-anchored against it would fall back to this machine's absolute
+/// path and ship inside the published manifest.
+#[test]
+fn publishing_a_nested_project_by_relative_path_keeps_catalog_entries_relative() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut server = mockito::Server::new();
+    let project_dir = workspace.path().join("projects/nested/bar");
+    fs::create_dir_all(&project_dir).expect("create the project directory");
+    fs::write(workspace.path().join(".npmrc"), format!("registry={}/\n", server.url()))
+        .expect("write .npmrc");
+    fs::write(
+        workspace.path().join("pnpm-workspace.yaml"),
+        "packages:\n  - projects/*/*\ncatalog:\n  \
+         pkg-from-tarball: file:./tarballs/pkg-from-tarball-1.0.0.tgz\n  \
+         local-lib: link:./libs/local-lib\n",
+    )
+    .expect("write pnpm-workspace.yaml");
+    fs::write(
+        project_dir.join("package.json"),
+        json!({
+            "name": "test-publish-nested",
+            "version": "1.0.0",
+            "dependencies": { "pkg-from-tarball": "catalog:", "local-lib": "catalog:" },
+        })
+        .to_string(),
+    )
+    .expect("write package.json");
+
+    let mock = server
+        .mock("PUT", "/test-publish-nested")
+        .match_body(Matcher::PartialJsonString(
+            r#"{"versions":{"1.0.0":{"dependencies":{
+                "pkg-from-tarball":"file:../../../tarballs/pkg-from-tarball-1.0.0.tgz",
+                "local-lib":"link:../../../libs/local-lib"}}}}"#
+                .to_owned(),
+        ))
+        .with_status(200)
+        .with_body(r#"{"ok":true}"#)
+        .expect(1)
+        .create();
+
+    assert_success(&publish(workspace.path(), &["./projects/nested/bar"]));
+    mock.assert();
+}
+
+#[test]
+fn detached_tag_publish_in_ci_preserves_git_checks() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut server = mockito::Server::new();
+    write_project(
+        dir.path(),
+        &format!("{}/", server.url()),
+        &json!({
+            "name": "test-detached-publish", "version": "1.0.0",
+        }),
+    );
+    pnpm_testing_utils::git_repo::init_isolated_repo(dir.path());
+    for args in [
+        vec!["add", "."],
+        vec!["commit", "-m", "init"],
+        vec!["tag", "-a", "v1.0.0", "-m", "release", "--no-sign"],
+        vec!["checkout", "v1.0.0"],
+    ] {
+        Command::new("git")
+            .with_current_dir(dir.path())
+            .with_args(args)
+            .assert()
+            .success();
+    }
+
+    let rejected = pacquet(dir.path())
+        .with_env("CI", "false")
+        .with_env("PNPM_CONFIG_CI", "false")
+        .with_args(["publish", "--dry-run"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&rejected.get_output().stderr);
+    assert!(stderr.contains("ERR_PNPM_GIT_UNKNOWN_BRANCH"), "stderr: {stderr}");
+
+    let uploaded = server
+        .mock("PUT", "/test-detached-publish")
+        .match_body(Matcher::PartialJson(json!({"dist-tags": {"latest": "1.0.0"}})))
+        .with_status(200)
+        .with_body(r#"{"ok":true}"#)
+        .expect(1)
+        .create();
+    pacquet(dir.path())
+        .with_env("CI", "true")
+        .without_env("PNPM_CONFIG_CI")
+        .with_args(["publish", "--publish-branch", "release"])
+        .assert()
+        .success();
+    uploaded.assert();
+
+    fs::write(dir.path().join("LICENSE"), "uncommitted").unwrap();
+    let rejected = pacquet(dir.path())
+        .with_env("CI", "true")
+        .without_env("PNPM_CONFIG_CI")
+        .with_args(["publish", "--dry-run"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&rejected.get_output().stderr);
+    assert!(stderr.contains("ERR_PNPM_GIT_UNCLEAN"), "stderr: {stderr}");
+}
+
+#[test]
+fn publish_branch_setting_allows_publishing_from_that_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    write_project(
+        dir.path(),
+        "http://127.0.0.1:1/",
+        &json!({
+            "name": "test-publish-branch-setting", "version": "1.0.0",
+        }),
+    );
+    fs::write(dir.path().join("pnpm-workspace.yaml"), "publishBranch: production\n").unwrap();
+    pnpm_testing_utils::git_repo::init_isolated_repo(dir.path());
+    for args in
+        [vec!["add", "."], vec!["commit", "-m", "init"], vec!["checkout", "-b", "production"]]
+    {
+        Command::new("git")
+            .with_current_dir(dir.path())
+            .with_args(args)
+            .assert()
+            .success();
+    }
+
+    pacquet(dir.path())
+        .with_args(["publish", "--dry-run"])
+        .assert()
+        .success();
+
+    let rejected = pacquet(dir.path())
+        .with_args(["publish", "--dry-run", "--publish-branch", "release"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&rejected.get_output().stderr);
+    assert!(stderr.contains("ERR_PNPM_GIT_NOT_CORRECT_BRANCH"), "stderr: {stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn publish_rejects_refused_head_metadata_in_ci() {
+    let dir = tempfile::tempdir().unwrap();
+    write_project(
+        dir.path(),
+        "http://127.0.0.1:1/",
+        &json!({
+            "name": "test-refused-head", "version": "1.0.0",
+        }),
+    );
+    pnpm_testing_utils::git_repo::init_isolated_repo(dir.path());
+    for args in [vec!["add", "."], vec!["commit", "-m", "init"], vec!["checkout", "-b", "blocked"]]
+    {
+        Command::new("git")
+            .with_current_dir(dir.path())
+            .with_args(args)
+            .assert()
+            .success();
+    }
+    let git_dir = dir.path().join(".git");
+    fs::remove_file(git_dir.join("HEAD")).unwrap();
+    std::os::unix::fs::symlink("refs/heads/blocked", git_dir.join("HEAD")).unwrap();
+
+    let rejected = pacquet(dir.path())
+        .with_env("CI", "true")
+        .without_env("PNPM_CONFIG_CI")
+        .with_args(["publish", "--dry-run"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&rejected.get_output().stderr);
+    assert!(stderr.contains("ERR_PNPM_GIT_UNKNOWN_BRANCH"), "stderr: {stderr}");
+}
+
+#[test]
+fn workspace_npmrc_registry_is_effective_for_package_publish() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut server = mockito::Server::new();
+    let project_dir = workspace.path().join("packages/pkg-a");
+    fs::create_dir_all(&project_dir).expect("create project directory");
+    fs::write(workspace.path().join(".npmrc"), format!("registry={}/\n", server.url()))
+        .expect("write .npmrc");
+    fs::write(workspace.path().join("pnpm-workspace.yaml"), "packages:\n  - packages/*\n")
+        .expect("write pnpm-workspace.yaml");
+    fs::write(
+        project_dir.join("package.json"),
+        json!({
+            "name": "test-publish-workspace-pkg",
+            "version": "1.0.0",
+        })
+        .to_string(),
+    )
+    .expect("write package.json");
+
+    let mock = server
+        .mock("PUT", "/test-publish-workspace-pkg")
+        .match_body(Matcher::PartialJsonString(
+            r#"{"name":"test-publish-workspace-pkg","dist-tags":{"latest":"1.0.0"}}"#.to_owned(),
+        ))
+        .with_status(200)
+        .with_body(r#"{"ok":true}"#)
+        .expect(1)
+        .create();
+
+    assert_success(&publish(&project_dir, &[]));
+    mock.assert();
+}
+
+mod wait;

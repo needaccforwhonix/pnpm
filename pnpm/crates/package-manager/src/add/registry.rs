@@ -1,28 +1,37 @@
-use super::{AddError, AddOptions, AddResolution, AddResolveInputs};
+use super::{AddError, AddOptions, AddResolveInputs};
 use crate::{
     resolution_policy::{PickPolicy, pick_package_context},
     resolve_latest::LatestPicker,
 };
 use pnpm_config::Config;
-use pnpm_lockfile_preferred_versions::get_preferred_versions_from_lockfile_and_manifests;
 use pnpm_package_manifest::PackageManifest;
 use pnpm_registry::RangeSpecStyle;
 use pnpm_resolving_npm_resolver::{
-    PickPackageOptions, calc_version_range, infer_range_spec_style, parse_bare_specifier,
-    pick_package, pick_registry_for_package,
+    PickPackageOptions, calc_version_range, parse_bare_specifier, pick_package,
+    pick_registry_for_package,
 };
 
 /// The range a brand-new dependency is saved with: its `latest` version
 /// under the configured range style.
 pub(super) async fn pick_latest_range(
     package_name: &str,
+    manifest: &PackageManifest,
     inputs: &AddResolveInputs<'_, '_>,
 ) -> Result<String, AddError> {
+    if needs_types_metadata(inputs.add, package_name) {
+        return resolve_explicit_registry_spec(package_name, "latest", None, manifest, inputs)
+            .await?
+            .map(|picked| picked.range)
+            .ok_or_else(|| AddError::ResolveLatest {
+                name: package_name.to_string(),
+                error: crate::resolve_latest::ResolveLatestError::NoLatestVersion,
+            });
+    }
     let config = inputs.add.config;
     let latest = inputs.resolution.latest_picker
         .get_or_try_init(|| {
             std::future::ready(
-                PickPolicy::from_config(config)
+                PickPolicy::from_config_at(config, inputs.resolution.started_at)
                     .map(|policy| {
                         LatestPicker::new(
                             config,
@@ -41,13 +50,22 @@ pub(super) async fn pick_latest_range(
         .map_err(|error| AddError::ResolveLatest { name: package_name.to_string(), error })?;
     Ok(calc_version_range(&latest.version, None, None, inputs.add.range_spec_style))
 }
+/// A registry specifier resolved to a concrete version, and the manifest
+/// range that records it.
+pub(super) struct PickedRange {
+    pub(super) range: String,
+    pub(super) version: String,
+}
 /// Resolve an explicit `add <name>@<spec>` registry specifier to the
 /// manifest range pnpm would record: the spec resolved to a concrete
-/// version (through the *same* resolver path the follow-up install uses, so
-/// the pinned version equals the version the install locks — `resolutionMode`
-/// and `minimumReleaseAge` included), carrying the operator the existing
-/// entry pins, then the spec's, then the configured default. So `pnpm add
-/// foo@^7` records `^7.8.4`, not `^7`.
+/// version (through the *same* resolver path the follow-up install uses —
+/// `resolutionMode` and `minimumReleaseAge` included), carrying the operator
+/// the existing entry pins, then the spec's, then the configured default. So
+/// `pnpm add foo@^7` records `^7.8.4`, not `^7`.
+///
+/// The saved range can admit versions newer than the one picked (`foo@dev`
+/// saved as `^3.9.4` while `3.9.10` exists), so the install has to be seeded
+/// with [`PickedRange::version`] to lock it.
 ///
 /// Returns `Ok(None)` — write the specifier verbatim — for anything that is
 /// not a plain registry range/tag/version for `package_name` itself:
@@ -58,35 +76,28 @@ pub(super) async fn resolve_explicit_registry_spec(
     package_name: &str,
     spec: &str,
     prev_specifier: Option<&str>,
-    add: AddOptions<'_>,
     manifest: &PackageManifest,
-    resolution: &AddResolution<'_>,
-) -> Result<Option<String>, AddError> {
+    inputs: &AddResolveInputs<'_, '_>,
+) -> Result<Option<PickedRange>, AddError> {
     if spec.starts_with("npm:") {
         return Ok(None);
     }
+    let add = inputs.add;
+    let resolution = inputs.resolution;
     let registry = package_registry(add.config, package_name);
     let Some(spec_parsed) = parse_explicit_registry_spec(package_name, spec, &registry) else {
         return Ok(None);
     };
 
-    let policy = PickPolicy::from_config(add.config).map_err(AddError::MinimumReleaseAgeExclude)?;
-    // Bias the pick toward versions already present in the workspace, so a
-    // dedup pick matches what the install locks (e.g. a sibling already on
-    // `1.2.0` keeps `pnpm add foo@^1` on `1.2.0`). Seeded from the wanted
-    // lockfile + this manifest; sibling manifests aren't reachable here, so
-    // an unlocked sibling declaration may still differ — never an
-    // inconsistency, since the install resolves the rewritten range.
-    let preferred_versions = get_preferred_versions_from_lockfile_and_manifests(
-        add.lockfile.and_then(|lockfile| lockfile.snapshots.as_ref()),
-        &[manifest],
-    );
+    let policy = add_pick_policy(inputs, &spec_parsed.name)?;
+    let preferred_versions = inputs.preferred_versions(manifest);
     let ctx = pick_package_context(
         add.http_client,
         add.config,
         &policy,
         &resolution.meta_cache,
         &resolution.fetch_locker,
+        resolution.store_view(add.config),
     );
     let opts = explicit_registry_pick_options(
         add.config,
@@ -101,15 +112,34 @@ pub(super) async fn resolve_explicit_registry_spec(
         return Ok(None);
     };
 
-    Ok(Some(saved_registry_range(
+    let range = saved_registry_range(
         &picked.version,
         package_name,
         &registry,
         prev_specifier,
         spec,
         add.range_spec_style,
-    )))
+    );
+    Ok(Some(PickedRange { range, version: picked.version.to_string() }))
 }
+pub(super) fn add_pick_policy(
+    inputs: &AddResolveInputs<'_, '_>,
+    package_name: &str,
+) -> Result<PickPolicy, AddError> {
+    let add = inputs.add;
+    let mut policy = PickPolicy::from_config_at(add.config, inputs.resolution.started_at)
+        .map_err(AddError::MinimumReleaseAgeExclude)?;
+    if needs_types_metadata(add, package_name) {
+        // Bundled type declarations are absent from abbreviated and filtered metadata.
+        policy.force_unfiltered_full_metadata();
+    }
+    Ok(policy)
+}
+
+fn needs_types_metadata(add: AddOptions<'_>, package_name: &str) -> bool {
+    add.save_types && !package_name.starts_with("@types/")
+}
+
 /// Registry-host tarball URLs must remain verbatim even though the npm parser accepts them.
 pub(super) fn parse_explicit_registry_spec(
     package_name: &str,
@@ -134,12 +164,14 @@ pub(super) fn explicit_registry_pick_options<'a>(
         blocked_versions: None,
         policy: pnpm_resolving_npm_resolver::PackagePickPolicy {
             published_by: policy.published_by,
+            fallback_published_by: None,
             published_by_exclude: policy.published_by_exclude.as_ref(),
             trust_policy: Some(config.trust_policy),
         },
         request: pnpm_resolving_npm_resolver::MetadataPickRequest {
             dry_run: false,
             optional: false,
+            refresh_metadata: false,
             update_checksums: false,
         },
     }
@@ -153,10 +185,9 @@ pub(super) fn saved_registry_range(
     spec: &str,
     range_spec_style: RangeSpecStyle,
 ) -> String {
-    let prev_pin = prev_specifier
-        .filter(|prev| is_registry_style_specifier(prev, package_name, registry))
-        .and_then(infer_range_spec_style);
-    calc_version_range(version, prev_pin, infer_range_spec_style(spec), range_spec_style)
+    let prev_specifier =
+        prev_specifier.filter(|prev| is_registry_style_specifier(prev, package_name, registry));
+    calc_version_range(version, prev_specifier, Some(spec), range_spec_style)
 }
 /// The registry `package_name` resolves against under the configured scopes.
 pub(super) fn package_registry(config: &Config, package_name: &str) -> String {
@@ -176,4 +207,16 @@ pub(super) fn is_registry_style_specifier(
 ) -> bool {
     parse_bare_specifier(specifier, Some(package_name), "latest", registry)
         .is_some_and(|parsed| parsed.normalized_bare_specifier.is_none())
+}
+/// The dist-tag `package_selector` requests, such as `legacy` in
+/// `foo@legacy`, or `default_tag` when it names no version.
+pub(super) fn requested_dist_tag<'a>(
+    package_selector: &'a str,
+    default_tag: Option<&'a str>,
+) -> Option<&'a str> {
+    pnpm_resolving_parse_wanted_dependency::parse_wanted_dependency(package_selector).alias?;
+    let specifier = super::specifier::split_name_spec(package_selector).1
+        .filter(|specifier| !specifier.is_empty())
+        .or(default_tag)?;
+    (!specifier.contains(':') && node_semver::Range::parse(specifier).is_err()).then_some(specifier)
 }

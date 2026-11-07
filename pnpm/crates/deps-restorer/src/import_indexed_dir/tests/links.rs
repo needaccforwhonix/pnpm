@@ -1,7 +1,7 @@
 #[cfg(unix)]
-use super::FORCE_KEEP;
+use super::{super::ImportIndexedDirError, FORCE_KEEP};
 use super::{
-    super::{ImportIndexedDirOpts, import_indexed_dir},
+    super::{ImportIndexedDirOpts, SymlinkTargets, import_indexed_dir},
     FORCE_SHARED, cas_map, write_source,
 };
 use pnpm_config::PackageImportMethod;
@@ -158,4 +158,311 @@ fn safe_to_skip_replaces_a_symlink_to_matching_store_content() {
             .is_symlink(),
     );
     assert_eq!(fs::read(target.join("index.js")).unwrap(), b"module.exports = 1");
+}
+
+#[cfg(unix)]
+#[test]
+fn preserve_symlinks_preserves_symlinked_package_json() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempdir().unwrap();
+    let src_root = tmp.path().join("src");
+    fs::create_dir_all(&src_root).unwrap();
+    let real_pkg_json = write_source(&src_root, "real_package.json", b"{\"name\":\"pkg\"}");
+    let link_pkg_json = src_root.join("package.json");
+    symlink("real_package.json", &link_pkg_json).unwrap();
+    let cas = cas_map(&[("real_package.json", real_pkg_json), ("package.json", link_pkg_json)]);
+
+    let target = tmp.path().join("target");
+    import_indexed_dir::<SilentReporter>(
+        &AtomicU8::new(0),
+        PackageImportMethod::Copy,
+        &target,
+        &cas,
+        ImportIndexedDirOpts {
+            symlink_targets: Some(SymlinkTargets::Imported),
+            ..ImportIndexedDirOpts::default()
+        },
+    )
+    .expect("import with preserve_symlinks should succeed");
+
+    let target_meta = fs::symlink_metadata(target.join("package.json")).unwrap();
+    assert!(target_meta.file_type().is_symlink(), "package.json marker must remain a symlink");
+    assert_eq!(fs::read(target.join("package.json")).unwrap(), b"{\"name\":\"pkg\"}");
+}
+
+#[cfg(unix)]
+#[test]
+fn preserve_symlinks_relocates_absolute_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempdir().unwrap();
+    let src_root = tmp.path().join("src");
+    fs::create_dir_all(&src_root).unwrap();
+    let real_file = write_source(&src_root, "real.txt", b"content");
+    let link_file = src_root.join("link.txt");
+    symlink(&real_file, &link_file).unwrap();
+    let cas = cas_map(&[("real.txt", real_file), ("link.txt", link_file)]);
+
+    let target = tmp.path().join("target");
+    import_indexed_dir::<SilentReporter>(
+        &AtomicU8::new(0),
+        PackageImportMethod::Copy,
+        &target,
+        &cas,
+        ImportIndexedDirOpts {
+            symlink_targets: Some(SymlinkTargets::Imported),
+            ..ImportIndexedDirOpts::default()
+        },
+    )
+    .expect("import with preserve_symlinks should succeed");
+
+    let target_meta = fs::symlink_metadata(target.join("link.txt")).unwrap();
+    assert!(target_meta.file_type().is_symlink(), "link.txt must remain a symlink");
+    let target_link = fs::read_link(target.join("link.txt")).unwrap();
+    assert_eq!(target_link, std::path::Path::new("real.txt"));
+    assert_eq!(fs::read(target.join("link.txt")).unwrap(), b"content");
+}
+
+#[cfg(unix)]
+#[test]
+fn preserve_symlinks_rejects_escaping_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempdir().unwrap();
+    let src_root = tmp.path().join("src");
+    fs::create_dir_all(&src_root).unwrap();
+    let real_file = write_source(&src_root, "real.txt", b"content");
+    let link_file = src_root.join("link.txt");
+    symlink(&real_file, &link_file).unwrap();
+    let cas = cas_map(&[("real.txt", real_file), ("link.txt", link_file.clone())]);
+
+    fs::remove_file(&link_file).unwrap();
+    symlink("../../outside", &link_file).unwrap();
+
+    for policy in [SymlinkTargets::Imported, SymlinkTargets::Internal] {
+        let target = tmp.path().join(format!("{policy:?}"));
+        let err = import_indexed_dir::<SilentReporter>(
+            &AtomicU8::new(0),
+            PackageImportMethod::Copy,
+            &target,
+            &cas,
+            ImportIndexedDirOpts {
+                symlink_targets: Some(policy),
+                ..ImportIndexedDirOpts::default()
+            },
+        )
+        .expect_err("import with escaping symlink should fail");
+
+        assert!(
+            matches!(err, ImportIndexedDirError::SymlinkTargetEscapes { .. }),
+            "expected SymlinkTargetEscapes error, got {err:?}",
+        );
+        assert!(
+            fs::symlink_metadata(target.join("link.txt")).is_err(),
+            "destination link must not be created",
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn preserve_symlinks_imports_a_link_to_a_left_out_file_as_that_file() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempdir().unwrap();
+    let src_root = tmp.path().join("src");
+    fs::create_dir_all(&src_root).unwrap();
+    write_source(&src_root, "real.txt", b"content");
+    let link_file = src_root.join("link.txt");
+    symlink("real.txt", &link_file).unwrap();
+    let cas = cas_map(&[("link.txt", link_file)]);
+
+    for (idx, method) in
+        [PackageImportMethod::Copy, PackageImportMethod::Hardlink].into_iter().enumerate()
+    {
+        let target = tmp.path().join(format!("target-{idx}"));
+        import_indexed_dir::<SilentReporter>(
+            &AtomicU8::new(0),
+            method,
+            &target,
+            &cas,
+            ImportIndexedDirOpts {
+                symlink_targets: Some(SymlinkTargets::Imported),
+                ..ImportIndexedDirOpts::default()
+            },
+        )
+        .expect("import with preserve_symlinks should succeed");
+
+        assert!(fs::symlink_metadata(target.join("link.txt")).unwrap().is_file());
+        assert_eq!(fs::read(target.join("link.txt")).unwrap(), b"content");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn preserve_symlinks_leaves_out_a_directory_link_to_a_left_out_directory() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempdir().unwrap();
+    let src_root = tmp.path().join("src");
+    write_source(&src_root, "sub/nested.txt", b"nested");
+    let link = src_root.join("dir-link");
+    symlink("sub", &link).unwrap();
+    let cas = cas_map(&[("dir-link", link)]);
+
+    let target = tmp.path().join("target");
+    import_indexed_dir::<SilentReporter>(
+        &AtomicU8::new(0),
+        PackageImportMethod::Copy,
+        &target,
+        &cas,
+        ImportIndexedDirOpts {
+            symlink_targets: Some(SymlinkTargets::Imported),
+            ..ImportIndexedDirOpts::default()
+        },
+    )
+    .expect("import with preserve_symlinks should succeed");
+
+    assert!(fs::symlink_metadata(target.join("dir-link")).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn preserve_symlinks_relativizes_an_absolute_link_through_a_linked_root() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempdir().unwrap();
+    let src_root = tmp.path().join("src");
+    let real_file = write_source(&src_root, "real.txt", b"content");
+    let root_link = tmp.path().join("src-link");
+    symlink(&src_root, &root_link).unwrap();
+    let link_file = src_root.join("link.txt");
+    symlink(root_link.join("real.txt"), &link_file).unwrap();
+    let cas = cas_map(&[("real.txt", real_file), ("link.txt", link_file)]);
+
+    let target = tmp.path().join("target");
+    import_indexed_dir::<SilentReporter>(
+        &AtomicU8::new(0),
+        PackageImportMethod::Copy,
+        &target,
+        &cas,
+        ImportIndexedDirOpts {
+            symlink_targets: Some(SymlinkTargets::Imported),
+            ..ImportIndexedDirOpts::default()
+        },
+    )
+    .expect("import with preserve_symlinks should succeed");
+
+    assert_eq!(fs::read_link(target.join("link.txt")).unwrap(), std::path::Path::new("real.txt"));
+}
+
+#[cfg(windows)]
+#[test]
+fn preserve_symlinks_recreates_an_internal_junction() {
+    let tmp = tempdir().unwrap();
+    let src_root = tmp.path().join("src");
+    let nested = write_source(&src_root, "sub/nested.txt", b"nested");
+    let link = src_root.join("dir-link");
+    junction::create(src_root.join("sub"), &link).unwrap();
+    let cas = cas_map(&[("sub/nested.txt", nested), ("dir-link", link)]);
+
+    let target = tmp.path().join("target");
+    import_indexed_dir::<SilentReporter>(
+        &AtomicU8::new(0),
+        PackageImportMethod::Copy,
+        &target,
+        &cas,
+        ImportIndexedDirOpts {
+            symlink_targets: Some(SymlinkTargets::Imported),
+            ..ImportIndexedDirOpts::default()
+        },
+    )
+    .expect("import with preserve_symlinks should succeed");
+
+    assert!(pnpm_fs::is_symlink_or_junction(&target.join("dir-link")).unwrap());
+    assert_eq!(fs::read(target.join("dir-link/nested.txt")).unwrap(), b"nested");
+}
+
+/// A hoisted duplicate placement is a directory link to another project's
+/// copy. Deleting that project's `node_modules` leaves the link dangling,
+/// and the next install has to replace it with a real directory. Windows
+/// refuses `remove_file` on a directory link or junction, dangling or not.
+#[test]
+fn force_import_replaces_a_dangling_directory_link() {
+    let tmp = tempdir().unwrap();
+    let src_root = tmp.path().join("cas");
+    let manifest = write_source(&src_root, "package.json", b"{}");
+    let cas = cas_map(&[("package.json", manifest)]);
+
+    let removed_copy = tmp.path().join("removed-copy");
+    fs::create_dir_all(&removed_copy).unwrap();
+    let target = tmp.path().join("pkg");
+    pnpm_fs::symlink_dir(&removed_copy, &target).unwrap();
+    fs::remove_dir(&removed_copy).unwrap();
+
+    import_indexed_dir::<SilentReporter>(
+        &AtomicU8::new(0),
+        PackageImportMethod::Copy,
+        &target,
+        &cas,
+        ImportIndexedDirOpts {
+            force: true,
+            keep_modules_dir: true,
+            ..ImportIndexedDirOpts::default()
+        },
+    )
+    .expect("a dangling directory link must be replaced");
+
+    assert!(!pnpm_fs::is_symlink_or_junction(&target).unwrap());
+    assert_eq!(fs::read(target.join("package.json")).unwrap(), b"{}");
+}
+
+#[cfg(unix)]
+#[test]
+fn internal_symlink_targets_keep_left_out_directory_links_in_fresh_staged_and_repaired_imports() {
+    use std::{os::unix::fs::symlink, path::Path};
+
+    let tmp = tempdir().unwrap();
+    let src = tmp.path().join("src");
+    write_source(&src, "omitted/file.txt", b"content");
+    symlink("omitted", src.join("directory-link")).unwrap();
+    symlink("omitted/file.txt", src.join("file-link")).unwrap();
+    symlink("node_modules/missing", src.join("dangling-link")).unwrap();
+    let cas = cas_map(&[
+        ("directory-link", src.join("directory-link")),
+        ("file-link", src.join("file-link")),
+        ("dangling-link", src.join("dangling-link")),
+    ]);
+    let opts = ImportIndexedDirOpts {
+        symlink_targets: Some(SymlinkTargets::Internal),
+        ..ImportIndexedDirOpts::default()
+    };
+    for (name, opts) in [
+        ("fresh", opts),
+        ("staged", ImportIndexedDirOpts { force: true, ..opts }),
+        ("repair", ImportIndexedDirOpts { force: true, safe_to_skip: true, ..opts }),
+    ] {
+        let target = tmp.path().join(name);
+        if opts.force {
+            fs::create_dir_all(&target).unwrap();
+            fs::write(target.join("file-link"), b"stale").unwrap();
+        }
+        import_indexed_dir::<SilentReporter>(
+            &AtomicU8::new(0),
+            PackageImportMethod::Copy,
+            &target,
+            &cas,
+            opts,
+        )
+        .unwrap();
+        assert_eq!(fs::read_link(target.join("directory-link")).unwrap(), Path::new("omitted"));
+        assert_eq!(
+            fs::read_link(target.join("dangling-link")).unwrap(),
+            Path::new("node_modules/missing"),
+        );
+        assert!(fs::symlink_metadata(target.join("file-link")).unwrap().is_file());
+        assert_eq!(fs::read(target.join("file-link")).unwrap(), b"content");
+        assert!(!target.join("omitted").exists(), "{target:?} must not copy unselected files");
+    }
 }

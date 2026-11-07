@@ -1,11 +1,47 @@
 use super::{
-    Arc, AuthHeaders, BTreeMap, BinaryArchive, BinaryResolution, BinarySpec,
+    Arc, AuthHeaders, BTreeMap, BinaryArchive, BinaryResolution, BinarySpec, FetchShasumsFileError,
     GetNodeArtifactAddressOptions, Integrity, LockfileResolution, NodeResolverError, Path,
     PlatformAssetResolution, PlatformAssetTarget, ShasumsFileItem, ThrottledClient,
     fetch_shasums_file_cached, fetch_shasums_file_cached_with_auth_headers,
     fetch_verified_node_shasums_file_cached,
     fetch_verified_node_shasums_file_cached_with_auth_headers, get_node_artifact_address,
 };
+use crate::normalize_arch::node_major;
+
+/// The musl assets `unofficial_mirror` publishes for `version`, or an
+/// empty list when that release has no musl builds.
+///
+/// A release the mirror never built answers 404, and that is the only
+/// failure this tolerates. Every other status and every transport
+/// error propagates: a mirror that is unreachable or blocked by a
+/// proxy must not silently drop the musl assets, because that writes a
+/// lockfile differing from the one the same command produces
+/// elsewhere.
+pub(super) async fn read_musl_assets(
+    http_client: &ThrottledClient,
+    auth_headers: &AuthHeaders,
+    unofficial_mirror: &str,
+    version: &str,
+    cache_dir: Option<&Path>,
+) -> Result<Vec<PlatformAssetResolution>, NodeResolverError> {
+    match read_node_assets_from_mirror(
+        http_client,
+        auth_headers,
+        unofficial_mirror,
+        version,
+        /* musl_only */ true,
+        /* verify_signature */ false,
+        cache_dir,
+    )
+    .await
+    {
+        Err(NodeResolverError::FetchShasumsFile(FetchShasumsFileError::StatusNotOk {
+            status: 404,
+            ..
+        })) => Ok(Vec::new()),
+        outcome => outcome,
+    }
+}
 
 /// Read the asset list for one mirror version and decode each row
 /// into a [`PlatformAssetResolution`].
@@ -127,11 +163,41 @@ fn node_platform_asset(
     let prefix = matches!(archive, BinaryArchive::Zip).then(|| address.basename.clone());
     let binary =
         BinaryResolution { url, integrity, bin: bin_spec_for_platform(&platform), archive, prefix };
-    let target = PlatformAssetTarget { os: platform, cpu: parsed.arch, libc };
-    Ok(PlatformAssetResolution {
-        resolution: LockfileResolution::Binary(binary),
-        targets: vec![target],
-    })
+    let targets = platform_asset_targets(&platform, &parsed.arch, libc, version);
+    Ok(PlatformAssetResolution { resolution: LockfileResolution::Binary(binary), targets })
+}
+
+fn platform_asset_targets(
+    platform: &str,
+    arch: &str,
+    libc: Option<String>,
+    version: &str,
+) -> Vec<PlatformAssetTarget> {
+    let mut targets = vec![PlatformAssetTarget {
+        os: platform.to_string(),
+        cpu: arch.to_string(),
+        libc,
+        ..PlatformAssetTarget::default()
+    }];
+    if let Some(major) = node_major(version) {
+        if platform == "darwin" && arch == "x64" && major < 16 {
+            targets.push(PlatformAssetTarget {
+                os: "darwin".to_string(),
+                cpu: "arm64".to_string(),
+                libc: None,
+                ..PlatformAssetTarget::default()
+            });
+        }
+        if platform == "win32" && arch == "x64" && major < 20 {
+            targets.push(PlatformAssetTarget {
+                os: "win32".to_string(),
+                cpu: "arm64".to_string(),
+                libc: None,
+                ..PlatformAssetTarget::default()
+            });
+        }
+    }
+    targets
 }
 
 pub(super) struct NodeFileName {
@@ -179,6 +245,11 @@ pub(super) fn node_bins_for_current_os(platform: &str) -> serde_json::Value {
 /// `linux`, ...). Reads `std::env::consts::OS` rather than spawning a
 /// helper so the lookup is allocation-free.
 pub(super) fn current_platform() -> &'static str {
+    #[cfg(target_family = "wasm")]
+    {
+        pnpm_detect_libc::host_platform()
+    }
+    #[cfg(not(target_family = "wasm"))]
     match std::env::consts::OS {
         "windows" => "win32",
         other => other,

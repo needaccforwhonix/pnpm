@@ -365,7 +365,6 @@ fn update_latest_no_save_catalog_bumps_lockfile_only() {
 
     pacquet(&workspace, ["update", "--latest", "--no-save"]).assert().success();
 
-    // package.json and the workspace catalog are untouched...
     assert_eq!(dep_spec(&workspace, DEP).as_deref(), Some("catalog:grp1"));
     let yaml = read_workspace_yaml(&workspace);
     assert!(yaml.contains("^100.0.0"), "catalog entry must be untouched under --no-save: {yaml}");
@@ -427,9 +426,7 @@ fn update_latest_default_catalog_preserves_reference() {
 /// `catalogMode: strict`, where the wanted version falls outside the
 /// catalog entry's range, rejects with
 /// `ERR_PNPM_CATALOG_VERSION_MISMATCH` instead of crashing
-/// ([pnpm#11706](https://github.com/pnpm/pnpm/pull/11706): before that
-/// fix, passing a range to the exact-version comparison threw `Invalid
-/// Version`).
+/// ([pnpm#11706](https://github.com/pnpm/pnpm/pull/11706)).
 #[test]
 fn update_strict_catalog_range_mismatch_errors() {
     let (root, workspace, anchor) = setup();
@@ -474,6 +471,58 @@ fn update_strict_catalog_range_covering_the_wanted_version_succeeds() {
         lockfile.contains(&format!("{DEP}@100.1.0")),
         "the update should have moved the catalog resolution to 100.1.0:\n{lockfile}",
     );
+    let yaml = read_workspace_yaml(&workspace);
+    assert!(yaml.contains("^100.1.0"), "catalog entry should move onto ^100.1.0: {yaml}");
+    assert!(!yaml.contains("^100.0.0"), "stale catalog entry should be gone: {yaml}");
+
+    drop((root, anchor));
+}
+
+#[test]
+fn update_recursive_strict_catalog_range_covering_the_wanted_version_moves_the_entry() {
+    let (root, workspace, anchor) = setup();
+    set_strict_catalog(&workspace, &[(DEP, "^100.0.0")]);
+    let yaml_path = workspace.join("pnpm-workspace.yaml");
+    let mut yaml = read_workspace_yaml(&workspace);
+    yaml.push_str("packages:\n  - 'packages/*'\n");
+    fs::write(&yaml_path, yaml).expect("write pnpm-workspace.yaml");
+    write_manifest(&workspace, "{}");
+    for name in ["a", "b"] {
+        let dir = workspace.join("packages").join(name);
+        fs::create_dir_all(&dir).expect("create the package dir");
+        fs::write(
+            dir.join("package.json"),
+            format!(r#"{{ "name": "{name}", "version": "1.0.0", "dependencies": {{ "{DEP}": "catalog:" }} }}"#),
+        )
+        .expect("write the package manifest");
+    }
+    pacquet(&workspace, ["install", "--lockfile-only"]).assert().success();
+
+    pacquet(&workspace, ["update", "--recursive", "--lockfile-only", &format!("{DEP}@100.1.0")])
+        .assert()
+        .success();
+
+    for name in ["a", "b"] {
+        let manifest = fs::read_to_string(
+            workspace
+                .join("packages")
+                .join(name)
+                .join("package.json"),
+        )
+        .expect("read the package manifest");
+        assert!(
+            manifest.contains(r#""catalog:""#),
+            "packages/{name} should keep its catalog reference: {manifest}",
+        );
+    }
+    let yaml = read_workspace_yaml(&workspace);
+    assert!(yaml.contains("^100.1.0"), "catalog entry should move onto ^100.1.0: {yaml}");
+    let lockfile = fs::read_to_string(workspace.join("pnpm-lock.yaml")).expect("read lockfile");
+    assert!(
+        !lockfile.contains(&format!("{DEP}@100.0.0")),
+        "no project should stay on 100.0.0:\n{lockfile}",
+    );
+    pacquet(&workspace, ["install", "--frozen-lockfile", "--lockfile-only"]).assert().success();
 
     drop((root, anchor));
 }

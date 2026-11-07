@@ -1,7 +1,7 @@
 use super::{
     Config, EnvVar, EnvVarOs, GetCurrentDir, GetHomeDir, Host, HostNoHome, LinkProbe, NodeLinker,
-    NodePackageMapType, OsString, Path, PathBuf, TrustPolicy, assert_eq, fs, io, safe_host_var,
-    tempdir, write_file,
+    NodePackageMapMode, NodePackageMapType, OsString, Path, PathBuf, TrustPolicy, assert_eq, fs,
+    io, safe_host_var, tempdir, write_file,
 };
 
 #[test]
@@ -19,6 +19,8 @@ pub fn materialization_env_vars_override_workspace_yaml() {
             match name {
                 "PNPM_CONFIG_VIRTUAL_STORE_ONLY" => Some("true".to_owned()),
                 "PNPM_CONFIG_ENABLE_MODULES_DIR" => Some("false".to_owned()),
+                "PNPM_CONFIG_MACOS_BACKUP_EXCLUDE_MODULES_DIR" => Some("true".to_owned()),
+                "PNPM_CONFIG_MACOS_BACKUP_EXCLUDE_STORE_DIR" => Some("true".to_owned()),
                 _ => safe_host_var(name),
             }
         }
@@ -39,8 +41,45 @@ pub fn materialization_env_vars_override_workspace_yaml() {
     let config = Config::new().current::<HostWithMaterializationEnv>(tmp.path()).expect("loads");
     assert!(config.virtual_store_only);
     assert!(!config.enable_modules_dir);
+    assert!(config.macos_backup.exclude_modules_dir);
+    assert!(config.macos_backup.exclude_store_dir);
     assert_eq!(config.hoist_pattern, Some(vec![]));
     assert_eq!(config.public_hoist_pattern, Some(vec![]));
+}
+
+#[test]
+pub fn time_machine_settings_cannot_be_set_by_a_project() {
+    let tmp = tempdir().unwrap();
+    fs::write(
+        tmp.path().join("pnpm-workspace.yaml"),
+        "macosBackup:\n  excludeModulesDir: false\n  excludeStoreDir: false\n",
+    )
+    .expect("write to pnpm-workspace.yaml");
+
+    let config = Config::new().current::<HostNoHome>(tmp.path()).expect("loads");
+
+    assert!(!config.macos_backup.exclude_modules_dir);
+    assert!(!config.macos_backup.exclude_store_dir);
+    assert_eq!(config.workspace_key_issues.refused, ["macosBackup"]);
+}
+
+#[test]
+pub fn global_config_may_disable_time_machine_backups() {
+    let tmp = tempdir().unwrap();
+    fs::write(
+        tmp.path().join("config.yaml"),
+        "macosBackup:\n  excludeModulesDir: true\n  excludeStoreDir: true\n",
+    )
+    .expect("write global config.yaml");
+    let settings = crate::TrustedSettings::load_global(tmp.path())
+        .expect("loads global config")
+        .expect("global config exists");
+    let mut config = Config::default();
+
+    settings.apply_to(&mut config, tmp.path());
+
+    assert!(config.macos_backup.exclude_modules_dir);
+    assert!(config.macos_backup.exclude_store_dir);
 }
 
 #[test]
@@ -254,6 +293,15 @@ pub fn virtual_store_dir_max_length_from_workspace_yaml() {
 }
 
 #[test]
+pub fn force_ignores_platform_from_workspace_yaml() {
+    let tmp = tempdir().unwrap();
+    fs::write(tmp.path().join("pnpm-workspace.yaml"), "forceIgnoresPlatform: true\n")
+        .expect("write to pnpm-workspace.yaml");
+    let config = Config::new().current::<HostNoHome>(tmp.path()).expect("yaml is valid");
+    assert!(config.force_ignores_platform);
+}
+
+#[test]
 pub fn engine_strict_node_version_and_max_sockets_from_workspace_yaml() {
     let tmp = tempdir().unwrap();
     fs::write(
@@ -332,6 +380,19 @@ pub fn node_version_from_pnpm_config_env_overrides_workspace_yaml() {
 }
 
 #[test]
+pub fn link_workspace_packages_from_pnpm_config_env_overrides_workspace_yaml() {
+    fake_env!(load_with_fake_env);
+    let tmp = tempdir().unwrap();
+    fs::write(tmp.path().join("pnpm-workspace.yaml"), "linkWorkspacePackages: false\n")
+        .expect("write to pnpm-workspace.yaml");
+
+    set_fake_env(&[("PNPM_CONFIG_LINK_WORKSPACE_PACKAGES", "deep")]);
+    let config = load_with_fake_env(tmp.path());
+
+    assert_eq!(config.link_workspace_packages, crate::LinkWorkspacePackages::Deep);
+}
+
+#[test]
 pub fn catalog_prune_from_workspace_yaml() {
     let tmp = tempdir().unwrap();
     let config = Config::new().current::<HostNoHome>(tmp.path()).expect("loads");
@@ -396,6 +457,59 @@ pub fn runtime_on_fail_from_workspace_yaml() {
     assert_eq!(config.runtime_on_fail, Some(crate::RuntimeOnFail::Download));
 }
 
+#[test]
+pub fn runtime_false_from_workspace_yaml_skips_runtimes() {
+    let tmp = tempdir().unwrap();
+    let config = Config::new().current::<HostNoHome>(tmp.path()).expect("loads");
+    assert!(!config.skip_runtimes);
+    fs::write(tmp.path().join("pnpm-workspace.yaml"), "runtime: false\n")
+        .expect("write to pnpm-workspace.yaml");
+    let config = Config::new().current::<HostNoHome>(tmp.path()).expect("yaml is valid");
+    assert!(config.skip_runtimes);
+}
+
+#[test]
+pub fn runtime_env_var_overrides_workspace_yaml() {
+    let tmp = tempdir().unwrap();
+    fs::write(tmp.path().join("pnpm-workspace.yaml"), "runtime: false\n")
+        .expect("write to pnpm-workspace.yaml");
+
+    struct HostWithRuntimeEnv;
+    impl EnvVar for HostWithRuntimeEnv {
+        fn var(name: &str) -> Option<String> {
+            match name {
+                "PNPM_CONFIG_RUNTIME" => Some("true".to_owned()),
+                _ => safe_host_var(name),
+            }
+        }
+    }
+    impl EnvVarOs for HostWithRuntimeEnv {
+        fn var_os(_: &str) -> Option<OsString> {
+            None
+        }
+    }
+    impl GetHomeDir for HostWithRuntimeEnv {
+        fn home_dir() -> Option<PathBuf> {
+            None
+        }
+    }
+    inert_link_probe!(HostWithRuntimeEnv);
+    host_current_dir!(HostWithRuntimeEnv);
+
+    let config = Config::new().current::<HostWithRuntimeEnv>(tmp.path()).expect("loads");
+    assert!(!config.skip_runtimes);
+}
+
+#[test]
+pub fn global_config_cannot_set_runtime() {
+    let tmp = tempdir().unwrap();
+    fs::write(tmp.path().join("config.yaml"), "runtime: false\n").expect("write config.yaml");
+    let settings = crate::TrustedSettings::load_global(tmp.path())
+        .expect("loads global config")
+        .expect("config.yaml exists");
+    assert_eq!(settings.settings.runtime, None);
+}
+
 /// `lockfileDir` moves the paths pnpm resolves against it: the root
 /// `node_modules` and the virtual store follow the pin, and the config
 /// root the install reads its root manifest and pnpmfile from becomes the
@@ -419,7 +533,7 @@ pub fn lockfile_dir_from_workspace_yaml_moves_the_paths_anchored_on_it() {
     assert_eq!(config.root_project_manifest_dir(&workspace), tmp.path());
     assert_eq!(config.modules_dir, tmp.path().join("node_modules"));
     assert_eq!(
-        config.virtual_store_dir,
+        config.install_state_dir,
         tmp.path()
             .join("node_modules")
             .join(".pnpm"),
@@ -435,8 +549,34 @@ pub fn package_map_settings_load_from_workspace_yaml() {
     )
     .expect("write to pnpm-workspace.yaml");
     let config = Config::new().current::<HostNoHome>(tmp.path()).expect("yaml is valid");
-    assert!(config.node_experimental_package_map);
+    assert_eq!(config.node_package_map_mode, NodePackageMapMode::Load);
     assert_eq!(config.node_package_map_type, NodePackageMapType::Loose);
+}
+
+#[test]
+pub fn node_package_map_section_loads_from_workspace_yaml() {
+    let tmp = tempdir().unwrap();
+    fs::write(
+        tmp.path().join("pnpm-workspace.yaml"),
+        "nodePackageMap:\n  mode: write-only\n  type: loose\n",
+    )
+    .expect("write to pnpm-workspace.yaml");
+    let config = Config::new().current::<HostNoHome>(tmp.path()).expect("yaml is valid");
+    assert_eq!(config.node_package_map_mode, NodePackageMapMode::WriteOnly);
+    assert_eq!(config.node_package_map_type, NodePackageMapType::Loose);
+}
+
+#[test]
+pub fn node_package_map_section_wins_over_its_deprecated_spellings() {
+    let tmp = tempdir().unwrap();
+    fs::write(
+        tmp.path().join("pnpm-workspace.yaml"),
+        "nodeExperimentalPackageMap: true\nnodePackageMapType: loose\nnodePackageMap:\n  mode: write-only\n  type: standard\n",
+    )
+    .expect("write to pnpm-workspace.yaml");
+    let config = Config::new().current::<HostNoHome>(tmp.path()).expect("yaml is valid");
+    assert_eq!(config.node_package_map_mode, NodePackageMapMode::WriteOnly);
+    assert_eq!(config.node_package_map_type, NodePackageMapType::Standard);
 }
 
 #[test]
@@ -525,4 +665,44 @@ pub fn extra_bin_paths_lists_workspace_root_bin_only_inside_a_workspace() {
                 .join(".bin")
         ],
     );
+}
+
+#[test]
+pub fn extra_bin_paths_follow_a_configured_modules_dir() {
+    fake_env!(load_with_fake_env);
+    let project = tempdir().expect("project tempdir");
+    set_fake_env(&[]);
+
+    fs::write(project.path().join("pnpm-workspace.yaml"), "packages:\n  - .\nmodulesDir: vendor\n")
+        .expect("write pnpm-workspace.yaml");
+    let config = load_with_fake_env(project.path());
+    assert_eq!(config.modules_dir_name(), std::ffi::OsStr::new("vendor"));
+    assert_eq!(
+        config.extra_bin_paths,
+        vec![
+            project
+                .path()
+                .join("vendor")
+                .join(".bin")
+        ],
+    );
+}
+
+#[test]
+pub fn anchoring_to_a_created_workspace_matches_loading_inside_it() {
+    fake_env!(load_with_fake_env);
+    let project = tempdir().expect("project tempdir");
+    set_fake_env(&[]);
+    let mut anchored = load_with_fake_env(project.path());
+
+    anchored.anchor_to_created_workspace(project.path().to_path_buf(), vec!["packages/*".into()]);
+
+    fs::write(project.path().join("pnpm-workspace.yaml"), "packages:\n  - packages/*\n")
+        .expect("write pnpm-workspace.yaml");
+    let loaded = load_with_fake_env(project.path());
+    assert_eq!(anchored.workspace_dir, loaded.workspace_dir);
+    assert_eq!(anchored.workspace_package_patterns, loaded.workspace_package_patterns);
+    assert_eq!(anchored.extra_bin_paths, loaded.extra_bin_paths);
+    assert_eq!(anchored.modules_dir, loaded.modules_dir);
+    assert_eq!(anchored.install_state_dir, loaded.install_state_dir);
 }

@@ -36,8 +36,8 @@ async fn install_with_drop_all_seed_policy_bumps_dependency_within_range() {
     config.lockfile = true;
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
-    config.registry = mock_instance.url();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
+    config.registry = mock_instance.url().to_string();
     let config = config.leak();
 
     let lockfile_path = dirs.project_root.join("pnpm-lock.yaml");
@@ -92,6 +92,8 @@ async fn install_with_drop_all_seed_policy_bumps_dependency_within_range() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -107,7 +109,7 @@ async fn install_with_drop_all_seed_policy_bumps_dependency_within_range() {
         .add_dependency("@pnpm.e2e/dep-of-pkg-with-1-dep", "^100.0.0", DependencyGroup::Prod)
         .unwrap();
     manifest.save().unwrap();
-    let lockfile = Lockfile::load_current_from_virtual_store_dir(&dirs.virtual_store_dir)
+    let lockfile = Lockfile::load_current_from_install_state_dir(&dirs.virtual_store_dir)
         .expect("read the written current lockfile")
         .expect("a lockfile should have been written");
 
@@ -162,6 +164,8 @@ async fn install_with_drop_all_seed_policy_bumps_dependency_within_range() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -192,8 +196,8 @@ async fn auto_install_peers_does_not_cascade_optional_peers() {
     let mut config = Config::new();
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
-    config.registry = mock_instance.url();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
+    config.registry = mock_instance.url().to_string();
     let config = config.leak();
 
     Install {
@@ -241,6 +245,8 @@ async fn auto_install_peers_does_not_cascade_optional_peers() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -321,8 +327,8 @@ async fn meta_only_optional_peers_absent_from_the_graph_are_not_installed() {
     let mut config = Config::new();
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
-    config.registry = mock_instance.url();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
+    config.registry = mock_instance.url().to_string();
     let config = config.leak();
 
     Install {
@@ -370,6 +376,8 @@ async fn meta_only_optional_peers_absent_from_the_graph_are_not_installed() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -442,8 +450,8 @@ async fn root_dependency_does_not_override_peers_of_self_contained_subtree() {
     let mut config = Config::new();
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
-    config.registry = mock_instance.url();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
+    config.registry = mock_instance.url().to_string();
     let config = config.leak();
 
     Install {
@@ -495,6 +503,8 @@ async fn root_dependency_does_not_override_peers_of_self_contained_subtree() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -548,8 +558,8 @@ async fn fresh_install_records_user_written_specifier() {
     let mut config = Config::new();
     config.store_dir = dirs.store_dir.clone().into();
     config.modules_dir = dirs.modules_dir.clone();
-    config.virtual_store_dir = dirs.virtual_store_dir.clone();
-    config.registry = mock_instance.url();
+    config.install_state_dir = dirs.virtual_store_dir.clone();
+    config.registry = mock_instance.url().to_string();
     let config = config.leak();
 
     Install {
@@ -601,6 +611,8 @@ async fn fresh_install_records_user_written_specifier() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -631,13 +643,13 @@ async fn test_install_resolve_only_ignores_layout_mismatch() {
     config_isolated.lockfile = false;
     config_isolated.store_dir = dirs.store_dir.clone().into();
     config_isolated.modules_dir = dirs.modules_dir.clone();
-    config_isolated.virtual_store_dir = dirs.virtual_store_dir.clone();
+    config_isolated.install_state_dir = dirs.virtual_store_dir.clone();
 
     let mut config_hoisted = Config::new();
     config_hoisted.lockfile = false;
     config_hoisted.store_dir = dirs.store_dir.clone().into();
     config_hoisted.modules_dir = dirs.modules_dir.clone();
-    config_hoisted.virtual_store_dir = dirs.virtual_store_dir.clone();
+    config_hoisted.install_state_dir = dirs.virtual_store_dir.clone();
     config_hoisted.hoist_pattern = Some(vec![]);
 
     let config_isolated = config_isolated.leak();
@@ -699,6 +711,8 @@ async fn test_install_resolve_only_ignores_layout_mismatch() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()
@@ -756,6 +770,8 @@ async fn test_install_resolve_only_ignores_layout_mismatch() {
             catalogs_override: None,
             pnpmfile_hook_override: None,
             workspace_projects_override: None,
+            dedicated: None,
+            discovered_workspace: None,
         },
     }
     .run::<SilentReporter>()

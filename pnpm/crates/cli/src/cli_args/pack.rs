@@ -1,6 +1,6 @@
 //! `pacquet pack` — create a tarball from a package.
 //!
-//! The single-project work lives in [`pnpm_pack::api`]; this module
+//! The single-project work lives in [`pnpm_pack::pack_archives`]; this module
 //! maps the resolved [`Config`] and CLI flags onto
 //! [`pnpm_pack::PackOptions`], and drives the recursive (`-r`) sweep
 //! over the workspace the same way the other recursive commands do.
@@ -22,8 +22,9 @@ use pnpm_catalogs_types::Catalogs;
 use pnpm_config::Config;
 use pnpm_hooks::PnpmfileHooks;
 use pnpm_pack::{
-    Host, PackError, PackOptions, PackOutputLocks, PackResultJson, api, format_pack_output,
-    pack_output_path, to_pack_result_json,
+    Host, PackError, PackOptions, PackOutputLocks, PackResultJson, PackedArchive,
+    WorkspacePackageManifest, archive_result_json, format_pack_output, pack_archives,
+    pack_output_path,
 };
 use pnpm_reporter::{LifecycleMessage, LifecycleStdio, LogEvent, Reporter};
 use pnpm_workspace_task_scheduler::{
@@ -95,6 +96,12 @@ pub struct PackArgs {
     #[clap(long)]
     pub out: Option<String>,
 
+    /// Pack only the archive of the `publishConfig.variants` entry this
+    /// target names, such as `linux-x64-musl`, or `any` for the archive of
+    /// every other host. Can be repeated.
+    #[clap(long = "variant", value_name = "TARGET")]
+    pub variant: Vec<String>,
+
     /// gzip compression level (`0`–`9`) for the tarball.
     #[clap(long = "pack-gzip-level", value_parser = clap::value_parser!(u32).range(0..=9))]
     pub pack_gzip_level: Option<u32>,
@@ -112,6 +119,14 @@ pub struct PackArgs {
     pub no_skip_manifest_obfuscation: bool,
 }
 
+struct PackSharedContext {
+    catalogs: Catalogs,
+    out: Option<String>,
+    pack_destination: Option<String>,
+    before_packing_hooks: Vec<Arc<dyn PnpmfileHooks>>,
+    workspace_packages: Option<Arc<HashMap<String, WorkspacePackageManifest>>>,
+}
+
 impl PackArgs {
     /// Pack the project at `dir` (or the `--filter`-selected workspace
     /// projects when `recursive`), returning the text/JSON the CLI prints.
@@ -122,22 +137,34 @@ impl PackArgs {
         recursive: bool,
         before_packing_hooks: Vec<Arc<dyn PnpmfileHooks>>,
     ) -> miette::Result<String> {
+        if recursive && !self.variant.is_empty() {
+            return Err(miette::miette!(
+                code = "ERR_PNPM_PACK_VARIANT_ALONE",
+                help = "Run it in the directory of each package whose archive you want.",
+                "--variant packs archives of one package's publishConfig.variants, so it does not take --recursive",
+            ));
+        }
         if recursive {
             self.run_recursive::<Reporter>(dir, config, before_packing_hooks).await
         } else {
-            let mut options = self.pack_options(
-                dir.to_path_buf(),
-                config,
-                configured_catalogs(config)?,
-                self.out.clone(),
-                self.pack_destination.clone(),
+            let shared = PackSharedContext {
+                catalogs: configured_catalogs(config)?,
+                out: self.out.clone(),
+                pack_destination: self.pack_destination.clone(),
                 before_packing_hooks,
-            );
+                workspace_packages: None,
+            };
+            let mut options = self.pack_options(dir.to_path_buf(), config, shared);
             set_injected_changelog(&mut options, config, dir).await?;
-            let result = api::<Reporter, Host>(&options).await
+            let archives = pack_archives::<Reporter, Host>(&options, &self.variant)
+                .await
                 .map_err(miette::Report::new)
                 .wrap_err(PACK_ERROR_CONTEXT)?;
-            Ok(format_pack_output(&[to_pack_result_json(&result)], self.json, false))
+            let results: Vec<PackResultJson> = archives.archives
+                .iter()
+                .map(archive_result_json)
+                .collect();
+            Ok(format_pack_output(&results, self.json, false))
         }
     }
 
@@ -146,9 +173,10 @@ impl PackArgs {
         config: &Config,
         project: &pnpm_workspace::Project,
         mut options: PackOptions,
-    ) -> miette::Result<pnpm_pack::PackResult> {
+    ) -> miette::Result<Vec<PackedArchive>> {
         set_injected_changelog(&mut options, config, &project.root_dir).await?;
-        api::<Reporter, Host>(&options).await
+        pack_archives::<Reporter, Host>(&options, &self.variant).await
+            .map(|packed| packed.archives)
             .map_err(miette::Report::new)
             .wrap_err_with(|| {
                 if self.json {
@@ -167,10 +195,7 @@ impl PackArgs {
         &self,
         project: &pnpm_workspace::Project,
         config: &Config,
-        catalogs: Catalogs,
-        out: Option<String>,
-        pack_destination: Option<String>,
-        before_packing_hooks: Vec<Arc<dyn PnpmfileHooks>>,
+        shared: PackSharedContext,
     ) -> Option<PackOptions> {
         let manifest = project.manifest.value();
         let declares = |field: &str| {
@@ -182,14 +207,7 @@ impl PackArgs {
         if !declares("name") || !declares("version") {
             return None;
         }
-        Some(self.pack_options(
-            project.root_dir.clone(),
-            config,
-            catalogs,
-            out,
-            pack_destination,
-            before_packing_hooks,
-        ))
+        Some(self.pack_options(project.root_dir.clone(), config, shared))
     }
 
     /// Map `self` plus the resolved `config` onto a [`PackOptions`].
@@ -201,11 +219,14 @@ impl PackArgs {
         &self,
         dir: PathBuf,
         config: &Config,
-        catalogs: Catalogs,
-        out: Option<String>,
-        pack_destination: Option<String>,
-        before_packing_hooks: Vec<Arc<dyn PnpmfileHooks>>,
+        shared: PackSharedContext,
     ) -> PackOptions {
+        let workspace_packages = shared.workspace_packages.or_else(|| {
+            crate::cli_args::workspace_packages::discover_workspace_package_manifests(
+                config.workspace_dir.as_deref(),
+                config,
+            )
+        });
         PackOptions {
             dir,
             workspace_dir: config.workspace_dir.clone(),
@@ -217,7 +238,8 @@ impl PackArgs {
                 extra_env: config.extra_env.clone(),
             },
             manifest: pnpm_pack::PackManifestOptions {
-                catalogs,
+                catalogs: shared.catalogs,
+                catalogs_dir: config.workspace_dir.clone(),
                 embed_readme: config.embed_readme,
                 node_linker: config.node_linker,
                 skip_obfuscation: resolve_bool_override(
@@ -225,13 +247,14 @@ impl PackArgs {
                     self.no_skip_manifest_obfuscation,
                     config.skip_manifest_obfuscation,
                 ),
-                before_packing_hooks,
+                before_packing_hooks: shared.before_packing_hooks,
+                workspace_packages,
             },
             output: pnpm_pack::PackOutputOptions {
                 gzip_level: self.pack_gzip_level,
                 dry_run: self.dry_run,
-                out,
-                destination: pack_destination,
+                out: shared.out,
+                destination: shared.pack_destination,
                 injected_files: Vec::new(),
                 locks: None,
             },
@@ -264,23 +287,28 @@ impl RecursivePack<'_, '_> {
         root: PathBuf,
     ) -> TaskCompletion {
         let project = self.graph[&root].package.project;
-        let Some(mut options) = args.packable_options(
-            project,
-            self.config,
-            self.catalogs.clone(),
-            self.output.out.clone(),
-            self.output.destination.clone(),
-            self.before_packing_hooks.clone(),
-        ) else {
+        let shared = PackSharedContext {
+            catalogs: self.catalogs.clone(),
+            out: self.output.out.clone(),
+            pack_destination: self.output.destination.clone(),
+            before_packing_hooks: self.before_packing_hooks.clone(),
+            workspace_packages: self.workspace_packages.clone(),
+        };
+        let Some(mut options) = args.packable_options(project, self.config, shared) else {
             return TaskCompletion::Passed;
         };
         options.output.locks = Some(Arc::clone(&self.output.locks));
         match args.pack_one::<Reporter>(self.config, project, options).await {
-            Ok(result) => {
+            Ok(archives) => {
+                let index = self.results.order_index[&root];
                 self.results.packed
                     .lock()
                     .expect("packed results lock is not poisoned")
-                    .push((self.results.order_index[&root], to_pack_result_json(&result)));
+                    .extend(
+                        archives
+                            .iter()
+                            .map(|archive| (index, archive_result_json(archive))),
+                    );
                 TaskCompletion::Passed
             }
             Err(error) => {
@@ -302,7 +330,8 @@ impl RecursivePack<'_, '_> {
         }
         let mut packed =
             self.results.packed.into_inner().expect("packed results lock is not poisoned");
-        packed.sort_unstable_by_key(|(index, _)| *index);
+        // Stable, so a package's archives keep their declaration order.
+        packed.sort_by_key(|(index, _)| *index);
         Ok(packed
             .into_iter()
             .map(|(_, result)| result)

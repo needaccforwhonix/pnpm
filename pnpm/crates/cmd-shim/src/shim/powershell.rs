@@ -51,7 +51,15 @@ pub fn generate_pwsh_shim(
         }
     }
 
-    pwsh
+    with_utf8_bom(pwsh, cfg!(windows))
+}
+
+/// Windows PowerShell 5.1 decodes a script without a byte order mark using the
+/// ANSI code page, so non-ASCII text in a shim generated on Windows
+/// (`windows_host`) needs a UTF-8 BOM. Elsewhere the shebang has to stay at
+/// the start of the file.
+pub(super) fn with_utf8_bom(pwsh: String, windows_host: bool) -> String {
+    if !windows_host || pwsh.is_ascii() { pwsh } else { format!("\u{FEFF}{pwsh}") }
 }
 
 fn write_pwsh_invocation(pwsh: &mut String, command: &str, indent: &str) {
@@ -87,7 +95,7 @@ fn pwsh_node_path_header(node_path: &[String]) -> Option<String> {
     let NodePathEnvVar {
         win32: win32_node_path,
         posix: posix_node_path,
-    } = normalize_node_path_env_var(node_path);
+    } = normalize_node_path_env_var(node_path, cfg!(windows));
     (!win32_node_path.is_empty()).then(|| {
         format!(
             "#!/usr/bin/env pwsh\n$basedir=Split-Path $MyInvocation.MyCommand.Definition -Parent\n\n$exe=\"\"\n$pathsep=\":\"\n$env_node_path=$env:NODE_PATH\n$new_node_path=\"{win32_node_path}\"\nif ($PSVersionTable.PSVersion -lt \"6.0\" -or $IsWindows) {{\n  # Fix case when both the Windows and Linux builds of Node\n  # are installed in the same directory\n  $exe=\".exe\"\n  $pathsep=\";\"\n}} else {{\n  $new_node_path=\"{posix_node_path}\"\n}}\nif ([string]::IsNullOrEmpty($env_node_path)) {{\n  $env:NODE_PATH=$new_node_path\n}} else {{\n  $env:NODE_PATH=\"$new_node_path$pathsep$env_node_path\"\n}}",

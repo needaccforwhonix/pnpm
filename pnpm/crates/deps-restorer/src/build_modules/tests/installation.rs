@@ -1,15 +1,15 @@
 #[cfg(unix)]
 use super::{
     super::BuildModules, TEST_LOGGED_METHODS, create_failing_postinstall_fixture,
-    create_postinstall_modifies_source_fixture, create_postinstall_with_unreadable_fixture, key,
+    create_postinstall_modifies_source_fixture, create_postinstall_with_unreadable_fixture,
     root_importers,
 };
 use super::{
     super::{
         allow_build_policy::AllowBuildPolicy,
-        slots::{is_contained_descendant, parse_name_version_from_key},
+        slots::{is_contained_descendant, parse_name_version_from_key, virtual_store_dir_for_key},
     },
-    policy_from_specs,
+    key, policy_from_specs,
 };
 #[cfg(unix)]
 use crate::SkippedSnapshots;
@@ -17,8 +17,6 @@ use crate::VirtualStoreLayout;
 use pnpm_config::Config;
 #[cfg(unix)]
 use pnpm_config::PackageImportMethod;
-#[cfg(unix)]
-use pnpm_executor::ScriptsPrependNodePath;
 use pnpm_lockfile::PackageKey;
 #[cfg(unix)]
 use pnpm_lockfile::SnapshotEntry;
@@ -237,7 +235,7 @@ fn do_not_fail_on_optional_dep_with_failing_postinstall() {
 
     let ignored = BuildModules {
         cache: crate::BuildCacheContext {
-            maps_by_snapshot: None,
+            side_effects: crate::CachedSideEffects { overlays: None, rows: None },
             engine_name: None,
             read: true,
             write: false,
@@ -247,6 +245,7 @@ fn do_not_fail_on_optional_dep_with_failing_postinstall() {
             frozen_store: false,
         },
         directories: crate::BuildLayout {
+            link_options: &pnpm_cmd_shim::LinkBinsOptions::default(),
             layout: &VirtualStoreLayout::legacy(
                 virtual_store_dir.path(),
                 pnpm_config::default_virtual_store_dir_max_length() as usize,
@@ -264,15 +263,23 @@ fn do_not_fail_on_optional_dep_with_failing_postinstall() {
             patches: None,
             requires_build_by_snapshot: None,
             importers: &importers,
+            dependency_groups: None,
+            build_scope: None,
+            variant_platforms: None,
         },
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),
             user_agent: "pnpm/test",
-            prepend_node_path: ScriptsPrependNodePath::Never,
+            path: crate::ScriptPath { extra_bin_paths: &[], private_hoisting: false },
             shell: None,
             shell_emulator: false,
             unsafe_perm: true,
             ignore: false,
+            patched_engines: crate::PatchedEngineCheck {
+                engine_strict: false,
+                node_version: None,
+                install_state_dir: None,
+            },
         },
 
         allow_build_policy: &policy,
@@ -332,7 +339,7 @@ pub(super) fn fail_when_failing_postinstall_is_required() {
 
     let err = BuildModules {
         cache: crate::BuildCacheContext {
-            maps_by_snapshot: None,
+            side_effects: crate::CachedSideEffects { overlays: None, rows: None },
             engine_name: None,
             read: true,
             write: false,
@@ -342,6 +349,7 @@ pub(super) fn fail_when_failing_postinstall_is_required() {
             frozen_store: false,
         },
         directories: crate::BuildLayout {
+            link_options: &pnpm_cmd_shim::LinkBinsOptions::default(),
             layout: &VirtualStoreLayout::legacy(
                 virtual_store_dir.path(),
                 pnpm_config::default_virtual_store_dir_max_length() as usize,
@@ -359,15 +367,23 @@ pub(super) fn fail_when_failing_postinstall_is_required() {
             patches: None,
             requires_build_by_snapshot: None,
             importers: &importers,
+            dependency_groups: None,
+            build_scope: None,
+            variant_platforms: None,
         },
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),
             user_agent: "pnpm/test",
-            prepend_node_path: ScriptsPrependNodePath::Never,
+            path: crate::ScriptPath { extra_bin_paths: &[], private_hoisting: false },
             shell: None,
             shell_emulator: false,
             unsafe_perm: true,
             ignore: false,
+            patched_engines: crate::PatchedEngineCheck {
+                engine_strict: false,
+                node_version: None,
+                install_state_dir: None,
+            },
         },
 
         allow_build_policy: &policy,
@@ -440,6 +456,7 @@ async fn write_path_disabled_skips_upload() {
         files: HashMap::new(),
         side_effects: None,
         remote_side_effects_quarantine: None,
+        tar_integrity: None,
     };
     {
         let mut index = StoreIndex::open_in(&store_dir).expect("open index for seed");
@@ -451,7 +468,7 @@ async fn write_path_disabled_skips_upload() {
 
     BuildModules {
         cache: crate::BuildCacheContext {
-            maps_by_snapshot: None,
+            side_effects: crate::CachedSideEffects { overlays: None, rows: None },
             engine_name: Some("darwin;arm64;node20"),
             read: true,
             write: false,
@@ -461,6 +478,7 @@ async fn write_path_disabled_skips_upload() {
             frozen_store: false,
         },
         directories: crate::BuildLayout {
+            link_options: &pnpm_cmd_shim::LinkBinsOptions::default(),
             layout: &VirtualStoreLayout::legacy(
                 virtual_store_dir.path(),
                 pnpm_config::default_virtual_store_dir_max_length() as usize,
@@ -478,15 +496,23 @@ async fn write_path_disabled_skips_upload() {
             patches: None,
             requires_build_by_snapshot: None,
             importers: &importers,
+            dependency_groups: None,
+            build_scope: None,
+            variant_platforms: None,
         },
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),
             user_agent: "pnpm/test",
-            prepend_node_path: ScriptsPrependNodePath::Never,
+            path: crate::ScriptPath { extra_bin_paths: &[], private_hoisting: false },
             shell: None,
             shell_emulator: false,
             unsafe_perm: true,
             ignore: false,
+            patched_engines: crate::PatchedEngineCheck {
+                engine_strict: false,
+                node_version: None,
+                install_state_dir: None,
+            },
         },
 
         allow_build_policy: &policy,
@@ -580,6 +606,7 @@ async fn upload_error_does_not_interrupt_install() {
         files: HashMap::new(),
         side_effects: None,
         remote_side_effects_quarantine: None,
+        tar_integrity: None,
     };
     {
         let mut index = StoreIndex::open_in(&store_dir).expect("open index for seed");
@@ -592,7 +619,7 @@ async fn upload_error_does_not_interrupt_install() {
 
     BuildModules {
         cache: crate::BuildCacheContext {
-            maps_by_snapshot: None,
+            side_effects: crate::CachedSideEffects { overlays: None, rows: None },
             engine_name: Some("darwin;arm64;node20"),
             read: true,
             write: true,
@@ -602,6 +629,7 @@ async fn upload_error_does_not_interrupt_install() {
             frozen_store: false,
         },
         directories: crate::BuildLayout {
+            link_options: &pnpm_cmd_shim::LinkBinsOptions::default(),
             layout: &VirtualStoreLayout::legacy(
                 virtual_store_dir.path(),
                 pnpm_config::default_virtual_store_dir_max_length() as usize,
@@ -619,15 +647,23 @@ async fn upload_error_does_not_interrupt_install() {
             patches: None,
             requires_build_by_snapshot: None,
             importers: &importers,
+            dependency_groups: None,
+            build_scope: None,
+            variant_platforms: None,
         },
         scripts: crate::BuildScriptOptions {
             extra_env: &HashMap::new(),
             user_agent: "pnpm/test",
-            prepend_node_path: ScriptsPrependNodePath::Never,
+            path: crate::ScriptPath { extra_bin_paths: &[], private_hoisting: false },
             shell: None,
             shell_emulator: false,
             unsafe_perm: true,
             ignore: false,
+            patched_engines: crate::PatchedEngineCheck {
+                engine_strict: false,
+                node_version: None,
+                install_state_dir: None,
+            },
         },
 
         allow_build_policy: &policy,
@@ -681,7 +717,7 @@ fn pkg_root_for_key_isolated_uses_layout() {
     let mut config = Config::new();
     config.store_dir = dir.path().join("store").into();
     config.modules_dir = dir.path().join("node_modules");
-    config.virtual_store_dir = dir.path().join("node_modules/.pacquet");
+    config.install_state_dir = dir.path().join("node_modules/.pacquet");
     let config = config.leak();
     let layout = VirtualStoreLayout::new(config, None, None, None, None, None);
 
@@ -691,7 +727,7 @@ fn pkg_root_for_key_isolated_uses_layout() {
         .expect("isolated lookup hits");
 
     assert!(
-        result.starts_with(&config.virtual_store_dir),
+        result.starts_with(&config.install_state_dir),
         "isolated pkg_dir lives under the virtual store: {result:?}",
     );
     assert!(
@@ -699,26 +735,82 @@ fn pkg_root_for_key_isolated_uses_layout() {
         "trailing path is `node_modules/<name>`: {result:?}",
     );
 }
-/// The GVS build-failure cleanup only recurse-deletes a slot that sits
-/// strictly inside the store root through `..`-free components, so a
-/// crafted package name cannot turn the cleanup into a path traversal.
+
+#[test]
+fn pkg_root_for_key_uses_parsed_name_for_non_registry_version() {
+    let dir = tempdir().unwrap();
+    let mut config = Config::new();
+    config.store_dir = dir.path().join("store").into();
+    config.modules_dir = dir.path().join("node_modules");
+    config.install_state_dir = dir.path().join("node_modules/.pacquet");
+    let config = config.leak();
+    let layout = VirtualStoreLayout::new(config, None, None, None, None, None);
+
+    let key = key("foo", "git+ssh://git@example.com/org/foo.git#abc123");
+    let result = virtual_store_dir_for_key(&layout, &key);
+
+    assert!(result.ends_with(Path::new("node_modules").join("foo")), "package name: {result:?}");
+}
+
+/// The failed-optional-build cleanup only recurse-deletes a directory that
+/// sits strictly inside its root through `..`-free components, so a crafted
+/// package name cannot turn the cleanup into a path traversal.
 #[test]
 fn is_contained_descendant_rejects_traversal_and_escapes() {
-    let root = Path::new("/store/v11/links");
+    let root = Path::new("/project/node_modules/.pnpm");
 
-    // A normal GVS slot suffix is accepted.
-    assert!(is_contained_descendant(root, &root.join("@pnpm.e2e/foo/1.0.0/deadbeef")));
-    assert!(is_contained_descendant(root, &root.join("foo/1.0.0/deadbeef")));
+    assert!(is_contained_descendant(
+        root,
+        &root.join("@pnpm.e2e+foo@1.0.0/node_modules/@pnpm.e2e/foo")
+    ));
+    assert!(is_contained_descendant(root, &root.join("foo@1.0.0/node_modules/foo")));
 
     // A `..` segment that climbs out of the root is rejected even though
     // the path still textually starts with the root.
     assert!(!is_contained_descendant(root, &root.join("../../../etc/passwd")));
     assert!(!is_contained_descendant(root, &root.join("foo/../../../escape")));
 
-    // The root itself is not a descendant — deleting it wholesale is not
-    // a per-slot cleanup.
+    // The root itself is not a descendant.
     assert!(!is_contained_descendant(root, root));
 
     // A sibling that merely shares a name prefix is not contained.
-    assert!(!is_contained_descendant(root, Path::new("/store/v11/links-evil/foo")));
+    assert!(!is_contained_descendant(root, Path::new("/project/node_modules/.pnpm-evil/foo")));
+}
+
+/// A hoisted snapshot recorded at a real placement plus a link that
+/// aliases it loses both on an optional-build skip. Walking the deduped
+/// write list would remove only the real directory and leave the link
+/// dangling where the consumer must see the package as absent.
+#[test]
+fn discard_skipped_optional_dependency_unlinks_the_hoisted_alias_too() {
+    let dir = tempdir().unwrap();
+    let mut config = Config::new();
+    config.store_dir = dir.path().join("store").into();
+    config.modules_dir = dir.path().join("node_modules");
+    config.install_state_dir = dir.path().join("node_modules/.pacquet");
+    let config = config.leak();
+    let layout = VirtualStoreLayout::new(config, None, None, None, None, None);
+
+    let placement = dir.path().join("node_modules/.pnpm/is-odd@3.0.0/node_modules/is-odd");
+    std::fs::create_dir_all(&placement).expect("create the real placement");
+    let alias = dir.path().join("packages/pkg-a/node_modules/is-odd");
+    std::fs::create_dir_all(alias.parent().expect("alias parent")).expect("create alias parent");
+    pnpm_fs::symlink_dir(&placement, &alias).expect("record the aliased duplicate placement");
+
+    let key: PackageKey = "/is-odd@3.0.0".parse().expect("parse key");
+    let map =
+        std::collections::HashMap::from([(key.clone(), vec![placement.clone(), alias.clone()])]);
+
+    super::super::discard_skipped_optional_dependency(
+        super::super::PkgRoots { layout: &layout, by_key: Some(&map) },
+        dir.path(),
+        &key,
+    )
+    .expect("discard the skipped optional dependency");
+
+    assert!(!placement.exists(), "the real placement must be removed");
+    assert!(
+        std::fs::symlink_metadata(&alias).is_err(),
+        "the aliasing link must be unlinked, not left dangling",
+    );
 }

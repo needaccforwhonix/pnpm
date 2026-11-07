@@ -108,6 +108,7 @@ pub struct ResolvedConfig {
 
 #[napi(js_name = "readConfig")]
 pub fn read_config(options: ReadConfigOptions) -> napi::Result<ResolvedConfig> {
+    pnpm_package_manager::configure_rayon_pool();
     let dir = std::path::PathBuf::from(options.dir);
     let config =
         resolve_config(&dir, &ConfigOverlay::default()).map_err(|error| to_napi_error(&error))?;
@@ -160,8 +161,8 @@ fn resolved_config_values(
         virtual_store_dir_max_length: bounded_u32(config.virtual_store_dir_max_length),
         enable_global_virtual_store: config.enable_global_virtual_store,
         global_virtual_store_dir: display_path(&config.global_virtual_store_dir),
-        virtual_store_dir: display_path(&config.virtual_store_dir),
-        effective_virtual_store_dir: display_path(config.effective_virtual_store_dir()),
+        virtual_store_dir: display_path(&config.install_state_dir),
+        effective_virtual_store_dir: display_path(config.virtual_store_dir()),
         network_concurrency: u32::try_from(config.network_concurrency).unwrap_or(u32::MAX),
         max_sockets: config.max_sockets.map(|value| u32::try_from(value).unwrap_or(u32::MAX)),
         fetch_retries: config.fetch_retries,

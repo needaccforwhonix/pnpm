@@ -13,6 +13,7 @@ repository.workspace = true
 [dependencies]
 pnpm-diagnostics = { workspace = true }
 pnpm-fs = { workspace = true }
+pnpm-lockfile = { workspace = true }
 pnpm-network = { workspace = true }
 pnpm-package-manifest = { workspace = true }
 pnpm-reporter = { workspace = true }
@@ -27,7 +28,6 @@ miette = { workspace = true }
 num_cpus = { workspace = true }
 pipe-trait = { workspace = true }
 rayon = { workspace = true }
-reqwest = { workspace = true }
 rustls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -39,11 +39,23 @@ url = { workspace = true }
 zip = { workspace = true }
 zune-inflate = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 dashmap = { workspace = true, features = ["raw-api"] }
 mockito = { workspace = true }
+pnpm-testing-utils = { workspace = true }
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+reqwest = { workspace = true }
+tokio = { workspace = true, features = ["net", "signal"] }
+zstd = { workspace = true }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+pnpm-http = { workspace = true }
 
 [lints]
 workspace = true

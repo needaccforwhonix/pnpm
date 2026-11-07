@@ -9,16 +9,22 @@ mod installation;
 #[cfg(unix)]
 use super::Host;
 use super::{FsHardLink, FsReflink};
-use std::{
-    fs, io,
-    path::{Path, PathBuf},
-};
+use pnpm_fs::StoreFile;
+use std::{fs, io, path::Path};
 
-fn write_source(dir: &Path, name: &str, contents: &[u8]) -> PathBuf {
+fn write_source(dir: &Path, name: &str, contents: &[u8]) -> StoreFile {
     let path = dir.join(name);
+    fs::create_dir_all(path.parent().unwrap()).expect("create source parent");
     fs::write(&path, contents).expect("write source file");
-    path
+    StoreFile::new(path)
 }
+
+/// A non-executable store entry, relative to the store directory.
+const STORE_ENTRY: &str = "files/1b/59d9e5d4c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8";
+
+/// An executable store entry, relative to the store directory.
+#[cfg(unix)]
+const STORE_EXEC_ENTRY: &str = "files/1b/59d9e5d4c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8-exec";
 
 /// A filesystem that refuses `link(2)` with `EPERM`: what a FUSE
 /// filesystem without hardlinks (`EdenFS`) answers for every link inside
@@ -96,6 +102,49 @@ impl FsHardLink for EaccesHardLink {
 impl FsReflink for EaccesHardLink {
     fn reflink(source: &Path, target: &Path) -> io::Result<()> {
         Host::reflink(source, target)
+    }
+}
+
+/// A reflink onto a fresh inode that carries the source's mode, which is
+/// what a real one does: `clonefile` copies the source's attributes, and
+/// the reflink tier sets them explicitly on Linux.
+#[cfg(unix)]
+struct FreshClone;
+
+#[cfg(unix)]
+impl FsHardLink for FreshClone {
+    fn hard_link(_source: &Path, _target: &Path) -> io::Result<()> {
+        unreachable!("the clone tier materializes the file, so no hardlink tier follows it")
+    }
+}
+
+#[cfg(unix)]
+impl FsReflink for FreshClone {
+    fn reflink(source: &Path, target: &Path) -> io::Result<()> {
+        fs::write(target, fs::read(source)?)?;
+        fs::set_permissions(target, fs::metadata(source)?.permissions())
+    }
+}
+
+/// A reflink whose target does not carry the source's mode. No real
+/// reflink does this. It makes visible whether the clone tier aligned the
+/// target afterwards.
+#[cfg(unix)]
+struct ModeDroppingClone;
+
+#[cfg(unix)]
+impl FsHardLink for ModeDroppingClone {
+    fn hard_link(_source: &Path, _target: &Path) -> io::Result<()> {
+        unreachable!("the clone tier materializes the file, so no hardlink tier follows it")
+    }
+}
+
+#[cfg(unix)]
+impl FsReflink for ModeDroppingClone {
+    fn reflink(source: &Path, target: &Path) -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(target, fs::read(source)?)?;
+        fs::set_permissions(target, fs::Permissions::from_mode(0o400))
     }
 }
 

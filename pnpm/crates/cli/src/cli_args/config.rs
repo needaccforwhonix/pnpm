@@ -19,10 +19,11 @@ use derive_more::{Display, Error};
 use indexmap::IndexMap;
 use miette::Diagnostic;
 use pnpm_config::{
-    Config, DEFAULT_JSR_REGISTRY, GLOBAL_CONFIG_YAML_FILENAME, WORKSPACE_MANIFEST_FILENAME,
-    config_types, naming_cases, property_path, property_path::Segment, protected_settings,
+    Config, DEFAULT_JSR_REGISTRY, GLOBAL_CONFIG_YAML_FILENAME, MacosBackupSettings,
+    WORKSPACE_MANIFEST_FILENAME, config_types, naming_cases, property_path, property_path::Segment,
+    protected_settings, refused_keys,
 };
-use pnpm_workspace_manifest_writer::update_manifest_field;
+use pnpm_workspace_manifest_writer::{update_manifest_field, update_workspace_setting};
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 use values::{
@@ -41,10 +42,11 @@ pub struct ConfigArgs {
 }
 
 impl ConfigArgs {
-    /// Whether `--global` / `-g` was passed, ignoring the default
-    /// [`resolve_global`] applies when no location flag is given.
-    pub(super) fn is_global(&self) -> bool {
-        self.flags.global
+    /// Whether this is a `get` / `list` the user scoped to the global config.
+    /// Such a read must not show the project's settings.
+    pub(super) fn reads_global_config(&self) -> bool {
+        self.flags.is_global()
+            && matches!(self.command, ConfigSubcommand::Get(_) | ConfigSubcommand::List(_))
     }
 }
 
@@ -75,6 +77,19 @@ pub struct ConfigFlags {
     /// Show all types of values in JSON format (not just objects and arrays).
     #[clap(long, global = true)]
     pub json: bool,
+}
+
+impl ConfigFlags {
+    /// Whether the user scoped the command to the global config with
+    /// `--global` or `--location=global`, ignoring the default
+    /// [`resolve_global`] applies when no location flag is given. `--global`
+    /// and `--location=global` are the same request.
+    pub(super) fn is_global(self) -> bool {
+        match self.location {
+            Some(location) => location == ConfigLocation::Global,
+            None => self.global,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -160,6 +175,19 @@ pub enum ConfigError {
     )]
     SetUnsupportedYamlConfigKey { key: String },
 
+    /// A project's `pnpm-workspace.yaml` carries no machine-level state, so
+    /// writing such a key there would only leave behind one pnpm ignores.
+    #[display("The key {key:?} cannot be set in a project's pnpm-workspace.yaml")]
+    #[diagnostic(code(ERR_PNPM_CONFIG_SET_NOT_A_PROJECT_SETTING), help("{belongs}"))]
+    SetNotAProjectSetting { key: String, belongs: String },
+
+    #[display("Invalid value for structured config key {key:?}: {reason}")]
+    #[diagnostic(
+        code(ERR_PNPM_CONFIG_SET_STRUCTURED_VALUE),
+        help("Use --json with an object value")
+    )]
+    SetStructuredValue { key: String, reason: String },
+
     #[display("Invalid property path: {_0}")]
     #[diagnostic(code(ERR_PNPM_CONFIG_INVALID_PROPERTY_PATH))]
     InvalidPropertyPath(#[error(not(source))] property_path::ParsePropertyPathError),
@@ -194,17 +222,19 @@ impl ConfigArgs {
                 config_set(config, dir, flags, &key, None)?;
             }
             ConfigSubcommand::Get(args) => {
-                let output = match args.key
+                let key = args.key
                     .as_deref()
-                    .filter(|key| !key.is_empty())
-                {
+                    .filter(|key| !key.is_empty());
+                let output = match key {
                     Some(key) => config_get(config, flags, key)?,
                     None => config_list(config),
                 };
-                println!("{output}");
+                pnpm_diagnostics::println!("{output}");
+                incomplete::warn_if_incomplete(config, key);
             }
             ConfigSubcommand::List(_) => {
-                println!("{}", config_list(config));
+                pnpm_diagnostics::println!("{}", config_list(config));
+                incomplete::warn_if_incomplete(config, None);
             }
         }
         Ok(())
@@ -218,8 +248,6 @@ pub(super) fn resolve_global(flags: ConfigFlags) -> bool {
     match flags.location {
         Some(ConfigLocation::Global) => true,
         Some(ConfigLocation::Project) => false,
-        // No `--location`: pnpm defaults config operations to global when no
-        // explicit location was given (a bare `--global` lands here too).
         None => true,
     }
 }
@@ -236,14 +264,10 @@ fn split_set_params(
         .ok_or_else(|| ConfigError::NoParams { subcommand: subcommand.to_string() })?;
     match value {
         Some(value) => Ok((key, value)),
-        None => {
-            // `key=value` form: the key is everything before the first `=`, the
-            // value everything after (so a value may itself contain `=`).
-            match key.split_once('=') {
-                Some((k, v)) => Ok((k.to_string(), v.to_string())),
-                None => Ok((key, String::new())),
-            }
-        }
+        None => match key.split_once('=') {
+            Some((k, v)) => Ok((k.to_string(), v.to_string())),
+            None => Ok((key, String::new())),
+        },
     }
 }
 
@@ -280,25 +304,104 @@ fn config_set(
     }
 
     let (config_dir, config_file_name) = get_config_file_info(&key, global, config, dir)?;
-    let config_path = config_dir.join(config_file_name);
 
     match config_file_name {
         GLOBAL_CONFIG_YAML_FILENAME | WORKSPACE_MANIFEST_FILENAME => {
-            if config_file_name == GLOBAL_CONFIG_YAML_FILENAME {
-                key = validate_yaml_config_key(&key)?;
-            }
-            key = validate_workspace_key(&key)?;
-            let cast = cast_field(value, &naming_cases::to_kebab_case(&key));
-            update_manifest_field(&config_path, &key, &cast).map_err(miette::Report::new)?;
+            set_yaml_setting(config_file_name, &config_dir, &key, value)?;
         }
         _ => {
             // INI file reached via `getConfigFileInfo` (auth/scoped/registry key
             // whose kebab-case form is an INI key). Validate against `types`.
             key = validate_ini_config_key(&key)?;
-            write_ini_setting(&config_path, &key, &value)?;
+            write_ini_setting(&config_dir.join(config_file_name), &key, &value)?;
         }
     }
     Ok(())
+}
+
+/// Write one setting to the global `config.yaml` or the project's
+/// `pnpm-workspace.yaml`, whichever `config_file_name` names. A project
+/// setting goes to the workspace file that owns it.
+fn set_yaml_setting(
+    config_file_name: &str,
+    config_dir: &Path,
+    key: &str,
+    value: Value,
+) -> miette::Result<()> {
+    let write = |key: &str, value: &Value| {
+        if config_file_name == WORKSPACE_MANIFEST_FILENAME {
+            update_workspace_setting(config_dir, key, value)
+        } else {
+            update_manifest_field(&config_dir.join(config_file_name), key, value)
+        }
+        .map_err(miette::Report::new)
+    };
+    let given_key = key;
+    let key = if config_file_name == GLOBAL_CONFIG_YAML_FILENAME {
+        validate_yaml_config_key(key)?
+    } else {
+        key.to_string()
+    };
+    let key = validate_workspace_key(&key)?;
+    let cast = cast_field(value, &naming_cases::to_kebab_case(&key));
+    if config_file_name == WORKSPACE_MANIFEST_FILENAME
+        && !cast.is_null()
+        && refused_keys::is_refused_by_a_project_manifest(&key)
+    {
+        return Err(ConfigError::SetNotAProjectSetting {
+            belongs: refused_keys::where_refused_key_belongs(&key),
+            key,
+        }
+        .into());
+    }
+    validate_macos_backup_value(&key, &cast)?;
+    write(&key, &cast)?;
+    if cast.is_null() {
+        clear_other_spellings(&key, given_key, write)?;
+    }
+    Ok(())
+}
+
+/// A hand-edited file may carry a spelling pnpm did not write, and that is the
+/// one the reader's warning names, so a removal also clears the spelling the
+/// user gave and the kebab-case one.
+fn clear_other_spellings(
+    key: &str,
+    given_key: &str,
+    write: impl Fn(&str, &Value) -> miette::Result<()>,
+) -> miette::Result<()> {
+    let kebab_key = naming_cases::to_kebab_case(key);
+    for spelling in [given_key, kebab_key.as_str()] {
+        if spelling != key {
+            write(spelling, &Value::Null)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_macos_backup_value(key: &str, value: &Value) -> Result<(), ConfigError> {
+    if key != "macosBackup" || value.is_null() {
+        return Ok(());
+    }
+    if let Some(unknown) = value
+        .as_object()
+        .and_then(|object| {
+            object
+                .keys()
+                .find(|field| !matches!(field.as_str(), "excludeModulesDir" | "excludeStoreDir"))
+        })
+    {
+        return Err(ConfigError::SetStructuredValue {
+            key: key.to_string(),
+            reason: format!("unknown field {unknown:?}"),
+        });
+    }
+    serde_json::from_value::<MacosBackupSettings>(value.clone())
+        .map(|_| ())
+        .map_err(|error| ConfigError::SetStructuredValue {
+            key: key.to_string(),
+            reason: error.to_string(),
+        })
 }
 
 /// Write an auth setting to the global `auth.ini` or the directory's
@@ -321,27 +424,46 @@ fn set_auth_setting(
 /// Read the INI file, set or delete `key`, and write it back. A delete of an
 /// absent key is a no-op (no write). Mirrors the INI arms of `configSet`.
 fn write_ini_setting(config_path: &Path, key: &str, value: &Value) -> miette::Result<()> {
-    let mut settings = ini::read(config_path)
+    let mut doc = ini::read(config_path)
         .map_err(miette::Report::msg)
         .map_err(|err| err.wrap_err(format!("reading {}", config_path.display())))?;
     if value.is_null() {
-        if settings.shift_remove(key).is_none() {
+        if !doc.delete(key) {
             return Ok(());
         }
+    } else if let Value::Array(_) = value {
+        let values = collect_ini_values(key, value)?;
+        doc.set_array(key, &values);
     } else {
-        let value_string = ini_value_string(value);
-        // A control character (notably a newline) in the value would split into
-        // extra `key=value` lines when the INI file is re-parsed, injecting
-        // settings the user never set. Refuse rather than corrupt the file.
-        if has_control_char(key) || has_control_char(&value_string) {
-            return Err(ConfigError::SetIniControlCharacter.into());
-        }
-        settings.insert(key.to_string(), value_string);
+        let values = collect_ini_values(key, value)?;
+        doc.set(key, &values);
     }
-    ini::write(config_path, &settings)
+    ini::write(config_path, &doc)
         .map_err(miette::Report::msg)
         .map_err(|err| err.wrap_err(format!("writing {}", config_path.display())))?;
     Ok(())
+}
+
+fn validate_ini_string(key: &str, value: &str) -> Result<(), ConfigError> {
+    if has_control_char(key) || has_control_char(value) {
+        return Err(ConfigError::SetIniControlCharacter);
+    }
+    Ok(())
+}
+
+fn collect_ini_values(key: &str, value: &Value) -> Result<Vec<String>, ConfigError> {
+    if let Value::Array(items) = value {
+        let mut values = Vec::with_capacity(items.len());
+        for item in items {
+            let formatted = ini_value_string(item);
+            validate_ini_string(key, &formatted)?;
+            values.push(formatted);
+        }
+        return Ok(values);
+    }
+    let formatted = ini_value_string(value);
+    validate_ini_string(key, &formatted)?;
+    Ok(vec![formatted])
 }
 
 /// Whether `text` holds a control character. The INI writer splices `text`
@@ -372,19 +494,27 @@ fn get_config_file_info<'a>(
     dir: &'a Path,
 ) -> Result<(PathBuf, &'static str), ConfigError> {
     let kebab = naming_cases::to_kebab_case(key);
-    let config_dir = if global { global_config_dir(config)? } else { dir.to_path_buf() };
-    let file_name = if config_types::is_ini_config_key(&kebab) {
-        if global { "auth.ini" } else { ".npmrc" }
-    } else if global {
-        GLOBAL_CONFIG_YAML_FILENAME
-    } else {
-        WORKSPACE_MANIFEST_FILENAME
-    };
-    Ok((config_dir, file_name))
+    if global {
+        let file_name = if config_types::is_ini_config_key(&kebab) {
+            "auth.ini"
+        } else {
+            GLOBAL_CONFIG_YAML_FILENAME
+        };
+        return Ok((global_config_dir(config)?, file_name));
+    }
+    if config_types::is_ini_config_key(&kebab) {
+        return Ok((dir.to_path_buf(), ".npmrc"));
+    }
+    // Unlike `.npmrc`, `pnpm-workspace.yaml` is read only from the workspace
+    // root. Writing one into a sub-package would make that sub-package the
+    // root. See <https://github.com/pnpm/pnpm/issues/13757>.
+    let workspace_dir = config.workspace_dir.as_deref().unwrap_or(dir);
+    Ok((workspace_dir.to_path_buf(), WORKSPACE_MANIFEST_FILENAME))
 }
 
 fn global_config_dir(config: &Config) -> Result<PathBuf, ConfigError> {
     config.config_dir.clone().ok_or(ConfigError::NoGlobalConfigDir)
 }
 
+mod incomplete;
 mod values;

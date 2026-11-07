@@ -1,6 +1,6 @@
 use super::{
-    GitFetcher, ScriptsPrependNodePath, SilentReporter, StoreDir, deny_all_builds, exec_git, fs,
-    make_monorepo_bare_repo, tempdir,
+    GitFetcher, SilentReporter, StoreDir, deny_all_builds, exec_git, fs, make_monorepo_bare_repo,
+    tempdir,
 };
 
 #[tokio::test(flavor = "multi_thread")]
@@ -16,11 +16,10 @@ async fn fetcher_packs_subfolder_when_path_set() {
             ignore: false,
             unsafe_perm: true,
             user_agent: None,
-            prepend_node_path: ScriptsPrependNodePath::Never,
             shell: None,
             node_execpath: None,
             npm_execpath: None,
-            pnpm_execpath: None,
+            running_pnpm: crate::RunningPnpm::default(),
         },
         source: crate::GitSource {
             cache: &crate::GitSourceCache::default(),
@@ -94,11 +93,10 @@ async fn fetcher_skips_build_when_ignore_scripts() {
             ignore: true,
             unsafe_perm: true,
             user_agent: None,
-            prepend_node_path: ScriptsPrependNodePath::Never,
             shell: None,
             node_execpath: None,
             npm_execpath: None,
-            pnpm_execpath: None,
+            running_pnpm: crate::RunningPnpm::default(),
         },
         source: crate::GitSource {
             cache: &crate::GitSourceCache::default(),
@@ -138,4 +136,27 @@ async fn fetcher_skips_build_when_ignore_scripts() {
     );
     assert!(received.cas_paths.contains_key("package.json"));
     assert!(received.cas_paths.contains_key("index.js"));
+}
+
+#[test]
+fn packlist_applies_the_files_field_of_a_package_yaml_manifest() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("package.yaml"), "name: pkg\nversion: 1.0.0\nfiles:\n  - dist\n")
+        .unwrap();
+    fs::create_dir_all(dir.path().join("dist")).unwrap();
+    fs::write(dir.path().join("dist/index.js"), "").unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(dir.path().join("src/index.ts"), "").unwrap();
+
+    let files = crate::fetcher::packlist_of(dir.path()).unwrap();
+    assert_eq!(files, vec!["dist/index.js".to_string(), "package.yaml".into()]);
+}
+
+#[test]
+fn packlist_rejects_an_invalid_package_yaml_manifest() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("package.yaml"), "name: [unclosed\n").unwrap();
+
+    let err = crate::fetcher::packlist_of(dir.path()).unwrap_err();
+    assert!(matches!(err, crate::GitFetcherError::ReadManifest(_)), "{err:?}");
 }

@@ -1,4 +1,4 @@
-use super::{super::host_platform_selector, leaked_offline_config, registry_metadata};
+use super::{DUMMY_SHA512, leaked_offline_config, registry_metadata};
 use pnpm_lockfile::PackageKey;
 use pretty_assertions::assert_eq;
 
@@ -9,16 +9,16 @@ use pretty_assertions::assert_eq;
 /// a second fetch of the same bytes.
 ///
 /// Seed the mem cache with a finished download keyed by the exact URL
-/// the registry resolution derives, then run the cold-batch installer
+/// and integrity the registry resolution derives, then run the
+/// cold-batch installer
 /// with `tarball_mem_cache: Some(..)`. It must return the seeded CAS
 /// map without touching the network — proven here by `offline: true`,
 /// which makes any fall-through to the download path error out.
 #[tokio::test]
 async fn cold_batch_reuses_in_flight_prefetch_from_mem_cache() {
-    use pnpm_tarball::{CacheValue, MemCache};
+    use pnpm_tarball::{CacheValue, CachedTarball, MemCache, package_mem_cache_key};
     use std::{
         collections::HashMap,
-        path::PathBuf,
         sync::{Arc, atomic::AtomicU8},
     };
 
@@ -30,12 +30,18 @@ async fn cold_batch_reuses_in_flight_prefetch_from_mem_cache() {
     // the seeded mem-cache key matches what the installer looks up.
     let tarball_url = "https://registry.test/foo/-/foo-1.0.0.tgz".to_string();
 
-    let seeded: HashMap<String, PathBuf> =
-        HashMap::from([("package.json".to_string(), store_tmp.path().join("blob"))]);
+    let seeded: pnpm_fs::CasPaths =
+        HashMap::from([("package.json".to_string(), store_tmp.path().join("blob").into())]);
     let mem_cache = Arc::new(MemCache::default());
+    let cached = CachedTarball::from_files(seeded.clone());
+    let shared = Arc::clone(&cached.files);
     mem_cache.insert(
-        tarball_url,
-        Arc::new(tokio::sync::RwLock::new(CacheValue::Available(Arc::new(seeded.clone())))),
+        package_mem_cache_key(
+            &tarball_url,
+            Some(&DUMMY_SHA512.parse().expect("parse integrity")),
+            false,
+        ),
+        Arc::new(tokio::sync::RwLock::new(CacheValue::Available(cached))),
     );
 
     let layout = crate::VirtualStoreLayout::legacy(store_tmp.path().join("vstore"), 120);
@@ -62,6 +68,14 @@ async fn cold_batch_reuses_in_flight_prefetch_from_mem_cache() {
             custom_fetcher_session: None,
         },
         ctx: &crate::InstallContext {
+            caches: crate::InstallCaches {
+                logged_methods: &logged_methods,
+                swap_lock: None,
+                git_source_cache: &pnpm_git_fetcher::GitSourceCache::default(),
+                materialized_graph: std::sync::Arc::default(),
+                dir_clone_cache: None,
+            },
+
             linker: crate::ModuleLinkerContext {
                 layout: &layout,
                 kind: pnpm_config::NodeLinker::Hoisted,
@@ -72,14 +86,11 @@ async fn cold_batch_reuses_in_flight_prefetch_from_mem_cache() {
             requester: "/project",
 
             allow_build_policy: &allow_build_policy,
-
-            logged_methods: &logged_methods,
-            git_source_cache: &pnpm_git_fetcher::GitSourceCache::default(),
         },
 
         skipped: &skipped,
         include_optional_dependencies: true,
-        runtime_platform_selector: &host_platform_selector(),
+        variant_platforms: &crate::platform_selection::VariantPlatforms::host(),
         // Hoisted skips slot materialization, so the test exercises
         // only the download-coordination branch and gets the CAS map
         // back directly.
@@ -90,7 +101,11 @@ async fn cold_batch_reuses_in_flight_prefetch_from_mem_cache() {
     .await
     .expect("cold batch must reuse the prefetched download instead of fetching");
 
-    assert_eq!(cas_paths.cas_paths, seeded);
+    assert_eq!(*cas_paths.cas_paths, seeded);
+    assert!(
+        Arc::ptr_eq(&cas_paths.cas_paths, &shared),
+        "every snapshot of the package imports from the cached map, not a copy",
+    );
 
     drop(store_tmp);
 }
@@ -103,10 +118,9 @@ async fn cold_batch_reuses_in_flight_prefetch_from_mem_cache() {
 #[tokio::test]
 async fn without_mem_cache_skips_coordination_and_downloads() {
     use crate::InstallPackageBySnapshotError;
-    use pnpm_tarball::{CacheValue, MemCache, TarballError};
+    use pnpm_tarball::{CacheValue, CachedTarball, MemCache, TarballError, package_mem_cache_key};
     use std::{
         collections::HashMap,
-        path::PathBuf,
         sync::{Arc, atomic::AtomicU8},
     };
 
@@ -116,12 +130,18 @@ async fn without_mem_cache_skips_coordination_and_downloads() {
     let package_key: PackageKey = "foo@1.0.0".parse().expect("parse key");
 
     // A populated mem cache that the `None` path must ignore.
-    let seeded: HashMap<String, PathBuf> =
-        HashMap::from([("package.json".to_string(), store_tmp.path().join("blob"))]);
+    let seeded: pnpm_fs::CasPaths =
+        HashMap::from([("package.json".to_string(), store_tmp.path().join("blob").into())]);
     let mem_cache = Arc::new(MemCache::default());
     mem_cache.insert(
-        "https://registry.test/foo/-/foo-1.0.0.tgz".to_string(),
-        Arc::new(tokio::sync::RwLock::new(CacheValue::Available(Arc::new(seeded)))),
+        package_mem_cache_key(
+            "https://registry.test/foo/-/foo-1.0.0.tgz",
+            Some(&DUMMY_SHA512.parse().expect("parse integrity")),
+            false,
+        ),
+        Arc::new(tokio::sync::RwLock::new(CacheValue::Available(CachedTarball::from_files(
+            seeded,
+        )))),
     );
 
     let layout = crate::VirtualStoreLayout::legacy(store_tmp.path().join("vstore"), 120);
@@ -148,6 +168,14 @@ async fn without_mem_cache_skips_coordination_and_downloads() {
             custom_fetcher_session: None,
         },
         ctx: &crate::InstallContext {
+            caches: crate::InstallCaches {
+                logged_methods: &logged_methods,
+                swap_lock: None,
+                git_source_cache: &pnpm_git_fetcher::GitSourceCache::default(),
+                materialized_graph: std::sync::Arc::default(),
+                dir_clone_cache: None,
+            },
+
             linker: crate::ModuleLinkerContext {
                 layout: &layout,
                 kind: pnpm_config::NodeLinker::Hoisted,
@@ -158,14 +186,11 @@ async fn without_mem_cache_skips_coordination_and_downloads() {
             requester: "/project",
 
             allow_build_policy: &allow_build_policy,
-
-            logged_methods: &logged_methods,
-            git_source_cache: &pnpm_git_fetcher::GitSourceCache::default(),
         },
 
         skipped: &skipped,
         include_optional_dependencies: true,
-        runtime_platform_selector: &host_platform_selector(),
+        variant_platforms: &crate::platform_selection::VariantPlatforms::host(),
 
         defer_link: false,
         link_concurrency_probe: None,

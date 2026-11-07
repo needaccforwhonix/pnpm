@@ -10,6 +10,8 @@
 //! parser for manifests written by old pnpm versions.
 
 pub use capabilities::{Clock, FsCreateDirAll, FsReadToString, FsWrite, Host};
+pub use hoisted_dir::hoisted_dir;
+
 use derive_more::{Display, Error, From, Into};
 use indexmap::{IndexMap, IndexSet};
 use pipe_trait::Pipe;
@@ -32,6 +34,7 @@ pub const MODULES_FILENAME: &str = ".modules.yaml";
 pub const DEFAULT_VIRTUAL_STORE_DIR_MAX_LENGTH: u64 = 120;
 
 mod capabilities;
+mod hoisted_dir;
 
 /// Newtype wrapper around a dependency-path string.
 ///
@@ -150,11 +153,6 @@ pub struct Modules {
     /// by rebuild (which throws `MISSING_HOISTED_LOCATIONS` when
     /// absent) and consulted by the hoisted dep-graph's skip-fetch
     /// optimization to decide whether the package is already on disk.
-    /// An optional `Record<string, string[]>` on the on-disk shape.
-    /// Pacquet's install pipeline does not populate this yet; the
-    /// field is wired into the schema so a future hoisted-linker
-    /// implementation can write it without changing the on-disk
-    /// shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hoisted_locations: Option<BTreeMap<String, Vec<String>>>,
 
@@ -169,6 +167,21 @@ pub struct Modules {
     /// matching pnpm's delete-when-falsy encoding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub virtual_store_only: Option<bool>,
+
+    /// The direct dependencies whose agent skills await approval, as
+    /// peer-free depPaths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_skills: Option<IndexSet<DepPath>>,
+
+    /// The agent skill entries pnpm linked, as `/`-separated paths
+    /// relative to the workspace root, or absolute when outside it. An
+    /// install prunes only these, so an entry pnpm did not write is never
+    /// removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked_skills: Option<Vec<String>>,
+    /// Whether approved skills await a target directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_unlinked_skills: Option<bool>,
 }
 
 /// A lightweight version of [`Modules`] that skips deserializing the potentially
@@ -222,6 +235,15 @@ pub struct ModulesLayout {
     /// check, which skips the hoist-pattern comparison when it is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub virtual_store_only: Option<bool>,
+    /// See [`Modules::pending_skills`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_skills: Option<IndexSet<DepPath>>,
+    /// See [`Modules::linked_skills`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked_skills: Option<Vec<String>>,
+    /// Whether approved skills await a target directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_unlinked_skills: Option<bool>,
 }
 
 /// Which dependency groups the install pipeline included.
@@ -236,6 +258,22 @@ pub struct IncludedDependencies {
     pub optional_dependencies: bool,
 }
 
+impl IncludedDependencies {
+    /// Whether at least one dependency group is left out.
+    #[must_use]
+    pub fn excludes_a_group(self) -> bool {
+        !(self.dependencies && self.dev_dependencies && self.optional_dependencies)
+    }
+
+    /// Whether a project's own `optionalDependencies` are included. They
+    /// install with its production dependencies, so `--dev` leaves them
+    /// out while it still installs the optional dependencies of packages.
+    #[must_use]
+    pub fn includes_project_optional_dependencies(self) -> bool {
+        self.dependencies && self.optional_dependencies
+    }
+}
+
 /// Linker variant the install pipeline used. The string variants match
 /// pnpm's runtime values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -244,6 +282,7 @@ pub enum NodeLinker {
     Hoisted,
     Isolated,
     Pnp,
+    Loaded,
 }
 
 /// Pinned identifier for the `node_modules` layout pacquet emits.
@@ -389,9 +428,6 @@ where
 /// `null` document.
 ///
 /// Production callers turbofish [`Host`]: `read_modules_manifest::<Host>(dir)`.
-/// The bounds list the minimal capabilities ([`FsReadToString`] +
-/// [`Clock`]) so test fakes only need to implement the methods that are
-/// actually called.
 pub fn read_modules_manifest<Sys>(modules_dir: &Path) -> Result<Option<Modules>, ReadModulesError>
 where
     Sys: FsReadToString + Clock,
@@ -481,15 +517,7 @@ fn normalize_modules_layout<Sys: Clock>(manifest: &mut ModulesLayout, modules_di
 /// Write `manifest` to `<modules_dir>/.modules.yaml`, creating `modules_dir`
 /// if it does not already exist.
 ///
-/// Takes `manifest` by value because the body unconditionally rewrites
-/// fields (sort `skipped`, drop legacy `hoistedAliases`, relativize
-/// `virtualStoreDir`); making the caller hand over ownership keeps the
-/// in-place mutation visible at the call site instead of forcing a hidden
-/// `clone()` inside the function. Per the `CODE_STYLE_GUIDE` rule that
-/// owned-vs-borrowed parameter choice should minimize copies.
-///
 /// Production callers turbofish [`Host`]: `write_modules_manifest::<Host>(dir, m)`.
-/// Bounds are minimal: only [`FsCreateDirAll`] and [`FsWrite`] are required.
 pub fn write_modules_manifest<Sys>(
     modules_dir: &Path,
     mut manifest: Modules,
@@ -529,7 +557,7 @@ fn resolve_virtual_store_dir(manifest: &mut Modules, modules_dir: &Path) {
         // relative path like `../../Users/.../store/v11/links` joined
         // with `<workspace>/node_modules` round-trips as
         // `<workspace>/node_modules/../../Users/...`, which never byte-
-        // matches the config's `effective_virtual_store_dir()` — and
+        // matches the config's `virtual_store_dir()` — and
         // [`crate::Install`]'s no-op short-circuit relies on that
         // equality to skip materialization on a clean install.
         (false, false) => lexical_normalize(&modules_dir.join(stored_path)),

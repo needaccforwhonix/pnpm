@@ -1,6 +1,9 @@
 //! `pnpm list` / `ls` / `ll` / `la` — list installed packages.
 
+pub(in crate::cli_args) mod recursive;
 pub(crate) mod render;
+
+mod linked_projects;
 
 use crate::cli_args::{
     deps_tree::{
@@ -14,15 +17,19 @@ use crate::cli_args::{
     },
     deps_tree_finders::{evaluate_finders, finder_candidates, resolve_finders},
     install::resolve_bool_override,
-    recursive::{AutoExcludeRoot, discover_workspace_projects, select_recursive_projects},
 };
 use clap::Args;
+use linked_projects::SharedLinkedProjects;
 use miette::IntoDiagnostic;
 use pnpm_config::Config;
 use pnpm_global::{ListReportAs, find_global_install_dirs, list_global_packages};
 use pnpm_modules_yaml::IncludedDependencies;
 use render::{ProjectHierarchy, RenderParseableOptions, RenderTreeOptions};
-use std::path::{Path, PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
+    sync::{Arc, OnceLock},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum RecursionLimit {
@@ -72,6 +79,10 @@ pub struct ListArgs {
     pub dependencies: TreeDependencyArgs,
     #[clap(flatten)]
     pub graph: ListGraphArgs,
+    /// Discovered once per command: a recursive listing with dedicated
+    /// lockfiles expands the linked projects of every selected project.
+    #[clap(skip)]
+    linked_project_dirs: OnceLock<Arc<HashMap<PathBuf, PathBuf>>>,
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -145,17 +156,27 @@ impl ListArgs {
                 )
             })?;
 
+        let tools = crate::cli_args::global::rust::global_tools(config);
+        let selects_tool =
+            !crate::cli_args::global::rust::selected_tools(&tools, &self.packages).is_empty();
+        let report_as = self.report_as();
         if (matches!(self.graph.depth, RecursionLimit::Levels(n) if n > 0)
             || self.graph.depth == RecursionLimit::Unlimited)
-            && let Some(output) = self.render_global_tree(config, &global_pkg_dir).await?
+            && let Some(output) =
+                self.render_global_tree(config, &global_pkg_dir, selects_tool).await?
         {
-            return Ok(output);
+            return Ok(crate::cli_args::global::rust::with_tools(
+                output,
+                &tools,
+                &self.packages,
+                global_report_as(report_as),
+            ));
         }
 
-        let report_as = self.report_as();
         list_global_packages(
             &global_pkg_dir,
             &self.packages,
+            tools,
             global_report_as(report_as),
             self.output.long,
         )
@@ -166,6 +187,7 @@ impl ListArgs {
         &self,
         config: &Config,
         global_pkg_dir: &Path,
+        selects_tool: bool,
     ) -> miette::Result<Option<String>> {
         let all_install_dirs = find_global_install_dirs(global_pkg_dir, &[]).into_diagnostic()?;
         if all_install_dirs.len() == 1 {
@@ -188,8 +210,10 @@ impl ListArgs {
         // install group.
         let matching_install_dirs =
             find_global_install_dirs(global_pkg_dir, &self.packages).into_diagnostic()?;
+        // Params that select only a tool, such as `rust`, are served by the
+        // flat listing.
         if matching_install_dirs.len() > 1
-            || (matching_install_dirs.is_empty() && !all_install_dirs.is_empty())
+            || (matching_install_dirs.is_empty() && !all_install_dirs.is_empty() && !selects_tool)
         {
             return Err(miette::miette!(
                 code = "ERR_PNPM_GLOBAL_LS_DEPTH_NOT_SUPPORTED",
@@ -209,49 +233,6 @@ impl ListArgs {
                 .map(Some);
         }
         Ok(None)
-    }
-
-    async fn run_recursive(&self, config: &Config, dir: &Path) -> miette::Result<String> {
-        let workspace_root = config.workspace_dir.clone().unwrap_or_else(|| dir.to_path_buf());
-        let (projects, _) = discover_workspace_projects(&workspace_root, config)?;
-        let selection =
-            select_recursive_projects(&projects, config, dir, AutoExcludeRoot::Disabled)?;
-        let project_dirs: Vec<PathBuf> = selection.selected
-            .keys()
-            .cloned()
-            .collect();
-
-        let always_print_root_package = self.graph.depth == RecursionLimit::ProjectsOnly;
-
-        if config.shares_one_lockfile() {
-            return self.render_projects(
-                config,
-                &project_dirs,
-                &self.packages,
-                config.lockfile_dir_for(&workspace_root),
-                always_print_root_package,
-            )
-            .await;
-        }
-
-        // Per-project lockfiles: each project renders independently
-        // (with its own legend and summary).
-        let mut outputs = Vec::new();
-        for project_dir in project_dirs {
-            let output = self.render_projects(
-                config,
-                std::slice::from_ref(&project_dir),
-                &self.packages,
-                &project_dir,
-                always_print_root_package,
-            )
-            .await?;
-            if !output.is_empty() {
-                outputs.push(output);
-            }
-        }
-        let joiner = if self.graph.depth == RecursionLimit::ProjectsOnly { "\n" } else { "\n\n" };
-        Ok(outputs.join(joiner))
     }
 
     fn report_as(&self) -> ReportAs {
@@ -285,24 +266,32 @@ impl ListArgs {
         lockfile_dir: &Path,
         always_print_root_package: bool,
     ) -> miette::Result<String> {
+        let projects =
+            self.load_project_hierarchies(config, project_dirs, params, lockfile_dir).await?;
+        self.render_project_hierarchies(&projects, always_print_root_package)
+    }
+
+    async fn load_project_hierarchies(
+        &self,
+        config: &Config,
+        project_dirs: &[PathBuf],
+        params: &[String],
+        lockfile_dir: &Path,
+    ) -> miette::Result<Vec<ProjectHierarchy>> {
         let state = LoadedState::load(
             lockfile_dir,
             Some(config.modules_dir.as_path()),
             self.graph.lockfile_only,
         )?;
-        let env = state.env(
-            lockfile_dir,
-            config.virtual_store_dir_max_length as usize,
-            &config.resolved_registries(),
-            config.registry_options_by_url.clone(),
-        );
+        let env = state.env_for_config(lockfile_dir, config);
 
         let hierarchies = match env
             .as_ref()
             .filter(|_| self.graph.depth != RecursionLimit::ProjectsOnly)
         {
             Some(env) => {
-                self.build_hierarchies(config, &state, env, project_dirs, lockfile_dir, params)
+                let request = TreeRequest::new(params, self.graph.depth.max_depth());
+                self.build_hierarchies(config, &state, env, project_dirs, lockfile_dir, &request)
                     .await?
             }
             // Without a materialized `node_modules` there is no tree to
@@ -329,7 +318,7 @@ impl ListArgs {
             })
             .collect();
 
-        self.render_project_hierarchies(&projects, always_print_root_package)
+        Ok(projects)
     }
     fn render_project_hierarchies(
         &self,
@@ -364,8 +353,9 @@ impl ListArgs {
         env: &pnpm_deps_inspection::pkg_info::PkgInfoEnv<'_>,
         project_dirs: &[PathBuf],
         lockfile_dir: &Path,
-        params: &[String],
+        request: &TreeRequest<'_>,
     ) -> miette::Result<Vec<(PathBuf, DependenciesHierarchy)>> {
+        let params = request.params;
         let include = self.include(config.optional);
         let root_ids = importer_root_ids(env.current_lockfile, lockfile_dir, project_dirs);
         let graph = build_dependency_graph(
@@ -374,17 +364,18 @@ impl ListArgs {
                 lockfile: env.current_lockfile,
                 include,
                 only_projects: self.graph.only_projects,
+                peer_edges: config.peer_edge_options(),
             },
         );
         let searcher = self.build_searcher(config, env, &graph, lockfile_dir, params).await?;
-        build_dependencies_tree(
+        let mut hierarchies = build_dependencies_tree(
             state,
             env,
             &graph,
             project_dirs,
             &BuildTreeOptions {
                 lockfile_dir,
-                depth: self.graph.depth.max_depth(),
+                depth: request.depth,
                 include,
                 exclude_peer_dependencies: self.exclude_peers,
                 only_projects: self.graph.only_projects,
@@ -392,7 +383,12 @@ impl ListArgs {
                 show_deduped_search_matches: searcher.is_some(),
                 modules_dir_opt: Some(config.modules_dir.as_path()),
             },
-        )
+        )?;
+        if self.graph.only_projects {
+            self.expand_linked_projects(config, env, lockfile_dir, request, &mut hierarchies)
+                .await?;
+        }
+        Ok(hierarchies)
     }
 
     /// The searcher the tree walk filters through. `None` when the
@@ -416,6 +412,26 @@ impl ListArgs {
             searcher.set_finder_results(results);
         }
         Ok(Some(searcher))
+    }
+}
+
+struct TreeRequest<'a> {
+    params: &'a [String],
+    depth: MaxDepth,
+    /// Linked projects whose trees enclose this walk, to stop at cycles
+    /// between projects with dedicated lockfiles.
+    linked_project_ancestors: HashSet<PathBuf>,
+    linked_projects: Option<Arc<SharedLinkedProjects>>,
+}
+
+impl<'a> TreeRequest<'a> {
+    fn new(params: &'a [String], depth: MaxDepth) -> Self {
+        TreeRequest {
+            params,
+            depth,
+            linked_project_ancestors: HashSet::new(),
+            linked_projects: None,
+        }
     }
 }
 
@@ -446,9 +462,9 @@ pub(crate) fn print_output(output: &str) {
         return;
     }
     if output.ends_with('\n') {
-        print!("{output}");
+        pnpm_diagnostics::print!("{output}");
     } else {
-        println!("{output}");
+        pnpm_diagnostics::println!("{output}");
     }
 }
 

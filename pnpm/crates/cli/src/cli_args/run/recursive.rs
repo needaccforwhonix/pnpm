@@ -9,27 +9,33 @@
 //! order under `workspaceConcurrency`, with no barrier between
 //! dependency-independent tasks. `--no-sort` drops the ordering entirely,
 //! `--reverse` runs the reverse graph, and `--parallel` starts every task
-//! concurrently. The main-dispatch auto-exclusion of the workspace root is
-//! applied via [`AutoExcludeRoot::Enabled`].
+//! concurrently. A task whose selector matched several scripts runs them
+//! side by side rather than one after another, and every script of the
+//! run draws on one [`ScriptBudget`], so `workspaceConcurrency` bounds
+//! the processes a run without `--parallel` has running, not the tasks
+//! it dispatched. The main-dispatch auto-exclusion of the workspace root
+//! is applied via [`AutoExcludeRoot::Enabled`].
 
 use super::{
     RunArgs, RunContext, ScriptSelector, get_run_script_commands, render_project_commands,
-    run_stages, throw_or_filter_hidden_scripts,
+    run_stages, script_concurrency, throw_or_filter_hidden_scripts,
 };
 use crate::cli_args::{
     recursive::{
         AutoExcludeRoot, ExecutionStatus, Status, count_failures, discover_workspace_projects,
-        filtered_projects_dependencies, find_resume_root, select_recursive_projects,
-        write_recursive_summary,
+        filtered_projects_dependencies, find_resume_root, print_no_projects_matched,
+        projects_to_verify, select_recursive_projects, write_recursive_summary,
     },
+    reporter::{ReporterType, reporter_emit, suppresses_info_output},
     task_run_state::{TaskRunExecutionSettings, TaskRunStateContext, task_run_execution_settings},
+    verify_deps::verify_deps_before_recursive_run,
 };
 use derive_more::{Display, Error};
 use execution::{RunOutcome, RunSlots, TaskRunner};
 use indexmap::IndexMap;
 use miette::{Diagnostic, IntoDiagnostic};
-use pnpm_config::Config;
-use pnpm_executor::{ProcessTracker, ScriptOutput};
+use pnpm_config::{Config, TaskSettings};
+use pnpm_executor::{ProcessTracker, ScriptExit, ScriptOutput, exit_like};
 use pnpm_package_manager::{
     make_node_package_map_option, make_node_require_option, package_map_path_for_execution,
     pnp_path_for_execution,
@@ -43,18 +49,19 @@ use pnpm_workspace_task_scheduler::{
     resume_task_graph_from, reverse_task_graph, schedule_tasks, sequence_tasks, task_graph_to_json,
     task_summary_key,
 };
+use script_budget::{ScriptBudget, ScriptPermit, run_script_budget};
 use selection::{
-    RunReporting, build_run_task_graph, check_a_project_has_the_script,
-    filter_hidden_requested_scripts, print_run_dry_run, print_selected_project_commands,
-    report_run_outcome, resume_task_graph, run_concurrency, run_process_tracker,
-    run_state_settings,
+    HiddenScriptCheck, RunReporting, a_project_has_the_script, build_run_task_graph,
+    check_a_project_has_the_script, check_required_script, filter_hidden_requested_scripts,
+    print_run_dry_run, print_selected_project_commands, report_run_outcome, resume_task_graph,
+    run_concurrency, run_process_tracker, run_state_settings, run_tasks,
 };
 use std::{
     collections::{HashMap, HashSet},
     env,
     path::{Path, PathBuf},
     sync::{
-        Mutex,
+        Condvar, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::Instant,
@@ -80,6 +87,15 @@ pub enum RecursiveRunError {
         script_name: String,
     },
 
+    #[display("Missing script \"{script_name}\" in packages: {packages}")]
+    #[diagnostic(code(ERR_PNPM_RECURSIVE_RUN_NO_SCRIPT))]
+    MissingRequiredScript {
+        #[error(not(source))]
+        script_name: String,
+        /// The comma-separated names of the projects that lack it.
+        packages: String,
+    },
+
     #[display("\"pnpm recursive run\" failed in {count} packages")]
     #[diagnostic(code(ERR_PNPM_RECURSIVE_FAIL))]
     RecursiveFail {
@@ -99,6 +115,14 @@ pub enum RecursiveRunError {
     ScriptNameRequired,
 }
 
+pub enum RecursiveRunOutcome {
+    Done,
+    /// No selected project has a script the name matches, and the caller
+    /// asked to fall back to `exec` instead of failing. Returned before
+    /// anything is dispatched.
+    NoMatchingScript,
+}
+
 /// Run `args.command` across the `--filter`-selected workspace projects,
 /// in task-graph dependency order. `dir` is the canonicalized working
 /// directory; the workspace root (and the directory the summary is written
@@ -108,9 +132,9 @@ pub fn run_recursive(
     args: &RunArgs,
     config: &Config,
     dir: &Path,
-    emit: fn(&LogEvent),
-    silent: bool,
-) -> miette::Result<()> {
+    reporter: ReporterType,
+    fallback_to_exec: bool,
+) -> miette::Result<RecursiveRunOutcome> {
     let workspace_root = config.workspace_dir.as_deref().unwrap_or(dir);
 
     let (projects, patterns) = discover_workspace_projects(workspace_root, config)?;
@@ -122,13 +146,19 @@ pub fn run_recursive(
     )?;
     let graph = &selection.selected;
     let Some(script_name) = args.script_name() else {
-        return print_selected_project_commands(graph, &projects, workspace_root);
+        print_selected_project_commands(graph, &projects, workspace_root)?;
+        return Ok(RecursiveRunOutcome::Done);
     };
+    let emit = reporter_emit(reporter);
+    let silent = matches!(reporter, ReporterType::Ndjson) || suppresses_info_output(reporter);
     emit_selection_scope(emit, config, graph.len(), projects.len());
     // An empty `--filter` selection is a no-op (exit 0); an empty
     // workspace instead falls through to the no-script error below.
     if !projects.is_empty() && graph.is_empty() {
-        return Ok(());
+        if !args.json && !silent {
+            print_no_projects_matched(config, dir);
+        }
+        return Ok(RecursiveRunOutcome::Done);
     }
 
     let run = RecursiveRun {
@@ -136,6 +166,7 @@ pub fn run_recursive(
         config,
         dir,
         graph,
+        reporter,
         selection: &selection,
         workspace_root,
         script: RecursiveScript {
@@ -143,6 +174,7 @@ pub fn run_recursive(
             silent,
             script_name,
             all_packages_selected: graph.len() == projects.len(),
+            fallback_to_exec,
         },
     };
     run.run_and_report()
@@ -168,6 +200,7 @@ struct RecursiveRun<'a, 'project> {
     config: &'a Config,
     dir: &'a Path,
     graph: &'a ProjectGraph<GraphPkg<'project>>,
+    reporter: ReporterType,
     selection: &'a crate::cli_args::recursive::RecursiveSelection<'project>,
     workspace_root: &'a Path,
     script: RecursiveScript<'a>,
@@ -178,6 +211,15 @@ pub(crate) struct RecursiveScript<'a> {
     silent: bool,
     script_name: &'a str,
     all_packages_selected: bool,
+    /// Whether a name no selected project has a script for is handed to
+    /// `exec`, as the `pnpm <command>` shorthand does.
+    fallback_to_exec: bool,
+}
+
+enum Prepared {
+    Run(Box<PreparedRun>),
+    DryRun,
+    NoMatchingScript,
 }
 
 /// The task graph ready to schedule, with the run-state journal started.
@@ -194,14 +236,39 @@ struct RunResults {
     ran_a_command: bool,
     /// The first failed project's prefix, when `--bail` stopped the run.
     first_failure: Option<String>,
+    /// How the first script the user's interrupt ended exited.
+    interrupted: Option<ScriptExit>,
 }
 
 impl RecursiveRun<'_, '_> {
-    fn run_and_report(&self) -> miette::Result<()> {
-        let Some(prepared) = self.prepare()? else {
-            return Ok(());
+    fn run_and_report(&self) -> miette::Result<RecursiveRunOutcome> {
+        let prepared = match self.prepare()? {
+            Prepared::Run(prepared) => *prepared,
+            Prepared::DryRun => return Ok(RecursiveRunOutcome::Done),
+            Prepared::NoMatchingScript => return Ok(RecursiveRunOutcome::NoMatchingScript),
         };
+        let verify_dirs = projects_to_verify(
+            prepared.task_graph
+                .values()
+                .filter(|node| !node.scripts.is_empty())
+                .map(|node| node.project.as_path()),
+            self.selection,
+            self.config,
+            self.dir,
+        )?;
+        verify_deps_before_recursive_run(
+            self.workspace_root,
+            verify_dirs,
+            self.config,
+            self.reporter,
+        )?;
         let results = self.execute(&prepared)?;
+        // The user ended the run, so pnpm ends the way the interrupted
+        // script did rather than reporting the scripts as failed
+        // (pnpm/pnpm#16964).
+        if let Some(exit) = results.interrupted {
+            exit_like(exit);
+        }
         report_run_outcome(
             &RunReporting {
                 args: self.args,
@@ -213,14 +280,18 @@ impl RecursiveRun<'_, '_> {
             },
             &results.statuses,
             results.first_failure,
-        )
+        )?;
+        Ok(RecursiveRunOutcome::Done)
     }
 
     /// Build, resume and sequence the task graph, then start the run-state
-    /// journal. `None` once a dry run has printed the graph instead.
-    fn prepare(&self) -> miette::Result<Option<PreparedRun>> {
+    /// journal.
+    fn prepare(&self) -> miette::Result<Prepared> {
         // Compiled once for the whole run, not per project or task.
         let full_task_graph = self.task_graph()?;
+        if self.falls_back_to_exec(&full_task_graph) {
+            return Ok(Prepared::NoMatchingScript);
+        }
         let extra_env: HashMap<String, String> = self.config.extra_env_with_node_options();
         let state_settings = run_state_settings(self.config, &extra_env);
         let task_run_state_context = TaskRunStateContext::new(
@@ -230,7 +301,8 @@ impl RecursiveRun<'_, '_> {
             &full_task_graph,
             self.workspace_root,
             |node, script| self.script_commands(node, script),
-        );
+        )
+        .with_modules_dir(&self.config.modules_dir);
         let mut task_graph = resume_task_graph(
             &task_run_state_context,
             self.args,
@@ -238,38 +310,75 @@ impl RecursiveRun<'_, '_> {
             &full_task_graph,
             self.script.script_name,
         )?;
-        // Also the cycle check: a cyclic graph cannot be scheduled, and
-        // sequenced into an arbitrary order it would succeed or fail by luck.
-        let sequenced_tasks = sequence_tasks(
-            &mut task_graph,
-            &SequenceTasksOptions {
-                workspace_dir: self.workspace_root,
-                ignore_cycles: self.config.ignore_workspace_cycles,
-                emit: self.script.emit,
-            },
-        )?;
+        let sequenced_tasks = self.sequence(&mut task_graph)?;
 
         if self.args.dry_run {
             print_run_dry_run(self.args, &task_graph, &sequenced_tasks, self.workspace_root)?;
-            return Ok(None);
+            return Ok(Prepared::DryRun);
         }
 
-        self.validate_requested_scripts(&mut task_graph)?;
+        self.validate_requested_scripts(&mut task_graph, &full_task_graph)?;
 
         let task_run_state = task_run_state_context.start(&initially_completed_tasks(
             &full_task_graph,
             &task_graph,
         ))?;
-        Ok(Some(PreparedRun { task_graph, sequenced_tasks, extra_env, task_run_state }))
+        Ok(Prepared::Run(Box::new(PreparedRun {
+            task_graph,
+            sequenced_tasks,
+            extra_env,
+            task_run_state,
+        })))
     }
 
-    fn validate_requested_scripts(&self, task_graph: &mut TaskGraph) -> miette::Result<()> {
+    /// Also the cycle check: a cyclic graph cannot be scheduled, and
+    /// sequenced into an arbitrary order it would succeed or fail by luck.
+    fn sequence(&self, task_graph: &mut TaskGraph) -> miette::Result<Vec<TaskKey>> {
+        Ok(sequence_tasks(
+            task_graph,
+            &SequenceTasksOptions {
+                workspace_dir: self.workspace_root,
+                ignore_cycles: self.config.ignore_workspace_cycles,
+                emit: self.script.emit,
+            },
+        )?)
+    }
+
+    /// Decided on the graph as built, before the run-only resume and
+    /// sequencing, which do not apply to `exec`.
+    fn falls_back_to_exec(&self, task_graph: &TaskGraph) -> bool {
+        self.script.fallback_to_exec
+            && !self.args.if_present
+            && !self.args.dry_run
+            && !a_project_has_the_script(task_graph)
+    }
+
+    fn validate_requested_scripts(
+        &self,
+        task_graph: &mut TaskGraph,
+        full_task_graph: &TaskGraph,
+    ) -> miette::Result<()> {
+        check_required_script(
+            task_graph,
+            self.graph,
+            self.script.script_name,
+            &self.config.required_scripts,
+        )?;
+
         // Hidden scripts (names starting with `.`) can only be invoked from
         // within another script, detected by an inherited
         // `npm_lifecycle_event`. Checked only for the tasks the invocation
         // named: a `dependsOn` declaration naming a hidden script is a
         // deliberate reference, like a call from another script.
-        filter_hidden_requested_scripts(task_graph, self.script.script_name)?;
+        filter_hidden_requested_scripts(
+            task_graph,
+            &HiddenScriptCheck {
+                script_name: self.script.script_name,
+                full_task_graph,
+                reversed: self.args.workspace.reverse,
+                tasks: run_tasks(self.args, self.config),
+            },
+        )?;
 
         check_a_project_has_the_script(
             task_graph,
@@ -310,8 +419,9 @@ impl RecursiveRun<'_, '_> {
         let concurrency = run_concurrency(self.args, self.config, prepared.task_graph.len());
         let runs_concurrently = concurrency > 1
             && !is_serial_task_graph(&prepared.task_graph, &prepared.sequenced_tasks);
-        let slots = RunSlots::queued(&prepared.task_graph);
+        let slots = RunSlots::queued(&prepared.task_graph, self.script.script_name);
         let process_tracker = run_process_tracker(bail, runs_concurrently);
+        let script_budget = run_script_budget(self.args, self.config, &prepared.task_graph);
         let init_cwd = env::current_dir().unwrap_or_else(|_| self.dir.to_path_buf());
         let runner = TaskRunner {
             run: self,
@@ -319,6 +429,7 @@ impl RecursiveRun<'_, '_> {
                 result: &slots.result,
                 has_command: &slots.has_command,
                 first_failure: &slots.first_failure,
+                interrupted: &slots.interrupted,
                 abort: &slots.abort,
                 process_tracker: process_tracker.as_ref(),
                 task_run_state: &prepared.task_run_state,
@@ -326,14 +437,12 @@ impl RecursiveRun<'_, '_> {
             },
             extra_env: &prepared.extra_env,
             bail,
+            script_budget: &script_budget,
             inherit_output: !self.config.stream && !runs_concurrently,
             init_cwd: &init_cwd,
         };
         let run_task = |node: &TaskNode| runner.run_task(node);
-        let on_task_skipped = |node: &TaskNode| {
-            slots.result.lock().expect("summary lock is not poisoned")[&task_summary_key(node)]
-                .status = Status::Skipped;
-        };
+        let on_task_skipped = |node: &TaskNode| slots.mark_skipped(node, self.script.script_name);
         schedule_tasks(
             &prepared.task_graph,
             &ScheduleTasksOptions {
@@ -361,5 +470,7 @@ fn initially_completed_tasks(
 }
 
 mod execution;
+
+mod script_budget;
 
 mod selection;

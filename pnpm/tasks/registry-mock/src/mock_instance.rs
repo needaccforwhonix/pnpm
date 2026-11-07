@@ -11,6 +11,9 @@ use std::{
 };
 use tokio::time::{Duration, sleep};
 
+#[cfg(test)]
+mod tests;
+
 /// Handler of a mocked registry server instance.
 ///
 /// The internal `pnpr` process is terminated on [drop](Drop).
@@ -73,7 +76,10 @@ impl MockInstanceOptions<'_> {
         }
     }
 
-    pub(crate) async fn spawn(self) -> MockInstance {
+    pub(crate) async fn spawn_recording_pid(
+        self,
+        pid_tx: Option<tokio::sync::oneshot::Sender<u32>>,
+    ) -> MockInstance {
         let MockInstanceOptions {
             port, public_url, stdout, stderr, ..
         } = self;
@@ -84,21 +90,26 @@ impl MockInstanceOptions<'_> {
         let stderr = stderr.map_or_else(Stdio::null, |stderr| {
             File::create(stderr).expect("create file for stderr").into()
         });
-        // Storage is built from the in-repo fixtures (see
-        // `registry_mock_storage`) and seeded into runtime storage by
-        // `pnpr_command`. pnpr runs in proxy mode
-        // against npmjs.org so off-fixture packages fall through to
-        // npm; see `pnpr_command` for the rationale.
         let process = pnpr_command(port, public_url)
             .stdin(Stdio::null())
             .stdout(stdout)
             .stderr(stderr)
             .spawn()
             .expect("spawn pnpr");
+        if let Some(tx) = pid_tx {
+            let _ = tx.send(process.id());
+        }
+        // Owning the child before the readiness wait is what lets a panicking
+        // or cancelled startup still run the kill-and-wait destructor.
+        let instance = MockInstance { process };
 
         self.wait_for_registry().await;
 
-        MockInstance { process }
+        instance
+    }
+
+    pub(crate) async fn spawn(self) -> MockInstance {
+        self.spawn_recording_pid(None).await
     }
 
     pub async fn spawn_if_necessary(self) -> Option<MockInstance> {
@@ -114,9 +125,6 @@ impl MockInstanceOptions<'_> {
 }
 
 /// Manage a single mocked registry server instance that is shared between multiple different tests.
-///
-/// This instance can either be automatically be spawned by the first test and tracked by a reference counter
-/// or be prepared by the CLI command.
 #[derive(Debug)]
 #[must_use]
 pub enum AutoMockInstance {
@@ -153,6 +161,7 @@ impl AutoMockInstance {
         }
     }
 
+    /// The npm registry URL, with a trailing `/`.
     #[must_use]
     pub fn url(&self) -> String {
         self.info().url()

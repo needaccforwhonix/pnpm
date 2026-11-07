@@ -1,8 +1,11 @@
 use super::{
-    Arc, AuditSettings, BTreeMap, BUILTIN_REGISTRIES_BY_PREFIX, Config, DEFAULT_JSR_REGISTRY,
-    NeedsFullMetadataFor, RegistryDeclaration, RegistryLookups, ResolutionMode, UpdateSettings,
-    full_metadata_policy, registries,
+    Arc, AuditSettings, BTreeMap, BUILTIN_REGISTRIES_BY_PREFIX, Config, DEFAULT_CARGO_INDEX_URL,
+    DEFAULT_JSR_REGISTRY, DEFAULT_PYPI_INDEX_URL, Ecosystem, IndexMap, NeedsFullMetadataFor,
+    RegistryDeclaration, RegistryLookups, ResolutionMode, UpdateSettings, full_metadata_policy,
+    registries,
 };
+use pnpm_lockfile::{DeclaredRegistryPrefixes, RegistryContext};
+use std::collections::HashMap;
 
 impl Config {
     /// The resolved retry policy for metadata and artifact requests.
@@ -25,6 +28,9 @@ impl Config {
             fetch_warn_timeout: std::time::Duration::from_millis(self.fetch_warn_timeout_ms),
             fetch_min_speed_ki_bps: self.fetch_min_speed_ki_bps,
             user_agent: self.user_agent.clone(),
+            network_concurrency_by_registry: self
+                .network_concurrency_by_registry
+                .clone(),
         }
     }
 
@@ -34,7 +40,7 @@ impl Config {
     /// The default registry is not among them: it travels as the request's
     /// own `registry` field.
     #[must_use]
-    pub fn registry_declarations(&self) -> BTreeMap<String, RegistryDeclaration> {
+    pub fn registry_declarations(&self) -> IndexMap<String, RegistryDeclaration> {
         registries::to_declarations(&self.registry_lookups(None))
     }
 
@@ -46,8 +52,52 @@ impl Config {
     /// the `@jsr` scope and the [`BUILTIN_REGISTRIES_BY_PREFIX`] prefixes —
     /// are declared too, unless the user pointed them elsewhere.
     #[must_use]
-    pub fn resolved_registry_declarations(&self) -> BTreeMap<String, RegistryDeclaration> {
+    pub fn resolved_registry_declarations(&self) -> IndexMap<String, RegistryDeclaration> {
         registries::to_resolved_declarations(&self.resolved_registry_lookups())
+    }
+
+    /// Python registries and their exclusive package routes, sorted by URL.
+    /// No declarations selects `PyPI`. Declared restricted registries do not
+    /// implicitly enable a public default.
+    #[must_use]
+    pub fn python_registry_indexes(&self) -> Vec<crate::EcosystemIndex> {
+        let mut indexes = self.indexes_by_ecosystem
+            .get(&Ecosystem::Pypi)
+            .filter(|indexes| !indexes.is_empty())
+            .cloned()
+            .unwrap_or_else(|| vec![DEFAULT_PYPI_INDEX_URL.to_string().into()]);
+        indexes.sort_by(|a, b| a.url.cmp(&b.url));
+        indexes
+    }
+
+    /// All Python index URLs, in canonical order independent of declarations.
+    #[must_use]
+    pub fn python_indexes(&self) -> Vec<&str> {
+        let Some(indexes) = self.indexes_by_ecosystem
+            .get(&Ecosystem::Pypi)
+            .filter(|indexes| !indexes.is_empty())
+        else {
+            return vec![DEFAULT_PYPI_INDEX_URL];
+        };
+        let mut urls: Vec<_> = indexes
+            .iter()
+            .map(|index| index.url.as_str())
+            .collect();
+        urls.sort_unstable();
+        urls
+    }
+
+    /// The sparse index to resolve Cargo dependencies from.
+    ///
+    /// The one `registries` entry that names `ecosystem: cargo`, or
+    /// [`DEFAULT_CARGO_INDEX_URL`] when none does. `registries` may name only
+    /// one, which is why this answers with an index rather than a list.
+    #[must_use]
+    pub fn cargo_index_url(&self) -> &str {
+        self.indexes_by_ecosystem
+            .get(&Ecosystem::Cargo)
+            .and_then(|indexes| indexes.first())
+            .map_or(DEFAULT_CARGO_INDEX_URL, |index| index.url.as_str())
     }
 
     /// The scope and prefix routes the CLI resolves a package's registry
@@ -74,6 +124,10 @@ impl Config {
             default_registry,
             registries_by_prefix: self.registries_by_prefix.clone(),
             registry_options_by_url: self.registry_options_by_url.clone(),
+            indexes_by_ecosystem: self.indexes_by_ecosystem.clone(),
+            network_concurrency_by_registry: self
+                .network_concurrency_by_registry
+                .clone(),
         }
     }
 
@@ -186,25 +240,24 @@ impl Config {
     /// abbreviated metadata to full on demand for the maturity check (see
     /// `maybe_upgrade_abbreviated_meta_for_release_age`), so it doesn't
     /// need the full packument requested up front.
-    ///
-    /// The install resolver (`PickPolicy`), `pacquet add`'s pre-resolution,
-    /// and the `self-update` / `pnpm with` engine probe all derive their
-    /// metadata mode from here so none of them can drift.
     #[must_use]
     pub fn requires_full_metadata_for_resolution(&self) -> bool {
-        self.full_metadata_policy(self.registry_supports_time_field)
+        self.requires_full_metadata_for_registry(&self.registry)
     }
 
     /// The same policy, asked of one registry: a registry that declares
-    /// `supportsTimeField` answers for itself, so a time-based resolution
-    /// reads abbreviated metadata from the registries that carry `time` and
-    /// full metadata only from the ones that do not.
+    /// `supportsTimeField` or `serverType: pnpr` answers for itself, so a
+    /// time-based or trust-checked resolution reads abbreviated metadata from
+    /// the registries that carry the required fields and full metadata only
+    /// from the ones that do not.
     ///
     /// A registry with no declaration answers exactly what
     /// [`Self::requires_full_metadata_for_resolution`] does.
     #[must_use]
     pub fn requires_full_metadata_for_registry(&self, registry: &str) -> bool {
-        self.full_metadata_policy(self.registry_supports_time_field(registry))
+        let server_type =
+            pnpm_lockfile::registry_server_type(&self.registry_options_by_url, registry);
+        self.full_metadata_policy(self.registry_supports_time_field(registry), false, server_type)
     }
 
     /// Whether a full packument, once fetched, is stored and read in pnpm's
@@ -220,7 +273,7 @@ impl Config {
     /// nothing.
     #[must_use]
     pub fn requires_filtered_full_metadata(&self) -> bool {
-        self.full_metadata_policy(false)
+        self.full_metadata_policy(false, false, None)
     }
 
     /// Whether `registry`'s abbreviated metadata carries the `time` field,
@@ -232,36 +285,93 @@ impl Config {
             .unwrap_or(self.registry_supports_time_field)
     }
 
-    pub(super) fn full_metadata_policy(&self, supports_time_field: bool) -> bool {
+    pub(super) fn full_metadata_policy(
+        &self,
+        supports_time_field: bool,
+        optional: bool,
+        server_type: Option<pnpm_lockfile::RegistryServerType>,
+    ) -> bool {
         full_metadata_policy(
             self.trust_policy,
             self.resolution_mode == ResolutionMode::TimeBased,
             supports_time_field,
+            optional,
+            server_type,
         )
     }
 
     /// [`Self::requires_full_metadata_for_registry`] as a closure the resolver
-    /// can hold, capturing the four facts it needs rather than the config.
+    /// can hold, capturing the facts it needs rather than the config.
     #[must_use]
     pub fn requires_full_metadata_for_registry_fn(&self) -> NeedsFullMetadataFor {
         let registry_options_by_url = self.registry_options_by_url.clone();
         let default_supports_time_field = self.registry_supports_time_field;
         let trust_policy = self.trust_policy;
         let time_based = self.resolution_mode == ResolutionMode::TimeBased;
-        Arc::new(move |registry: &str| {
+        Arc::new(move |registry: &str, optional: bool| {
             let supports_time_field =
                 pnpm_lockfile::registry_supports_time_field(&registry_options_by_url, registry)
                     .unwrap_or(default_supports_time_field);
-            full_metadata_policy(trust_policy, time_based, supports_time_field)
+            let server_type =
+                pnpm_lockfile::registry_server_type(&registry_options_by_url, registry);
+            full_metadata_policy(
+                trust_policy,
+                time_based,
+                supports_time_field,
+                optional,
+                server_type,
+            )
         })
+    }
+
+    /// Every prefix a `<prefix>:` specifier may name: the declared ones over
+    /// the [`BUILTIN_REGISTRIES_BY_PREFIX`] aliases, unvalidated. The resolver
+    /// chain validates the declared URLs when it is built.
+    #[must_use]
+    pub fn merged_registries_by_prefix(&self) -> HashMap<String, String> {
+        BUILTIN_REGISTRIES_BY_PREFIX
+            .iter()
+            .map(|(prefix, registry)| ((*prefix).to_string(), (*registry).to_string()))
+            .chain(
+                self.registries_by_prefix
+                    .iter()
+                    .map(|(prefix, registry)| (prefix.clone(), registry.clone())),
+            )
+            .collect()
+    }
+
+    /// The prefixes the project declares, which qualify the lockfile keys of
+    /// the packages resolved from their registries. See
+    /// [`DeclaredRegistryPrefixes`].
+    #[must_use]
+    pub fn declared_registry_prefixes(&self) -> DeclaredRegistryPrefixes {
+        DeclaredRegistryPrefixes::new(&self.registries_by_prefix, &self.registry)
+    }
+
+    /// How a package's registry is decided and what it serves, for the
+    /// layers that read and write lockfile keys. Plain keys read as resolved
+    /// through the current routes; a layer that knows the routes the
+    /// lockfile was resolved under adds them with
+    /// [`RegistryContext::with_locked_registries`].
+    #[must_use]
+    pub fn registry_context(&self) -> RegistryContext {
+        RegistryContext {
+            registries: self
+                .resolved_registries()
+                .into_iter()
+                .collect(),
+            registries_by_prefix: self.merged_registries_by_prefix(),
+            declared_prefixes: self.declared_registry_prefixes(),
+            registry_options_by_url: self.registry_options_by_url.clone(),
+            locked_registries: None,
+        }
     }
 
     /// Registry map in pnpm's `Registries` shape: `default` plus the
     /// configured scoped routes keyed by `@scope`.
     ///
     /// The built-in `@jsr` route is one of them, so every consumer that
-    /// routes a package by its scope — the resolver, the lockfile
-    /// verifier, `pnpm why`, `pnpm view` — reaches JSR packages at
+    /// routes a package by its scope reaches JSR packages at
     /// npm.jsr.io instead of asking the default registry for an
     /// `@jsr/*` packument it does not serve. A configured `@jsr:registry`
     /// wins over it.

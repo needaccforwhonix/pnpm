@@ -1,11 +1,11 @@
-use super::{build_zip, fast_retry_opts, gzipped_tar, tempdir_with_leaked_path};
+use super::{build_zip, fast_retry_opts, gzipped_tar, store_paths, tempdir_with_leaked_path};
 use crate::{ArchiveStoreProjection, IngestTarballToStore, IngestZipArchiveToStore, TarballError};
+use pnpm_fs::EnsureFileError;
 use pnpm_network::{AuthHeaders, RetryOpts, ThrottledClient};
 use pnpm_reporter::{LogEvent, Reporter, SilentReporter};
-use pnpm_store_dir::{StoreIndex, StoreIndexWriter};
+use pnpm_store_dir::{StoreIndex, StoreIndexWriter, WriteCasFileError};
 use ssri::Integrity;
 use std::{
-    collections::HashMap,
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -38,6 +38,8 @@ async fn archive_requests_preserve_the_deployments_redirect_guard() {
         0,
         0,
         false,
+        None,
+        crate::archive_request::ArchiveContentCoding::Negotiated,
     )
     .await;
     let error = result.err().expect("off-allowlist redirect must fail");
@@ -86,7 +88,15 @@ async fn archive_retry_redacts_secrets_and_accepts_the_maximum_retry_budget() {
         RetryOpts { retries: u32::MAX, ..fast_retry_opts() },
         |attempt| {
             crate::archive_request::request_archive::<RecordingReporter>(
-                &client, &url, "fixture", &auth, 0, attempt, false,
+                &client,
+                &url,
+                "fixture",
+                &auth,
+                0,
+                attempt,
+                false,
+                None,
+                crate::archive_request::ArchiveContentCoding::Negotiated,
             )
         },
     )
@@ -111,11 +121,69 @@ async fn archive_retry_redacts_secrets_and_accepts_the_maximum_retry_budget() {
 }
 
 #[tokio::test]
+async fn archive_store_write_out_of_space_fails_without_retry() {
+    let mut attempts = 0;
+    let result = crate::archive_retry::retry_archive::<SilentReporter, _, _>(
+        "https://example.test/pkg.tgz",
+        "fixture",
+        "test",
+        None,
+        fast_retry_opts(),
+        |_| {
+            attempts += 1;
+            async {
+                Err::<(), _>(TarballError::WriteCasFile(WriteCasFileError::WriteFile(
+                    EnsureFileError::WriteFile {
+                        file_path: PathBuf::from("store/file"),
+                        error: std::io::Error::from(std::io::ErrorKind::StorageFull),
+                    },
+                )))
+            }
+        },
+    )
+    .await;
+    assert!(matches!(result, Err(TarballError::WriteCasFile(_))));
+    assert_eq!(attempts, 1);
+}
+
+#[tokio::test]
+async fn archive_store_write_interrupted_retries() {
+    let mut attempts = 0;
+    let result = crate::archive_retry::retry_archive::<SilentReporter, _, _>(
+        "https://example.test/pkg.tgz",
+        "fixture",
+        "test",
+        None,
+        fast_retry_opts(),
+        |_| {
+            attempts += 1;
+            let attempt = attempts;
+            async move {
+                if attempt == 1 {
+                    Err(TarballError::WriteCasFile(WriteCasFileError::WriteFile(
+                        EnsureFileError::WriteFile {
+                            file_path: PathBuf::from("store/file"),
+                            error: std::io::Error::from(std::io::ErrorKind::Interrupted),
+                        },
+                    )))
+                } else {
+                    Ok(())
+                }
+            }
+        },
+    )
+    .await;
+    assert!(result.is_ok(), "interrupted store write should be retried: {result:?}");
+    assert_eq!(attempts, 2);
+}
+
+#[tokio::test]
 async fn archive_network_errors_remove_urls_from_the_source_chain() {
     let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = socket.local_addr().unwrap();
+    let port = socket.local_addr().unwrap().port();
     drop(socket);
-    let url = format!("http://user:password@{address}/artifact?token=secret#fragment");
+    // `0.0.0.0` fails the connect at once on Windows too, unlike a refused loopback port.
+    let url = format!("http://user:password@0.0.0.0:{port}/artifact?token=secret#fragment");
     let client = ThrottledClient::default();
     let result = crate::archive_request::request_archive::<SilentReporter>(
         &client,
@@ -125,6 +193,8 @@ async fn archive_network_errors_remove_urls_from_the_source_chain() {
         0,
         u32::MAX,
         false,
+        None,
+        crate::archive_request::ArchiveContentCoding::Negotiated,
     )
     .await;
     let error = result.err().expect("closed port must fail");
@@ -173,7 +243,7 @@ async fn archive_requests_do_not_downgrade_secure_credentials_to_plain_http() {
         "Basic secret".to_string(),
     );
     let url = format!("http://registry.example:{}/simple/pkg.whl", address.port());
-    let (_guard, response) = crate::archive_request::request_archive::<SilentReporter>(
+    let (_guard, response, _) = crate::archive_request::request_archive::<SilentReporter>(
         &client,
         &url,
         "python:alpha",
@@ -181,12 +251,71 @@ async fn archive_requests_do_not_downgrade_secure_credentials_to_plain_http() {
         0,
         0,
         false,
+        None,
+        crate::archive_request::ArchiveContentCoding::Negotiated,
     )
     .await
     .unwrap();
     eprintln!("response={response:?}");
     assert_eq!(response.bytes().await.unwrap(), "wheel");
     request.assert_async().await;
+}
+
+#[tokio::test]
+async fn archive_requests_accept_not_modified_only_when_sending_a_validator() {
+    let mut server = mockito::Server::new_async().await;
+    let not_modified = server
+        .mock("GET", "/pkg.tgz")
+        .with_status(304)
+        .expect(2)
+        .create_async()
+        .await;
+    let url = format!("{}/pkg.tgz", server.url());
+    let client = ThrottledClient::default();
+    let auth = AuthHeaders::default();
+    for (if_none_match, accepted) in [(Some(r#""v1""#), true), (Some(" "), false)] {
+        let result = crate::archive_request::request_archive::<SilentReporter>(
+            &client,
+            &url,
+            "fixture",
+            &auth,
+            0,
+            0,
+            false,
+            if_none_match,
+            crate::archive_request::ArchiveContentCoding::Negotiated,
+        )
+        .await;
+        assert_eq!(result.is_ok(), accepted, "{if_none_match:?}");
+    }
+    not_modified.assert_async().await;
+}
+
+#[tokio::test]
+async fn archive_response_meta_joins_repeated_cache_control_fields() {
+    let mut server = mockito::Server::new_async().await;
+    let _mock = server
+        .mock("GET", "/pkg.tgz")
+        .with_header("cache-control", "max-age=3600")
+        .with_header("cache-control", "no-store")
+        .with_body("archive")
+        .create_async()
+        .await;
+    let url = format!("{}/pkg.tgz", server.url());
+    let (_guard, _response, meta) = crate::archive_request::request_archive::<SilentReporter>(
+        &ThrottledClient::default(),
+        &url,
+        "fixture",
+        &AuthHeaders::default(),
+        0,
+        0,
+        false,
+        None,
+        crate::archive_request::ArchiveContentCoding::Negotiated,
+    )
+    .await
+    .unwrap();
+    assert_eq!(meta.cache_headers.cache_control.as_deref(), Some("max-age=3600, no-store"));
 }
 
 impl Container {
@@ -203,39 +332,55 @@ impl Container {
     async fn ingest(
         self,
         input: &IngestTarballToStore<'_>,
-    ) -> Result<HashMap<String, PathBuf>, TarballError> {
+    ) -> Result<pnpm_fs::CasPaths, TarballError> {
         match self {
             Self::TarGz => input.run_without_mem_cache::<SilentReporter>().await,
-            Self::Zip => {
-                IngestZipArchiveToStore {
-                    fetching: input.fetching,
-                    package: crate::ZipArchivePackage {
-                        integrity: input.package.integrity.unwrap(),
-                        url: input.package.url,
-                        id: input.package.id,
-                    },
-                    store: crate::ArchiveStoreContext {
-                        dir: input.store.dir,
-                        index: input.store.index.clone(),
-                        index_writer: input.store.index_writer.clone(),
-                        verify_integrity: input.store.verify_integrity,
-                        strict_pkg_content_check: input.store.strict_pkg_content_check,
-                        verified_files_cache: Arc::clone(&input.store.verified_files_cache),
-                        prefetched_cas_paths: input.store.prefetched_cas_paths,
-                    },
-
-                    requester: input.requester,
-
-                    archive_prefix: Some("artifact"),
-                    ignore_file_pattern: input.ignore_file_pattern.clone(),
-
-                    store_projection: input.store_projection,
-                }
-                .run_without_mem_cache::<SilentReporter>()
-                .await
-            }
+            Self::Zip => zip_ingestion(input).run_without_mem_cache::<SilentReporter>().await,
         }
     }
+}
+
+fn zip_ingestion<'a>(input: &'a IngestTarballToStore<'a>) -> IngestZipArchiveToStore<'a> {
+    IngestZipArchiveToStore {
+        fetching: input.fetching,
+        package: crate::ZipArchivePackage {
+            max_bytes: None,
+            integrity: input.package.integrity.unwrap(),
+            url: input.package.url,
+            id: input.package.id,
+        },
+        store: crate::ArchiveStoreContext {
+            dir: input.store.dir,
+            index: input.store.index.clone(),
+            index_writer: input.store.index_writer.clone(),
+            verify_integrity: input.store.verify_integrity,
+            strict_pkg_content_check: input.store.strict_pkg_content_check,
+            verified_files_cache: Arc::clone(&input.store.verified_files_cache),
+            prefetched_cas_paths: input.store.prefetched_cas_paths,
+        },
+
+        requester: input.requester,
+
+        archive_prefix: Some("artifact"),
+        ignore_file_pattern: input.ignore_file_pattern.clone(),
+
+        store_projection: input.store_projection,
+    }
+}
+
+async fn assert_buffered_cache(
+    container: Container,
+    input: &IngestTarballToStore<'_>,
+    paths: &pnpm_fs::CasPaths,
+) {
+    if !matches!(container, Container::Zip) {
+        return;
+    }
+    let cached = zip_ingestion(input)
+        .run_with_buffer::<SilentReporter>(b"not a ZIP".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(store_paths(&cached), store_paths(paths));
 }
 
 #[tokio::test]
@@ -269,8 +414,10 @@ async fn formats_share_projection_offline_replay_and_missing_blob_validation() {
                     auth_headers: &auth,
                     retry_opts: fast_retry_opts(),
                     offline: false,
+                    tar_limits: crate::TarLimits::default(),
                 },
                 package: crate::TarballPackage {
+                    integrity_kind: crate::IntegrityKind::Resource,
                     integrity: Some(&integrity),
                     unpacked_size: None,
                     file_count: None,
@@ -305,8 +452,10 @@ async fn formats_share_projection_offline_replay_and_missing_blob_validation() {
             drop(writer);
             StoreIndexWriter::drain(task, "contract test").await;
             input.store.index = StoreIndex::shared_readonly_in(store);
+            assert_buffered_cache(container, &input, &paths).await;
             input.fetching.offline = true;
-            assert_eq!(container.ingest(&input).await.unwrap(), paths);
+            let replayed = container.ingest(&input).await.unwrap();
+            assert_eq!(store_paths(&replayed), store_paths(&paths));
 
             std::fs::remove_file(&paths["data.txt"]).unwrap();
             input.store.verified_files_cache = Arc::default();
@@ -345,8 +494,10 @@ async fn formats_share_retry_classification_and_never_publish_failed_integrity()
                     auth_headers: &auth,
                     retry_opts: fast_retry_opts(),
                     offline: false,
+                    tar_limits: crate::TarLimits::default(),
                 },
                 package: crate::TarballPackage {
+                    integrity_kind: crate::IntegrityKind::Resource,
                     integrity: Some(&integrity),
                     unpacked_size: None,
                     file_count: None,
@@ -392,4 +543,81 @@ fn assert_fetch_error(status: usize, error: &TarballError) {
     } else {
         assert!(matches!(error, TarballError::HttpStatus(_)));
     }
+}
+
+#[tokio::test]
+async fn zip_download_limits_cover_content_lengths_and_chunked_bodies() {
+    for chunked in [false, true] {
+        let mut server = mockito::Server::new_async().await;
+        let body = build_zip(&[("data.txt", b"artifact")]);
+        let integrity = Integrity::from(body.as_slice());
+        let request = server.mock("GET", "/oversized");
+        let streamed = body.clone();
+        let stream_body = move |writer: &mut dyn std::io::Write| writer.write_all(&streamed);
+        let request =
+            if chunked { request.with_chunked_body(stream_body) } else { request.with_body(body) };
+        let request = request.expect(1).create_async().await;
+        let (_root, store) = tempdir_with_leaked_path();
+        store.init().unwrap();
+        let error = crate::zip_archive::fetch_and_extract_zip_once::<SilentReporter>(
+            &ThrottledClient::default(),
+            &format!("{}/oversized", server.url()),
+            &integrity,
+            "fixture",
+            0,
+            store,
+            &AuthHeaders::default(),
+            None,
+            None,
+            Some(16),
+            crate::TarLimits::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, TarballError::TarballTooLarge { .. }), "{error}");
+        request.assert_async().await;
+    }
+}
+
+#[tokio::test]
+async fn request_archive_quick_retries_transient_connection_reset() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+
+    let server_task = tokio::spawn(async move {
+        if let Ok((mut socket, _)) = listener.accept().await {
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            drop(socket);
+        }
+        if let Ok((mut socket, _)) = listener.accept().await {
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let response = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndone";
+            let _ = socket.write_all(response.as_bytes()).await;
+        }
+    });
+
+    let client = ThrottledClient::default();
+    let url = format!("http://{address}/pkg.tgz");
+    let result = crate::archive_request::request_archive::<SilentReporter>(
+        &client,
+        &url,
+        "test-pkg",
+        &AuthHeaders::default(),
+        0,
+        0,
+        false,
+        None,
+        crate::archive_request::ArchiveContentCoding::Negotiated,
+    )
+    .await;
+
+    let (_guard, response, _) =
+        result.expect("quick retry must recover from initial connection drop");
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.text().await.unwrap(), "done");
+    server_task.await.unwrap();
 }

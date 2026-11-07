@@ -31,16 +31,13 @@ fn registry_revision_uses_the_registry_declared_for_its_prefix() {
     let (tarball_url, _) = tarball_url_and_integrity(&resolution, &package_key, &config)
         .expect("a prefixed registry revision is fetchable");
 
-    assert_eq!(
-        tarball_url.as_ref(),
-        format!("https://registry.example/workspace/npm/-/tarballs/sha512/{}", "A".repeat(86)),
-    );
+    assert_eq!(tarball_url.as_ref(), "https://registry.example/workspace/npm/foo@1.0.0+r4");
 }
 #[test]
 fn tarball_revision_rejects_a_url_outside_its_effective_registry() {
     let config = Config::new();
     let resolution = LockfileResolution::Tarball(TarballResolution {
-        tarball: format!("https://attacker.example/-/tarballs/sha512/{}", "A".repeat(86)),
+        tarball: "https://attacker.example/foo@1.0.0+r1".to_string(),
         integrity: Some(DUMMY_SHA512.parse().expect("parse integrity")),
         revision: Some(TarballRevision::try_from(1).unwrap()),
         git_hosted: None,
@@ -126,11 +123,17 @@ fn render_variant_targets_formats_each_triple_with_optional_libc() {
                 directory: "fixture".into(),
             }),
             targets: vec![
-                PlatformAssetTarget { os: "darwin".into(), cpu: "arm64".into(), libc: None },
+                PlatformAssetTarget {
+                    os: "darwin".into(),
+                    cpu: "arm64".into(),
+                    libc: None,
+                    ..PlatformAssetTarget::default()
+                },
                 PlatformAssetTarget {
                     os: "linux".into(),
                     cpu: "x64".into(),
                     libc: Some("musl".into()),
+                    ..PlatformAssetTarget::default()
                 },
             ],
         },
@@ -142,6 +145,7 @@ fn render_variant_targets_formats_each_triple_with_optional_libc() {
                 os: "win32".into(),
                 cpu: "x64".into(),
                 libc: None,
+                ..PlatformAssetTarget::default()
             }],
         },
     ];
@@ -149,17 +153,14 @@ fn render_variant_targets_formats_each_triple_with_optional_libc() {
     let rendered = render_variant_targets(&variants);
     assert_eq!(rendered, "darwin/arm64, linux/x64+musl, win32/x64");
 }
-/// The resolve-time prefetch is best-effort: if it failed (its mem-cache
-/// slot is [`CacheValue::Failed`]), the cold batch must not inherit the
-/// failure — it falls back to its own retried download. Proven here by
-/// seeding a `Failed` slot under `offline: true`: the only way to reach
-/// the offline gate (`NoOfflineTarball`) instead of surfacing
-/// `SiblingFetchFailed` is for the fallback to `run_without_mem_cache` to
-/// have run.
+/// A prefetch that failed has already spent the archive's retry budget, so
+/// the cold batch reports its error instead of downloading again. The slot
+/// is seeded under `offline: true`, where a second download would fail at
+/// the offline gate (`NoOfflineTarball`) instead.
 #[tokio::test]
-async fn cold_batch_falls_back_when_prefetch_failed() {
+async fn cold_batch_reports_a_failed_prefetch_without_downloading_again() {
     use crate::InstallPackageBySnapshotError;
-    use pnpm_tarball::{CacheValue, MemCache, TarballError};
+    use pnpm_tarball::{CacheValue, MemCache, TarballError, package_mem_cache_key};
     use std::sync::{Arc, atomic::AtomicU8};
 
     let store_tmp = tempfile::tempdir().expect("tempdir");
@@ -169,8 +170,12 @@ async fn cold_batch_falls_back_when_prefetch_failed() {
 
     let mem_cache = Arc::new(MemCache::default());
     mem_cache.insert(
-        "https://registry.test/foo/-/foo-1.0.0.tgz".to_string(),
-        Arc::new(tokio::sync::RwLock::new(CacheValue::Failed)),
+        package_mem_cache_key(
+            "https://registry.test/foo/-/foo-1.0.0.tgz",
+            Some(&DUMMY_SHA512.parse().expect("parse integrity")),
+            false,
+        ),
+        Arc::new(tokio::sync::RwLock::new(CacheValue::Failed("prefetch failed".into()))),
     );
 
     let layout = crate::VirtualStoreLayout::legacy(store_tmp.path().join("vstore"), 120);
@@ -197,6 +202,14 @@ async fn cold_batch_falls_back_when_prefetch_failed() {
             custom_fetcher_session: None,
         },
         ctx: &crate::InstallContext {
+            caches: crate::InstallCaches {
+                logged_methods: &logged_methods,
+                swap_lock: None,
+                git_source_cache: &pnpm_git_fetcher::GitSourceCache::default(),
+                materialized_graph: std::sync::Arc::default(),
+                dir_clone_cache: None,
+            },
+
             linker: crate::ModuleLinkerContext {
                 layout: &layout,
                 kind: pnpm_config::NodeLinker::Hoisted,
@@ -207,28 +220,26 @@ async fn cold_batch_falls_back_when_prefetch_failed() {
             requester: "/project",
 
             allow_build_policy: &allow_build_policy,
-
-            logged_methods: &logged_methods,
-            git_source_cache: &pnpm_git_fetcher::GitSourceCache::default(),
         },
 
         skipped: &skipped,
         include_optional_dependencies: true,
-        runtime_platform_selector: &host_platform_selector(),
+        variant_platforms: &crate::platform_selection::VariantPlatforms::host(),
 
         defer_link: false,
         link_concurrency_probe: None,
     }
     .run::<pnpm_reporter::SilentReporter>(&package_key, &metadata, &snapshot)
     .await
-    .expect_err("a failed prefetch must fall back to a real download, here offline-gated");
+    .expect_err("the failed prefetch must fail the install");
 
     assert!(
         matches!(
-            err,
-            InstallPackageBySnapshotError::DownloadTarball(TarballError::NoOfflineTarball { .. }),
+            &err,
+            InstallPackageBySnapshotError::DownloadTarball(TarballError::SiblingFetchFailed { cause })
+                if &**cause == "prefetch failed",
         ),
-        "fallback must reach the offline download gate, not inherit SiblingFetchFailed; got {err:?}",
+        "the prefetch's error must be reported without another download; got {err:?}",
     );
 
     drop(store_tmp);
@@ -241,8 +252,8 @@ async fn cold_batch_falls_back_when_prefetch_failed() {
 /// original URL was never seeded).
 #[tokio::test]
 async fn custom_fetcher_delegate_rewrites_the_resolution() {
-    use pnpm_tarball::{CacheValue, MemCache};
-    use std::{collections::HashMap, path::PathBuf, sync::Arc};
+    use pnpm_tarball::{CacheValue, CachedTarball, MemCache, package_mem_cache_key};
+    use std::{collections::HashMap, sync::Arc};
 
     let store_tmp = tempfile::tempdir().expect("tempdir");
     let config = leaked_offline_config("https://registry.test", store_tmp.path());
@@ -256,12 +267,18 @@ async fn custom_fetcher_delegate_rewrites_the_resolution() {
         path: None,
     });
 
-    let seeded: HashMap<String, PathBuf> =
-        HashMap::from([("package.json".to_string(), store_tmp.path().join("blob"))]);
+    let seeded: pnpm_fs::CasPaths =
+        HashMap::from([("package.json".to_string(), store_tmp.path().join("blob").into())]);
     let mem_cache = Arc::new(MemCache::default());
     mem_cache.insert(
-        "https://registry.test/foo/-/foo-1.0.0.tgz".to_string(),
-        Arc::new(tokio::sync::RwLock::new(CacheValue::Available(Arc::new(seeded.clone())))),
+        package_mem_cache_key(
+            "https://registry.test/foo/-/foo-1.0.0.tgz",
+            Some(&DUMMY_SHA512.parse().expect("parse integrity")),
+            false,
+        ),
+        Arc::new(tokio::sync::RwLock::new(CacheValue::Available(CachedTarball::from_files(
+            seeded.clone(),
+        )))),
     );
 
     let session = scripted_session(
@@ -279,7 +296,7 @@ async fn custom_fetcher_delegate_rewrites_the_resolution() {
     .await
     .expect("the delegated registry resolution must drive the fetch");
 
-    assert_eq!(cas_paths.cas_paths, seeded);
+    assert_eq!(*cas_paths.cas_paths, seeded);
 
     drop(store_tmp);
 }
@@ -289,19 +306,25 @@ async fn custom_fetcher_delegate_rewrites_the_resolution() {
 /// `fetch` ran (`can_fetch = false` must short-circuit it).
 #[tokio::test]
 async fn custom_fetcher_declining_falls_through_to_the_original_resolution() {
-    use pnpm_tarball::{CacheValue, MemCache};
-    use std::{collections::HashMap, path::PathBuf, sync::Arc};
+    use pnpm_tarball::{CacheValue, CachedTarball, MemCache, package_mem_cache_key};
+    use std::{collections::HashMap, sync::Arc};
 
     let store_tmp = tempfile::tempdir().expect("tempdir");
     let config = leaked_offline_config("https://registry.test", store_tmp.path());
     let metadata = registry_metadata();
 
-    let seeded: HashMap<String, PathBuf> =
-        HashMap::from([("package.json".to_string(), store_tmp.path().join("blob"))]);
+    let seeded: pnpm_fs::CasPaths =
+        HashMap::from([("package.json".to_string(), store_tmp.path().join("blob").into())]);
     let mem_cache = Arc::new(MemCache::default());
     mem_cache.insert(
-        "https://registry.test/foo/-/foo-1.0.0.tgz".to_string(),
-        Arc::new(tokio::sync::RwLock::new(CacheValue::Available(Arc::new(seeded.clone())))),
+        package_mem_cache_key(
+            "https://registry.test/foo/-/foo-1.0.0.tgz",
+            Some(&DUMMY_SHA512.parse().expect("parse integrity")),
+            false,
+        ),
+        Arc::new(tokio::sync::RwLock::new(CacheValue::Available(CachedTarball::from_files(
+            seeded.clone(),
+        )))),
     );
 
     let session = scripted_session(
@@ -322,7 +345,7 @@ async fn custom_fetcher_declining_falls_through_to_the_original_resolution() {
     .await
     .expect("a declined package must take the built-in path unchanged");
 
-    assert_eq!(cas_paths.cas_paths, seeded);
+    assert_eq!(*cas_paths.cas_paths, seeded);
 
     drop(store_tmp);
 }
@@ -414,19 +437,25 @@ async fn custom_fetcher_custom_typed_delegate_is_rejected() {
 /// the custom `type` tag exactly as the lockfile spells it.
 #[tokio::test]
 async fn custom_typed_resolution_installs_via_delegating_fetcher() {
-    use pnpm_tarball::{CacheValue, MemCache};
-    use std::{collections::HashMap, path::PathBuf, sync::Arc};
+    use pnpm_tarball::{CacheValue, CachedTarball, MemCache, package_mem_cache_key};
+    use std::{collections::HashMap, sync::Arc};
 
     let store_tmp = tempfile::tempdir().expect("tempdir");
     let config = leaked_offline_config("https://registry.test", store_tmp.path());
     let metadata = custom_resolution_metadata("@my-org/custom");
 
-    let seeded: HashMap<String, PathBuf> =
-        HashMap::from([("package.json".to_string(), store_tmp.path().join("blob"))]);
+    let seeded: pnpm_fs::CasPaths =
+        HashMap::from([("package.json".to_string(), store_tmp.path().join("blob").into())]);
     let mem_cache = Arc::new(MemCache::default());
     mem_cache.insert(
-        "https://registry.test/foo/-/foo-1.0.0.tgz".to_string(),
-        Arc::new(tokio::sync::RwLock::new(CacheValue::Available(Arc::new(seeded.clone())))),
+        package_mem_cache_key(
+            "https://registry.test/foo/-/foo-1.0.0.tgz",
+            Some(&DUMMY_SHA512.parse().expect("parse integrity")),
+            false,
+        ),
+        Arc::new(tokio::sync::RwLock::new(CacheValue::Available(CachedTarball::from_files(
+            seeded.clone(),
+        )))),
     );
 
     let session = scripted_session(
@@ -444,7 +473,7 @@ async fn custom_typed_resolution_installs_via_delegating_fetcher() {
     .await
     .expect("a delegating fetcher must install a custom-typed resolution");
 
-    assert_eq!(cas_paths.cas_paths, seeded);
+    assert_eq!(*cas_paths.cas_paths, seeded);
 
     drop(store_tmp);
 }
@@ -502,16 +531,18 @@ async fn an_unpinned_delegate_to_a_directory_keeps_its_resolution() {
         path: None,
     });
 
-    let resolution = session
-        .resolve_tarball_integrity::<pnpm_reporter::SilentReporter>(
+    let metadata = session
+        .resolve_tarball_metadata::<pnpm_reporter::SilentReporter>(
             pnpm_tarball::IngestTarballToStore {
                 fetching: pnpm_tarball::ArchiveFetchOptions {
                     http_client: &pnpm_network::ThrottledClient::default(),
                     auth_headers: &config.auth_headers,
                     retry_opts: pnpm_tarball::RetryOpts { retries: 0, ..Default::default() },
                     offline: true,
+                    tar_limits: pnpm_tarball::TarLimits::default(),
                 },
                 package: pnpm_tarball::TarballPackage {
+                    integrity_kind: pnpm_tarball::IntegrityKind::Resource,
                     integrity: None,
                     unpacked_size: None,
                     file_count: None,
@@ -539,13 +570,54 @@ async fn an_unpinned_delegate_to_a_directory_keeps_its_resolution() {
             },
             &unpinned,
             serde_json::json!({ "lockfileDir": store_tmp.path() }),
+            config,
         )
         .await
         .expect("a digest-less delegate is not an integrity failure");
 
+    let resolution = metadata.resolution;
     assert!(
         matches!(resolution, LockfileResolution::Tarball(ref tarball) if tarball.integrity.is_none()),
         "the unpinned resolution is recorded unchanged: {resolution:?}",
     );
     drop(store_tmp);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn git_subdirectory_install_reuses_raw_archive_cache() {
+    use pnpm_tarball::{CacheValue, CachedTarball, MemCache, package_mem_cache_key};
+    use std::{collections::HashMap, sync::Arc};
+    let dir = tempfile::tempdir().unwrap();
+    let url =
+        "https://codeload.github.com/example/repo/tar.gz/0123456789abcdef0123456789abcdef01234567";
+    let manifest = dir.path().join("package.json");
+    std::fs::write(&manifest, r#"{"name":"foo","version":"1.0.0"}"#).unwrap();
+    let files = HashMap::from([("packages/foo/package.json".to_string(), manifest.into())]);
+    let cache = Arc::new(MemCache::default());
+    cache.insert(
+        package_mem_cache_key(url, None, false),
+        Arc::new(tokio::sync::RwLock::new(CacheValue::Available(CachedTarball::from_files(files)))),
+    );
+    let mut metadata = registry_metadata();
+    metadata.resolution = LockfileResolution::Tarball(TarballResolution {
+        tarball: url.to_string(),
+        integrity: None,
+        revision: None,
+        path: Some("/packages/foo".to_string()),
+        git_hosted: None,
+    });
+    let installed = run_snapshot_install_with_session(
+        leaked_offline_config("https://registry.npmjs.org/", &dir.path().join("store")),
+        &metadata,
+        &scripted_session(false, Ok(serde_json::json!({}))),
+        Some(&cache),
+        dir.path(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(installed.cas_paths.len(), 1);
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&installed.cas_paths["package.json"]).unwrap())
+            .unwrap();
+    assert_eq!(manifest["name"], "foo");
 }

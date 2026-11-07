@@ -1,11 +1,10 @@
 use super::{
     super::{
-        BuildModulesError, HashMap, PackageKey, Path, PathBuf, Reporter, materialize_side_effects,
-        store_index_key_for_resolution,
+        BuildModulesError, NEEDS_BUILD_MARKER, PackageKey, Path, Reporter,
+        materialize_side_effects, store_index_key_for_resolution,
     },
     BuildCandidate, BuildOneSnapshot, global_slot_carries_overlay, report_broken_slot,
 };
-use std::sync::atomic::Ordering;
 
 /// The side-effects cache key, computed once per snapshot before the
 /// `is_built` gate. The same value is later consumed by the WRITE-path
@@ -14,8 +13,9 @@ use std::sync::atomic::Ordering;
 /// call free anyway, but routing through one value keeps the gate-side
 /// and write-side keys provably identical.
 ///
-/// `None` when the cache gate can't fire (no engine, no graph, etc.);
-/// both downstream consumers short-circuit on `None`.
+/// `None` when the cache gate can't fire (no engine, no graph, etc.) or
+/// `sideEffectsCache.exclude` names the package; both downstream
+/// consumers short-circuit on `None`.
 ///
 /// The `deps_state_cache` is shared across all scheduled nodes via
 /// `Mutex` because `calc_dep_state` is recursive and memoizes — a
@@ -26,6 +26,9 @@ pub(super) fn side_effects_cache_key(
     snapshot_key: &PackageKey,
     candidate: &BuildCandidate<'_>,
 ) -> Option<String> {
+    if !context.allow_build_policy.caches_build(snapshot_key) {
+        return None;
+    }
     let (graph, engine) = context.progress.dep_graph.zip(context.cache.engine_name)?;
     // Poison-recover: `calc_dep_state` mutates the cache by
     // inserting one entry per recursive walk node, each
@@ -55,20 +58,21 @@ pub(super) fn side_effects_cache_key(
 /// snapshot would otherwise run its scripts — but if the prefetch
 /// surfaced a matching side-effects-cache entry, the build is already
 /// represented on disk (seeded on a previous install) and can be
-/// skipped. An explicit `pacquet rebuild` (`force_rebuild`) always
-/// re-runs the scripts, so it bypasses this gate.
+/// skipped. An explicit `pacquet rebuild` (`force_rebuild`) re-runs the
+/// scripts, so it bypasses this gate unless
+/// [`RebuildOptions::skip_if_has_side_effects_cache`] is set.
+///
+/// [`RebuildOptions::skip_if_has_side_effects_cache`]: crate::RebuildOptions::skip_if_has_side_effects_cache
 pub(super) fn already_built<Reporter: self::Reporter>(
     context: &BuildOneSnapshot<'_>,
     snapshot_key: &PackageKey,
     candidate: &BuildCandidate<'_>,
     cache_key: Option<&str>,
 ) -> Result<bool, BuildModulesError> {
-    if !candidate.force_rebuild
+    if !bypasses_side_effects_cache(context, candidate)
         && context.cache.read
-        && let Some(maps_by_snapshot) = context.cache.maps_by_snapshot
-        && let Some(maps) = maps_by_snapshot.get(snapshot_key)
         && let Some(key) = cache_key
-        && let Some(overlay) = maps.get(key)
+        && let Some(overlay) = context.cache.side_effects.overlay(snapshot_key, key)
     {
         return satisfy_from_side_effects_cache::<Reporter>(
             context,
@@ -77,7 +81,47 @@ pub(super) fn already_built<Reporter: self::Reporter>(
             (&candidate.name, &candidate.version),
         );
     }
-    Ok(false)
+    Ok(rebuild_found_empty_row(context, snapshot_key, cache_key))
+}
+/// A rebuild with [`RebuildOptions::skip_if_has_side_effects_cache`]
+/// skips a package whose side-effects row for this cache key is empty.
+/// The build ran before and changed nothing inside the package, so there
+/// is nothing to restore, and running it again would only repeat that.
+/// pnpm v11's `rebuild` takes any row as a hit the same way, unless the
+/// package directory carries [`NEEDS_BUILD_MARKER`]: that slot has not
+/// been built yet. An install still runs such a build, because its effect
+/// may lie outside the package directory (pnpm/pnpm#14717).
+///
+/// [`RebuildOptions::skip_if_has_side_effects_cache`]: crate::RebuildOptions::skip_if_has_side_effects_cache
+fn rebuild_found_empty_row(
+    context: &BuildOneSnapshot<'_>,
+    snapshot_key: &PackageKey,
+    cache_key: Option<&str>,
+) -> bool {
+    let hit = context.rebuild.is_some_and(|rebuild| rebuild.skip_if_has_side_effects_cache)
+        && context.cache.read
+        && cache_key.is_some_and(|key| context.cache.side_effects.has_empty_row(snapshot_key, key))
+        && !context
+            .pkg_roots()
+            .all_recorded(snapshot_key)
+            .iter()
+            .any(|pkg_dir| pkg_dir.join(NEEDS_BUILD_MARKER).exists());
+    if hit {
+        tracing::debug!(
+            target: "pacquet::build",
+            ?snapshot_key,
+            cache_key,
+            "side-effects cache holds an empty build; skipping the rebuild",
+        );
+    }
+    hit
+}
+fn bypasses_side_effects_cache(
+    context: &BuildOneSnapshot<'_>,
+    candidate: &BuildCandidate<'_>,
+) -> bool {
+    candidate.force_rebuild
+        && !context.rebuild.is_some_and(|rebuild| rebuild.skip_if_has_side_effects_cache)
 }
 /// Whether a side-effects-cache hit already put this snapshot's build output
 /// on disk, so the build can be skipped.
@@ -91,7 +135,7 @@ pub(super) fn already_built<Reporter: self::Reporter>(
 pub(super) fn satisfy_from_side_effects_cache<Reporter: self::Reporter>(
     context: &BuildOneSnapshot<'_>,
     snapshot_key: &PackageKey,
-    cached: (&str, &HashMap<String, PathBuf>),
+    cached: (&str, &pnpm_store_dir::SideEffectsOverlay),
     named: (&str, &str),
 ) -> Result<bool, BuildModulesError> {
     let (key, overlay) = cached;
@@ -101,12 +145,12 @@ pub(super) fn satisfy_from_side_effects_cache<Reporter: self::Reporter>(
         cache_key = key,
         "side-effects cache hit; skipping build",
     );
-    if global_slot_carries_overlay(context, snapshot_key, overlay) {
+    let Some(_slot_lock) = lock_slot_missing_overlay(context, snapshot_key, overlay) else {
         return Ok(true);
-    }
+    };
     // The overlay carries the patched / built contents, so it has to reach
     // every hoisted copy for the same reason patch application does.
-    context.progress.slot_mutations.store(true, Ordering::Relaxed);
+    super::dependency_bins::record_mutation(context, snapshot_key)?;
     for pkg_dir in context.pkg_roots().all(snapshot_key) {
         // No slot to materialize into (skipped / never linked) — nothing for
         // the build phase to do either.
@@ -155,17 +199,37 @@ pub(super) enum OverlayOutcome {
     /// with a broken package.
     Broken(BuildModulesError),
 }
+/// The lock to hold while the overlay is re-imported into the slot, or `None`
+/// when the slot already carries it. Another install may be building the
+/// shared slot, which the forced re-import would overwrite; once that build
+/// finishes, its output is the overlay.
+fn lock_slot_missing_overlay(
+    context: &BuildOneSnapshot<'_>,
+    snapshot_key: &PackageKey,
+    overlay: &pnpm_store_dir::SideEffectsOverlay,
+) -> Option<Option<pnpm_fs::DirLock>> {
+    if global_slot_carries_overlay(context, snapshot_key, overlay) {
+        return None;
+    }
+    let lock = context.directories.pkg_roots_by_key
+        .is_none()
+        .then(|| {
+            crate::gvs_slot_lock::lock_global_virtual_store_slot(
+                context.directories.layout,
+                snapshot_key,
+            )
+        });
+    if global_slot_carries_overlay(context, snapshot_key, overlay) {
+        return None;
+    }
+    Some(lock.flatten())
+}
 pub(super) fn materialize_overlay_into_slot<Reporter: self::Reporter>(
     context: &BuildOneSnapshot<'_>,
     pkg_dir: &Path,
-    overlay: &HashMap<String, PathBuf>,
+    overlay: &pnpm_store_dir::SideEffectsOverlay,
 ) -> OverlayOutcome {
-    match materialize_side_effects::<Reporter>(
-        context.directories.logged_methods,
-        context.directories.import_method,
-        pkg_dir,
-        overlay,
-    ) {
+    match materialize_side_effects::<Reporter>(&context.directories, pkg_dir, overlay) {
         Ok(()) => OverlayOutcome::Materialized,
         Err(error) if pkg_dir.join("package.json").exists() => OverlayOutcome::Rebuild(error),
         Err(error) => OverlayOutcome::Broken(error),

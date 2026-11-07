@@ -8,23 +8,31 @@
 
 pub(super) use warm_children::warm_children_resolutions;
 
+pub(super) use crate::resolve_dependency_tree::workspace_ctx::{
+    cached_workspace_final, completed_resolved_wanted, wanted_key_admission,
+};
+
 pub(crate) use child_seeds::parent_ids_contain_sequence;
 
 pub(super) use level_walk::{level_aliases, level_versions};
 
 pub(super) use locked_versions::node_alias;
 
-pub(super) use edge_resolution::{closes_cycle, node_id_for, resolve_node_seed};
+pub(super) use edge_resolution::{
+    closes_cycle, node_id_for, resolve_node_seed, try_resolve_edge_cached,
+    try_resolve_edge_detached,
+};
 
 mod warm_children;
 
+mod manifest_hooks;
 mod workspace_resolution;
 use workspace_resolution::resolve_wanted_cached;
 
 mod child_seeds;
 use child_seeds::{
-    catalogs_for_children, overlay_lookup_names, resolve_catalog_child_specs,
-    resolves_children_through_catalogs, seed_node_children,
+    ChildSeedScope, catalogs_for_children, child_wanted, landed_on_prior_entry,
+    overlay_lookup_names, resolves_children_through_catalogs, seed_node_children, walk_child_specs,
 };
 
 mod level_walk;
@@ -32,20 +40,29 @@ use level_walk::{assign_level_owners, pkgs_info_from_ids, seeded_dep, settle_lev
 
 mod locked_versions;
 use locked_versions::{
-    ensure_same_registry_revision, overlay_version_view, pin_locked_version, pin_patched_revision,
+    ensure_same_registry_revision, keeps_locked_version, overlay_version_view, pin_locked_version,
+    pin_patched_revision,
 };
 
 mod edge_resolution;
+
+mod failed_edge;
+
+mod package_root_link;
+use package_root_link::{
+    link_file_deps_inside_package, package_root_link_result, wanted_package_root_link,
+};
 
 use async_recursion::async_recursion;
 use futures_util::future;
 use pipe_trait::Pipe;
 use pnpm_catalogs_types::Catalogs;
 use pnpm_lockfile::{LockfileResolution, PkgNameVerPeer, SnapshotEntry, TarballRevision};
+use pnpm_resolving_npm_resolver::PickPackageError;
 use pnpm_resolving_resolver_base::{
     CurrentPkg, GitResolveError, NoMatchingVersionError, PreferredVersionsOverlay,
-    RegistryResponseError, ResolveError, ResolveOptions, Resolver, UpdateBehavior,
-    WantedDependency,
+    RegistryResponseError, ResolveError, ResolveOptions, Resolver, UnsupportedProtocolError,
+    UpdateBehavior, WantedDependency,
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use serde_json::Value;
@@ -54,98 +71,125 @@ use std::{borrow::Cow, collections::BTreeMap, path::Path, sync::Arc};
 use crate::{
     lockfile_reuse::{current_pkg_from_lockfile, prior_child_key},
     node_id::NodeId,
-    parent_pkg_aliases::{ParentPkgAliases, peer_shadowed_dependencies},
-    resolved_tree::{DirectDep, ResolvedPackage},
+    parent_pkg_aliases::ParentPkgAliases,
+    peer_provider::{dependencies_named_as_peers, peer_shadowed_dependencies},
+    resolved_tree::{
+        AncestorPkgIds, DirectDep, ResolvedPackage, ResolvedPackageInput, TreeChildren,
+    },
 };
 
 use super::{
-    ResolveDependencyTreeError, SkippedOptionalDependency, SkippedOptionalDependencyParent,
-    catalogs::resolve_catalog_specifier,
+    DependencySpec, ResolveDependencyTreeError, SkippedOptionalDependency,
+    SkippedOptionalDependencyParent,
+    catalogs::catalog_anchor,
     lock_recoverable,
     manifest::{
         build_pkg_id_with_patch_hash, emit_deprecation_if_needed, extract_children,
         extract_peer_dependencies, is_exotic_resolved_via, pkg_is_leaf,
     },
+    read_recoverable,
     reuse::{
-        ReuseSource, higher_direct_dep_version, is_update_target,
-        node_depends_on_changed_direct_dep, real_package_name_of, resolve_reused_node,
-        try_reuse_node, update_unpins_edge, wanted_lockfile_contains_satisfying_entry,
+        PendingReusedNode, ReuseSource, finish_reused_node, higher_direct_dep_version,
+        node_depends_on_changed_direct_dep, real_package_name_of, seed_reused_node, try_reuse_node,
+        wanted_lockfile_contains_satisfying_entry,
     },
     tree_ctx::{
         TreeCtx, declaring_manifest_dir, opts_relative_to_declaring_manifest,
         project_relative_cache_scope,
     },
+    update_scope::{is_update_target, update_unpins_edge},
     workspace_ctx::{
-        ChildSpec, ChildrenOwnerClaim, RecordedChildrenContext, SharedWorkspaceWantedKey,
-        WantedKey, WorkspaceFinalWantedKey, claim_children_owner, claim_children_warmup,
-        insert_tree_node, is_current_children_owner, lazy_children, make_non_owner_nodes_lazy,
-        record_children, recorded_children_match, register_peer_dep_names,
-        remember_node_parent_ids,
+        ChildrenOwnerClaim, ChildrenRecording, PackageRegistration, RecordedChildrenContext,
+        SharedWorkspaceWantedKey, WantedKey, WorkspaceFinalWantedKey, children_warmup_claimed,
+        claim_children_owner, claim_children_warmup, claim_recorded_subtree_owners,
+        insert_tree_node, is_current_children_owner, make_non_owner_nodes_lazy, record_children,
+        recorded_children_match, recorded_prior_key, register_peer_dep_names,
+        register_shadowable_dep_names,
     },
+    write_recoverable,
 };
 
-/// Resolve one `(alias, range)` edge end-to-end with no
-/// preferred-versions overlay: [`fn@resolve_node_seed`] then
-/// [`fn@walk_from_seeds`]. Used where per-level preference folding
-/// does not apply — the lockfile-reuse subtree walk, whose versions
-/// are exact pins.
-///
-/// The node's children resolve in the same `parent_pkg_aliases` scope
-/// as the node itself, without this level's own aliases folded in: a
-/// reused subtree takes its children from the lockfile snapshot rather
-/// than from a manifest, so no shadowed dependency can be dropped
-/// inside it, and the narrower scope only ever means one omission
-/// fewer where an edge falls back to a fresh resolve.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "internal walker helper threading per-node context through the recursion"
-)]
-#[async_recursion]
-pub(super) async fn resolve_node<Chain>(
+/// Walk the snapshot children of any reused seeds in `seeds` once the
+/// level's `children_pkg_aliases` scope has been settled.
+pub(super) async fn finish_reused_seeds<Chain>(
     ctx: &TreeCtx,
     resolver: &Chain,
-    wanted: WantedDependency,
-    ancestor_ids: &Arc<Vec<String>>,
-    depth: i32,
-    parent_optional: bool,
-    reuse: ReuseSource,
-    parent_pkg_aliases: &Arc<ParentPkgAliases>,
-) -> Result<Option<DirectDep>, ResolveDependencyTreeError>
+    seeds: &mut [NodeSeed],
+    children_pkg_aliases: &Arc<ParentPkgAliases>,
+) -> Result<(), ResolveDependencyTreeError>
 where
     Chain: Resolver + ?Sized,
 {
-    let base_overlay = ctx.options.base.version.preferred_versions_overlay.clone();
-    let seed = resolve_node_seed(
-        ctx,
-        resolver,
-        wanted,
-        ChildEdge {
-            ancestor_ids,
-            depth,
-            parent_optional,
-            reuse,
-            pick_overlay: base_overlay.clone(),
-            parent_dir: None,
-            parent_pkg_aliases,
-            parent_is_workspace: false,
-        },
-    )
-    .await?;
-    let direct =
-        walk_from_seeds(ctx, resolver, vec![seed], base_overlay, Arc::clone(parent_pkg_aliases))
-            .await?;
-    Ok(direct.into_iter().next())
+    let reused: Vec<PendingReusedNode> = seeds
+        .iter_mut()
+        .filter_map(|seed| match seed {
+            NodeSeed::Reused(_) => {
+                let NodeSeed::Reused(reused) = std::mem::replace(seed, NodeSeed::Done(None)) else {
+                    unreachable!()
+                };
+                *seed = NodeSeed::Done(Some(reused.dep.clone()));
+                Some(*reused)
+            }
+            _ => None,
+        })
+        .collect();
+    if reused.is_empty() {
+        return Ok(());
+    }
+    reused
+        .into_iter()
+        .map(|node| finish_reused_node(ctx, resolver, node, children_pkg_aliases))
+        .pipe(future::try_join_all)
+        .await?;
+    Ok(())
 }
 
 /// Outcome of [`fn@resolve_node_seed`]: either the edge completed
-/// without a children walk (lockfile reuse, cycle break), or the
-/// package resolved and its children are still pending — the level
-/// settles which occurrence of it walks them, and only then does that
-/// one seed its children, so their resolution sees the whole level's
-/// versions in its preferred-versions overlay.
+/// without a children walk (cycle break, skipped optional, or finished
+/// lockfile reuse), the package was reused from the lockfile and its
+/// snapshot children are waiting on the level's settled alias scope,
+/// or the package resolved fresh and its children are still pending —
+/// the level settles which occurrence of it walks them, and only then
+/// does that one seed its children, so their resolution sees the whole
+/// level's versions in its preferred-versions overlay.
 pub(super) enum NodeSeed {
     Done(Option<DirectDep>),
+    Reused(Box<PendingReusedNode>),
     Pending(Box<PendingNode>),
+}
+
+/// How the walk treats one package occurrence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum NodeKind {
+    /// A workspace link. The linked project resolves its own
+    /// dependencies as a separate importer, so this walk does not
+    /// descend into it.
+    Link,
+    /// A package with no dependencies, optional dependencies, peers, or
+    /// `peerDependenciesMeta`.
+    Leaf,
+    /// A package whose children are walked.
+    Branch,
+}
+
+impl NodeKind {
+    pub(super) fn of(result: &pnpm_resolving_resolver_base::ResolveResult, id: &str) -> Self {
+        if id.starts_with("link:") {
+            NodeKind::Link
+        } else if pkg_is_leaf(result) {
+            NodeKind::Leaf
+        } else {
+            NodeKind::Branch
+        }
+    }
+
+    /// Links and leaves share one tree node per package: see [`fn@node_id_for`].
+    pub(super) fn is_leaf(self) -> bool {
+        match self {
+            NodeKind::Link | NodeKind::Leaf => true,
+            NodeKind::Branch => false,
+        }
+    }
 }
 
 /// A resolved-but-not-settled node: everything the level settlement
@@ -153,7 +197,7 @@ pub(super) enum NodeSeed {
 /// children, and [`fn@seed_node_children`] needs to seed them.
 pub(super) struct PendingNode {
     result: Arc<pnpm_resolving_resolver_base::ResolveResult>,
-    is_link: bool,
+    kind: NodeKind,
     resolves_children_through_catalogs: bool,
     /// The dependency names this occurrence's own `peerDependencies`
     /// shadow. Ownership of the package's children is settled across
@@ -177,14 +221,14 @@ pub(super) struct PendingNode {
 }
 
 pub(super) struct PendingNodeIdentity {
-    id: String,
+    id: Arc<str>,
     alias: String,
     node_id: NodeId,
 }
 
 pub(super) struct PendingNodeAncestry {
-    parent_ancestors: Arc<Vec<String>>,
-    next_ancestors: Arc<Vec<String>>,
+    parent_ancestors: AncestorPkgIds,
+    next_ancestors: AncestorPkgIds,
     depth: i32,
     current_is_optional: bool,
 }
@@ -197,13 +241,12 @@ struct SeededPackage<'a> {
     peer_shadowed: &'a HashSet<String>,
     resolves_children_through_catalogs: bool,
     current_is_optional: bool,
-    is_link: bool,
-    is_leaf: bool,
+    kind: NodeKind,
 }
 
 /// The parent-side context one child edge resolves in.
 pub(super) struct ChildEdge<'e> {
-    pub(super) ancestor_ids: &'e Arc<Vec<String>>,
+    pub(super) ancestor_ids: &'e AncestorPkgIds,
     pub(super) depth: i32,
     pub(super) parent_optional: bool,
     pub(super) reuse: ReuseSource,
@@ -230,7 +273,7 @@ struct FrontierNode {
 /// their own packages on to the next level.
 struct SeededNode {
     node: FrontierNode,
-    child_specs: Arc<Vec<ChildSpec>>,
+    child_specs: Arc<Vec<DependencySpec>>,
     seeds: Vec<NodeSeed>,
     grandchild_overlay: Option<Arc<PreferredVersionsOverlay>>,
     grandchild_pkg_aliases: Arc<ParentPkgAliases>,
@@ -260,6 +303,7 @@ pub(super) async fn walk_from_seeds<Chain>(
 where
     Chain: Resolver + ?Sized,
 {
+    finish_reused_seeds(ctx, resolver, &mut seeds, &children_pkg_aliases).await?;
     assign_level_owners(ctx, seeds.iter_mut())?;
     let direct: Vec<DirectDep> = seeds
         .iter()

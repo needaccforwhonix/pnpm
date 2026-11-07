@@ -8,7 +8,7 @@ use pnpm_catalogs_types::Catalogs;
 use pnpm_config::{PackageExtension, RegistryDeclaration};
 use pnpm_network::AuthHeadersByScope;
 use pnpr_registry::Ecosystem;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub type DepMap = BTreeMap<String, String>;
 
@@ -68,6 +68,13 @@ pub struct PypiResolveRequest {
     pub requires_python: Option<String>,
 }
 
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectPublishConfig {
+    pub directory: Option<String>,
+    pub link_directory: Option<bool>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResolveRequestProject {
@@ -80,11 +87,17 @@ pub struct ResolveRequestProject {
     #[serde(default)]
     pub version: Option<String>,
     #[serde(default)]
+    pub publish_config: Option<ProjectPublishConfig>,
+    #[serde(default)]
     pub dependencies: DepMap,
     #[serde(default)]
     pub dev_dependencies: DepMap,
     #[serde(default)]
     pub optional_dependencies: DepMap,
+    /// Auto-installed as dependencies of the importer when the request
+    /// enables `autoInstallPeers`.
+    #[serde(default)]
+    pub peer_dependencies: DepMap,
 }
 
 fn root_dir() -> String {
@@ -115,6 +128,8 @@ pub struct ResolveRequest {
     #[serde(default)]
     pub optional_dependencies: Option<DepMap>,
     #[serde(default)]
+    pub peer_dependencies: Option<DepMap>,
+    #[serde(default)]
     pub projects: Option<Vec<ResolveRequestProject>>,
     /// The client's default registry. Falls back to npmjs when absent.
     #[serde(default)]
@@ -129,7 +144,7 @@ pub struct ResolveRequest {
     /// a key is always a URL, which is what lets the boundary checks read one
     /// as a fetch target. A request in the older shape fails to parse.
     #[serde(default)]
-    pub registries: BTreeMap<String, RegistryDeclaration>,
+    pub registries: IndexMap<String, RegistryDeclaration>,
     /// The caller's forwarded upstream credentials so the server resolves
     /// and fetches private content as the caller. Keyed as
     /// `auth_headers[registry_uri][scope]`; the `@` scope stores
@@ -172,6 +187,10 @@ pub struct ResolveRequest {
     pub dedupe_peers: Option<bool>,
     #[serde(default)]
     pub exclude_links_from_lockfile: Option<bool>,
+    #[serde(default)]
+    pub add_missing_peer_types: Option<bool>,
+    #[serde(default)]
+    pub project_scoped_optional_peers: Option<bool>,
     /// The client's existing on-disk lockfile, when present. Sent both
     /// as the verification target (the server verifies it under the
     /// client's policy before resolving) and as the resolution-reuse
@@ -236,6 +255,63 @@ pub struct ResolveRequest {
     /// check.
     #[serde(default)]
     pub trust_policy_ignore_after: Option<u64>,
+    /// Lockfile formats the client accepts (e.g. `["9.0"]`). The server
+    /// renders the highest compatible format it supports.
+    #[serde(default)]
+    pub accepted_lockfile_formats: Option<Vec<String>>,
+}
+
+/// The policies the server applied to a resolution, echoed in the `done`
+/// frame so the client can verify that requested verification and resolution
+/// policies were actually enforced by the server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    dylint_lib = "perfectionist",
+    expect(
+        perfectionist::too_many_struct_fields,
+        reason = "The fields mirror the `applied` object of the pnpr `done` frame."
+    )
+)]
+pub struct AppliedPolicies {
+    pub auto_install_peers: bool,
+    pub dedupe_peers: bool,
+    pub exclude_links_from_lockfile: bool,
+    pub add_missing_peer_types: bool,
+    pub project_scoped_optional_peers: bool,
+    pub frozen_lockfile: bool,
+    pub resolution_mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub minimum_release_age: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_policy: Option<String>,
+}
+
+impl AppliedPolicies {
+    pub fn from_request(request: &ResolveRequest) -> Self {
+        let settings = super::config_cache::EffectiveResolverSettings::for_request(request);
+        let resolution_mode = match request.resolution_mode {
+            pnpm_config::ResolutionMode::Highest => "highest",
+            pnpm_config::ResolutionMode::TimeBased => "time-based",
+            pnpm_config::ResolutionMode::LowestDirect => "lowest-direct",
+        }
+        .to_string();
+        let trust_policy = match request.trust_policy {
+            pnpm_config::TrustPolicy::Off => None,
+            pnpm_config::TrustPolicy::NoDowngrade => Some("no-downgrade".to_string()),
+        };
+        Self {
+            auto_install_peers: settings.auto_install_peers,
+            dedupe_peers: settings.dedupe_peers,
+            exclude_links_from_lockfile: settings.exclude_links_from_lockfile,
+            add_missing_peer_types: settings.add_missing_peer_types,
+            project_scoped_optional_peers: settings.project_scoped_optional_peers,
+            frozen_lockfile: request.frozen_lockfile,
+            resolution_mode,
+            minimum_release_age: request.minimum_release_age,
+            trust_policy,
+        }
+    }
 }
 
 /// One project's importer dir and its dependency maps, normalized
@@ -244,9 +320,11 @@ pub struct ProjectDeps {
     pub dir: String,
     pub name: Option<String>,
     pub version: Option<String>,
+    pub publish_config: Option<ProjectPublishConfig>,
     pub dependencies: DepMap,
     pub dev_dependencies: DepMap,
     pub optional_dependencies: DepMap,
+    pub peer_dependencies: DepMap,
 }
 
 impl ResolveRequest {
@@ -265,9 +343,11 @@ impl ResolveRequest {
                     dir: project.dir.clone(),
                     name: project.name.clone(),
                     version: project.version.clone(),
+                    publish_config: project.publish_config.clone(),
                     dependencies: project.dependencies.clone(),
                     dev_dependencies: project.dev_dependencies.clone(),
                     optional_dependencies: project.optional_dependencies.clone(),
+                    peer_dependencies: project.peer_dependencies.clone(),
                 })
                 .collect();
         }
@@ -275,9 +355,11 @@ impl ResolveRequest {
             dir: root_dir(),
             name: None,
             version: None,
+            publish_config: None,
             dependencies: self.dependencies.clone().unwrap_or_default(),
             dev_dependencies: self.dev_dependencies.clone().unwrap_or_default(),
             optional_dependencies: self.optional_dependencies.clone().unwrap_or_default(),
+            peer_dependencies: self.peer_dependencies.clone().unwrap_or_default(),
         }]
     }
 }

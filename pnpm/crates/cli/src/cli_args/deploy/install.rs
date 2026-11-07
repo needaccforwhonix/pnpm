@@ -1,9 +1,11 @@
 use super::{
-    Arc, Config, Context, DeployArgs, DeployInstallMode, LazyLockfile, Lockfile, NodeLinker,
-    NodeLinkerArg, Path, PreferredVersions, Reporter, State, WantedLockfileSelection,
-    deployed_workspace_projects, get_preferred_versions_from_lockfile_and_manifests,
-    resolve_bool_override, warn,
+    Arc, Config, Context, DeployArgs, DeployInstallMode, DirectSpecs, LazyLockfile, Lockfile,
+    NodeLinker, NodeLinkerArg, Path, PathBuf, PreferredVersions, Reporter, State,
+    WantedLockfileSelection, approve_legacy_workspace_project_builds, deployed_workspace_projects,
+    get_preferred_versions_from_lockfile_and_manifests, resolve_bool_override, warn,
 };
+use pnpm_lockfile_verification::{VerifyLockfileResolutionsOptions, verify_lockfile_resolutions};
+use pnpm_package_manager::build_resolution_verifiers;
 
 /// The lockfile a shared deploy generates records no
 /// `pnpmfileChecksum`, so the pnpmfile behind these hooks must not
@@ -26,13 +28,7 @@ fn apply_shared_deploy_config(config: &mut Config, deploy_dir: &Path, mode: Depl
     let DeployInstallMode::Shared { workspace_config } = mode else {
         return;
     };
-    config.workspace_dir = deploy_dir.to_path_buf().into();
-    config.inject_workspace_packages = false;
-    config.overrides = None;
-    config.package_extensions = None;
-    config.config_dependencies = None;
-    config.patched_dependencies = workspace_config.patched_dependencies;
-    config.allow_builds = workspace_config.allow_builds;
+    workspace_config.apply_to_config(config, deploy_dir);
 }
 
 /// The lockfile a legacy deploy install reads and writes.
@@ -68,29 +64,91 @@ pub(super) fn source_pnpmfile_hooks(
     .map_err(|error| miette::miette!(code = "ERR_PNPM_PNPMFILE_NOT_FOUND", "{error}"))
 }
 
-/// Loads source lockfile pins as preferred versions for legacy deploy.
-/// The source install's branch-lockfile selection is preserved, while a
-/// missing or malformed source lockfile falls back to fresh resolution.
-pub(super) fn legacy_deploy_preferred_versions<ReporterT: Reporter>(
-    config: &Config,
-    source_lockfile_dir: &Path,
-) -> Option<PreferredVersions> {
-    if !config.lockfile {
-        return None;
-    }
-    match Lockfile::load_wanted(source_lockfile_dir, &config.wanted_lockfile_selection()) {
-        Ok(Some(lockfile)) => Some(get_preferred_versions_from_lockfile_and_manifests(
-            lockfile.snapshots.as_ref(),
-            &[],
-        )),
-        Ok(None) => None,
-        Err(error) => {
-            warn::<ReporterT>(
-                source_lockfile_dir,
-                format!("Ignoring broken lockfile at {}: {error}", source_lockfile_dir.display()),
-            );
-            None
+/// The source workspace lockfile whose pins a legacy deploy prefers.
+pub(super) struct LegacyDeploySource {
+    lockfile: Lockfile,
+    path: PathBuf,
+}
+
+impl LegacyDeploySource {
+    /// The source install's branch-lockfile selection is preserved, while a
+    /// missing or malformed source lockfile falls back to fresh resolution.
+    pub(super) fn load<ReporterT: Reporter>(
+        config: &Config,
+        source_lockfile_dir: &Path,
+    ) -> Option<Self> {
+        if !config.lockfile {
+            return None;
         }
+        match Lockfile::load_wanted(source_lockfile_dir, &config.wanted_lockfile_selection()) {
+            Ok(Some(lockfile)) => Some(Self {
+                lockfile,
+                path: source_lockfile_dir.join(config.wanted_lockfile_name()),
+            }),
+            Ok(None) => None,
+            Err(error) => {
+                warn::<ReporterT>(
+                    source_lockfile_dir,
+                    format!(
+                        "Ignoring broken lockfile at {}: {error}",
+                        source_lockfile_dir.display(),
+                    ),
+                );
+                None
+            }
+        }
+    }
+
+    fn preferred_versions(&self) -> PreferredVersions {
+        get_preferred_versions_from_lockfile_and_manifests(
+            self.lockfile.snapshots.as_ref(),
+            DirectSpecs::without_catalogs(&[]),
+        )
+    }
+
+    /// Applies the resolution policies to the source lockfile, as an install
+    /// in the source workspace does. The resolver treats its pins only as
+    /// preferences, so it would otherwise replace a rejected pin silently.
+    async fn verify<ReporterT: Reporter>(&self, state: &State) -> miette::Result<()> {
+        let verifiers = build_resolution_verifiers(
+            state.config,
+            Arc::clone(&state.http_client),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .map_err(miette::Report::new)?;
+        verify_lockfile_resolutions::<ReporterT>(
+            &self.lockfile,
+            &verifiers,
+            &VerifyLockfileResolutionsOptions {
+                concurrency: None,
+                lockfile_path: Some(&self.path),
+                cache_dir: Some(&state.config.cache_dir),
+                replaced: None,
+                repairs_lockfile: false,
+            },
+        )
+        .await
+        .map_err(miette::Report::new)
+    }
+}
+
+/// A global virtual store or an absolute `virtualStoreDir` is shared with
+/// the source workspace, and the self-contained deploy must not write into it.
+pub(super) fn configured_virtual_store_dir(config: &Config) -> Option<&str> {
+    config.explicit_settings
+        .get("virtualStoreDir")
+        .and_then(serde_json::Value::as_str)
+        .filter(|raw| !config.enable_global_virtual_store && !Path::new(raw).is_absolute())
+}
+
+fn deploy_virtual_store_dir(base_config: &Config, deploy_dir: &Path) -> PathBuf {
+    match configured_virtual_store_dir(base_config) {
+        Some(raw) => pnpm_fs::lexical_normalize(&deploy_dir.join(raw)),
+        None => deploy_dir.join("node_modules").join(".pnpm"),
     }
 }
 
@@ -101,13 +159,13 @@ pub(super) fn create_deploy_install_config(
 ) -> Config {
     let mut deploy_config = base_config.clone();
     deploy_config.modules_dir = deploy_dir.join("node_modules");
-    deploy_config.virtual_store_dir = deploy_dir.join("node_modules").join(".pnpm");
+    deploy_config.install_state_dir = deploy_virtual_store_dir(base_config, deploy_dir);
     // The deploy directory owns the lockfile this install runs against —
     // the generated one for a shared deploy, its own resolution for the
     // legacy path. A `lockfileDir` pinning the *source* workspace's
     // lockfile must not redirect either.
     deploy_config.lockfile_dir = None;
-    deploy_config.global_virtual_store_dir = deploy_config.virtual_store_dir.clone();
+    deploy_config.global_virtual_store_dir = deploy_config.install_state_dir.clone();
     deploy_config.enable_global_virtual_store = false;
     deploy_config.pnpr_server = None;
     deploy_config.optimistic_repeat_install = false;
@@ -125,21 +183,26 @@ impl DeployArgs {
         mode: DeployInstallMode,
         frozen_lockfile: bool,
         source_hooks: Option<Arc<dyn pnpm_hooks::PnpmfileHooks>>,
-        preferred_versions_override: Option<PreferredVersions>,
+        legacy_source: Option<LegacyDeploySource>,
     ) -> miette::Result<()> {
-        let legacy = matches!(&mode, DeployInstallMode::Legacy);
+        let legacy = matches!(&mode, DeployInstallMode::Legacy { .. });
         let config = self.deploy_install_config(
             base_config,
             deploy_dir,
             mode,
             frozen_lockfile,
             source_hooks.is_none(),
-        );
+        )?;
         let pnpmfile_hook = deploy_pnpmfile_hooks(source_hooks, legacy);
         let mut state = State::init(deploy_dir.join("package.json"), config, frozen_lockfile)
             .wrap_err("initialize the deploy install state")?;
         if legacy {
             state.lockfile = deployed_lockfile(&state, deploy_dir, frozen_lockfile);
+        }
+        if let Some(source) = &legacy_source
+            && !self.trust_lockfile(config)
+        {
+            source.verify::<ReporterT>(&state).await?;
         }
         self.install_deployed_state::<ReporterT>(
             &state,
@@ -147,9 +210,17 @@ impl DeployArgs {
             legacy,
             frozen_lockfile,
             pnpmfile_hook,
-            preferred_versions_override,
+            legacy_source.as_ref().map(LegacyDeploySource::preferred_versions),
         )
         .await
+    }
+
+    fn trust_lockfile(&self, config: &Config) -> bool {
+        resolve_bool_override(
+            self.install_args.lockfile_updates.trust_lockfile,
+            self.install_args.lockfile_updates.no_trust_lockfile,
+            config.trust_lockfile,
+        )
     }
 
     async fn install_deployed_state<ReporterT: Reporter + 'static>(
@@ -167,11 +238,7 @@ impl DeployArgs {
         let supported_architectures = self.install_args.supported_architectures.apply_to(
             config.supported_architectures.clone(),
         );
-        let trust_lockfile = resolve_bool_override(
-            self.install_args.lockfile_updates.trust_lockfile,
-            self.install_args.lockfile_updates.no_trust_lockfile,
-            config.trust_lockfile,
-        );
+        let trust_lockfile = self.trust_lockfile(config);
         let lockfile_path = config.lockfile.then(|| deploy_dir.join(Lockfile::FILE_NAME));
         let dependency_groups = self.install_args.dependency_options
             .dependency_groups(config.optional)
@@ -179,6 +246,7 @@ impl DeployArgs {
 
         let install = {
             let mut base_install = state.install(dependency_groups);
+            base_install.execution.mutation = pnpm_package_manager::ProjectMutation::Deploy;
             base_install.lockfile_policy.frozen = frozen_lockfile;
             base_install.lockfile_policy.prefer_frozen = frozen_lockfile
                 .then_some(true)
@@ -187,7 +255,8 @@ impl DeployArgs {
             base_install.lockfile_policy.disable_optimistic_repeat = true;
             base_install.execution.skip_runtimes =
                 config.skip_runtimes || self.install_args.materialization.no_runtime;
-            base_install.resolution.preferred_versions_override = preferred_versions_override;
+            base_install.resolution.preferred_versions_override =
+                preferred_versions_override.map(Into::into);
             base_install.context.lockfile_path = lockfile_path.as_deref();
             base_install.projects.supported_architectures = supported_architectures;
             base_install.projects.pnpmfile_hook_override = pnpmfile_hook;
@@ -211,7 +280,7 @@ impl DeployArgs {
         mode: DeployInstallMode,
         frozen_lockfile: bool,
         ignore_pnpmfile: bool,
-    ) -> &'static Config {
+    ) -> miette::Result<&'static Config> {
         let node_linker = self.install_args.materialization.node_linker.map_or(
             base_config.node_linker,
             NodeLinkerArg::into_config,
@@ -228,7 +297,28 @@ impl DeployArgs {
         // manifest, where `copy_project` may have left the deployed
         // project's own pnpmfile.
         deploy_config.ignore_pnpmfile = ignore_pnpmfile;
+        deploy_config.disable_agent_skills();
+        // The deploy hook injects only the workspace packages a manifest
+        // declares. A `workspace:` peer that the install auto-installs has
+        // no declaring manifest, and must still be copied into the deploy.
+        // This applies to every workspace package of the deploy install,
+        // whatever the workspace sets; a legacy deploy saves no lockfile,
+        // so the setting is not recorded anywhere.
+        if let DeployInstallMode::Legacy {
+            workspace_projects,
+            source_lockfile_dir,
+        } = &mode
+        {
+            deploy_config.inject_workspace_packages = true;
+            let lockfile_dir = deploy_config.lockfile_dir_for(deploy_dir).to_path_buf();
+            approve_legacy_workspace_project_builds(
+                &mut deploy_config.allow_builds,
+                workspace_projects,
+                &lockfile_dir,
+                source_lockfile_dir,
+            )?;
+        }
         apply_shared_deploy_config(&mut deploy_config, deploy_dir, mode);
-        Config::leak(deploy_config)
+        Ok(Config::leak(deploy_config))
     }
 }

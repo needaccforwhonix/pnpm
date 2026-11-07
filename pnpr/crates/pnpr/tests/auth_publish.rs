@@ -4,6 +4,9 @@
 #[path = "auth_publish/scoped_publishing.rs"]
 mod scoped_publishing;
 
+#[path = "auth_publish/package_names.rs"]
+mod package_names;
+
 #[path = "auth_publish/publish_validation.rs"]
 mod publish_validation;
 
@@ -13,20 +16,19 @@ mod behavior;
 #[path = "auth_publish/authentication.rs"]
 mod authentication;
 
-// `#[path]` rather than the `tests/common/mod.rs` layout, which the
-// Perfectionist dylint forbids.
-#[path = "common/storage.rs"]
-mod common;
-#[path = "common/npm.rs"]
-mod npm;
+#[path = "auth_publish/manifest_verification.rs"]
+mod manifest_verification;
+
+use crate::{npm, storage as common};
 
 use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
 use base64::engine::general_purpose::STANDARD as BASE64;
-use npm::{publish_doc, sha1_hex, sri_sha512};
+use npm::{npm_tgz, npm_tgz_with, publish_doc, sha1_hex, sri_sha512};
 use pnpr::{Config, MaxUsers, router};
+use pnpr_fixtures::MockConfigPresets;
 use serde_json::{Value, json};
 use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},

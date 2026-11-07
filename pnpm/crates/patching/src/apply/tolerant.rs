@@ -10,6 +10,10 @@
 //! 2. A hunk that doesn't match at its recorded position is retried up
 //!    to twenty lines either side of it.
 //!
+//! Some tolerances apply before the patch is parsed; see
+//! [`strip_cr_from_extended_headers`] and
+//! [`drop_context_no_newline_markers`].
+//!
 //! The file is modeled as `split('\n')` throughout — the same
 //! representation `patch-package` uses — so a line's own ending is
 //! whatever the surrounding text carried: untouched CRLF lines keep
@@ -21,6 +25,88 @@ use diffy::{Line, Patch};
 /// How far either side of its recorded position a hunk is retried
 /// before the patch is rejected.
 const MAX_FUZZING_OFFSET: isize = 20;
+
+const NO_NEWLINE_MARKER: &str = r"\ No newline at end of file";
+
+/// Remove each `\ No newline at end of file` marker that follows a context
+/// line, leaving every other line untouched.
+//
+// `pnpm patch-commit` diffs with `--ignore-cr-at-eol`, which counts a line
+// that only lost its final newline as unchanged, so git prints it as context
+// carrying the marker, followed by the deletions after it. `diffy` rejects
+// anything but the end of the hunk after a marked context line. Both
+// `patch-package` and `apply` ignore that marker, so dropping it loses
+// nothing.
+pub(super) fn drop_context_no_newline_markers(text: String) -> String {
+    if !text.contains(NO_NEWLINE_MARKER) {
+        return text;
+    }
+    let mut kept = String::with_capacity(text.len());
+    let mut follows_context = false;
+    for line in text.split_inclusive('\n') {
+        if follows_context && line.starts_with(NO_NEWLINE_MARKER) {
+            follows_context = false;
+            continue;
+        }
+        // `diffy` reads an empty line inside a hunk as context too.
+        follows_context = line.starts_with([' ', '\n']) || line.starts_with("\r\n");
+        kept.push_str(line);
+    }
+    kept
+}
+
+/// The git extended headers whose value [`diffy`] matches exactly: the
+/// file modes, the rename and copy paths, and the `diff --git` line the
+/// path fallback reads. No hunk line can begin with one of these, so a
+/// line that matches is a header and not content.
+const VALUE_EXTENDED_HEADERS: [&str; 9] = [
+    "diff --git ",
+    "old mode ",
+    "new mode ",
+    "new file mode ",
+    "deleted file mode ",
+    "rename from ",
+    "rename to ",
+    "copy from ",
+    "copy to ",
+];
+
+/// Drop the carriage return a CRLF patch file leaves on its git extended
+/// header lines.
+///
+/// [`diffy`]'s git-header parser strips only the trailing `\n`, so on a
+/// patch saved with CRLF line endings each of those values keeps its `\r`
+/// and then fails the match it feeds: `invalid file mode: 100644`, an
+/// unparsable rename path, or an invalid `diff --git` fallback. Hunk
+/// lines are left alone — a `\r` there is content both `patch-package` and
+/// [`diffy`] preserve, and an LF patch for a CRLF file relies on it.
+pub(super) fn strip_cr_from_extended_headers(text: String) -> String {
+    if !text.contains('\r') {
+        return text;
+    }
+    let mut kept = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let (content, newline) = match line.strip_suffix('\n') {
+            Some(content) => (content, "\n"),
+            None => (line, ""),
+        };
+        let header = content
+            .strip_suffix('\r')
+            .filter(|header| {
+                VALUE_EXTENDED_HEADERS
+                    .iter()
+                    .any(|prefix| header.starts_with(prefix))
+            });
+        match header {
+            Some(header) => {
+                kept.push_str(header);
+                kept.push_str(newline);
+            }
+            None => kept.push_str(line),
+        }
+    }
+    kept
+}
 
 /// Apply every hunk of `patch` to `original`.
 ///

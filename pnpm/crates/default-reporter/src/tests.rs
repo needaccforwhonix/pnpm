@@ -3,7 +3,7 @@ use pnpm_reporter::{
     PromptAction, StatsLog, StatsMessage,
 };
 
-use super::{LogEvent, Output, Sink, is_coalesceable};
+use super::{LogEvent, Output, Sink, is_coalesceable, progress, set_progress};
 
 #[test]
 fn progress_and_in_progress_downloads_coalesce() {
@@ -23,6 +23,40 @@ fn progress_and_in_progress_downloads_coalesce() {
     });
     assert!(is_coalesceable(&progress));
     assert!(is_coalesceable(&downloading));
+}
+
+/// The restore is ordered ahead of the assertions: a failing one must not
+/// leave progress off for whatever else shares the process.
+#[test]
+fn disabled_progress_drops_only_the_progress_streams() {
+    let resolved = LogEvent::Progress(ProgressLog {
+        level: LogLevel::Debug,
+        message: ProgressMessage::Resolved {
+            package_id: "foo".to_string(),
+            requester: "/repo".to_string(),
+        },
+    });
+    let downloading = LogEvent::FetchingProgress(FetchingProgressLog {
+        level: LogLevel::Debug,
+        message: FetchingProgressMessage::InProgress {
+            downloaded: 1,
+            package_id: "foo".to_string(),
+        },
+    });
+    let stats = LogEvent::Stats(StatsLog {
+        level: LogLevel::Debug,
+        message: StatsMessage::Added { prefix: "/repo".to_string(), added: 1 },
+    });
+
+    set_progress(true);
+    assert!(!progress::is_suppressed(&resolved));
+
+    set_progress(false);
+    let suppressed = [&resolved, &downloading, &stats].map(progress::is_suppressed);
+    set_progress(true);
+
+    assert_eq!(suppressed, [true, true, false]);
+    assert!(!progress::is_suppressed(&resolved));
 }
 
 #[test]
@@ -134,7 +168,7 @@ fn never_redraws_above_the_top_of_the_terminal() {
     };
 
     for groups in 1..=ROWS * 3 {
-        sink.write_to(Output::Frame(frame(groups, 1)), false, &mut writes);
+        sink.write_to(Output::Frame(frame(groups, groups)), false, &mut writes);
     }
     sink.write_to(Output::Frame(frame(ROWS * 3, 2)), false, &mut writes);
 
@@ -145,6 +179,40 @@ fn never_redraws_above_the_top_of_the_terminal() {
         ups.iter().all(|up| *up < ROWS),
         "no redraw may reach above the terminal's top row, got: {ups:?}",
     );
+}
+
+/// Regression test for pnpm/pnpm#17387: `pnpm run --stream` adds a line to the
+/// frame for every line a script prints. Once the frame fills the terminal,
+/// the lines still on screen must not be written again with each new one.
+#[test]
+fn a_frame_growing_past_the_terminal_writes_each_line_once() {
+    const ROWS: usize = 6;
+    const COLUMNS: usize = 120;
+    const LINES: usize = ROWS * 3;
+
+    let mut sink = Sink::new();
+    sink.viewport.terminal_size = || Some((COLUMNS, Some(ROWS)));
+    sink.diff = crate::diff::Diff::new(COLUMNS);
+    let mut writes = Vec::new();
+
+    for count in 1..=LINES {
+        let frame = (1..=count)
+            .map(|line| format!("A {line:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        sink.write_to(Output::Frame(frame), false, &mut writes);
+    }
+
+    let output = String::from_utf8(writes).expect("utf8 output");
+    for line in 1..=LINES {
+        assert_eq!(
+            output
+                .matches(&format!("A {line:02}"))
+                .count(),
+            1,
+            "line {line} in {output:?}",
+        );
+    }
 }
 
 /// An error frame stands in for the progress output rather than extending it,

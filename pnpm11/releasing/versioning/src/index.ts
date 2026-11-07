@@ -14,6 +14,7 @@ export {
   isDirRef,
   materializeWorkspaceRange,
   type PlannedRelease,
+  privateProjectDirs,
   type ProjectRefIndex,
   type ReleaseCause,
   type ReleasePlan,
@@ -26,6 +27,11 @@ export {
   prependChangelogSection,
   renderChangelog,
 } from './changelog.js'
+export {
+  checkPendingRelease,
+  describeCheckedIntents,
+  type PendingReleaseCheck,
+} from './checkPendingRelease.js'
 export {
   BUMP_TYPES,
   type ChangeIntent,

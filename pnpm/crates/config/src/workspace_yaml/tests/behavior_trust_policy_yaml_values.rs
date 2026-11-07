@@ -3,6 +3,7 @@ use super::{
     RegistryDeclaration, RegistryEntry, RegistryOptions, RegistryServerType, ResolutionMode,
     TrustPolicy, WORKSPACE_MANIFEST_FILENAME, WorkspaceSettings, assert_eq, fs,
 };
+use crate::{MachineSettings, RegistryPrefixes, TrustedSettings};
 
 /// `trustPolicy` accepts the two upstream string values; an absent
 /// key leaves the [`TrustPolicy::Off`] default in place.
@@ -17,7 +18,8 @@ fn trust_policy_yaml_values_round_trip() {
     assert_eq!(settings.trust_policy, Some(TrustPolicy::NoDowngrade));
 
     let yaml = "";
-    let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
+    let settings: WorkspaceSettings =
+        serde_saphyr::from_str::<Option<WorkspaceSettings>>(yaml).unwrap().unwrap_or_default();
     assert!(settings.trust_policy.is_none());
     let mut config = Config::new();
     settings.apply_to(&mut config, Path::new("/irrelevant"));
@@ -103,6 +105,7 @@ fn parses_registry_declarations_from_yaml_and_normalizes_the_keys() {
 registries:
   https://artifactory.example/artifactory/api/npm/npm-virtual: {serverType: artifactory}
   https://npm.example.com/: {serverType: npm}
+  https://pnpr.example/~zstd/: {serverType: pnpr}
 ";
     let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
     let mut config = Config::new();
@@ -118,6 +121,12 @@ registries:
             .get("https://npm.example.com/")
             .map(|options| options.server_type),
         Some(Some(RegistryServerType::Npm)),
+    );
+    assert_eq!(
+        config.registry_options_by_url
+            .get("https://pnpr.example/~zstd/")
+            .map(|options| options.server_type),
+        Some(Some(RegistryServerType::Pnpr)),
     );
 }
 
@@ -323,10 +332,13 @@ fn rebuilds_the_declarations_from_the_lookups() {
         declarations.get("https://npm.corp.example/"),
         Some(&RegistryDeclaration {
             scopes: Some(vec!["@acme".to_owned(), "@acme-internal".to_owned()]),
-            prefix: Some("work".to_owned()),
+            prefixes: RegistryPrefixes {
+                prefix: Some("work".to_owned()),
+                ..RegistryPrefixes::default()
+            },
             server_type: Some(RegistryServerType::Artifactory),
             supports_time_field: None,
-            unknown: BTreeMap::new(),
+            ..RegistryDeclaration::default()
         }),
     );
     assert_eq!(
@@ -372,7 +384,10 @@ fn resolved_declarations_declare_every_route() {
     assert_eq!(
         declarations.get("https://github.corp.example/"),
         Some(&RegistryDeclaration {
-            prefix: Some("gh".to_owned()),
+            prefixes: RegistryPrefixes {
+                prefix: Some("gh".to_owned()),
+                ..RegistryPrefixes::default()
+            },
             ..RegistryDeclaration::default()
         }),
     );
@@ -380,7 +395,10 @@ fn resolved_declarations_declare_every_route() {
     assert_eq!(
         declarations.get("https://registry.npmjs.org/"),
         Some(&RegistryDeclaration {
-            prefix: Some("npmjs".to_owned()),
+            prefixes: RegistryPrefixes {
+                prefix: Some("npmjs".to_owned()),
+                ..RegistryPrefixes::default()
+            },
             ..RegistryDeclaration::default()
         }),
     );
@@ -418,7 +436,7 @@ registries:
     settings.apply_to(&mut config, Path::new("/irrelevant"));
 
     let rebuilt = config.registry_declarations();
-    let original: std::collections::BTreeMap<String, RegistryDeclaration> = entries
+    let original: indexmap::IndexMap<String, RegistryDeclaration> = entries
         .into_iter()
         .map(|(registry, entry)| match entry {
             RegistryEntry::Declaration(declaration) => (registry, declaration),
@@ -463,6 +481,35 @@ registries:
     settings.apply_to(&mut config, Path::new("/irrelevant"));
 
     assert!(config.requires_full_metadata_for_registry("https://time.example.com/"));
+}
+
+#[test]
+fn pnpr_registry_waives_full_metadata_for_trust_policy_and_time_based() {
+    let yaml = r"
+resolutionMode: time-based
+trustPolicy: no-downgrade
+registries:
+  https://pnpr.example.com/: {serverType: pnpr}
+";
+    let settings: WorkspaceSettings = serde_saphyr::from_str(yaml).unwrap();
+    let mut config = Config::new();
+    settings.apply_to(&mut config, Path::new("/irrelevant"));
+
+    assert!(config.registry_supports_time_field("https://pnpr.example.com/"));
+    assert!(config.registry_supports_time_field("https://pnpr.example.com"));
+    assert!(!config.registry_supports_time_field("https://registry.npmjs.org/"));
+
+    assert!(!config.requires_full_metadata_for_registry("https://pnpr.example.com/"));
+    assert!(!config.requires_full_metadata_for_registry("https://pnpr.example.com"));
+    assert!(config.requires_full_metadata_for_registry("https://registry.npmjs.org/"));
+
+    let policy_fn = config.requires_full_metadata_for_registry_fn();
+    assert!(!policy_fn("https://pnpr.example.com/", false));
+    assert!(!policy_fn("https://pnpr.example.com", false));
+    assert!(!policy_fn("https://pnpr.example.com/", true));
+    assert!(!policy_fn("https://pnpr.example.com", true));
+    assert!(policy_fn("https://registry.npmjs.org/", false));
+    assert!(policy_fn("https://registry.npmjs.org/", true));
 }
 
 /// Nothing is filtered when no registry can need full metadata.
@@ -618,24 +665,36 @@ fn expanding_a_home_prefix_joins_the_way_pnpm_does() {
     let home = PathBuf::from("/home/example");
     for (configured, expected) in [
         ("~/bin", home.join("bin")),
+        (r"~\bin", home.join("bin")),
         ("~//bin", home.join("bin")),
         ("~/../bin", PathBuf::from("/home").join("bin")),
         ("~/nested/../bin", home.join("bin")),
     ] {
-        let mut settings = WorkspaceSettings {
-            global_dir: Some(configured.to_string()),
-            global_bin_dir: Some(configured.to_string()),
-            ..WorkspaceSettings::default()
+        let mut settings = TrustedSettings {
+            settings: WorkspaceSettings {
+                store_dir: Some(configured.to_string()),
+                ..WorkspaceSettings::default()
+            },
+            machine: MachineSettings {
+                global_dir: Some(configured.to_string()),
+                global_bin_dir: Some(configured.to_string()),
+                ..MachineSettings::default()
+            },
         };
-        settings.expand_global_dir_home_prefixes::<FakeHome>();
+        settings.expand_home_prefixes::<FakeHome>();
         let expected = Some(expected.as_path());
         assert_eq!(
-            settings.global_dir.as_deref().map(Path::new),
+            settings.settings.store_dir.as_deref().map(Path::new),
+            expected,
+            "storeDir {configured}",
+        );
+        assert_eq!(
+            settings.machine.global_dir.as_deref().map(Path::new),
             expected,
             "globalDir {configured}",
         );
         assert_eq!(
-            settings.global_bin_dir.as_deref().map(Path::new),
+            settings.machine.global_bin_dir.as_deref().map(Path::new),
             expected,
             "globalBinDir {configured}",
         );
@@ -653,14 +712,21 @@ fn a_tilde_without_a_separator_is_left_alone() {
         }
     }
 
-    let mut settings = WorkspaceSettings {
-        global_dir: Some("~backup/global".to_string()),
-        global_bin_dir: Some("bin/~/nested".to_string()),
-        ..WorkspaceSettings::default()
+    let mut settings = TrustedSettings {
+        settings: WorkspaceSettings {
+            store_dir: Some("~backup/store".to_string()),
+            ..WorkspaceSettings::default()
+        },
+        machine: MachineSettings {
+            global_dir: Some("~backup/global".to_string()),
+            global_bin_dir: Some("bin/~/nested".to_string()),
+            ..MachineSettings::default()
+        },
     };
-    settings.expand_global_dir_home_prefixes::<FakeHome>();
-    assert_eq!(settings.global_dir.as_deref(), Some("~backup/global"));
-    assert_eq!(settings.global_bin_dir.as_deref(), Some("bin/~/nested"));
+    settings.expand_home_prefixes::<FakeHome>();
+    assert_eq!(settings.settings.store_dir.as_deref(), Some("~backup/store"));
+    assert_eq!(settings.machine.global_dir.as_deref(), Some("~backup/global"));
+    assert_eq!(settings.machine.global_bin_dir.as_deref(), Some("bin/~/nested"));
 }
 
 /// The settings that report as the user set them are outside this property

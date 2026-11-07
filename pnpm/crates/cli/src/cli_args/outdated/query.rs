@@ -1,28 +1,54 @@
+pub(super) use candidates::current_versions_from_importer;
+
 use super::{
-    Arc, CatalogResolutionResult, CatalogWantedDependency, Catalogs, Config, Cow, DependencyGroup,
-    HashMap, InMemoryPackageMetaCache, LatestQuery, Lockfile, Matcher, NpmResolver,
-    PackageManifest, PickPolicy, ResolveOptions, ResolverWantedDependency, ThrottledClient,
-    Version, configured_catalogs, create_configured_npm_resolver, create_matcher, github_actions,
-    parse_catalog_protocol, resolve_from_catalog,
+    Arc, CatalogAnchor, CatalogResolutionResult, CatalogWantedDependency, Catalogs, Config, Cow,
+    DefaultResolver, DependencyGroup, HashMap, LatestQuery, Lockfile, Matcher, PackageManifest,
+    PickPolicy, ResolveOptions, ResolverWantedDependency, ThrottledClient, Version,
+    VersionsOverrider, configured_catalogs, create_configured_registry_resolver, create_matcher,
+    github_actions, parse_catalog_protocol as dereference_catalog_protocol, parse_overrides_iter,
+    project_dir, resolve_from_catalog,
 };
-use pnpm_resolving_resolver_base::Resolver;
+use crate::cli_args::{
+    ecosystem_deps::{
+        EcosystemFilterKind, collect_ecosystem_outdated, ecosystem_project_name,
+        patterns_for_ecosystem,
+    },
+    engine_deps::{DeclaredEngineDep, declared_engine_deps, min_version_of_spec},
+};
+use candidates::{collect_importer_candidates, outdated_dependency};
+
+mod candidates;
 
 /// State shared by every importer inspected in one `outdated` (or
 /// `update --interactive`) run: one resolver and metadata cache, so a
 /// dependency several workspace projects share is fetched once, plus the
 /// catalogs their `catalog:` specifiers dereference against.
 pub(crate) struct OutdatedRun {
-    pub(super) resolver: NpmResolver<InMemoryPackageMetaCache>,
+    pub(crate) config: Box<Config>,
+    pub(crate) http_client: Arc<ThrottledClient>,
+    pub(crate) raw_packages: Vec<String>,
+    pub(super) resolver: DefaultResolver,
     pub(super) resolve_options: ResolveOptions,
     pub(super) catalogs: Catalogs,
 }
 
 impl OutdatedRun {
-    pub(crate) fn new(config: &Config, http_client: Arc<ThrottledClient>) -> miette::Result<Self> {
-        let policy = PickPolicy::from_config(config).map_err(miette::Report::new)?;
-        let resolver = create_configured_npm_resolver(config, http_client, &policy)
-            .map_err(miette::Report::new)?;
+    pub(crate) fn new(
+        config: &Config,
+        http_client: Arc<ThrottledClient>,
+        query: &OutdatedQuery<'_>,
+    ) -> miette::Result<Self> {
+        let mut policy = PickPolicy::from_config(config).map_err(miette::Report::new)?;
+        if query.full_metadata {
+            policy.force_unfiltered_full_metadata();
+        }
+        let resolver =
+            create_configured_registry_resolver(config, Arc::clone(&http_client), &policy)
+                .map_err(miette::Report::new)?;
         Ok(Self {
+            config: Box::new(config.clone()),
+            http_client,
+            raw_packages: Vec::new(),
             resolver,
             resolve_options: ResolveOptions {
                 version: pnpm_resolving_resolver_base::VersionSelectionOptions {
@@ -39,6 +65,31 @@ impl OutdatedRun {
             catalogs: configured_catalogs(config)?,
         })
     }
+
+    #[must_use]
+    pub(crate) fn with_raw_packages(mut self, raw_packages: Vec<String>) -> Self {
+        self.raw_packages = raw_packages;
+        self
+    }
+
+    /// `manifest` with the overrides `lockfile` records applied.
+    fn overridden_manifest<'a>(
+        &self,
+        manifest: &'a PackageManifest,
+        lockfile: Option<&Lockfile>,
+    ) -> miette::Result<Cow<'a, PackageManifest>> {
+        let Some(overrides) = lockfile.and_then(|lockfile| lockfile.overrides.as_ref()) else {
+            return Ok(Cow::Borrowed(manifest));
+        };
+        let overrides =
+            parse_overrides_iter(overrides, &self.catalogs).map_err(miette::Report::new)?;
+        // Only registry specifiers are compared, so the base a `link:`
+        // override resolves against does not matter here.
+        let project_dir = project_dir(manifest);
+        let mut overridden = manifest.clone();
+        VersionsOverrider::new(&overrides, project_dir).apply(&mut overridden, Some(project_dir));
+        Ok(Cow::Owned(overridden))
+    }
 }
 
 /// Which registry version a dependency is compared against to decide
@@ -46,7 +97,6 @@ impl OutdatedRun {
 #[derive(Debug, Clone, Copy)]
 pub enum TargetVersion {
     /// The `latest` dist-tag — the absolute newest published version.
-    /// pnpm's default for `outdated`.
     Latest,
     /// The highest version satisfying the manifest range. pnpm's
     /// `outdated --compatible`, and the version an in-range `update`
@@ -59,11 +109,11 @@ pub enum TargetVersion {
 /// `current` is the lockfile-pinned version; `target` is the resolved
 /// [`TargetVersion`]. Both are always present — dependencies without a
 /// lockfile pin, without a registry target, or whose specifier is not a
-/// plain semver range are dropped during collection because they cannot
+/// supported registry specifier are dropped during collection because they cannot
 /// be diffed.
 pub struct OutdatedPackage {
     /// The `package.json` key (and `node_modules` directory name). Equals
-    /// `package_name` except for npm-alias entries (`"foo": "npm:bar@^1"`).
+    /// `package_name` except for aliased registry entries (`"foo": "npm:bar@^1"`).
     pub alias: String,
     /// The registry package name actually queried.
     pub package_name: String,
@@ -75,7 +125,46 @@ pub struct OutdatedPackage {
     pub metadata: OutdatedMetadata,
 }
 
-#[derive(Debug, Clone)]
+impl OutdatedPackage {
+    #[must_use]
+    pub fn current_str(&self) -> Cow<'_, str> {
+        self.metadata.display_versions
+            .as_ref()
+            .map_or_else(
+                || Cow::Owned(self.current.to_string()),
+                |versions| Cow::Borrowed(versions.current.as_str()),
+            )
+    }
+
+    #[must_use]
+    pub fn target_str(&self) -> Cow<'_, str> {
+        self.metadata.display_versions
+            .as_ref()
+            .map_or_else(
+                || Cow::Owned(self.target.to_string()),
+                |versions| Cow::Borrowed(versions.target.as_str()),
+            )
+    }
+
+    #[must_use]
+    pub fn wanted_str(&self) -> Cow<'_, str> {
+        self.metadata.display_versions
+            .as_ref()
+            .map_or_else(
+                || Cow::Owned(self.wanted.to_string()),
+                |versions| Cow::Borrowed(versions.wanted.as_str()),
+            )
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub(crate) struct OutdatedDisplayVersions {
+    pub current: String,
+    pub target: String,
+    pub wanted: String,
+}
+
+#[derive(Debug, Default, Clone)]
 pub(crate) struct OutdatedMetadata {
     /// Deprecation reason of the `target` version, when the registry
     /// marked it deprecated.
@@ -88,6 +177,9 @@ pub(crate) struct OutdatedMetadata {
     /// project without a `name`, and for entries that belong to no
     /// project (GitHub Actions).
     pub workspace: Option<String>,
+    /// Exact version strings to display when the ecosystem's version format
+    /// differs from 3-component semver (e.g. PEP 440 `"1.0"`).
+    pub display_versions: Option<Box<OutdatedDisplayVersions>>,
 }
 
 impl From<github_actions::OutdatedGitHubAction> for OutdatedPackage {
@@ -104,6 +196,7 @@ impl From<github_actions::OutdatedGitHubAction> for OutdatedPackage {
                 deprecated: None,
                 homepage: Some(action.homepage),
                 workspace: None,
+                display_versions: None,
             },
         }
     }
@@ -127,6 +220,17 @@ pub struct OutdatedQuery<'a> {
     /// `update` does not (a deprecated-but-current dependency has no
     /// newer version to move to).
     pub include_deprecated: bool,
+    /// Fetch the full packument instead of the abbreviated install
+    /// metadata. The full document is the only source of `homepage`,
+    /// which the `--long` details column renders.
+    pub full_metadata: bool,
+}
+
+impl OutdatedQuery<'_> {
+    pub(crate) fn matches_name(&self, name: &str) -> bool {
+        self.match_names.is_none_or(|matcher| matcher.matches(name))
+            && !self.ignore_names.is_some_and(|matcher| matcher.matches(name))
+    }
 }
 
 /// The matcher for `updateConfig.ignoreDependencies`, or [`None`] when
@@ -170,14 +274,9 @@ pub(crate) async fn collect_outdated_for_importer(
     http_client: &Arc<ThrottledClient>,
     query: &OutdatedQuery<'_>,
 ) -> miette::Result<Vec<OutdatedPackage>> {
-    collect_outdated_for_importer_in_run(
-        manifest,
-        lockfile,
-        importer_id,
-        query,
-        &OutdatedRun::new(config, Arc::clone(http_client))?,
-    )
-    .await
+    let run = Box::new(OutdatedRun::new(config, Arc::clone(http_client), query)?);
+    Box::pin(collect_outdated_for_importer_in_run(manifest, lockfile, importer_id, query, &run))
+        .await
 }
 
 pub(crate) async fn collect_outdated_for_importer_in_run(
@@ -187,203 +286,72 @@ pub(crate) async fn collect_outdated_for_importer_in_run(
     query: &OutdatedQuery<'_>,
     run: &OutdatedRun,
 ) -> miette::Result<Vec<OutdatedPackage>> {
+    let manifest = &run.overridden_manifest(manifest, lockfile)?;
+    let workspace = importer_workspace_label(manifest, importer_id, &run.config);
+    let mut results = Box::pin(collect_node_outdated_for_importer(
+        manifest,
+        lockfile,
+        importer_id,
+        &workspace,
+        query,
+        run,
+    ))
+    .await?;
+    if run.config.cargo.enabled || run.config.python.enabled {
+        let ecosystem_outdated = Box::pin(collect_ecosystem_outdated(
+            project_dir(manifest),
+            Some(workspace),
+            query,
+            &run.raw_packages,
+            run,
+        ))
+        .await?;
+        results.extend(ecosystem_outdated);
+    }
+    Ok(results)
+}
+
+async fn collect_node_outdated_for_importer(
+    manifest: &PackageManifest,
+    lockfile: Option<&Lockfile>,
+    importer_id: &str,
+    workspace: &str,
+    query: &OutdatedQuery<'_>,
+    run: &OutdatedRun,
+) -> miette::Result<Vec<OutdatedPackage>> {
+    let node_patterns = patterns_for_ecosystem(&run.raw_packages, EcosystemFilterKind::Node)?;
+    if !run.raw_packages.is_empty() && node_patterns.is_empty() {
+        return Ok(Vec::new());
+    }
+    let node_matcher = (!node_patterns.is_empty()).then(|| create_matcher(&node_patterns));
+    let node_query =
+        OutdatedQuery { match_names: node_matcher.as_ref().or(query.match_names), ..*query };
     let current_versions =
-        current_versions_from_importer(lockfile, importer_id, query.include_direct);
-    let current_versions = &current_versions;
-    // Recorded on every entry so the interactive update list can say
-    // which workspace project each outdated dependency came from. A
-    // project is not required to declare a name, and an empty label
-    // leaves several unnamed projects indistinguishable, so fall back to
-    // the path that identifies the project in the lockfile.
-    let workspace = manifest
-        .value()
-        .get("name")
-        .and_then(serde_json::Value::as_str)
-        // A name that is missing, empty, or only whitespace all give an
-        // equally blank label.
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map_or_else(|| importer_id.to_string(), str::to_string);
-    let workspace = &workspace;
-
-    // Gather the lockfile-pinned direct dependencies to inspect, then
-    // fetch their packuments concurrently — mirroring pnpm's
-    // `Promise.all` fan-out. Concurrency is bounded by the HTTP client's
-    // per-registry limit (`network_concurrency`), so this does not flood
-    // the registry. Dependencies without a lockfile pin are dropped here.
-    let fetches = query.include_direct
-        .iter()
-        .flat_map(move |&group| {
-            manifest
-                .dependencies([group])
-                .filter_map(move |(alias, bare_specifier)| {
-                    if query.match_names.is_some_and(|matcher| !matcher.matches(alias))
-                        || query.ignore_names.is_some_and(|matcher| matcher.matches(alias))
-                    {
-                        return None;
-                    }
-                    let current = current_versions.get(alias).cloned()?;
-                    Some(OutdatedCandidate { alias, group, bare_specifier, current })
-                })
-        })
-        .map(|candidate| outdated_dependency(run, query, workspace, candidate));
-
+        current_versions_from_importer(lockfile, importer_id, node_query.include_direct);
+    let engine_deps = declared_engine_deps(manifest, &run.config, node_query.include_direct);
+    let candidates =
+        collect_importer_candidates(manifest, &current_versions, &engine_deps, &node_query);
+    let fetches = candidates
+        .into_iter()
+        .map(|candidate| outdated_dependency(run, &node_query, workspace, candidate));
     let fetched = futures_util::future::join_all(fetches).await
         .into_iter()
         .collect::<miette::Result<Vec<_>>>()?;
     Ok(fetched.into_iter().flatten().collect())
 }
 
-/// One lockfile-pinned direct dependency to compare against the registry.
-struct OutdatedCandidate<'a> {
-    alias: &'a str,
-    group: DependencyGroup,
-    bare_specifier: &'a str,
-    current: Version,
-}
-
-/// The dependency's outdated entry: `None` when the registry names no
-/// target, or the target is neither newer nor (when asked) deprecated.
-async fn outdated_dependency(
-    run: &OutdatedRun,
-    query: &OutdatedQuery<'_>,
-    workspace: &str,
-    candidate: OutdatedCandidate<'_>,
-) -> miette::Result<Option<OutdatedPackage>> {
-    let bare_specifier =
-        dereference_catalog(&run.catalogs, candidate.alias, candidate.bare_specifier)?;
-    let resolved_package_name =
-        PackageManifest::resolve_registry_dependency(candidate.alias, &bare_specifier)
-            .0
-            .to_string();
-    let latest = resolve_outdated_target(
-        run,
-        query,
-        &candidate,
-        bare_specifier.into_owned(),
-        &resolved_package_name,
-    )
-    .await?;
-    let Some(target_manifest) = latest.and_then(|latest| latest.latest_manifest) else {
-        return Ok(None);
-    };
-    Ok(outdated_target(query, workspace, candidate, &target_manifest, &resolved_package_name))
-}
-
-/// Replace a `catalog:` specifier with the specifier the catalog holds,
-/// so both the queried package name and the `--compatible` range come
-/// from the catalog entry — which may itself be an npm alias
-/// (`npm:@types/table@^6`). Any other specifier passes through.
-fn dereference_catalog<'a>(
-    catalogs: &Catalogs,
-    alias: &str,
-    bare_specifier: &'a str,
-) -> miette::Result<Cow<'a, str>> {
-    // Most dependencies are not catalog entries, and every walked
-    // dependency reaches this, so screen them out before the resolver's
-    // owned `WantedDependency`.
-    if parse_catalog_protocol(bare_specifier).is_none() {
-        return Ok(Cow::Borrowed(bare_specifier));
-    }
-    let wanted = CatalogWantedDependency {
-        alias: alias.to_string(),
-        bare_specifier: bare_specifier.to_string(),
-    };
-    match resolve_from_catalog(catalogs, &wanted) {
-        CatalogResolutionResult::Found(found) => Ok(Cow::Owned(found.resolution.specifier)),
-        CatalogResolutionResult::Misconfiguration(misconfiguration) => {
-            Err(miette::Report::new(misconfiguration.error))
-        }
-        CatalogResolutionResult::Unused => Ok(Cow::Borrowed(bare_specifier)),
-    }
-}
-
-pub(super) fn current_versions_from_importer(
-    lockfile: Option<&Lockfile>,
+fn importer_workspace_label(
+    manifest: &PackageManifest,
     importer_id: &str,
-    include_direct: &[DependencyGroup],
-) -> HashMap<String, Version> {
-    let mut map = HashMap::new();
-    let Some(importer) = lockfile.and_then(|lockfile| lockfile.importers.get(importer_id)) else {
-        return map;
-    };
-    for (name, spec) in importer.dependencies_by_groups(include_direct.iter().copied()) {
-        if let Some(version) = spec.version.ver_peer().and_then(|ver| ver.version_semver()) {
-            map.insert(name.to_string(), version.clone());
-        }
-    }
-    map
-}
-
-async fn resolve_outdated_target(
-    run: &OutdatedRun,
-    query: &OutdatedQuery<'_>,
-    candidate: &OutdatedCandidate<'_>,
-    bare_specifier: String,
-    resolved_package_name: &str,
-) -> miette::Result<Option<pnpm_resolving_resolver_base::LatestInfo>> {
-    run.resolver
-        .resolve_latest(
-            &LatestQuery {
-                wanted_dependency: ResolverWantedDependency {
-                    alias: Some(candidate.alias.to_string()),
-                    bare_specifier: Some(bare_specifier),
-                    optional: Some(candidate.group == DependencyGroup::Optional),
-                    ..ResolverWantedDependency::default()
-                },
-                compatible: matches!(query.target_version, TargetVersion::WithinRange),
-            },
-            &run.resolve_options,
-        )
-        .await
-        .map_err(|error| {
-            let reason = pnpm_network::redact_url_credentials(&error.to_string());
-            miette::miette!(
-                code = "ERR_PNPM_OUTDATED_REGISTRY_ERROR",
-                r#"Failed to fetch metadata for "{resolved_package_name}": {reason}"#,
-            )
-        })
-}
-
-fn outdated_target(
-    query: &OutdatedQuery<'_>,
-    workspace: &str,
-    candidate: OutdatedCandidate<'_>,
-    target_manifest: &pnpm_resolving_resolver_base::SharedDependencyManifest,
-    resolved_package_name: &str,
-) -> Option<OutdatedPackage> {
-    let target = target_manifest
-        .get("version")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|version| version.parse::<Version>().ok())?;
-    let deprecated = target_manifest
-        .get("deprecated")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
-    let is_newer = target > candidate.current;
-    if !(is_newer || (query.include_deprecated && deprecated.is_some())) {
-        return None;
-    }
-    let package_name = target_manifest
+    config: &Config,
+) -> String {
+    manifest
+        .value()
         .get("name")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or(resolved_package_name)
-        .to_string();
-    Some(OutdatedPackage {
-        alias: candidate.alias.to_string(),
-        package_name,
-        belongs_to: candidate.group,
-        wanted: candidate.current.clone(),
-        current: candidate.current,
-        target,
-        github_action: false,
-        metadata: OutdatedMetadata {
-            deprecated,
-            homepage: target_manifest
-                .get("homepage")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
-            workspace: Some(workspace.to_string()),
-        },
-    })
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .or_else(|| ecosystem_project_name(project_dir(manifest), config))
+        .unwrap_or_else(|| importer_id.to_string())
 }

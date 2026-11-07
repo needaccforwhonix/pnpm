@@ -1,35 +1,26 @@
+pub use pnpm_package_manifest::{
+    ScriptRuntime, extension_program, parse_shebang, parse_shebang_from_bytes,
+};
 pub use powershell::generate_pwsh_shim;
 pub use quoting::{cmd_escape, sh_single_quote};
-pub use sh::{generate_sh_shim, is_sh_shim_hardened, is_shim_pointing_at};
+pub(crate) use relocatable::{is_relocatable_shim, is_within_root};
+pub use replaced_batch::end_replaced_cmd_shim_batch;
+pub use sh::{
+    generate_sh_shim, is_sh_shim_hardened, is_sh_shim_msys_cmd_switch_doubled, is_shim_pointing_at,
+};
+pub use sh_anchored_target::is_sh_shim_basedir_anchor_current;
+#[cfg(target_family = "wasm")]
+pub(crate) use wasm::generate_wasm_shim;
+#[cfg(any(all(test, unix), target_family = "wasm"))]
+mod wasm;
 
 use crate::{capabilities::FsReadHead, path_util::lexical_normalize};
+use pnpm_package_manifest::infer_script_runtime_from_shebang;
 use std::{
     fmt::Write as _,
     io,
     path::{Path, PathBuf},
 };
-
-/// Detected runtime for a target script.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScriptRuntime {
-    /// The interpreter to invoke. `None` means "exec the file directly".
-    pub prog: Option<String>,
-    /// Extra arguments declared after the interpreter in the shebang. Empty
-    /// when the runtime came from the extension fallback.
-    pub args: String,
-}
-
-/// Map of file extensions to their default runtime when the script lacks a
-/// shebang.
-fn extension_program(extension: &str) -> Option<&'static str> {
-    match extension {
-        "js" | "cjs" | "mjs" => Some("node"),
-        "cmd" | "bat" => Some("cmd"),
-        "ps1" => Some("pwsh"),
-        "sh" => Some("sh"),
-        _ => None,
-    }
-}
 
 /// Read up to 512 bytes of `path` and infer the runtime.
 ///
@@ -38,22 +29,8 @@ fn extension_program(extension: &str) -> Option<&'static str> {
 /// has already verified the bin path resolves under the package root by
 /// this point and a real failure deserves to surface.
 pub fn search_script_runtime<Sys: FsReadHead>(path: &Path) -> io::Result<Option<ScriptRuntime>> {
-    let extension = path
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
-
     let runtime_from_shebang = read_shebang::<Sys>(path)?;
-    if let Some(rt) = runtime_from_shebang {
-        return Ok(Some(rt));
-    }
-
-    if let Some(prog) = extension_program(extension) {
-        let args = if prog == "cmd" { "/C" } else { "" };
-        return Ok(Some(ScriptRuntime { prog: Some(prog.to_string()), args: args.to_string() }));
-    }
-
-    Ok(None)
+    Ok(infer_script_runtime_from_shebang(path, runtime_from_shebang))
 }
 
 fn read_shebang<Sys: FsReadHead>(path: &Path) -> io::Result<Option<ScriptRuntime>> {
@@ -78,10 +55,6 @@ fn read_shebang<Sys: FsReadHead>(path: &Path) -> io::Result<Option<ScriptRuntime
 /// reads are common. On regular files at offset 0 the underlying
 /// `read` returns the whole prefix in one syscall, so the loop adds
 /// no extra syscalls in the hot path. The cost is one extra branch.
-///
-/// Kept generic over [`FsReadHead`] so tests can plug in a fake that
-/// deliberately returns short and verify the loop accumulates
-/// correctly.
 pub fn read_head_filled<Sys: FsReadHead>(path: &Path, buf: &mut [u8]) -> io::Result<usize> {
     let mut total = 0;
     while total < buf.len() {
@@ -93,92 +66,25 @@ pub fn read_head_filled<Sys: FsReadHead>(path: &Path, buf: &mut [u8]) -> io::Res
     Ok(total)
 }
 
-/// Parse the runtime out of the first line of a script's content. Pure
-/// function over bytes so the caller can plug in any I/O strategy.
-///
-/// Does **not** trim leading whitespace before looking for `#!`. The
-/// kernel treats `#!` as a shebang only when it sits at byte 0 of the
-/// file; trimming would accept inputs like
-/// `" \n#!/usr/bin/env node"` as a valid shebang and could select the
-/// wrong runtime for files that just happen to mention `#!` after some
-/// whitespace. The first line is taken exactly as-is (`#!` is matched
-/// at column 0 of that line via `strip_prefix` in `parse_shebang`).
-#[must_use]
-pub fn parse_shebang_from_bytes(bytes: &[u8]) -> Option<ScriptRuntime> {
-    let head = String::from_utf8_lossy(bytes);
-    let first_line = head
-        .split('\n')
-        .next()
-        .unwrap_or("")
-        .trim_end_matches('\r');
-    parse_shebang(first_line)
-}
-
-/// Parses the shebang against the grammar
-/// `^#!\s*(?:/usr/bin/env(?:\s+-S\s*)?)?\s*([^ \t]+)(.*)$`.
-///
-/// `args` is captured **including the leading whitespace** that
-/// separates it from `prog` — everything from after `prog`'s end of
-/// match to end of line. Preserving the leading whitespace is what
-/// produces byte-identical shim text (e.g. the double space between
-/// `$basedir/sh` and `-e` in the rendered exec line).
-fn parse_shebang(line: &str) -> Option<ScriptRuntime> {
-    let rest = line.strip_prefix("#!")?.trim_start();
-    let (rest, _) = strip_env_prefix(rest);
-    let rest = rest.trim_start();
-
-    // Slice at the first space or tab; the args slice keeps the separator
-    // so the rendered shim stays byte-for-byte stable. Using `splitn`
-    // would discard the separator and silently drop one space from the
-    // `exec` line.
-    let (prog, args) = match rest.find([' ', '\t']) {
-        Some(idx) => rest.split_at(idx),
-        None => (rest, ""),
-    };
-
-    if prog.is_empty() {
-        return None;
-    }
-
-    Some(ScriptRuntime { prog: Some(prog.to_string()), args: args.to_string() })
-}
-
-/// Strip a leading `/usr/bin/env`, optionally followed by `-S`, from the
-/// shebang body. Returns the remainder and whether `env` was present.
-fn strip_env_prefix(input: &str) -> (&str, bool) {
-    let Some(rest) = input.strip_prefix("/usr/bin/env") else {
-        return (input, false);
-    };
-    let trimmed = rest.trim_start();
-    if let Some(after_dash_s) = trimmed.strip_prefix("-S") {
-        return (after_dash_s, true);
-    }
-    (trimmed, true)
-}
-
 /// Render `node_path` entries into the platform variants cmd-shim's
 /// `normalizePathEnvVar` produces: `win32` joins with `;` and
-/// backslashes, `posix` joins with `:` and forward slashes. On a
-/// Windows host the posix form additionally rewrites the drive prefix
-/// (`C:` → `/proc/cygdrive/c` under Cygwin/MSYS, `/mnt/c` otherwise),
-/// matching cmd-shim. On Unix the entries pass through unchanged.
+/// backslashes, `posix` joins with `:` and forward slashes. When the shim
+/// is generated on Windows (`windows_host`), the posix form additionally
+/// maps a drive prefix to WSL's mount (`C:` → `/mnt/c`). Shells under
+/// Cygwin and MSYS read the `win32` form instead, which the shim picks at
+/// run time, so the rendering doesn't depend on the installing shell. On
+/// Unix the entries pass through unchanged.
 struct NodePathEnvVar {
     win32: String,
     posix: String,
 }
 
-fn normalize_node_path_env_var(node_path: &[String]) -> NodePathEnvVar {
-    // The Cygwin/MSYS probe is process-invariant — read the
-    // environment once, not per entry.
-    let mount = cfg!(windows).then(windows_posix_mount_prefix);
+fn normalize_node_path_env_var(node_path: &[String], windows_host: bool) -> NodePathEnvVar {
     let mut win32 = String::new();
     let mut posix = String::new();
     for entry in node_path {
         let entry_win32 = entry.replace('/', r"\");
-        let entry_posix = match mount {
-            Some(mount) => windows_entry_to_posix(entry, mount),
-            None => entry.clone(),
-        };
+        let entry_posix = if windows_host { windows_entry_to_posix(entry) } else { entry.clone() };
         if !win32.is_empty() {
             win32.push(';');
         }
@@ -191,24 +97,9 @@ fn normalize_node_path_env_var(node_path: &[String]) -> NodePathEnvVar {
     NodePathEnvVar { win32, posix }
 }
 
-/// The mount prefix a Windows drive letter maps to in the posix
-/// rendering. Cygwin/MSYS is detected the way cmd-shim does —
-/// `TERM=CYGWIN` or a set `MSYSTEM`.
-///
-/// NOTE: the probe runs at shim-*generation* time, so the posix path
-/// baked into the `.ps1` reflects the installing shell. A shim
-/// generated under Cygwin and later run under WSL points at a
-/// `/proc/cygdrive` path that doesn't exist there — the same known
-/// trap cmd-shim has.
-fn windows_posix_mount_prefix() -> &'static str {
-    let is_cygwin = std::env::var("TERM").is_ok_and(|term| term == "CYGWIN")
-        || std::env::var_os("MSYSTEM").is_some();
-    if is_cygwin { "/proc/cygdrive" } else { "/mnt" }
-}
-
 /// cmd-shim's Windows-host posix rendering: flip backslashes and map a
-/// leading drive letter to the [`windows_posix_mount_prefix`].
-fn windows_entry_to_posix(entry: &str, mount: &str) -> String {
+/// leading drive letter under WSL's `/mnt`.
+fn windows_entry_to_posix(entry: &str) -> String {
     let flipped = entry.replace('\\', "/");
     let Some((drive, rest)) = flipped.split_once(':') else {
         return flipped;
@@ -216,7 +107,7 @@ fn windows_entry_to_posix(entry: &str, mount: &str) -> String {
     if drive.is_empty() || drive.contains('/') {
         return flipped;
     }
-    format!("{mount}/{}{rest}", drive.to_lowercase())
+    format!("/mnt/{}{rest}", drive.to_lowercase())
 }
 
 /// Generate the Windows `.cmd` shim contents for `target_path`. Pacquet
@@ -232,17 +123,24 @@ pub fn generate_cmd_shim(
     shim_path: &Path,
     runtime: Option<&ScriptRuntime>,
     node_path: &[String],
+    batch: CmdShimBatch,
 ) -> String {
-    let cmd_target_rel = relative_target_windows(target_path, shim_path);
+    let cmd_target_rel = cmd_escape(&relative_target_windows(target_path, shim_path));
     let quoted_target = if Path::new(&cmd_target_rel).is_absolute() {
         format!(r#""{cmd_target_rel}""#)
     } else {
         format!(r#""%~dp0\{cmd_target_rel}""#)
     };
 
+    let runs_target_directly = runtime.is_none_or(|runtime| runtime.prog.is_none());
+    if batch == CmdShimBatch::EndedBeforeTarget && runs_target_directly {
+        let args = runtime.map_or(String::new(), |runtime| cmd_escape(&runtime.args));
+        return generate_batchless_cmd_shim(&quoted_target, &args);
+    }
+
     let mut cmd = String::from("@SETLOCAL\r\n");
 
-    let cmd_node_path = normalize_node_path_env_var(node_path).win32;
+    let cmd_node_path = cmd_escape(&normalize_node_path_env_var(node_path, cfg!(windows)).win32);
     if !cmd_node_path.is_empty() {
         write!(
             cmd,
@@ -253,6 +151,8 @@ pub fn generate_cmd_shim(
 
     match runtime {
         Some(ScriptRuntime { prog: Some(prog), args }) => {
+            let prog = cmd_escape(prog);
+            let args = cmd_escape(args);
             let long_prog = format!(r#""%~dp0\{prog}.exe""#);
             writeln!(
                 cmd,
@@ -261,12 +161,100 @@ pub fn generate_cmd_shim(
             .unwrap();
         }
         runtime_opt => {
-            let args = runtime_opt.map_or("", |runtime| runtime.args.as_str());
+            let args = runtime_opt.map_or(String::new(), |runtime| cmd_escape(&runtime.args));
             writeln!(cmd, "@{quoted_target} {args} %*\r").unwrap();
         }
     }
 
+    with_utf8_codepage(cmd)
+}
+
+/// Whether a `.cmd` shim's batch context is still active while its target
+/// runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CmdShimBatch {
+    /// The target runs as a command of the batch file, as in cmd-shim.
+    Kept,
+    /// The shim ends its batch context before the target starts, so when
+    /// Ctrl+C stops the target, cmd.exe has no batch job left to ask
+    /// `Terminate batch job (Y/N)?` about.
+    ///
+    /// The `SETLOCAL` scope ends with the batch context, so such a shim sets no
+    /// `NODE_PATH`. A target run through an interpreter keeps
+    /// [`Kept`](Self::Kept), because its interpreter lookup sets `PATHEXT`,
+    /// which would then leak into an interactive cmd.exe session.
+    EndedBeforeTarget,
+}
+
+/// The [`CmdShimBatch::EndedBeforeTarget`] form of a shim that runs
+/// `quoted_target` directly.
+///
+/// A `GOTO` to a missing label ends the batch context, yet cmd.exe still runs
+/// the rest of the line it has already parsed, in command-line context. Percent
+/// expansion happened during that parse, so the target path and `%*` are in
+/// place.
+///
+/// An interactive cmd.exe adds the batch command to the window title and
+/// restores the title when the batch ends. This exit skips the restore, so the
+/// title would grow with every call. The shim resets it to `%COMSPEC%` when
+/// cmd.exe is interactive, that is, when its command line has no `/c`. Under
+/// `/c`, as when PowerShell runs a `.cmd`, cmd.exe leaves the title alone, and
+/// so does the shim. `=` ends an `IF` operand, so the substitution goes through
+/// a variable before the comparison.
+///
+/// A non-ASCII target needs the UTF-8 code page while cmd.exe reads the line,
+/// and the line restores the caller's code page itself, since nothing after it
+/// runs.
+fn generate_batchless_cmd_shim(quoted_target: &str, args: &str) -> String {
+    let target_command = format!("{quoted_target} {args} %*");
+    let restore_codepage = if target_command.is_ascii() {
+        ""
+    } else {
+        r#"(IF NOT "%_PNPM_CODEPAGE%"=="" "%SystemRoot%\System32\chcp.com" %_PNPM_CODEPAGE% >NUL) & "#
+    };
+    let mut cmd = format!(
+        "@SETLOCAL\r\n\
+         @SET \"_PNPM_RESTORE_TITLE=\"\r\n\
+         @SETLOCAL EnableDelayedExpansion\r\n\
+         @SET \"_PNPM_CMDLINE=!CMDCMDLINE:/c=!\"\r\n\
+         @IF \"!_PNPM_CMDLINE!\"==\"!CMDCMDLINE!\" (ENDLOCAL & SET \"_PNPM_RESTORE_TITLE=1\") ELSE ENDLOCAL\r\n\
+         {BATCH_END}(IF \"%_PNPM_RESTORE_TITLE%\"==\"1\" TITLE %COMSPEC%) & {restore_codepage}{target_command}\r\n",
+    );
+    if !cmd.is_ascii() {
+        insert_utf8_codepage_switch(&mut cmd);
+    }
     cmd
+}
+
+/// The start of the line that ends a [`CmdShimBatch::EndedBeforeTarget`]
+/// shim's batch and runs its target.
+const BATCH_END: &str = "@GOTO #_undefined_# 2>NUL || ";
+
+/// What a [`CmdShimBatch::Kept`] shim runs after its target when it switched
+/// the code page: the restore, with the target's exit code carried past it.
+const CODEPAGE_RESTORE_TRAILER: &str = "@SET \"_PNPM_EXIT_CODE=%ERRORLEVEL%\"\r\n\
+    @IF DEFINED _PNPM_CODEPAGE @\"%SystemRoot%\\System32\\chcp.com\" %_PNPM_CODEPAGE% >NUL\r\n\
+    @EXIT /B %_PNPM_EXIT_CODE%\r\n";
+
+fn with_utf8_codepage(mut cmd: String) -> String {
+    if !cmd.is_ascii() {
+        insert_utf8_codepage_switch(&mut cmd);
+        cmd.push_str(CODEPAGE_RESTORE_TRAILER);
+    }
+    cmd
+}
+
+/// Save the caller's code page and switch to UTF-8, right after the shim's
+/// leading `@SETLOCAL`, so cmd.exe reads the non-ASCII lines that follow
+/// correctly.
+fn insert_utf8_codepage_switch(cmd: &mut String) {
+    cmd.insert_str(
+        "@SETLOCAL\r\n".len(),
+        "@SET \"_PNPM_CODEPAGE=\"\r\n\
+         @FOR /F \"tokens=2 delims=:\" %%a IN ('\"%SystemRoot%\\System32\\chcp.com\"') DO @SET \"_PNPM_CODEPAGE=%%a\"\r\n\
+         @\"%SystemRoot%\\System32\\chcp.com\" 65001 >NUL\r\n\
+         @SET \"ERRORLEVEL=\"\r\n",
+    );
 }
 
 /// Compute the Windows-style relative path from `shim_path`'s parent
@@ -287,7 +275,8 @@ fn relative_target_windows(target_path: &Path, shim_path: &Path) -> String {
 fn relative_target(target_path: &Path, shim_path: &Path) -> String {
     let shim_dir = shim_path.parent().unwrap_or_else(|| Path::new(""));
     let rel = relative_path_from(shim_dir, target_path);
-    rel.to_string_lossy().replace('\\', "/")
+    let rel = rel.to_string_lossy();
+    if cfg!(windows) { rel.replace('\\', "/") } else { rel.into_owned() }
 }
 
 fn relative_path_from(from: &Path, to: &Path) -> PathBuf {
@@ -322,5 +311,11 @@ mod tests;
 mod powershell;
 
 mod quoting;
+
+mod relocatable;
+
+mod replaced_batch;
+
+mod sh_anchored_target;
 
 mod sh;

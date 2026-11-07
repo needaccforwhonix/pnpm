@@ -37,11 +37,15 @@ use url_credentials::{addressed_registry_segment, contains_dot_segment, nerf_pre
 
 mod route_hook;
 
+mod connect_policy;
+use connect_policy::ConnectPolicy;
+
 mod footprint;
 
 use std::{
     collections::BTreeSet,
     fmt,
+    net::IpAddr,
     sync::{Arc, Mutex},
 };
 
@@ -108,6 +112,8 @@ pub struct RouteContext {
     /// the alias descriptor covers every name the alias resolves, shared
     /// among callers the registry-level `access:` admits.)
     upstream_rules: IndexMap<String, PackageRules>,
+    /// The addresses a resolver connection may be opened to.
+    connect_policy: ConnectPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -126,8 +132,7 @@ struct RouteMatcher {
 struct ResolvedAlias {
     name: String,
     /// [`credential_digest`] of [`Self::authorization`]: the credential epoch
-    /// this alias's private cache entries are keyed by. Changes when the
-    /// upstream credential rotates.
+    /// this alias's private cache entries are keyed by.
     credential_digest: String,
     registry: String,
     /// Nerf-darted upstream origin the alias serves. Routing is by origin
@@ -206,18 +211,8 @@ impl RouteContext {
             registries,
             hosted_rules,
             upstream_rules,
+            connect_policy: ConnectPolicy::from_config(config),
         }
-    }
-
-    #[must_use]
-    pub fn is_only_ecosystem(&self, ecosystem: Ecosystem) -> bool {
-        self.registries.is_only_ecosystem(ecosystem)
-    }
-
-    /// See [`Registries::base_path`].
-    #[must_use]
-    pub fn base_path(&self, ecosystem: Ecosystem) -> String {
-        self.registries.base_path(ecosystem)
     }
 
     /// Whether the upstream registry's effective per-package access admits
@@ -228,7 +223,7 @@ impl RouteContext {
         let (Some(package), Some(rules)) = (package, self.upstream_rules.get(registry)) else {
             return true;
         };
-        rules.for_package(package).access.allows(identity)
+        rules.access_admits(package, identity)
     }
 
     /// The descriptor package qualifier for a proxied fetch: `Some(package)`
@@ -238,7 +233,7 @@ impl RouteContext {
     /// the common footprint one descriptor per alias.
     fn alias_package_qualifier(&self, alias: &str, package: Option<&str>) -> Option<String> {
         let (package, rules) = (package?, self.upstream_rules.get(alias)?);
-        rules.for_package(package).access_is_explicit.then(|| package.to_string())
+        rules.access_is_explicit(package).then(|| package.to_string())
     }
 
     /// Classify a single fetch to `url` for `package` (`None` for a
@@ -300,14 +295,8 @@ impl RouteContext {
         hosted: &str,
         package: Option<&str>,
     ) -> RouteClass {
-        // Spelled out rather than built from `base_path`: this wants a path
-        // segment with a trailing slash, not the `/<ecosystem>` prefix that
-        // URL building uses.
-        let npm_endpoint = if self.registries.is_only_ecosystem(Ecosystem::Npm) {
-            hosted.to_string()
-        } else {
-            format!("{hosted}npm/")
-        };
+        let npm_endpoint =
+            format!("{}{}/", hosted.trim_end_matches('/'), Ecosystem::Npm.base_path());
         if let Some(registry) = addressed_registry_segment(fetch, &npm_endpoint) {
             return self.classify_addressed(identity, registry, package);
         }
@@ -436,6 +425,26 @@ impl RouteContext {
             .any(|origin| fetch.starts_with(origin))
     }
 
+    /// Whether the resolver may fetch `url`: its registry is on the
+    /// allowlist ([`Self::allows_registry`]) and, when its host is an IP
+    /// literal, [`Self::allows_address`] admits it.
+    #[must_use]
+    pub fn allows_fetch(&self, url: &str) -> bool {
+        self.allows_registry(url) && self.connect_policy.allows_literal_host(url)
+    }
+
+    /// Whether the resolver may open a connection to `address`, resolved for
+    /// `host`: a public address, one in `routes.allowedPrivateNetworks`, or
+    /// any address of this server's own `public_url` host. The allowlist
+    /// admits a registry by name, so this is what keeps an allowlisted name
+    /// that resolves to an internal address (DNS rebinding), or a fetch path
+    /// the allowlist does not gate, off loopback, private networks, and the
+    /// link-local cloud metadata endpoint.
+    #[must_use]
+    pub fn allows_address(&self, host: &str, address: IpAddr) -> bool {
+        self.connect_policy.allows_address(host, address)
+    }
+
     /// A pnpr-hosted route is public when the hosted registry's effective
     /// access for the package admits an anonymous caller; otherwise it is
     /// private and gated by re-running that registry's rules for the caller.
@@ -461,7 +470,8 @@ impl RouteContext {
         let Some(rules) = self.hosted_rules.get(registry) else {
             return RouteClass::Public;
         };
-        let access = rules.for_package(package).access;
+        let table = rules.snapshot();
+        let access = table.for_package(package).access;
         if access.allows(&Identity::Anonymous) {
             return RouteClass::Public;
         }
@@ -507,13 +517,7 @@ impl RouteContext {
                 // authorization-only check could replay a lockfile routed
                 // through a different `/~<name>/` endpoint than this caller
                 // resolves through. A since-removed alias (`find` → `None`) or
-                // a rotated credential also fails closed here. A descriptor
-                // carrying a package qualifier (recorded when the upstream's
-                // rules explicitly refine that name) re-checks the per-package
-                // gate through `select_alias`, so cache replay is exactly as
-                // strict as a fresh resolve; unqualified descriptors gate at
-                // the registry level, shared among the callers the upstream's
-                // `access:` admits.
+                // a rotated credential also fails closed here.
                 self.aliases
                     .iter()
                     .find(|candidate| candidate.name == alias.as_str())
@@ -532,7 +536,7 @@ impl RouteContext {
                 match policy_id.split_once('\0') {
                     Some((registry, package)) => self.hosted_rules
                         .get(registry)
-                        .is_some_and(|rules| rules.for_package(package).access.allows(identity)),
+                        .is_some_and(|rules| rules.access_admits(package, identity)),
                     None => false,
                 }
             }

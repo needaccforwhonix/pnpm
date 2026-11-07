@@ -1,22 +1,79 @@
 use super::{
-    Context, GlobalError, GlobalPackageInfo, HashMap, IntoDiagnostic, Path, PathBuf, fs,
-    is_plain_version_spec, is_valid_old_npm_package_name, lexical_normalize,
-    parse_wanted_dependency, safe_read_package_json_from_dir, tool_install_selector,
+    AddRequest, Context, GlobalError, GlobalPackageInfo, HashMap, IntoDiagnostic, Path, PathBuf,
+    fs, is_plain_version_spec, is_valid_old_npm_package_name, lexical_normalize, local_file_path,
+    parse_wanted_dependency, rust_toolchain_request, safe_read_package_json_from_dir,
+    tool_install_selector,
 };
+
+/// The packages one global install request asks for: the tokens a
+/// comma-separated request splits into, and whether they may name a tool
+/// pnpm manages rather than packages to install.
+pub(super) struct SelectorGroup {
+    tokens: Vec<String>,
+    may_name_a_tool: bool,
+}
+
+impl SelectorGroup {
+    pub(super) fn tokens(&self) -> &[String] {
+        &self.tokens
+    }
+}
 
 /// A tool name becomes the selector that installs the tool itself, which
 /// the ordinary pipeline then handles — so the result stays a normal global
 /// install that `pnpm ls -g` and `pnpm remove -g` see.
-pub(super) fn tool_install_selectors(groups: Vec<Vec<String>>) -> Vec<Vec<String>> {
+///
+/// A group a Package URL was rewritten into is left alone: a purl names a
+/// package in a registry, so it is installed even when it reads as a tool.
+pub(super) fn tool_install_selectors(groups: Vec<SelectorGroup>) -> Vec<Vec<String>> {
     groups
         .into_iter()
         .map(|group| {
-            group
+            if !group.may_name_a_tool {
+                return group.tokens;
+            }
+            group.tokens
                 .into_iter()
                 .map(|token| tool_install_selector(&token).unwrap_or(token))
                 .collect()
         })
         .collect()
+}
+
+/// Take the `rust[@<channel>]` requests out of `groups`: the Rust toolchain
+/// is installed globally beside the npm groups rather than as one. A group
+/// left with no other selector is dropped. A Package URL never names the
+/// toolchain.
+pub(super) fn take_rust_toolchains(
+    groups: Vec<SelectorGroup>,
+) -> miette::Result<(Vec<pnpm_rust_toolchain::Channel>, Vec<SelectorGroup>)> {
+    let mut channels = Vec::new();
+    let mut remaining = Vec::new();
+    for mut group in groups {
+        if group.may_name_a_tool {
+            group.tokens = take_rust_tokens(group.tokens, &mut channels)?;
+        }
+        if !group.tokens.is_empty() {
+            remaining.push(group);
+        }
+    }
+    Ok((channels, remaining))
+}
+
+/// `tokens` without the ones naming the Rust toolchain, whose channels go
+/// to `channels`.
+fn take_rust_tokens(
+    tokens: Vec<String>,
+    channels: &mut Vec<pnpm_rust_toolchain::Channel>,
+) -> miette::Result<Vec<String>> {
+    let mut remaining = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        match rust_toolchain_request(&token) {
+            Some(channel) => channels.push(channel?),
+            None => remaining.push(token),
+        }
+    }
+    Ok(remaining)
 }
 
 /// The installed groups the update targets. `None` when the command
@@ -38,17 +95,15 @@ pub(super) fn groups_matching_params(
         })
         .collect();
     if filtered.is_empty() {
-        println!("No matching global packages found");
+        pnpm_diagnostics::println!("No matching global packages found");
         return None;
     }
     Some(filtered)
 }
 
-/// With `--latest`, a dependency is reduced to its bare alias so the newest
-/// registry version is resolved.
-/// The selectors that reinstall a group. With `--latest` a plain version spec
-/// is dropped so the newest release is picked; `pins` holds back the aliases
-/// that would otherwise move backwards.
+/// The selectors that reinstall a group. With `--latest`, a plain version spec
+/// uses the latest dist-tag so the seeded manifest range cannot hold it back;
+/// `pins` holds back aliases that would otherwise move backwards.
 pub(super) fn update_selectors(
     dependencies: &[(String, String)],
     latest: bool,
@@ -60,12 +115,30 @@ pub(super) fn update_selectors(
             if let Some(pin) = pins.get(alias) {
                 format!("{alias}@{pin}")
             } else if latest && is_plain_version_spec(spec) {
-                alias.clone()
+                format!("{alias}@latest")
             } else {
                 format!("{alias}@{spec}")
             }
         })
         .collect()
+}
+
+/// The warning `update -g` prints for a group it skips because the `file:`
+/// source one of its dependencies was installed from is gone. Reinstalling the
+/// group would fail with `ERR_PNPM_LINKED_PKG_DIR_NOT_FOUND`, and the group
+/// still works from what it installed, so the other groups are updated instead.
+pub(super) fn missing_file_source_warning(pkg: &GlobalPackageInfo) -> Option<String> {
+    let (alias, source) = pkg.dependencies
+        .iter()
+        .find_map(|(alias, spec)| {
+            let source = local_file_path(spec, &pkg.install_dir)?;
+            matches!(source.try_exists(), Ok(false)).then_some((alias, source))
+        })?;
+    Some(format!(
+        r#"Skipped updating {} because "{}" no longer exists. Reinstall {alias} from an existing location, or remove it with "pnpm remove -g {alias}"."#,
+        pkg.aliases().join(", "),
+        source.display(),
+    ))
 }
 
 pub(super) fn replacement_aliases(aliases: &[String]) -> Vec<String> {
@@ -138,7 +211,7 @@ pub fn selects_pnpm_cli<'a>(params: impl IntoIterator<Item = &'a String>) -> boo
 /// Whether a dependency declared as `alias` at `spec` is the pnpm CLI. An
 /// `npm:` alias resolves to its target, so `foo` at `npm:pnpm@9` is the pnpm
 /// CLI under another name — the install still carries pnpm's own `pnpm` bin.
-fn is_pnpm_cli_dependency(alias: &str, spec: Option<&str>) -> bool {
+pub(super) fn is_pnpm_cli_dependency(alias: &str, spec: Option<&str>) -> bool {
     let name = npm_alias_target(spec);
     is_pnpm_cli_package_name(name.as_deref().unwrap_or(alias))
 }
@@ -154,16 +227,17 @@ fn npm_alias_target(spec: Option<&str>) -> Option<String> {
 
 // --- param grouping (split/resolve helpers) -------------------------------
 
-pub(super) fn split_into_groups(params: &[String], base_dir: &Path) -> Vec<Vec<String>> {
+pub(super) fn split_into_groups(params: &[AddRequest], base_dir: &Path) -> Vec<SelectorGroup> {
     params
         .iter()
-        .map(|param| {
-            split_comma_separated(param, base_dir)
+        .map(|param| SelectorGroup {
+            tokens: split_comma_separated(param.selector(), base_dir)
                 .into_iter()
                 .map(|token| resolve_local_param(&token, base_dir))
-                .collect::<Vec<String>>()
+                .collect(),
+            may_name_a_tool: param.may_name_a_tool(),
         })
-        .filter(|group| !group.is_empty())
+        .filter(|group| !group.tokens.is_empty())
         .collect()
 }
 

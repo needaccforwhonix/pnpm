@@ -67,6 +67,64 @@ fn audit_fix_override_writes_overrides_in_the_configured_save_style() {
 }
 
 #[test]
+fn audit_fix_override_respects_save_exact() {
+    let CommandTempCwd {
+        mut pacquet, workspace, root: _root, ..
+    } = CommandTempCwd::init();
+    let mut registry = mockito::Server::new();
+    let mock = audit_mock(
+        &mut registry,
+        &advisory_response("vulnerable", 123, "high", "<2.0.0", "test", "GHSA-test-1111-2222"),
+    )
+    .create();
+    write_audit_workspace(&workspace, &registry.url(), "saveExact: true\n");
+
+    let output = pacquet
+        .arg("audit")
+        .arg("--fix")
+        .output()
+        .expect("run pacquet audit --fix");
+
+    assert_success(&output);
+    let manifest =
+        fs::read_to_string(workspace.join("pnpm-workspace.yaml")).expect("read workspace manifest");
+    assert!(
+        manifest.contains("vulnerable@<2.0.0: 2.0.0"),
+        "manifest should hold the exact override:\n{manifest}",
+    );
+    mock.assert();
+}
+
+#[test]
+fn audit_fix_override_respects_save_prefix_equals() {
+    let CommandTempCwd {
+        mut pacquet, workspace, root: _root, ..
+    } = CommandTempCwd::init();
+    let mut registry = mockito::Server::new();
+    let mock = audit_mock(
+        &mut registry,
+        &advisory_response("vulnerable", 123, "high", "<2.0.0", "test", "GHSA-test-1111-2222"),
+    )
+    .create();
+    write_audit_workspace(&workspace, &registry.url(), "savePrefix: '='\n");
+
+    let output = pacquet
+        .arg("audit")
+        .arg("--fix")
+        .output()
+        .expect("run pacquet audit --fix");
+
+    assert_success(&output);
+    let manifest =
+        fs::read_to_string(workspace.join("pnpm-workspace.yaml")).expect("read workspace manifest");
+    assert!(
+        manifest.contains("vulnerable@<2.0.0: =2.0.0"),
+        "manifest should hold the equals-pinned override:\n{manifest}",
+    );
+    mock.assert();
+}
+
+#[test]
 fn audit_fix_override_writes_minimum_release_age_excludes_when_configured() {
     let CommandTempCwd {
         mut pacquet, workspace, root: _root, ..
@@ -259,8 +317,12 @@ fn audit_fix_override_writes_age_exclude_when_patched_version_is_within_the_wind
         "manifest should hold the exclusions:\n{manifest}",
     );
     assert!(
-        manifest.contains("vulnerable@1.5.0 || 2.0.0"),
-        "manifest should hold both patched-version exclusions:\n{manifest}",
+        manifest.contains("vulnerable@2.0.0"),
+        "manifest should hold the unpruned patched-version exclusion:\n{manifest}",
+    );
+    assert!(
+        !manifest.contains("1.5.0"),
+        "subsumed advisory patched version should be pruned:\n{manifest}",
     );
     mock.assert();
     packument_mock.assert();
@@ -620,6 +682,71 @@ fn audit_fix_rejects_invalid_method() {
     mock.assert();
 }
 
+/// Run `pnpm audit` with `args` and assert it fails with
+/// `ERR_PNPM_AUDIT_FIX_WITH_IGNORE` before requesting the audit endpoint or
+/// touching `pnpm-workspace.yaml`.
+fn assert_audit_rejects_fix_with_ignore(args: &[&str], message: &str) {
+    let CommandTempCwd {
+        mut pacquet, workspace, root: _root, ..
+    } = CommandTempCwd::init();
+    let mut registry = mockito::Server::new();
+    let mock = audit_mock(
+        &mut registry,
+        &advisory_response("vulnerable", 123, "high", "<2.0.0", "test", "GHSA-test-1111-2222"),
+    )
+    .expect(0)
+    .create();
+    write_audit_workspace(&workspace, &registry.url(), "");
+    let manifest_path = workspace.join("pnpm-workspace.yaml");
+    let manifest_before = fs::read_to_string(&manifest_path).expect("read workspace manifest");
+
+    let output = pacquet
+        .arg("audit")
+        .args(args)
+        .output()
+        .expect("run pacquet audit");
+
+    assert_failure(&output);
+    let stderr = stderr(&output);
+    assert!(stderr.contains("ERR_PNPM_AUDIT_FIX_WITH_IGNORE"), "{stderr}");
+    assert!(stderr.contains(message), "{stderr}");
+    let manifest_after = fs::read_to_string(&manifest_path).expect("read workspace manifest");
+    assert_eq!(manifest_after, manifest_before);
+    mock.assert();
+}
+
+#[test]
+fn audit_fix_rejects_ignore() {
+    assert_audit_rejects_fix_with_ignore(
+        &["--fix", "--ignore", "GHSA-test-1111-2222"],
+        r#""--fix" may not be used with "--ignore""#,
+    );
+}
+
+#[test]
+fn audit_fix_update_rejects_ignore() {
+    assert_audit_rejects_fix_with_ignore(
+        &["--fix=update", "--ignore", "GHSA-test-1111-2222"],
+        r#""--fix" may not be used with "--ignore""#,
+    );
+}
+
+#[test]
+fn audit_fix_rejects_ignore_unfixable() {
+    assert_audit_rejects_fix_with_ignore(
+        &["--fix", "--ignore-unfixable"],
+        r#""--fix" may not be used with "--ignore-unfixable""#,
+    );
+}
+
+#[test]
+fn audit_interactive_rejects_ignore_unfixable() {
+    assert_audit_rejects_fix_with_ignore(
+        &["--interactive", "--ignore-unfixable"],
+        r#""--interactive" may not be used with "--ignore-unfixable""#,
+    );
+}
+
 #[test]
 fn audit_ignore_writes_ghsa_to_audit_config() {
     let CommandTempCwd {
@@ -680,6 +807,81 @@ fn audit_ignore_unfixable_ignores_advisories_without_a_fix() {
         "manifest should hold the GHSA:\n{manifest}",
     );
     mock.assert();
+}
+
+/// Run `pnpm audit <args>` against a registry serving one unfixable high
+/// advisory (`GHSA-test-1111-2222`) and one fixable low advisory
+/// (`GHSA-test-3333-4444`), returning the exit code.
+fn audit_exit_code_with_mixed_advisories(workspace_yaml: &str, args: &[&str]) -> Option<i32> {
+    let CommandTempCwd {
+        mut pacquet, workspace, root: _root, ..
+    } = CommandTempCwd::init();
+    let mut registry = mockito::Server::new();
+    let mock = audit_mock(
+        &mut registry,
+        &format!(
+            "{{\n{},\n{}\n}}",
+            advisory_entry(
+                "vulnerable",
+                401,
+                "high",
+                ">=0.0.0",
+                "unfixable",
+                "GHSA-test-1111-2222"
+            ),
+            advisory_entry("moderate-pkg", 402, "low", "<2.0.0", "fixable", "GHSA-test-3333-4444"),
+        ),
+    )
+    .create();
+    write_audit_workspace(&workspace, &registry.url(), workspace_yaml);
+
+    let output = pacquet
+        .arg("audit")
+        .args(args)
+        .output()
+        .expect("run pacquet audit");
+
+    mock.assert();
+    output.status.code()
+}
+
+#[test]
+fn audit_ignore_fails_when_a_vulnerability_that_was_not_ignored_remains() {
+    let code = audit_exit_code_with_mixed_advisories("", &["--ignore", "GHSA-test-1111-2222"]);
+    assert_eq!(code, Some(1));
+}
+
+#[test]
+fn audit_ignore_succeeds_when_every_vulnerability_is_ignored() {
+    let code = audit_exit_code_with_mixed_advisories(
+        "",
+        &["--ignore", "GHSA-test-1111-2222", "--ignore", "GHSA-test-3333-4444"],
+    );
+    assert_eq!(code, Some(0));
+}
+
+#[test]
+fn audit_ignore_succeeds_when_the_remaining_vulnerabilities_were_ignored_before() {
+    let code = audit_exit_code_with_mixed_advisories(
+        "auditConfig:\n  ignoreGhsas:\n    - GHSA-test-3333-4444\n",
+        &["--ignore", "GHSA-test-1111-2222"],
+    );
+    assert_eq!(code, Some(0));
+}
+
+#[test]
+fn audit_ignore_unfixable_fails_when_a_fixable_vulnerability_remains() {
+    let code = audit_exit_code_with_mixed_advisories("", &["--ignore-unfixable"]);
+    assert_eq!(code, Some(1));
+}
+
+#[test]
+fn audit_ignore_unfixable_succeeds_when_the_remaining_vulnerabilities_are_below_the_audit_level() {
+    let code = audit_exit_code_with_mixed_advisories(
+        "",
+        &["--ignore-unfixable", "--audit-level", "moderate"],
+    );
+    assert_eq!(code, Some(0));
 }
 
 /// End-to-end `audit --fix update`: install a dependency whose range spans a

@@ -6,7 +6,20 @@ use std::{fmt, str::FromStr};
 use strum::{EnumIter, IntoEnumIterator as _};
 
 /// The protocol whose naming rules a registry surface follows.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, EnumIter)]
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    EnumIter,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Ecosystem {
     #[default]
@@ -28,13 +41,16 @@ impl Ecosystem {
     }
 
     /// Every ecosystem pnpr can serve.
-    ///
-    /// Derived rather than written out, because a caller asking "is this the
-    /// only one configured" has to compare against all of them, and a list
-    /// maintained by hand answers that wrongly the moment an ecosystem is
-    /// added without it.
     pub fn all() -> impl Iterator<Item = Self> {
         Self::iter()
+    }
+
+    /// The path this ecosystem's endpoints sit under, whatever else the
+    /// server is configured with. Every URL pnpr writes about itself and every
+    /// route it mounts starts here.
+    #[must_use]
+    pub fn base_path(self) -> String {
+        format!("/{self}")
     }
 }
 
@@ -91,16 +107,29 @@ pub enum OciNameError {
 /// image repository.
 /// Construction applies the ecosystem's normalization and validation before
 /// the name can be used as a storage or cache key.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CanonicalPackageName {
     raw: String,
     /// The unscoped portion — for `@scope/name` and `namespace/image` this is
     /// the last component, for `name` this is the whole thing. Used to
     /// validate tarball filenames, which are always `<basename>-<version>.tgz`.
     basename: String,
+    ecosystem: Ecosystem,
 }
 
 impl CanonicalPackageName {
+    /// Create a canonical name directly from an already-stored name without
+    /// re-parsing it against a specific ecosystem grammar. Used for offline
+    /// store migration and maintenance.
+    #[must_use]
+    pub fn from_stored(raw: &str, ecosystem: Ecosystem) -> Self {
+        let basename = raw
+            .rsplit_once('/')
+            .map_or(raw, |(_, last)| last)
+            .to_string();
+        Self { raw: raw.to_string(), basename, ecosystem }
+    }
+
     pub fn parse(raw: &str, ecosystem: Ecosystem) -> Result<Self, RegistryError> {
         let canonical = match ecosystem {
             Ecosystem::Npm => raw.to_string(),
@@ -118,10 +147,10 @@ impl CanonicalPackageName {
                 let basename =
                     canonical.rsplit_once('/').map_or(canonical.as_str(), |(_, last)| last);
                 let basename = basename.to_string();
-                return Ok(Self { raw: canonical, basename });
+                return Ok(Self { raw: canonical, basename, ecosystem });
             }
         };
-        Self::parse_canonical(&canonical)
+        Self::parse_canonical(&canonical, ecosystem)
             .map_err(|error| match ecosystem {
                 Ecosystem::Npm => error,
                 Ecosystem::Cargo | Ecosystem::Pypi | Ecosystem::Oci => invalid_ecosystem_name(
@@ -132,7 +161,7 @@ impl CanonicalPackageName {
             })
     }
 
-    fn parse_canonical(raw: &str) -> Result<Self, RegistryError> {
+    fn parse_canonical(raw: &str, ecosystem: Ecosystem) -> Result<Self, RegistryError> {
         let invalid = || RegistryError::InvalidPackageName { name: raw.to_string() };
         if raw.is_empty() || raw.len() > 214 {
             return Err(invalid());
@@ -149,7 +178,16 @@ impl CanonicalPackageName {
             }
             raw.to_string()
         };
-        Ok(Self { raw: raw.to_string(), basename })
+        Ok(Self { raw: raw.to_string(), basename, ecosystem })
+    }
+
+    /// Check the naming rules for publishing a new npm package. Reads retain
+    /// the legacy grammar used by [`Self::parse`].
+    pub fn validate_npm_publish(&self) -> Result<(), RegistryError> {
+        if !pnpm_package_name::is_valid_new_npm_package_name(&self.raw) {
+            return Err(RegistryError::InvalidPackageName { name: self.raw.clone() });
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -158,8 +196,25 @@ impl CanonicalPackageName {
     }
 
     #[must_use]
+    pub fn ecosystem(&self) -> Ecosystem {
+        self.ecosystem
+    }
+
+    #[must_use]
     pub fn tarball_name_for_version(&self, version: &str) -> String {
         format!("{}-{version}.tgz", self.basename)
+    }
+
+    /// The blob a hosted tar registry stores `version` in: its tar, zstd
+    /// compressed, in place of the published `.tgz`.
+    #[must_use]
+    pub fn tar_name_for_version(&self, version: &str) -> String {
+        format!("{}-{version}.tar.zst", self.basename)
+    }
+
+    #[must_use]
+    pub fn sigstore_name_for_version(&self, version: &str) -> String {
+        format!("{}-{version}.sigstore", self.basename)
     }
 
     /// Validate `filename` and return the canonical disk filename
@@ -168,6 +223,14 @@ impl CanonicalPackageName {
     /// disk under the same path the GET endpoint serves.
     pub fn canonicalize_tarball_name(&self, filename: &str) -> Result<String, RegistryError> {
         self.parse_tarball_name(filename).map(|(canonical, _)| canonical)
+    }
+
+    fn parse_versioned_stem<'a>(&self, stem: &'a str) -> Option<&'a str> {
+        let rest = stem
+            .strip_prefix(&self.raw)
+            .or_else(|| stem.strip_prefix(&self.basename))?;
+        let version = rest.strip_prefix('-')?;
+        is_safe_segment(version).then_some(version)
     }
 
     /// Like [`Self::canonicalize_tarball_name`] but also returns the
@@ -181,17 +244,24 @@ impl CanonicalPackageName {
             filename: filename.to_string(),
         };
         let stem = filename.strip_suffix(".tgz").ok_or_else(invalid)?;
-        // Try the longer prefix first so that for an unscoped package
-        // (where `self.raw == self.basename`) we still match.
-        let rest = stem
-            .strip_prefix(&self.raw)
-            .or_else(|| stem.strip_prefix(&self.basename))
-            .ok_or_else(invalid)?;
-        let version = rest.strip_prefix('-').ok_or_else(invalid)?;
-        if !is_safe_segment(version) {
-            return Err(invalid());
-        }
+        let version = self.parse_versioned_stem(stem).ok_or_else(invalid)?;
         Ok((self.tarball_name_for_version(version), version.to_string()))
+    }
+
+    /// Parse a sigstore provenance attachment filename (`<basename>-<version>.sigstore`
+    /// or with scope prefix / `.sigstore.json` extension). Returns the canonical
+    /// disk filename (`<basename>-<version>.sigstore`) and the version string.
+    pub fn parse_sigstore_name(&self, filename: &str) -> Result<(String, String), RegistryError> {
+        let invalid = || RegistryError::InvalidTarballName {
+            package: self.raw.clone(),
+            filename: filename.to_string(),
+        };
+        let stem = filename
+            .strip_suffix(".sigstore.json")
+            .or_else(|| filename.strip_suffix(".sigstore"))
+            .ok_or_else(invalid)?;
+        let version = self.parse_versioned_stem(stem).ok_or_else(invalid)?;
+        Ok((self.sigstore_name_for_version(version), version.to_string()))
     }
 }
 

@@ -21,6 +21,9 @@
 mod registry_tarball;
 use registry_tarball::npm_registry_tarball;
 
+mod registry_routes;
+use registry_routes::VerificationRegistryRoutes;
+
 mod trust_check;
 
 mod policy_snapshot;
@@ -37,11 +40,13 @@ mod age_check;
 
 mod artifact_binding;
 use artifact_binding::{
-    canonical_tarball_url, current_history_violation, current_revision_number, lockfile_revision,
+    current_history_violation, current_revision_number, lockfile_revision,
     missing_artifact_violation, select_revision, tarball_url_violation,
 };
 
 mod metadata_projection;
+
+mod variations;
 use metadata_projection::{load_local_meta_time, project_abbreviated_meta, project_trust_meta};
 
 use std::{
@@ -54,37 +59,37 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use miette::Diagnostic as _;
 use pipe_trait::Pipe;
-use pnpm_config::{TrustPolicy, version_policy::PackageVersionPolicy};
 use pnpm_lockfile::{
-    LockfileResolution, PkgName, TarballRevision, is_git_hosted_tarball_url,
-    is_integrity_addressed_registry_tarball_url,
+    LockfileResolution, PkgName, TarballRevision, has_complete_sha512_digest,
+    is_git_hosted_tarball_url, is_revision_registry_tarball_url,
 };
 use pnpm_network::{AuthHeaders, RetryOpts, ThrottledClient, redact_url_credentials};
-use pnpm_registry::{
-    Approver, DerivedPackuments, NpmUser, Package, PackageDistribution, PackageVersion,
-};
+use pnpm_registry::Package;
 use pnpm_resolving_resolver_base::{
-    ResolutionVerification, ResolutionVerifier, VerifyCtx, VerifyFuture, parse_packument_timestamp,
+    ResolutionVerification, ResolutionVerifier, TrustPolicy, VerifyCtx, VerifyFuture,
+    parse_packument_timestamp,
 };
+use pnpm_version_policy::PackageVersionPolicy;
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use tokio::sync::OnceCell;
 
 use crate::{
-    FetchAttestationOptions, FetchFullMetadataCachedOptions, TrustCheckOptions, TrustViolation,
-    fetch_attestation_published_at, fetch_full_metadata_cached,
+    FetchAttestationOptions, FetchFullMetadataCachedOptions, TrustCheckOptions, TrustEvidence,
+    TrustHistory, TrustViolation, fetch_attestation_published_at, fetch_full_metadata_cached,
+    fetch_full_metadata_cached::fetch_full_metadata_projected,
     lookup_context::{
         PublishedAtLookupContext, PublishedAtTimeMap, RegistryArtifact, RegistryArtifactHistory,
-        package_key, version_key,
+        TrustHistoryProjection, package_key, version_key,
     },
-    named_registry::{named_registry_tarball_prefixes, pick_registry_for_package},
+    named_registry::named_registry_tarball_prefixes,
     pick_package::{PackageMetaCache, SkippedTimeCheck, warn_missing_time_once},
     registry_url::to_registry_url,
     trust_checks::fail_if_trust_downgraded,
     violation_codes::{
-        MINIMUM_RELEASE_AGE_VIOLATION_CODE, MISSING_NAMED_REGISTRY_VIOLATION_CODE,
-        MISSING_TARBALL_INTEGRITY_VIOLATION_CODE, TARBALL_REVISION_MISMATCH_VIOLATION_CODE,
-        TARBALL_URL_MISMATCH_VIOLATION_CODE, TRUST_DOWNGRADE_VIOLATION_CODE,
+        MINIMUM_RELEASE_AGE_VIOLATION_CODE, MISSING_TARBALL_INTEGRITY_VIOLATION_CODE,
+        TARBALL_REVISION_MISMATCH_VIOLATION_CODE, TARBALL_URL_MISMATCH_VIOLATION_CODE,
+        TRUST_DOWNGRADE_VIOLATION_CODE,
     },
 };
 
@@ -96,6 +101,7 @@ use crate::{
 pub struct DistStats {
     pub unpacked_size: Option<usize>,
     pub file_count: Option<usize>,
+    pub requires_build: Option<bool>,
 }
 
 /// `(package name, version) → dist` work statistics filled by the
@@ -125,6 +131,9 @@ pub struct CreateNpmResolutionVerifierOptions {
     /// `https://npm.pkg.github.com/`). Merged with
     /// [`crate::BUILTIN_REGISTRIES_BY_PREFIX`].
     pub registries_by_prefix: HashMap<String, String>,
+    /// Per-registry options (`serverType`, `supportsTimeField`) keyed by URL.
+    pub registry_options_by_url:
+        Option<std::collections::BTreeMap<String, pnpm_lockfile::RegistryOptions>>,
     /// Override for `Utc::now()` when computing the age cutoff and
     /// the `trustPolicyIgnoreAfter` window. `None` falls back to
     /// wall-clock at construction time.
@@ -184,7 +193,7 @@ pub struct VerificationMetadataClient {
     pub auth_headers: Arc<AuthHeaders>,
     /// Root of pnpm's on-disk metadata mirror. When set, the verifier
     /// reads conditional headers from
-    /// `<cache_dir>/v11/metadata-full/<registry>/<pkg>.jsonl` and
+    /// `<cache_dir>/v12/metadata-full/<registry>/<pkg>.jsonl` and
     /// writes 200 responses back; when `None`, every fetch is
     /// unconditional.
     pub cache_dir: Option<PathBuf>,
@@ -220,6 +229,9 @@ pub struct VerificationArtifacts {
     /// nothing or run a resolver alongside) keeps the metadata-backed
     /// chain for every entry.
     pub canonical_fetches: Option<pnpm_resolving_resolver_base::PlannedCanonicalFetches>,
+    /// Lookups to share with the verifiers of other installs. `None`
+    /// gives the verifier lookups of its own.
+    pub lookups: Option<crate::VerifierLookups>,
 }
 
 /// Verifier returned by [`create_npm_resolution_verifier`]. Stores
@@ -229,7 +241,7 @@ pub struct VerificationArtifacts {
 pub struct NpmResolutionVerifier {
     now: Option<DateTime<Utc>>,
     policy_snapshot: serde_json::Map<String, JsonValue>,
-    lookup_context: PublishedAtLookupContext,
+    lookup_context: Arc<PublishedAtLookupContext>,
     release_age: ReleaseAgeCheck,
     trust: TrustCheck,
     metadata: VerificationMetadataClient,
@@ -252,15 +264,6 @@ struct TrustCheck {
     exclude: Option<PackageVersionPolicy>,
     ignore_after: Option<u64>,
     sorted_excludes: Vec<String>,
-}
-
-struct VerificationRegistryRoutes {
-    registries: HashMap<String, String>,
-    named_registry_prefixes: Vec<String>,
-    /// Alias → URL map (built-ins merged with the user's setting) for
-    /// routing registry-qualified lockfile keys, which carry no tarball
-    /// URL for the prefix list to match.
-    registries_by_prefix: HashMap<String, String>,
 }
 
 impl std::fmt::Debug for NpmResolutionVerifier {
@@ -310,7 +313,7 @@ pub fn create_npm_resolution_verifier(
     NpmResolutionVerifier {
         now: opts.now,
         policy_snapshot,
-        lookup_context: PublishedAtLookupContext::new(),
+        lookup_context: crate::VerifierLookups::context_or_new(opts.artifacts.lookups.as_ref()),
         release_age: ReleaseAgeCheck {
             minimum_minutes: opts.release_age.minimum_minutes,
             cutoff,
@@ -329,12 +332,18 @@ pub fn create_npm_resolution_verifier(
             registries: opts.registries,
             named_registry_prefixes,
             registries_by_prefix: opts.registries_by_prefix,
+            registry_options_by_url: opts.registry_options_by_url,
         },
     }
 }
 
 impl ResolutionVerifier for NpmResolutionVerifier {
     fn might_verify(&self, resolution: &LockfileResolution, ctx: VerifyCtx<'_>) -> bool {
+        if let LockfileResolution::Variations(variations) = resolution {
+            return variations
+                .resolutions()
+                .any(|resolution| self.might_verify(resolution, ctx));
+        }
         let Some(tarball_url) = npm_registry_tarball(resolution) else {
             return false;
         };
@@ -423,6 +432,10 @@ impl NpmResolutionVerifier {
         resolution: &LockfileResolution,
         ctx: VerifyCtx<'_>,
     ) -> ResolutionVerification {
+        if let LockfileResolution::Variations(variations) = resolution {
+            return self.verify_variations(variations, ctx).await;
+        }
+
         let Some(tarball_url) = npm_registry_tarball(resolution) else {
             return ResolutionVerification::Ok;
         };
@@ -541,9 +554,9 @@ fn render_fetch_metadata_error(error: &crate::FetchMetadataError) -> String {
 fn is_excluded(policy: Option<&PackageVersionPolicy>, name: &PkgName, version: &str) -> bool {
     let Some(policy) = policy else { return false };
     match policy.matches(&name.to_string()) {
-        pnpm_config::version_policy::PolicyMatch::No => false,
-        pnpm_config::version_policy::PolicyMatch::AnyVersion => true,
-        pnpm_config::version_policy::PolicyMatch::ExactVersions(versions) => versions
+        pnpm_version_policy::PolicyMatch::No => false,
+        pnpm_version_policy::PolicyMatch::AnyVersion => true,
+        pnpm_version_policy::PolicyMatch::ExactVersions(versions) => versions
             .iter()
             .any(|exact| exact == version),
     }
@@ -562,48 +575,6 @@ fn format_trust_violation(err: TrustViolation) -> String {
 
 #[cfg(test)]
 mod tests;
-
-impl VerificationRegistryRoutes {
-    /// The URL a registry-qualified entry routes to.
-    ///
-    /// Registry-qualified entries name their registry in the dep path, so
-    /// routing does not depend on a recorded tarball URL (canonical URLs are
-    /// omitted from the lockfile in the 12.0 format). This fails closed on
-    /// an unknown alias: none of the metadata-backed checks could vouch for
-    /// the entry without its registry URL.
-    fn named_registry_url(
-        &self,
-        registry_name: Option<&str>,
-    ) -> Result<Option<String>, ResolutionVerification> {
-        let Some(registry_name) = registry_name else { return Ok(None) };
-        match self.registries_by_prefix.get(registry_name) {
-            Some(url) => Ok(Some(url.clone())),
-            None => Err(ResolutionVerification::Err {
-                code: MISSING_NAMED_REGISTRY_VIOLATION_CODE,
-                reason: format!(
-                    "has registry prefix '{registry_name}:', which is not declared by the registries setting",
-                ),
-            }),
-        }
-    }
-
-    fn pick_registry(&self, name: &PkgName, tarball_url: Option<&str>) -> String {
-        if let Some(url) = tarball_url {
-            // Match on the same canonical form the tarball comparison uses, so
-            // a named-registry tarball that differs from the configured base
-            // only by scheme or `%2f` encoding still routes to its registry
-            // instead of falling back (and then failing closed against the
-            // wrong packument).
-            let normalized = canonical_tarball_url(url);
-            for prefix in &self.named_registry_prefixes {
-                if normalized.starts_with(&canonical_tarball_url(prefix)) {
-                    return prefix.clone();
-                }
-            }
-        }
-        pick_registry_for_package(&self.registries, &name.to_string(), None)
-    }
-}
 
 impl ReleaseAgeCheck {
     fn age_check_active(&self) -> bool {

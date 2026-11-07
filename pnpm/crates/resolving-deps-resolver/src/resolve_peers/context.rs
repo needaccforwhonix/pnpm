@@ -2,10 +2,12 @@
 //! map, the shared ancestor chains threaded down the walk, `link:`
 //! node-id remapping, peer-suffix parsing, and range matching.
 
+pub(crate) use peer_specifier::satisfies_with_prereleases;
 pub(super) use peer_specifier::{
     ComparablePeerRange, importer_relative_link_dep_path, link_node_id_as_dep_path, peer_id_pair,
-    peer_segment_names, pkg_name, pkg_name_version, remap_link_node_id, satisfies_with_prereleases,
+    peer_segment_names, remap_link_node_id,
 };
+pub(crate) use pnpm_lockfile::split_peer_suffix_segments;
 
 mod peer_specifier;
 use peer_specifier::version_gte;
@@ -13,7 +15,7 @@ use peer_specifier::version_gte;
 use crate::{
     node_id::NodeId,
     resolve_peers::{ResolvePeersOptions, walker::Walker},
-    resolved_tree::{ResolvedPackage, TreeChildren},
+    resolved_tree::{ResolvedPackage, TreeChildren, pkg_name},
 };
 use node_semver::{Range, Version};
 use pnpm_deps_path::{DepPath, PeerId, index_of_dep_path_suffix};
@@ -27,7 +29,7 @@ use std::{
 /// Per-name entry in the propagating [`ParentRefs`] map.
 #[derive(Debug, Clone)]
 pub(super) struct ParentRef {
-    pub(super) version: String,
+    pub(super) version: Arc<str>,
     /// `None` for top-level deps that were already installed. Pacquet
     /// doesn't surface those yet — `None` only appears on the
     /// importer-level cycle-break fallback, where the `name@version`
@@ -36,16 +38,6 @@ pub(super) struct ParentRef {
     /// Local install name in `node_modules`. May differ from the
     /// package's real name for npm-alias entries.
     pub(super) alias: Option<String>,
-    /// Depth at which this parent was added. Threaded into
-    /// [`ParentPkgInfo`] so [`Walker::parent_packages_match`] can
-    /// apply the depth-equality fallback when peer dependencies are
-    /// shadowed across occurrences.
-    pub(super) depth: i32,
-    /// Per-name shadowing counter. Incremented when a same-name
-    /// parent is added at a deeper walk that doesn't match the
-    /// existing entry. Used by [`Walker::parent_packages_match`] to
-    /// detect shadowed peers.
-    pub(super) occurrence: u32,
 }
 
 /// `name → ParentRef` map propagated down the walk. Entries are indexed
@@ -63,9 +55,7 @@ pub(super) type ParentRefs = HashMap<String, ParentRef>;
 #[derive(Debug, Clone)]
 pub(super) struct ParentPkgInfo {
     pub(super) pkg_id: Option<Arc<str>>,
-    pub(super) version: Option<String>,
-    pub(super) depth: i32,
-    pub(super) occurrence: u32,
+    pub(super) version: Option<Arc<str>>,
 }
 
 #[derive(Debug, Clone)]
@@ -214,16 +204,8 @@ impl Walker<'_> {
                 .as_ref()
                 .and_then(|nid| self.tree.dependencies_tree.get(nid))
                 .map(|tn| std::sync::Arc::<str>::clone(&tn.resolved_package_id));
-            let version = pkg_id.is_none().then(|| parent_ref.version.clone());
-            out.insert(
-                name.clone(),
-                ParentPkgInfo {
-                    pkg_id,
-                    version,
-                    depth: parent_ref.depth,
-                    occurrence: parent_ref.occurrence,
-                },
-            );
+            let version = pkg_id.is_none().then(|| Arc::clone(&parent_ref.version));
+            out.insert(name.clone(), ParentPkgInfo { pkg_id, version });
         }
         // Shared, not cloned: the same snapshot is recorded for every
         // child of a node, and these maps dominated the walker's
@@ -235,20 +217,21 @@ impl Walker<'_> {
         if current.version != new.version || current.alias != new.alias {
             return false;
         }
-        let Some(current_name) = self.parent_ref_package_name(current) else {
-            return true;
+        let (Some(current_node_id), Some(new_node_id)) =
+            (current.node_id.as_ref(), new.node_id.as_ref())
+        else {
+            return current.node_id == new.node_id;
         };
-        let Some(new_name) = self.parent_ref_package_name(new) else {
+        if current_node_id == new_node_id {
             return true;
+        }
+        let (Some(current_node), Some(new_node)) = (
+            self.tree.dependencies_tree.get(current_node_id),
+            self.tree.dependencies_tree.get(new_node_id),
+        ) else {
+            return false;
         };
-        current_name == new_name
-    }
-
-    fn parent_ref_package_name(&self, parent_ref: &ParentRef) -> Option<String> {
-        let node_id = parent_ref.node_id.as_ref()?;
-        let tree_node = self.tree.dependencies_tree.get(node_id)?;
-        let pkg = self.tree.packages.get(&tree_node.resolved_package_id)?;
-        Some(pkg_name_version(&pkg.result).0)
+        current_node.resolved_package_id == new_node.resolved_package_id
     }
 
     pub(super) fn inherited_parent_pkg_breaks_peer_diamond(
@@ -275,14 +258,12 @@ impl Walker<'_> {
         else {
             return false;
         };
-        let (parent_pkg_name, _) = pkg_name_version(&parent_pkg.result);
-
         let conflicting_peers =
             self.conflicting_peer_names(parent_refs, inherited_context, parent_pkg);
         if conflicting_peers.is_empty() {
             return false;
         }
-        self.child_binds_conflicting_peer(node_id, &parent_pkg_name, &conflicting_peers)
+        self.descendant_binds_conflicting_peer(node_id, parent_pkg.name(), &conflicting_peers)
     }
 
     /// The peers `parent_pkg` declares that the inherited provider's own
@@ -294,7 +275,7 @@ impl Walker<'_> {
         parent_pkg: &ResolvedPackage,
     ) -> HashSet<String> {
         let mut conflicting_peers = HashSet::default();
-        for peer_name in parent_pkg.peer_dependencies.keys() {
+        for peer_name in parent_pkg.peer_set.taken().keys() {
             if !self.tree.all_peer_dep_names.contains(peer_name) {
                 continue;
             }
@@ -307,47 +288,127 @@ impl Walker<'_> {
         conflicting_peers
     }
 
-    /// Whether a child of `node_id` closes the diamond: it takes the provider
-    /// as a peer *and* takes one of the peers the two contexts disagree
-    /// about.
-    fn child_binds_conflicting_peer(
+    /// Whether a descendant of `node_id` closes the diamond: it takes the
+    /// provider as a peer *and* takes one of the peers the two contexts
+    /// disagree about. The consumer need not be a direct child; any
+    /// descendant that inherits this node's provider counts
+    /// (<https://github.com/pnpm/pnpm/issues/12098>). A node's children
+    /// depend only on its package, so each package's children are expanded
+    /// once. A package is marked only when it inherits the provider, because
+    /// cycle pruning can cut its copy of the provider in one occurrence and
+    /// keep it in another.
+    fn descendant_binds_conflicting_peer(
         &self,
         node_id: &NodeId,
         parent_pkg_name: &str,
         conflicting_peers: &HashSet<String>,
     ) -> bool {
         let Some(node) = self.tree.dependencies_tree.get(node_id) else { return false };
-        for child_pkg_id in self.child_pkg_ids_of(node) {
-            let Some(child_pkg) = self.tree.packages.get(child_pkg_id) else { continue };
-            if !child_pkg.peer_dependencies.contains_key(parent_pkg_name) {
+        let mut visited = HashSet::<&str>::default();
+        let mut pending = self.child_edges_of(node);
+        while let Some((_, child_pkg_id, child_node_id)) = pending.pop() {
+            if visited.contains(child_pkg_id) {
                 continue;
             }
-            if conflicting_peers
-                .iter()
-                .any(|peer| child_pkg.peer_dependencies.contains_key(peer))
-            {
+            if self.pkg_binds_conflicting_peer(child_pkg_id, parent_pkg_name, conflicting_peers) {
                 return true;
             }
+            let Some(grandchildren) =
+                self.children_inheriting(child_pkg_id, child_node_id, parent_pkg_name)
+            else {
+                continue;
+            };
+            visited.insert(child_pkg_id);
+            pending.extend(grandchildren);
         }
         false
     }
 
-    /// The package ids of a node's children, from its realized map or, while
-    /// it is still lazy, from the tree's per-package child edges.
-    fn child_pkg_ids_of(&self, node: &crate::DependenciesTreeNode) -> Vec<&str> {
-        match &node.children {
-            TreeChildren::Realized(children) => children
-                .values()
-                .filter_map(|child_node_id| self.tree.dependencies_tree.get(child_node_id))
-                .map(|child| &*child.resolved_package_id)
-                .collect(),
-            TreeChildren::Lazy { .. } => self.tree.children_by_id
-                .get(&node.resolved_package_id)
-                .into_iter()
-                .flat_map(|children| children.iter())
-                .map(|child| &*child.pkg_id)
-                .collect(),
+    /// Whether `pkg_id` peer-depends on the provider and on one of the peers
+    /// the two contexts disagree about.
+    fn pkg_binds_conflicting_peer(
+        &self,
+        pkg_id: &str,
+        parent_pkg_name: &str,
+        conflicting_peers: &HashSet<String>,
+    ) -> bool {
+        let Some(pkg) = self.tree.packages.get(pkg_id) else { return false };
+        pkg.peer_set.taken().contains_key(parent_pkg_name)
+            && conflicting_peers
+                .iter()
+                .any(|peer| pkg.peer_set.taken().contains_key(peer))
+    }
+
+    /// The children of a descendant that still inherits the provider, or
+    /// `None` when the descendant has its own copy of it, because that copy
+    /// is what its subtree inherits.
+    fn children_inheriting<'a>(
+        &'a self,
+        pkg_id: &'a str,
+        node_id: Option<&'a NodeId>,
+        parent_pkg_name: &str,
+    ) -> Option<Vec<(&'a str, &'a str, Option<&'a NodeId>)>> {
+        let children =
+            match node_id.and_then(|node_id| self.tree.dependencies_tree.get(node_id)) {
+                Some(node) => self.child_edges_of(node),
+                None => self.child_edges_of_pkg(pkg_id),
+            };
+        if children
+            .iter()
+            .any(|&(alias, child_pkg_id, _)| {
+                self.edge_provides(alias, child_pkg_id, parent_pkg_name)
+            })
+        {
+            return None;
         }
+        Some(children)
+    }
+
+    /// Whether a child edge provides `pkg_name` as a peer. An aliased
+    /// dependency provides it under its real package name too, as
+    /// `index_peer_provider_edge` indexes it.
+    fn edge_provides(&self, alias: &str, pkg_id: &str, pkg_name: &str) -> bool {
+        alias == pkg_name
+            || self.tree.packages
+                .get(pkg_id)
+                .is_some_and(|pkg| &**pkg.name() == pkg_name)
+    }
+
+    /// A node's children as `(alias, package id, node id)`, from its realized
+    /// map or, while it is still lazy, from the tree's per-package child edges.
+    /// Either way, the cycle edges the peer walk cuts at every occurrence
+    /// ([`Self::cuts_cycle_edge`]) are left out. A realized map keeps such an
+    /// edge as a record-only node that the walk does not descend into.
+    fn child_edges_of<'a>(
+        &'a self,
+        node: &'a crate::DependenciesTreeNode,
+    ) -> Vec<(&'a str, &'a str, Option<&'a NodeId>)> {
+        let TreeChildren::Realized(children) = &node.children else {
+            return self.child_edges_of_pkg(&node.resolved_package_id);
+        };
+        let canonical_scc = self.canonical_scc();
+        children
+            .iter()
+            .filter_map(|(alias, child_node_id)| {
+                let child = self.tree.dependencies_tree.get(child_node_id)?;
+                Some((alias.as_str(), &*child.resolved_package_id, Some(child_node_id)))
+            })
+            .filter(|(_, child_pkg_id, _)| {
+                !Self::cuts_cycle_edge(&canonical_scc, &node.resolved_package_id, child_pkg_id)
+            })
+            .collect()
+    }
+
+    /// See [`Self::child_edges_of`].
+    fn child_edges_of_pkg(&self, pkg_id: &str) -> Vec<(&str, &str, Option<&NodeId>)> {
+        let canonical_scc = self.canonical_scc();
+        self.tree.children_by_id
+            .get(pkg_id)
+            .into_iter()
+            .flat_map(|children| children.iter())
+            .filter(|child| !Self::cuts_cycle_edge(&canonical_scc, pkg_id, &child.pkg_id))
+            .map(|child| (child.alias.as_str(), &*child.pkg_id, None))
+            .collect()
     }
 
     fn parent_peer_differs(
@@ -380,19 +441,16 @@ pub(super) fn insert_parent_ref(
     direct_alias: &str,
     parent_node_id: NodeId,
     pkg: &ResolvedPackage,
-    depth: i32,
 ) {
-    let (real_name, version) = pkg_name_version(&pkg.result);
+    let real_name: &str = pkg.name();
     let parent_ref = ParentRef {
-        version,
+        version: Arc::clone(pkg.version()),
         node_id: Some(parent_node_id),
         alias: (direct_alias != real_name).then(|| direct_alias.to_string()),
-        depth,
-        occurrence: 0,
     };
     update_parent_refs(refs, direct_alias, &parent_ref);
     if direct_alias != real_name {
-        update_parent_refs(refs, &real_name, &parent_ref);
+        update_parent_refs(refs, real_name, &parent_ref);
     }
 }
 

@@ -7,30 +7,46 @@
 //! lockfile. Plugin-hook loading (the `updateConfig` half) is wired in
 //! separately.
 
-pub use hooks::{load_before_packing_hooks, prepare_config, run_update_config_hooks};
+pub use declarations::{add_config_dependencies, update_config_dependencies};
+pub use engine_policy::mature_pnpm_version_for_range;
+pub use hooks::{
+    apply_config_dependency_settings, load_before_packing_hooks, may_update_config, prepare_config,
+    run_update_config_hooks,
+};
 
-use crate::config_overrides::apply_store_dir_override;
+pub(crate) use declarations::declared_specifier;
+
+mod declarations;
+mod network;
+mod store;
+
+use crate::{
+    cli_args::config_warnings::emit_config_warning, config_overrides::apply_store_dir_override,
+};
+use engine_policy::engine_resolve_options;
+use network::EnvironmentNetwork;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use pnpm_catalogs_config::get_catalogs_from_workspace_manifest;
 use pnpm_config::{
-    Config, Host, PNPM_VERSION, WorkspaceSettings, default_state_dir,
+    Config, Host, PNPM_VERSION, TrustedSettings, WorkspaceSettings, default_state_dir,
     known_settings::is_known_setting_key, resolve_configured_state_dir,
 };
 use pnpm_env_installer::{
-    ConfigDepsInstallOptions, pnpm_engine_packages, resolve_and_install_config_deps,
-    resolve_package_manager_integrities,
+    ConfigDepUpdates, ConfigDependencyVerification, ConfigDepsInstallMode,
+    ConfigDepsInstallOptions, pnpm_engine_packages, read_config_dependency_lockfile,
+    resolve_and_install_config_deps_updating, resolve_package_manager_integrities,
+    running_version_unpublished,
 };
 use pnpm_graph_hasher::{detect_node_version, host_arch, host_libc, host_platform};
 use pnpm_hooks::{HookContext, LogFn, PnpmfileHooks, finder};
 use pnpm_lockfile::EnvLockfile;
-use pnpm_network::{RetryOpts, ThrottledClient};
+use pnpm_network::ThrottledClient;
 use pnpm_reporter::{HookLog, LogEvent, LogLevel, PnpmLog, Reporter};
-use pnpm_resolving_npm_resolver::{
-    InMemoryPackageMetaCache, NpmResolver, shared_packument_fetch_locker,
-    shared_picked_manifest_cache,
+use pnpm_resolving_npm_resolver::{InMemoryPackageMetaCache, NpmResolver};
+use pnpm_resolving_resolver_base::{
+    ResolutionPolicyOptions, ResolveOptions, Resolver, WantedDependency,
 };
-use pnpm_resolving_resolver_base::{ResolveOptions, Resolver, WantedDependency};
 use pnpm_workspace_state::ConfigDependency;
 use serde_json::Value;
 use std::{
@@ -39,22 +55,29 @@ use std::{
     sync::Arc,
 };
 
-/// Resolve + install the project's `configDependencies` (a no-op when
-/// none are declared). `root_dir` is the lockfile directory;
+/// Prepare the project's `configDependencies` according to `mode`.
+/// `root_dir` is the lockfile directory;
 /// `frozen_lockfile` forwards `--frozen-lockfile` so config deps refuse
 /// to mutate an out-of-date env lockfile.
 pub async fn install_config_deps<Reporter: self::Reporter>(
     config: &Config,
     root_dir: &Path,
     frozen_lockfile: bool,
+    mode: ConfigDepsInstallMode,
 ) -> Result<()> {
-    let Some(config_dependencies) = config.config_dependencies.as_ref() else {
-        return Ok(());
-    };
-    if config_dependencies.is_empty() {
-        return Ok(());
-    }
-    resolve_and_install::<Reporter>(config, config_dependencies, root_dir, frozen_lockfile).await
+    let empty = BTreeMap::new();
+    let config_dependencies = config.config_dependencies.as_ref().unwrap_or(&empty);
+    let updates = ConfigDepUpdates::default();
+    resolve_and_install::<Reporter>(
+        config,
+        config_dependencies,
+        root_dir,
+        frozen_lockfile,
+        &updates,
+        mode,
+    )
+    .await?;
+    Ok(())
 }
 
 /// Install the project's `configDependencies` and run their `updateConfig`
@@ -71,9 +94,58 @@ pub async fn prepare<Reporter: self::Reporter>(
     root_dir: &Path,
     frozen_lockfile: bool,
 ) -> Result<()> {
-    install_config_deps::<Reporter>(config, root_dir, frozen_lockfile).await?;
+    install_config_deps::<Reporter>(
+        config,
+        root_dir,
+        frozen_lockfile,
+        ConfigDepsInstallMode::Reconcile,
+    )
+    .await?;
+    apply_config_dependency_settings(config)?;
     run_update_config_hooks::<Reporter>(config, root_dir).await?;
     Ok(())
+}
+
+/// Record the pin of the pnpm already running, warning instead of failing
+/// when [`running_version_unpublished`] holds. The pin stays in the
+/// manifest, and a later run records it.
+///
+/// A caller that reads back what it recorded, to install or verify it, wants
+/// [`sync_package_manager_dependencies`] instead.
+pub async fn record_running_package_manager_pin(
+    config: &Config,
+    root_dir: &Path,
+    wanted_specifier: &str,
+    pnpm_version: &str,
+    frozen_lockfile: bool,
+    force_resync: bool,
+) -> Result<()> {
+    let boot_config = config.for_boot();
+    let config = &*boot_config;
+    let context = EnvInstallerContext::for_package_manager(config)?;
+    let options = context.options(root_dir, frozen_lockfile);
+    let resolved = resolve_package_manager_integrities(
+        pnpm_engine_packages(pnpm_version),
+        wanted_specifier,
+        pnpm_version,
+        &context.resolver,
+        &options,
+        force_resync,
+    )
+    .await;
+    match resolved {
+        Ok(_) => Ok(()),
+        Err(error) if running_version_unpublished(&error, pnpm_version) => {
+            emit_config_warning(&format!(
+                "The registry publishes no pnpm {pnpm_version}, so the packageManager pin was \
+                 not recorded in pnpm-lock.yaml. Continuing with the running pnpm.",
+            ));
+            Ok(())
+        }
+        Err(error) => {
+            Err(miette::Report::new(error)).wrap_err("resolve package manager dependencies")
+        }
+    }
 }
 
 /// Resolve pnpm's own engine dependencies into the env lockfile's
@@ -89,7 +161,7 @@ pub async fn sync_package_manager_dependencies(
     force_resync: bool,
 ) -> Result<EnvLockfile> {
     sync_engine_dependencies(
-        config,
+        &config.for_boot(),
         root_dir,
         pnpm_engine_packages(pnpm_version),
         wanted_specifier,
@@ -161,23 +233,53 @@ pub struct EnginePolicyViolation {
 /// (via [`EnvInstallerContext`]), so under `trustPolicy=no-downgrade` or
 /// `resolutionMode=time-based` the probe fetches the full packument the
 /// trust and maturity checks need — the same resolver behaviour as a
-/// regular install, rather than a self-update-specific abbreviated-metadata
-/// path that would fail closed with "missing time".
+/// regular install.
 pub async fn resolve_engine_version(
     config: &Config,
     package: &str,
     bare_specifier: &str,
 ) -> Result<Option<ResolvedEngine>> {
-    let context = EnvInstallerContext::for_package_manager(config)?;
+    resolve_engine(config, package, bare_specifier, false).await
+}
 
+/// Resolve as [`resolve_engine_version`], but without the `minimumReleaseAge`
+/// cutoff. `self-update` uses this to tell a lagging `latest` dist-tag
+/// from a pick that is older only because the true latest is still within
+/// the cutoff (pnpm/pnpm#12006).
+pub async fn resolve_engine_version_ignoring_maturity(
+    config: &Config,
+    package: &str,
+    bare_specifier: &str,
+) -> Result<Option<ResolvedEngine>> {
+    resolve_engine(config, package, bare_specifier, true).await
+}
+
+async fn resolve_engine(
+    config: &Config,
+    package: &str,
+    bare_specifier: &str,
+    ignore_maturity: bool,
+) -> Result<Option<ResolvedEngine>> {
+    let boot_config = config.for_boot();
+    let config = &*boot_config;
+    let context = EnvInstallerContext::for_package_manager(config)?;
+    let opts = engine_resolve_options(config, ignore_maturity)?;
+    resolve_engine_with(&context, package, bare_specifier, &opts).await
+}
+
+async fn resolve_engine_with(
+    context: &EnvInstallerContext,
+    package: &str,
+    bare_specifier: &str,
+    opts: &ResolveOptions,
+) -> Result<Option<ResolvedEngine>> {
     let wanted = WantedDependency {
         alias: Some(package.to_string()),
         bare_specifier: Some(bare_specifier.to_string()),
         ..WantedDependency::default()
     };
-    let opts = engine_resolve_options(config)?;
     let result = context.resolver
-        .resolve(&wanted, &opts)
+        .resolve(&wanted, opts)
         .await
         .map_err(|error| miette::miette!("{error}"))
         .wrap_err_with(|| format!("resolve {package}@{bare_specifier}"))?;
@@ -204,96 +306,59 @@ pub async fn resolve_engine_version(
     }))
 }
 
-/// The resolve options carrying the maturity and trust policies of the
-/// install path.
-fn engine_resolve_options(config: &Config) -> Result<ResolveOptions> {
-    let published_by = engine_release_cutoff(config)?;
-    // The running version is already on this machine, so hiding it behind the
-    // maturity cutoff protects nothing — it only makes a dist-tag that points
-    // at it fall back to an older release, downgrading the user
-    // (pnpm/pnpm#13883).
-    let mut exclude_patterns = config.minimum_release_age_exclude.clone().unwrap_or_default();
-    exclude_patterns.push(format!("pnpm@{PNPM_VERSION}"));
-    let published_by_exclude =
-        pnpm_config::version_policy::create_package_version_policy(&exclude_patterns)
-            .into_diagnostic()
-            .wrap_err("compile the minimum-release-age-exclude policy")
-            .map(Some)?;
-    let trust_policy = match config.trust_policy {
-        pnpm_config::TrustPolicy::Off => None,
-        pnpm_config::TrustPolicy::NoDowngrade => Some(pnpm_config::TrustPolicy::NoDowngrade),
-    };
-    let trust_policy_exclude = config.trust_policy_exclude
-        .as_deref()
-        .filter(|patterns| !patterns.is_empty())
-        .map(pnpm_config::version_policy::create_package_version_policy)
-        .transpose()
-        .into_diagnostic()
-        .wrap_err("compile the trust-policy-exclude policy")?;
-
-    Ok(ResolveOptions {
-        version: pnpm_resolving_resolver_base::VersionSelectionOptions {
-            default_tag: Some("latest".to_string()),
-            ..Default::default()
-        },
-        policy: pnpm_resolving_resolver_base::ResolutionPolicyOptions {
-            published_by,
-            published_by_exclude,
-            trust_policy,
-            trust_policy_exclude,
-            trust_policy_ignore_after: config.trust_policy_ignore_after,
-            ..Default::default()
-        },
-        ..ResolveOptions::default()
-    })
-}
-
-/// Add config dependencies: resolve + install them (merged with any
-/// already-declared config deps), then write the clean specifiers into
-/// `pnpm-workspace.yaml`'s `configDependencies` block. Backs
-/// `pacquet add --config`.
-pub async fn add_config_dependencies<Reporter: self::Reporter>(
-    config: &Config,
-    root_dir: &Path,
-    added: &BTreeMap<String, String>,
-) -> Result<()> {
-    let mut config_dependencies = config.config_dependencies.clone().unwrap_or_default();
-    for (name, specifier) in added {
-        config_dependencies.insert(
-            name.clone(),
-            ConfigDependency::VersionWithIntegrity(specifier.clone()),
-        );
-    }
-
-    resolve_and_install::<Reporter>(config, &config_dependencies, root_dir, false).await?;
-
-    pnpm_workspace_manifest_writer::set_config_dependencies(
-        root_dir,
-        added
-            .iter()
-            .map(|(name, specifier)| (name.as_str(), specifier.as_str())),
-    )
-    .into_diagnostic()
-    .wrap_err("recording the config dependencies in pnpm-workspace.yaml")
-}
-
-/// Build the resolver + install options from `config` and resolve +
-/// install `config_dependencies`. Shared by [`install_config_deps`] and
-/// [`add_config_dependencies`].
+/// Build the resolver + install options from the boot policy of `config`
+/// (see [`Config::for_boot`]) and resolve + install `config_dependencies`.
 async fn resolve_and_install<Reporter: self::Reporter>(
     config: &Config,
     config_dependencies: &std::collections::BTreeMap<String, ConfigDependency>,
     root_dir: &Path,
     frozen_lockfile: bool,
-) -> Result<()> {
+    updates: &ConfigDepUpdates,
+    mode: ConfigDepsInstallMode,
+) -> Result<BTreeMap<String, String>> {
+    let Some(env_lockfile) =
+        read_config_dependency_lockfile(Some(config_dependencies), root_dir, mode)?
+    else {
+        return Ok(BTreeMap::new());
+    };
+    let boot_config = config.for_boot();
+    let config = &*boot_config;
+    let _store_lock = store::lock_config_dependency_store::<Reporter>(config)?;
+
     let context = EnvInstallerContext::new(config)?;
     context.network.http_client.set_warning_handler(pnpm_reporter::emit_global_warning::<Reporter>);
-    let options = context.options(root_dir, frozen_lockfile);
+    let mut options = context.options(root_dir, frozen_lockfile);
+    options.mode = mode;
+    // Sampled before the verifiers so the resolution cutoff is never later
+    // than the verification cutoff.
+    options.verification.resolution_policy = release_age_policy(config)?;
+    options.verification.resolution_verifiers = context.resolution_verifiers(config)?;
+    let store_index =
+        store::StoreIndexSession::attach(&mut options.store_index, context.store.dir, config).await;
+    let result = resolve_and_install_config_deps_updating::<Reporter>(
+        env_lockfile,
+        config_dependencies,
+        updates,
+        &context.resolver,
+        &options,
+    )
+    .await
+    .map_err(miette::Report::new)
+    .wrap_err("install configurational dependencies");
+    drop(options);
+    store_index.drain().await;
+    result
+}
 
-    resolve_and_install_config_deps::<Reporter>(config_dependencies, &context.resolver, &options)
-        .await
-        .map_err(miette::Report::new)
-        .wrap_err("install configurational dependencies")
+/// The `minimumReleaseAge` cutoff that the install's resolution verifiers
+/// enforce on config dependencies, for resolving them.
+fn release_age_policy(config: &Config) -> Result<ResolutionPolicyOptions> {
+    let policy = pnpm_package_manager::PickPolicy::from_config(config).into_diagnostic()?;
+    Ok(ResolutionPolicyOptions {
+        published_by: policy.published_by,
+        published_by_exclude: policy.published_by_exclude,
+        ..ResolutionPolicyOptions::default()
+    })
 }
 
 struct EnvInstallerContext {
@@ -301,17 +366,26 @@ struct EnvInstallerContext {
     resolver: NpmResolver<InMemoryPackageMetaCache>,
     network: EnvironmentNetwork,
     store: pnpm_env_installer::ConfigDependencyStore,
-}
-
-pub(crate) struct EnvironmentNetwork {
-    http_client: Arc<ThrottledClient>,
-    auth_headers: Arc<pnpm_network::AuthHeaders>,
-    registries: HashMap<String, String>,
-    retry_opts: RetryOpts,
-    offline: bool,
+    symlinked_lockfile_target_dirs: Vec<std::path::PathBuf>,
 }
 
 impl EnvInstallerContext {
+    fn resolution_verifiers(
+        &self,
+        config: &Config,
+    ) -> Result<Vec<Arc<dyn pnpm_resolving_resolver_base::ResolutionVerifier>>> {
+        pnpm_package_manager::build_resolution_verifiers(
+            config,
+            Arc::clone(&self.network.http_client),
+            None,
+            Some(Arc::clone(&self.network.auth_headers)),
+            None,
+            None,
+            None,
+        )
+        .into_diagnostic()
+    }
+
     /// Context for resolving the project's `configDependencies`, using the
     /// project's configured registries and network settings.
     fn new(config: &Config) -> Result<Self> {
@@ -364,6 +438,7 @@ impl EnvInstallerContext {
             registries,
             retry_opts,
             offline: config.offline,
+            tar_limits: config.tar_limits(),
         };
         let resolver = network.resolver(config);
 
@@ -377,6 +452,9 @@ impl EnvInstallerContext {
                 strict_pkg_content_check: config.strict_store_pkg_content_check,
                 package_import_method: config.package_import_method,
             },
+            symlinked_lockfile_target_dirs: config
+                .symlinked_lockfile_target_dirs
+                .clone(),
         })
     }
 
@@ -386,11 +464,18 @@ impl EnvInstallerContext {
         frozen_lockfile: bool,
     ) -> ConfigDepsInstallOptions<'a> {
         ConfigDepsInstallOptions {
+            mode: ConfigDepsInstallMode::Reconcile,
+            verification: ConfigDependencyVerification {
+                registries: &self.network.registries,
+                resolution_verifiers: Vec::new(),
+                resolution_policy: ResolutionPolicyOptions::default(),
+            },
             fetching: pnpm_tarball::ArchiveFetchOptions {
                 http_client: &self.network.http_client,
                 auth_headers: &self.network.auth_headers,
                 retry_opts: self.network.retry_opts,
                 offline: self.network.offline,
+                tar_limits: self.network.tar_limits,
             },
             platform: pnpm_package_is_installable::InstallabilityOptions {
                 supported_architectures: None,
@@ -401,11 +486,14 @@ impl EnvInstallerContext {
                 ..Default::default()
             },
             store: self.store,
+            store_index: pnpm_env_installer::ConfigDependencyStoreIndex::default(),
             root_dir,
-
-            registries: &self.network.registries,
-
-            frozen_lockfile,
+            lockfile: pnpm_env_installer::EnvLockfileOptions {
+                frozen: frozen_lockfile,
+                symlinked: pnpm_lockfile::SymlinkedLockfile::allowing(
+                    &self.symlinked_lockfile_target_dirs,
+                ),
+            },
         }
     }
 }
@@ -413,57 +501,6 @@ impl EnvInstallerContext {
 #[cfg(test)]
 mod tests;
 
-/// Fail closed when the configured maturity cutoff cannot be represented.
-fn engine_release_cutoff(config: &Config) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
-    Ok(match config.resolved_minimum_release_age() {
-        Some(minutes) => {
-            let minutes = i64::try_from(minutes)
-                .into_diagnostic()
-                .wrap_err("convert minimumReleaseAge to minutes")?;
-            let duration = chrono::Duration::try_minutes(minutes)
-                .ok_or_else(|| miette::miette!("minimumReleaseAge is too large"))?;
-            Some(
-                chrono::Utc::now()
-                    .checked_sub_signed(duration)
-                    .ok_or_else(|| miette::miette!("minimumReleaseAge cutoff is out of range"))?,
-            )
-        }
-        None => None,
-    })
-}
-
 mod hooks;
 
-impl EnvironmentNetwork {
-    fn resolver(&self, config: &Config) -> NpmResolver<InMemoryPackageMetaCache> {
-        NpmResolver {
-            registries: self.registries.clone(),
-            registries_by_prefix: HashMap::new(),
-            metadata: pnpm_resolving_npm_resolver::RegistryMetadataClient {
-                http_client: Arc::clone(&self.http_client),
-                auth_headers: Arc::clone(&self.auth_headers),
-                meta_cache: Arc::new(InMemoryPackageMetaCache::default()),
-                fetch_locker: shared_packument_fetch_locker(),
-                picked_manifest_cache: shared_picked_manifest_cache(),
-                cache_dir: Some(config.cache_dir.clone()),
-                retry_opts: self.retry_opts,
-            },
-            format: pnpm_resolving_npm_resolver::RegistryMetadataFormat {
-                // Derive the metadata mode from config exactly as the install
-                // resolver does (via `PickPolicy`), so resolving the pnpm engine
-                // (or a config dependency) under `resolutionMode=time-based` /
-                // `trustPolicy=no-downgrade` fetches the full packument the
-                // `minimumReleaseAge` and trust checks need — instead of failing
-                // closed on abbreviated metadata that omits `time`.
-                full_metadata: config.requires_full_metadata_for_resolution(),
-                needs_full_metadata_for: None,
-                filter_metadata: config.requires_full_metadata_for_resolution(),
-            },
-            cache_policy: pnpm_resolving_npm_resolver::MetadataCachePolicy {
-                offline: self.offline,
-                prefer_offline: config.prefer_offline,
-                ignore_missing_time_field: config.minimum_release_age_ignore_missing_time,
-            },
-        }
-    }
-}
+mod engine_policy;

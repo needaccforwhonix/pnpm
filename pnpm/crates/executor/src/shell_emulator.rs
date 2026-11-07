@@ -1,9 +1,9 @@
+pub use crate::shell_emulator_types::{EmulatedOutput, ShellEmulatorError};
+
 use deno_task_shell::{
     KillSignal, ShellPipeReader, ShellPipeWriter, ShellState, SignalKind, execute_with_pipes,
     parser, parser::SequentialList, pipe,
 };
-use derive_more::{Display, Error};
-use miette::Diagnostic;
 use pnpm_reporter::LifecycleStdio;
 use std::{
     collections::HashMap,
@@ -15,36 +15,6 @@ use std::{
 use tokio::{runtime::Builder, task::LocalSet};
 
 use crate::process_tracker::{EmulatedCancellation, ProcessTracker};
-
-/// Failure to run a script under the `shellEmulator` setting. A script
-/// that runs and exits non-zero is not an error here — the exit code is
-/// returned to the caller, which decides what a failure means.
-#[derive(Debug, Display, Error, Diagnostic)]
-#[non_exhaustive]
-pub enum ShellEmulatorError {
-    #[display("Failed to parse `{script}` with the shell emulator: {message}")]
-    #[diagnostic(code(ERR_PNPM_EXECUTOR_SHELL_EMULATOR_PARSE))]
-    Parse { script: String, message: String },
-
-    #[display("Failed to start the shell emulator for `{script}`: {source}")]
-    #[diagnostic(code(ERR_PNPM_EXECUTOR_SHELL_EMULATOR_START))]
-    Start {
-        script: String,
-        #[error(source)]
-        source: io::Error,
-    },
-}
-
-/// Where an emulated script's output goes.
-#[derive(Clone, Copy)]
-pub enum EmulatedOutput<'a> {
-    /// Straight to pacquet's own stdout and stderr, for a foreground
-    /// `pnpm run`.
-    Inherit,
-    /// One call per output line, tagged with the stream it came from,
-    /// for the install-time path that turns lines into reporter events.
-    Lines(&'a (dyn Fn(LifecycleStdio, String) + Sync)),
-}
 
 /// Run `script` through the built-in shell instead of the platform's
 /// own (`shellEmulator`), so a script written for `sh` behaves the same
@@ -60,7 +30,8 @@ pub fn execute_emulated(
     output: EmulatedOutput<'_>,
     process_tracker: Option<&ProcessTracker>,
 ) -> Result<i32, ShellEmulatorError> {
-    let list = parser::parse(script)
+    let expanded_script = braced_parameters::expand(script, env);
+    let list = parser::parse(&expanded_script)
         .map_err(|error| ShellEmulatorError::Parse {
             script: script.to_string(),
             message: error.to_string(),
@@ -78,7 +49,7 @@ pub fn execute_emulated(
             .map(|(key, value)| (OsString::from(key), OsString::from(value)))
             .collect(),
         cwd,
-        cancellation: cancellation.as_ref().map(EmulatedCancellation::receiver),
+        cancellation: cancellation.as_ref().map(EmulatedCancellation::to_receiver),
     };
     match output {
         EmulatedOutput::Inherit => {
@@ -216,6 +187,10 @@ impl Write for LineWriter<'_> {
         Ok(())
     }
 }
+
+/// Rewriting `${...}` parameter expansions into the `$NAME` references the
+/// bundled parser understands.
+mod braced_parameters;
 
 #[cfg(test)]
 mod tests;

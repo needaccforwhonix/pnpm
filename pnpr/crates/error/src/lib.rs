@@ -1,21 +1,30 @@
 pub use redact_url::redact_url_credentials;
 
 mod redact_url;
+#[cfg(feature = "server")]
+mod response;
+#[cfg(feature = "server")]
+pub use response::PublicErrorMessage;
 
-use axum::{
-    http::StatusCode,
-    response::{IntoResponse, Response},
-};
 use derive_more::{Display, Error, From};
 
 #[derive(Debug, Display, Error, From)]
 #[non_exhaustive]
 pub enum RegistryError {
     #[display("Upstream request to {url} failed: {source}")]
+    #[cfg(feature = "server")]
     Upstream {
         url: String,
         #[error(source)]
         source: reqwest::Error,
+    },
+
+    /// The upstream sent no response head within its `timeout`.
+    #[display("Upstream request to {url} timed out before the response arrived")]
+    #[from(skip)]
+    UpstreamTimeout {
+        #[error(not(source))]
+        url: String,
     },
 
     #[display("Upstream response body from {url} failed: {source}")]
@@ -51,6 +60,14 @@ pub enum RegistryError {
     UpstreamUnavailable {
         #[error(not(source))]
         upstream: String,
+        retry_after: std::time::Duration,
+    },
+
+    #[display("Storage is temporarily unavailable: {reason}")]
+    #[from(skip)]
+    StorageUnavailable {
+        #[error(not(source))]
+        reason: String,
     },
 
     #[display("EINTEGRITY: tarball {filename:?} for package {package:?}: {reason}")]
@@ -115,15 +132,40 @@ pub enum RegistryError {
         resource: String,
     },
 
-    /// A team mutation (create/destroy/add/rm) hit the npm team API, but
-    /// pnpr teams are declared in the registry configuration and cannot be
-    /// changed over HTTP. Maps to 403.
+    /// A team mutation (create/destroy/add/rm) hit the npm team API on a
+    /// registry whose teams are declared in the configuration. Maps to 403.
     #[display(
         "Teams on this registry are declared in the pnpr configuration; to {action}, ask the \
          registry operator to update the config"
     )]
     #[from(skip)]
     TeamsConfigManaged { action: &'static str },
+
+    /// A conditional write whose `If-Match` names a version the resource no
+    /// longer has. Maps to 412.
+    #[display("{resource} changed since version {expected}; read it again and repeat the change")]
+    #[from(skip)]
+    PreconditionFailed {
+        #[error(not(source))]
+        resource: String,
+        expected: String,
+    },
+
+    /// A rules edit hit the admin API on a registry whose rules are declared
+    /// in the configuration. Maps to 403.
+    #[display(
+        "The package rules of this registry are declared in the pnpr configuration; to change \
+         them, ask the registry operator to update the config"
+    )]
+    #[from(skip)]
+    RulesConfigManaged,
+
+    /// An admin edit that the current state refuses. Maps to 409.
+    #[from(skip)]
+    AdminConflict {
+        #[error(not(source))]
+        reason: String,
+    },
 
     /// Tarball payload from a publish couldn't be decoded — bad
     /// base64, length mismatch, or integrity mismatch.
@@ -181,15 +223,19 @@ pub enum RegistryError {
         entry: String,
     },
 
-    /// A publish transaction committed, but another writer already owned
-    /// what one of its packages tried to publish, so that package's entry
-    /// was left out of the document rather than pointed at bytes that are
-    /// not the ones it uploaded.
-    #[display("Publish transaction could not record: {packages}")]
+    /// A publish depended on an incarnation of an archive's bytes that a
+    /// reclaim is removing or removed, or that another incarnation replaced,
+    /// so the bytes it stored or found may be gone. A retry stores them
+    /// afresh.
+    #[display(
+        "Archive {artifact:?} of {package} was reclaimed while the publish was in flight; publish again"
+    )]
     #[from(skip)]
-    PublishNotRecorded {
+    ArchiveReclaimed {
         #[error(not(source))]
-        packages: String,
+        package: String,
+        #[error(not(source))]
+        artifact: String,
     },
 
     #[display("Upload {id:?} changed; query its offset before retrying")]
@@ -206,6 +252,17 @@ pub enum RegistryError {
         package: String,
     },
 
+    #[display(
+        "Hosted document {document} has format version {format_version}, but this server only supports up to version {supported_version}; refusing to rewrite"
+    )]
+    #[from(skip)]
+    DocumentFormatTooNew {
+        #[error(not(source))]
+        document: String,
+        format_version: u32,
+        supported_version: u32,
+    },
+
     /// Another request is already approving this staged publish. A staged
     /// record is approved exactly once: the approving request claims it with
     /// a conditional write, and a second one is refused rather than
@@ -215,17 +272,6 @@ pub enum RegistryError {
     StagedApprovalInFlight {
         #[error(not(source))]
         stage_id: String,
-    },
-
-    #[display("Hosted revision digest already has the maximum of {limit} references")]
-    #[from(skip)]
-    RevisionReferenceLimit { limit: usize },
-
-    #[display("Hosted revision reference index for digest {digest:?} changed while writing")]
-    #[from(skip)]
-    RevisionReferenceWriteConflict {
-        #[error(not(source))]
-        digest: String,
     },
 
     #[display(
@@ -256,6 +302,93 @@ pub enum RegistryError {
     #[from(skip)]
     TooManyUsers { max: u64 },
 
+    /// A registration attempt targeted a reserved username (`auth.admins`,
+    /// an OIDC binding, or a SCIM-provisioned user).
+    #[display("Username {name:?} is reserved")]
+    #[from(skip)]
+    ReservedUsername {
+        #[error(not(source))]
+        name: String,
+    },
+
+    /// Caller is not a maintainer of the package.
+    #[display("You must be a package maintainer to {action} {package:?}")]
+    #[from(skip)]
+    NotPackageMaintainer {
+        #[error(not(source))]
+        action: &'static str,
+        #[error(not(source))]
+        package: String,
+    },
+
+    /// Package was unpublished and cannot be claimed by non-maintainers.
+    #[display(
+        "Package {package:?} was unpublished and can only be republished by former maintainers"
+    )]
+    #[from(skip)]
+    PackageTombstoned {
+        #[error(not(source))]
+        package: String,
+    },
+
+    /// A version that was previously unpublished cannot be republished.
+    #[display("Cannot republish previously unpublished version {version:?} of package {package:?}")]
+    #[from(skip)]
+    CannotRepublishUnpublishedVersion {
+        #[error(not(source))]
+        package: String,
+        #[error(not(source))]
+        version: String,
+    },
+
+    /// A publish submitted version metadata that disagrees with the
+    /// `package.json` inside its archive, under the manifest interpretation
+    /// profile `profile`. `fields` names the install-critical fields that
+    /// differ.
+    #[display(
+        "The metadata submitted for {package}@{version} does not match the package.json in its \
+         archive under {profile}: {fields}"
+    )]
+    #[from(skip)]
+    ManifestMismatch {
+        #[error(not(source))]
+        package: String,
+        #[error(not(source))]
+        version: String,
+        #[error(not(source))]
+        profile: &'static str,
+        #[error(not(source))]
+        fields: String,
+    },
+
+    /// Maintainers list cannot be emptied.
+    #[display("Package {package:?} must have at least one maintainer")]
+    #[from(skip)]
+    EmptyMaintainers {
+        #[error(not(source))]
+        package: String,
+    },
+
+    /// The client sent too many requests. Maps to 429 Too Many Requests.
+    #[display("Too many requests: {reason}")]
+    #[from(skip)]
+    TooManyRequests {
+        #[error(not(source))]
+        reason: String,
+    },
+
+    /// Request processing timed out. Maps to 504 Gateway Timeout.
+    #[display("Request timed out: {reason}")]
+    #[from(skip)]
+    RequestTimeout {
+        #[error(not(source))]
+        reason: String,
+    },
+
+    /// An error wrapped in an `Arc` so multiple concurrent waiters sharing a
+    /// singleflight upstream fetch can clone the failure.
+    Shared(std::sync::Arc<RegistryError>),
+
     #[display("Internal error: {reason}")]
     #[from(skip)]
     Internal {
@@ -277,15 +410,18 @@ pub enum RegistryError {
 
     /// Bcrypt hash/verify failure. Operational error, not user-facing.
     #[display("Bcrypt failure: {_0}")]
+    #[cfg(feature = "server")]
     Bcrypt(bcrypt::BcryptError),
 
-    /// SQLite-backed token store failure.
-    #[display("Token database error: {_0}")]
+    /// A failure of an `SQLite` database: the token store or the metadata.
+    #[display("SQLite database error: {_0}")]
+    #[cfg(feature = "server")]
     Sqlite(rusqlite::Error),
 
-    /// Networked-SQLite (libsql / Turso) auth backend failure.
+    /// A failure of a libSQL database (Turso): the auth backend or the
+    /// metadata.
     #[cfg(feature = "backend-libsql")]
-    #[display("Auth database error: {_0}")]
+    #[display("libSQL database error: {_0}")]
     Libsql(libsql::Error),
 
     /// SQL auth backend failure.
@@ -305,6 +441,7 @@ pub enum RegistryError {
     /// A blocking task spawned for bcrypt or `SQLite` work panicked
     /// or was cancelled. Treat as an internal server error.
     #[display("Background task failed: {_0}")]
+    #[cfg(feature = "server")]
     JoinError(tokio::task::JoinError),
 
     #[display("I/O error: {_0}")]
@@ -313,230 +450,15 @@ pub enum RegistryError {
     /// Object-store (S3 / R2 / S3-compatible) backend failure on the
     /// hosted store.
     #[display("Object store error: {_0}")]
+    #[cfg(feature = "server")]
     ObjectStore(object_store::Error),
 
     #[display("JSON error: {_0}")]
+    #[cfg(feature = "server")]
     Json(serde_json::Error),
-}
-
-impl RegistryError {
-    /// Whether a failed upstream fetch is a transient *availability* failure —
-    /// a transport error, an open circuit breaker, or an upstream `5xx`. A `4xx`
-    /// is an authoritative response about *this* request — `401`/`403` (auth),
-    /// `429` (throttle), `400`/`410`, etc. — and is **not** transient: it must
-    /// surface immediately rather than be masked (e.g. by serving a stale cache
-    /// entry), which would let a revoked credential or a `410 Gone` keep being
-    /// answered from old bytes.
-    ///
-    /// A `404` never reaches here — it is modeled as a distinct not-found
-    /// outcome, not an error.
-    #[must_use]
-    pub fn is_transient_upstream_error(&self) -> bool {
-        match self {
-            RegistryError::Upstream { .. }
-            | RegistryError::UpstreamBody { .. }
-            | RegistryError::UpstreamUnavailable { .. } => true,
-            RegistryError::UpstreamStatus { status, .. } => *status >= 500,
-            _ => false,
-        }
-    }
-
-    #[must_use]
-    pub fn log_kind(&self) -> &'static str {
-        match self {
-            RegistryError::Upstream { .. } | RegistryError::UpstreamBody { .. } => "upstream",
-            RegistryError::UpstreamStatus { .. } => "upstream_status",
-            RegistryError::UpstreamResponse { .. } => "upstream_response",
-            RegistryError::UpstreamUnavailable { .. } => "upstream_unavailable",
-            RegistryError::TarballIntegrity { .. } => "tarball_integrity",
-            RegistryError::InvalidPackageName { .. } => "invalid_package_name",
-            RegistryError::InvalidEcosystemPackageName { .. } => "invalid_package_name",
-            RegistryError::InvalidTarballName { .. } => "invalid_tarball_name",
-            RegistryError::InvalidConfig { .. } => "invalid_config",
-            RegistryError::NotFound => "not_found",
-            RegistryError::Unauthenticated { .. } => "unauthenticated",
-            RegistryError::Forbidden { .. } => "forbidden",
-            RegistryError::TeamsConfigManaged { .. } => "teams_config_managed",
-            RegistryError::InvalidAttachment { .. } => "invalid_attachment",
-            RegistryError::BadRequest { .. } => "bad_request",
-            RegistryError::VersionAlreadyPublished { .. } => "version_already_published",
-            RegistryError::ArtifactAlreadyPublished { .. } => "artifact_already_published",
-            RegistryError::PublishNotRecorded { .. } => "publish_not_recorded",
-            RegistryError::BlobUploadConflict { .. } => "blob_upload_conflict",
-            RegistryError::DocumentWriteConflict { .. } => "document_write_conflict",
-            RegistryError::StagedApprovalInFlight { .. } => "staged_approval_in_flight",
-            RegistryError::RevisionReferenceLimit { .. } => "revision_reference_limit",
-            RegistryError::RevisionReferenceWriteConflict { .. } => {
-                "revision_reference_write_conflict"
-            }
-            RegistryError::OsvVulnerability { .. } => "osv_vulnerability",
-            RegistryError::RegistrationDisabled => "registration_disabled",
-            RegistryError::TooManyUsers { .. } => "too_many_users",
-            _ => self.storage_log_kind(),
-        }
-    }
-
-    fn storage_log_kind(&self) -> &'static str {
-        match self {
-            RegistryError::Internal { .. } => "internal",
-            RegistryError::InvalidHtpasswdFile { .. } => "invalid_htpasswd_file",
-            RegistryError::Bcrypt(_) => "bcrypt",
-            RegistryError::Sqlite(_) => "sqlite",
-            #[cfg(feature = "backend-libsql")]
-            RegistryError::Libsql(_) => "libsql",
-            #[cfg(any(feature = "backend-postgres", feature = "backend-mysql"))]
-            RegistryError::Sqlx(_) => "sqlx",
-            #[cfg(any(
-                feature = "backend-libsql",
-                feature = "backend-postgres",
-                feature = "backend-mysql"
-            ))]
-            RegistryError::AuthDatabaseTimeout => "auth_database_timeout",
-            RegistryError::JoinError(_) => "join_error",
-            RegistryError::Io(_) => "io",
-            RegistryError::ObjectStore(_) => "object_store",
-            RegistryError::Json(_) => "json",
-            _ => unreachable!("non-storage errors are classified by log_kind"),
-        }
-    }
-
-    fn storage_status_code(&self) -> StatusCode {
-        match self {
-            RegistryError::Internal { .. }
-            | RegistryError::InvalidHtpasswdFile { .. }
-            | RegistryError::Bcrypt(_)
-            | RegistryError::Sqlite(_)
-            | RegistryError::JoinError(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            #[cfg(feature = "backend-libsql")]
-            RegistryError::Libsql(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            #[cfg(any(feature = "backend-postgres", feature = "backend-mysql"))]
-            RegistryError::Sqlx(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            #[cfg(any(
-                feature = "backend-libsql",
-                feature = "backend-postgres",
-                feature = "backend-mysql"
-            ))]
-            RegistryError::AuthDatabaseTimeout => StatusCode::GATEWAY_TIMEOUT,
-            RegistryError::Io(_) | RegistryError::ObjectStore(_) | RegistryError::Json(_) => {
-                StatusCode::BAD_GATEWAY
-            }
-            _ => unreachable!("non-storage errors are classified by status_code"),
-        }
-    }
-
-    #[must_use]
-    pub fn log_message(&self) -> String {
-        redact_url_credentials(&self.to_string())
-    }
-
-    #[must_use]
-    pub fn public_message(&self) -> String {
-        let status = self.status_code();
-        if status.is_server_error() {
-            return status
-                .canonical_reason()
-                .unwrap_or("Internal Server Error")
-                .to_string();
-        }
-        self.to_string()
-    }
-
-    /// Map the error to the HTTP status the proxy should return to the
-    /// client. Follows the standard gateway semantics:
-    ///
-    /// * `502 Bad Gateway` — upstream returned something we can't make
-    ///   use of (5xx, malformed JSON, generic transport failure).
-    /// * `503 Service Unavailable` — couldn't reach upstream at all
-    ///   (DNS, connection refused, network unreachable). Distinct from
-    ///   502 so pnpm clients see "service down" rather than "upstream
-    ///   misbehaved" — both trigger the client's retry loop, but the
-    ///   distinction matters for monitoring and for any future circuit
-    ///   breaker.
-    /// * `504 Gateway Timeout` — upstream took too long to respond.
-    /// * `400 Bad Request` — client-supplied package or tarball name
-    ///   wasn't usable. Not retryable.
-    #[must_use]
-    pub fn status_code(&self) -> StatusCode {
-        match self {
-            RegistryError::Upstream { source, .. } => upstream_status_code(source),
-            RegistryError::UpstreamBody { source, .. } => upstream_body_status_code(source),
-            RegistryError::UpstreamStatus { .. }
-            | RegistryError::UpstreamResponse { .. }
-            | RegistryError::TarballIntegrity { .. } => StatusCode::BAD_GATEWAY,
-            RegistryError::UpstreamUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
-            RegistryError::InvalidPackageName { .. }
-            | RegistryError::InvalidEcosystemPackageName { .. }
-            | RegistryError::InvalidTarballName { .. }
-            | RegistryError::InvalidConfig { .. }
-            | RegistryError::InvalidAttachment { .. }
-            | RegistryError::BadRequest { .. } => StatusCode::BAD_REQUEST,
-            RegistryError::VersionAlreadyPublished { .. }
-            | RegistryError::ArtifactAlreadyPublished { .. }
-            | RegistryError::PublishNotRecorded { .. }
-            | RegistryError::BlobUploadConflict { .. }
-            | RegistryError::DocumentWriteConflict { .. }
-            | RegistryError::StagedApprovalInFlight { .. }
-            | RegistryError::RevisionReferenceLimit { .. }
-            | RegistryError::RevisionReferenceWriteConflict { .. } => StatusCode::CONFLICT,
-            RegistryError::NotFound => StatusCode::NOT_FOUND,
-            RegistryError::Unauthenticated { .. } => StatusCode::UNAUTHORIZED,
-            RegistryError::Forbidden { .. }
-            | RegistryError::TeamsConfigManaged { .. }
-            | RegistryError::OsvVulnerability { .. }
-            | RegistryError::RegistrationDisabled
-            | RegistryError::TooManyUsers { .. } => StatusCode::FORBIDDEN,
-            _ => self.storage_status_code(),
-        }
-    }
-}
-
-/// Only server faults need [`Self::log_message`]'s redaction: every variant
-/// that can embed a request URL — and so a credential — is one. The 401 / 403 /
-/// 404 tier drops to `debug` so a probing or unauthorized client cannot flood
-/// the log with warnings.
-impl IntoResponse for RegistryError {
-    fn into_response(self) -> Response {
-        let status = self.status_code();
-        let error_kind = self.log_kind();
-        if status.is_server_error() {
-            let err = self.log_message();
-            tracing::error!(%err, %error_kind, %status, "request failed");
-        } else if matches!(
-            status,
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND,
-        ) {
-            tracing::debug!(err = %self, %error_kind, %status, "request failed");
-        } else {
-            tracing::warn!(err = %self, %error_kind, %status, "request failed");
-        }
-        (status, self.public_message()).into_response()
-    }
 }
 
 pub type Result<Value, Error = RegistryError> = std::result::Result<Value, Error>;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "server"))]
 mod tests;
-
-fn upstream_status_code(source: &reqwest::Error) -> StatusCode {
-    if source.is_timeout() {
-        StatusCode::GATEWAY_TIMEOUT
-    } else if source.is_connect() {
-        StatusCode::SERVICE_UNAVAILABLE
-    } else {
-        StatusCode::BAD_GATEWAY
-    }
-}
-
-fn upstream_body_status_code(source: &std::io::Error) -> StatusCode {
-    if source.kind() == std::io::ErrorKind::TimedOut
-        || source
-            .get_ref()
-            .and_then(|source| source.downcast_ref::<reqwest::Error>())
-            .is_some_and(reqwest::Error::is_timeout)
-    {
-        StatusCode::GATEWAY_TIMEOUT
-    } else {
-        StatusCode::BAD_GATEWAY
-    }
-}

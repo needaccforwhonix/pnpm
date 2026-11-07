@@ -44,7 +44,7 @@ declare module 'strip-comments-strings' {
   export interface CodeItem {
     // What feature of the code has been found:
     type: string
-    // The indices of the feature in the original code string:
+    // The indices of the feature in the input code string:
     index: number
     indexEnd: number
     // The test of the feature
@@ -82,5 +82,30 @@ declare module 'npm-packlist' {
     workspaces?: Map<string, string>
   }
   function npmPacklist (tree: PacklistTree, options?: Record<string, unknown>): Promise<string[]>
+  namespace npmPacklist {
+    interface StatOptions {
+      st: import('node:fs').Stats
+      entry: string
+      file: boolean
+      dir: boolean
+      isSymbolicLink: boolean
+    }
+    class Walker {
+      constructor (tree: PacklistTree, options?: Record<string, unknown>)
+      isPackage: boolean
+      path: string
+      requiredFiles: string[]
+      tree: PacklistTree
+      onstat (opts: StatOptions, callback: () => void): void
+      walker (entry: string, opts: Record<string, unknown>, callback: () => void): void
+      walkerOpt (entry: string, opts: Record<string, unknown>): Record<string, unknown>
+      on (event: 'done', listener: (files: string[]) => void): this
+      on (event: 'error', listener: (err: unknown) => void): this
+      start (): this
+      onReaddir (entries: string[]): void
+      injectRules (filename: string | symbol, rules: string[], callback?: () => void): void
+      processPackage (callback: () => void): void
+    }
+  }
   export = npmPacklist
 }

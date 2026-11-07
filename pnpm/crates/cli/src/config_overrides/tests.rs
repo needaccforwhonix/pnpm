@@ -1,14 +1,13 @@
-use super::{
-    ConfigOverrides, apply_registry_override, apply_state_dir_override, apply_store_dir_override,
-};
+use super::{ConfigOverrides, apply_state_dir_override, apply_store_dir_override};
 use pnpm_config::{
     ColorMode, Config, EnvVar, GetCurrentDir, GetHomeDir, LinkProbe, LinkWorkspacePackages,
-    NodeLinker, PackageImportMethod, PmOnFail, RemoteSideEffectsCacheSettings, RuntimeOnFail,
-    SaveWorkspaceProtocol, TrustPolicy,
+    NodeLinker, NodePackageMapMode, PackageImportMethod, PmOnFail, RemoteSideEffectsCacheSettings,
+    RuntimeOnFail, SaveWorkspaceProtocol, TrustPolicy,
 };
 use pnpm_store_dir::STORE_VERSION;
 use pretty_assertions::assert_eq;
 use std::{
+    collections::BTreeMap,
     ffi::OsString,
     path::{Path, PathBuf},
 };
@@ -20,6 +19,15 @@ fn argv<Items: IntoIterator<Item = &'static str>>(items: Items) -> Vec<OsString>
         .collect()
 }
 
+/// `config` after [`Config::current`] would have applied the command line's
+/// registry routes, and the CLI its own overrides.
+pub(super) fn config_with_cli_registries(overrides: &ConfigOverrides, config: Config) -> Config {
+    let mut config = Config { cli: overrides.cli_layer(None), ..config };
+    config.apply_cli_registries();
+    overrides.apply(&mut config, Path::new("/workspace"));
+    config
+}
+
 #[test]
 fn extract_separates_config_tokens_from_argv() {
     let (overrides, remaining) = ConfigOverrides::extract(argv([
@@ -29,8 +37,7 @@ fn extract_separates_config_tokens_from_argv() {
         "--frozen-lockfile",
     ]));
     assert_eq!(remaining, argv(["pacquet", "install", "--frozen-lockfile"]));
-    let mut config = Config::default();
-    overrides.apply(&mut config, Path::new("/workspace"));
+    let config = config_with_cli_registries(&overrides, Config::default());
     assert_eq!(config.registry, "https://example.test/");
     assert_eq!(config.package_manager_bootstrap.registry, "https://example.test/");
     assert_eq!(
@@ -51,6 +58,17 @@ fn extract_reads_the_login_scope() {
     let mut config = Config::default();
     overrides.apply(&mut config, Path::new("/workspace"));
     assert_eq!(config.scope.as_deref(), Some("@my-org"));
+}
+
+#[test]
+fn extract_applies_progress_override() {
+    let (overrides, remaining) =
+        ConfigOverrides::extract(argv(["pacquet", "--config.progress=false", "install"]));
+    assert_eq!(remaining, argv(["pacquet", "install"]));
+    let mut config = Config::default();
+    assert!(config.progress);
+    overrides.apply(&mut config, Path::new("/workspace"));
+    assert!(!config.progress);
 }
 
 #[test]
@@ -76,17 +94,39 @@ fn extract_leaves_config_tokens_after_the_separator_for_the_child() {
             "--config.registry=https://example.test/",
         ]),
     );
-    let mut config = Config::default();
-    overrides.apply(&mut config, Path::new("/workspace"));
+    let config = config_with_cli_registries(&overrides, Config::default());
     assert_eq!(config.pm_on_fail, None);
     assert_eq!(config.registry, Config::default().registry);
+}
+
+#[test]
+fn npmrc_tokens_keep_the_setting_tokens_before_the_separator() {
+    let (overrides, _) = ConfigOverrides::extract(argv([
+        "pacquet",
+        "--config.lockfileDir=..",
+        "--ignore-scripts",
+        "--config.store-dir=/store",
+        "run",
+        "build",
+        "--",
+        "--config.registry=https://example.test/",
+    ]));
+
+    assert_eq!(
+        overrides.cli_layer(None).npmrc_tokens,
+        [
+            ("lockfileDir".to_owned(), "..".to_owned()),
+            ("ignore-scripts".to_owned(), "true".to_owned()),
+            ("store-dir".to_owned(), "/store".to_owned()),
+        ],
+    );
 }
 
 #[test]
 fn registry_cli_override_normalizes_and_sets_every_registry_slot() {
     let mut config = Config::default();
     // No trailing slash on the input; it is normalized on the way in.
-    apply_registry_override(&mut config, "https://cli.example");
+    config.apply_registry_override("https://cli.example");
     assert_eq!(config.registry, "https://cli.example/");
     assert_eq!(
         config.registries_by_scope.get("default").map(String::as_str),
@@ -100,6 +140,20 @@ fn registry_cli_override_normalizes_and_sets_every_registry_slot() {
 }
 
 #[test]
+fn registry_flag_outranks_a_config_registry_token() {
+    let (overrides, _) =
+        ConfigOverrides::extract(argv(["pacquet", "--config.registry=https://config.example/"]));
+    assert_eq!(
+        overrides
+            .cli_layer(Some("https://flag.example"))
+            .registry
+            .as_deref(),
+        Some("https://flag.example/"),
+    );
+    assert_eq!(overrides.cli_layer(None).registry.as_deref(), Some("https://config.example/"));
+}
+
+#[test]
 fn extract_applies_scoped_registry_overrides() {
     let (overrides, remaining) = ConfigOverrides::extract(argv([
         "pacquet",
@@ -107,8 +161,7 @@ fn extract_applies_scoped_registry_overrides() {
         "install",
     ]));
     assert_eq!(remaining, argv(["pacquet", "install"]));
-    let mut config = Config::default();
-    overrides.apply(&mut config, Path::new("/workspace"));
+    let config = config_with_cli_registries(&overrides, Config::default());
     assert_eq!(
         config.registries_by_scope.get("@private").map(String::as_str),
         Some("https://private.example/npm/"),
@@ -132,7 +185,7 @@ fn scoped_registry_override_wins_over_existing_config() {
         "@private".to_string(),
         "https://json-env.example/npm/".to_string(),
     );
-    overrides.apply(&mut config, Path::new("/workspace"));
+    let config = config_with_cli_registries(&overrides, config);
     assert_eq!(
         config.registries_by_scope.get("@private").map(String::as_str),
         Some("https://cli.example/npm/"),
@@ -149,8 +202,7 @@ fn unknown_keys_are_dropped_silently() {
         ConfigOverrides::extract(argv(["pacquet", "--config.unknown-key=whatever", "install"]));
     assert_eq!(remaining, argv(["pacquet", "install"]));
     let default_registry = Config::default().registry;
-    let mut config = Config::default();
-    overrides.apply(&mut config, Path::new("/workspace"));
+    let config = config_with_cli_registries(&overrides, Config::default());
     assert_eq!(config.registry, default_registry, "no known key set ⇒ registry untouched");
 }
 
@@ -194,6 +246,16 @@ fn max_sockets_overrides_win_over_the_config_layers_in_either_spelling() {
     let mut config = Config::default();
     overrides.apply(&mut config, Path::new("/workspace"));
     assert_eq!(config.max_sockets, Some(9), "the canonical spelling wins over npm's");
+
+    for argv in [
+        argv(["pacquet", "--config.maxsockets=4", "--config.maxSockets=9", "install"]),
+        argv(["pacquet", "--config.maxSockets=9", "--config.maxsockets=4", "install"]),
+    ] {
+        let (overrides, _) = ConfigOverrides::extract(argv);
+        let mut config = Config::default();
+        overrides.apply(&mut config, Path::new("/workspace"));
+        assert_eq!(config.max_sockets, Some(9), "the camelCase canonical spelling wins too");
+    }
 }
 
 #[test]
@@ -346,8 +408,7 @@ fn config_tokens_after_external_command_stay_in_argv() {
     ]));
     let expected = argv(["pacquet", "--dir", "project", "commitlint", "--config.foo=bar"]);
     assert_eq!(remaining, expected);
-    let mut config = Config::default();
-    overrides.apply(&mut config, Path::new("/workspace"));
+    let config = config_with_cli_registries(&overrides, Config::default());
     assert_eq!(config.registry, "https://example.test/");
 }
 
@@ -366,8 +427,7 @@ fn non_utf8_token_stops_config_token_extraction() {
     let expected = vec![OsString::from("pacquet"), non_utf8, OsString::from("--config.foo=bar")];
     assert_eq!(remaining, expected);
 
-    let mut config = Config::default();
-    overrides.apply(&mut config, Path::new("/workspace"));
+    let config = config_with_cli_registries(&overrides, Config::default());
     assert_eq!(config.registry, "https://example.test/");
 }
 
@@ -384,8 +444,7 @@ fn last_value_wins_for_repeated_keys() {
         "--config.registry=https://first.test/",
         "--config.registry=https://second.test/",
     ]));
-    let mut config = Config::default();
-    overrides.apply(&mut config, Path::new("/workspace"));
+    let config = config_with_cli_registries(&overrides, Config::default());
     assert_eq!(config.registry, "https://second.test/");
     assert_eq!(config.package_manager_bootstrap.registry, "https://second.test/");
 }
@@ -421,8 +480,7 @@ fn dotted_proxy_overrides_apply_to_network_config() {
 fn apply_is_a_noop_when_no_overrides_set() {
     let (overrides, _) = ConfigOverrides::extract(argv(["pacquet", "install"]));
     let default_registry = Config::default().registry;
-    let mut config = Config::default();
-    overrides.apply(&mut config, Path::new("/workspace"));
+    let config = config_with_cli_registries(&overrides, Config::default());
     assert_eq!(config.registry, default_registry);
 }
 
@@ -501,6 +559,19 @@ fn install_keeps_the_trust_lockfile_pair_for_clap() {
     for flag in ["--trust-lockfile", "--no-trust-lockfile"] {
         let (overrides, remaining) = ConfigOverrides::extract(argv(["pacquet", "install", flag]));
         assert_eq!(remaining, argv(["pacquet", "install", flag]));
+
+        let mut config = Config::default();
+        overrides.apply(&mut config, Path::new("/workspace"));
+        assert_eq!(config.trust_lockfile, Config::default().trust_lockfile, "{flag}");
+    }
+}
+
+#[test]
+fn remove_keeps_the_trust_lockfile_pair_for_clap() {
+    for flag in ["--trust-lockfile", "--no-trust-lockfile"] {
+        let (overrides, remaining) =
+            ConfigOverrides::extract(argv(["pacquet", "remove", "foo", flag]));
+        assert_eq!(remaining, argv(["pacquet", "remove", "foo", flag]));
 
         let mut config = Config::default();
         overrides.apply(&mut config, Path::new("/workspace"));
@@ -621,3 +692,89 @@ fn install_with_a_package_claims_the_options_of_add() {
 mod paths;
 
 mod bare_flags;
+
+mod tls_settings;
+
+/// A setting no table claims is handed to [`Config::current`], keyed by its
+/// kebab-case name whichever spelling the command line used.
+#[test]
+fn unclaimed_dotted_settings_are_kept_for_config_loading() {
+    let (overrides, remaining) = ConfigOverrides::extract(argv([
+        "pacquet",
+        "--config.frozen-lockfile=true",
+        "--config.autoInstallPeers=false",
+        "--config.network-concurrency=4",
+        "install",
+    ]));
+    assert_eq!(remaining, argv(["pacquet", "install"]));
+    assert_eq!(
+        overrides.unported_settings(),
+        &BTreeMap::from([
+            ("auto-install-peers".to_string(), "false".to_string()),
+            ("frozen-lockfile".to_string(), "true".to_string()),
+            ("network-concurrency".to_string(), "4".to_string()),
+        ]),
+    );
+}
+
+#[test]
+fn claimed_dotted_settings_are_not_passed_on() {
+    let (overrides, _) = ConfigOverrides::extract(argv([
+        "pacquet",
+        "--config.node-linker=hoisted",
+        "--config.registry=https://example.test",
+        "install",
+    ]));
+    assert!(overrides.unported_settings().is_empty());
+}
+
+/// A setting the `--config.` tables claim has to leave the same mark on
+/// [`Config::explicit_settings`] as one from a config file, because that
+/// record is what `pnpm config get` and `pnpm config list` answer from.
+#[test]
+fn claimed_dotted_settings_are_recorded_as_explicitly_set() {
+    use serde_json::json;
+
+    let cases: [(&str, &str, &str, serde_json::Value); 22] = [
+        ("bail", "true", "bail", json!(true)),
+        ("ci", "true", "ci", json!(true)),
+        ("color", "always", "color", json!("always")),
+        ("embed-readme", "true", "embedReadme", json!(true)),
+        ("ignore-workspace-root-check", "true", "ignoreWorkspaceRootCheck", json!(true)),
+        ("optional", "true", "optional", json!(true)),
+        ("pending", "true", "pending", json!(true)),
+        ("progress", "true", "progress", json!(true)),
+        ("recursive-install", "true", "recursiveInstall", json!(true)),
+        ("reverse", "true", "reverse", json!(true)),
+        ("shell-emulator", "true", "shellEmulator", json!(true)),
+        ("skip-manifest-obfuscation", "true", "skipManifestObfuscation", json!(true)),
+        ("sort", "true", "sort", json!(true)),
+        ("use-beta-cli", "true", "useBetaCli", json!(true)),
+        ("deploy-all-files", "true", "deployAllFiles", json!(true)),
+        ("force-legacy-deploy", "true", "forceLegacyDeploy", json!(true)),
+        ("inject-workspace-packages", "true", "injectWorkspacePackages", json!(true)),
+        ("node-linker", "hoisted", "nodeLinker", json!("hoisted")),
+        ("pm-on-fail", "ignore", "pmOnFail", json!("ignore")),
+        ("runtime-on-fail", "warn", "runtimeOnFail", json!("warn")),
+        // A number, like every other numeric setting pnpm 12 records.
+        ("max-sockets", "5", "maxSockets", json!(5)),
+        ("package-lock", "false", "packageLock", json!(false)),
+    ];
+
+    for (key, value, recorded_as, expected) in cases {
+        let (overrides, remaining) = ConfigOverrides::extract([
+            OsString::from("pacquet"),
+            OsString::from(format!("--config.{key}={value}")),
+            OsString::from("install"),
+        ]);
+        assert_eq!(remaining, argv(["pacquet", "install"]), "{key}");
+
+        let mut config = Config::default();
+        overrides.apply(&mut config, Path::new("/workspace"));
+        assert_eq!(
+            config.explicit_settings.get(recorded_as),
+            Some(&expected),
+            "--config.{key}={value} was not recorded as {recorded_as} = {expected}",
+        );
+    }
+}

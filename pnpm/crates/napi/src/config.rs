@@ -14,9 +14,7 @@
 //! leaked memory cannot be reclaimed). Retained configs therefore grow with the
 //! number of unique `(dir, overlay, config sources)` combinations the process
 //! observes, which is bounded in practice for the trusted embedder this binding
-//! targets. Removing the leak entirely requires the engine to accept a borrowed
-//! or `Arc` config instead of `&'static Config`; that is a pacquet-core change
-//! tracked as a follow-up.
+//! targets.
 //!
 //! The base is [`Config::current`] over `dir` — it reads the `.npmrc`
 //! auth/registry/network subset and `pnpm-workspace.yaml` exactly as the CLI
@@ -103,6 +101,8 @@ pub struct ConfigOverlay {
     pub prefer_frozen_lockfile: Option<bool>,
     pub dedupe_peer_dependents: Option<bool>,
     pub dedupe_peers: Option<bool>,
+    pub add_missing_peer_types: Option<bool>,
+    pub project_scoped_optional_peers: Option<bool>,
     pub dedupe_direct_deps: Option<bool>,
     pub dedupe_injected_deps: Option<bool>,
     pub resolve_peers_from_workspace_root: Option<bool>,
@@ -129,10 +129,13 @@ pub struct ConfigOverlay {
     pub strict_dep_builds: Option<bool>,
     /// Per-package build-script allow-list: `name -> allowed`. A package must
     /// be `true` here (or covered by `dangerously_allow_all_builds`) for its
-    /// lifecycle scripts to run. `BTreeMap` (not `HashMap`) so the overlay's
-    /// `Debug` output — which feeds the config intern cache key — is stable.
+    /// lifecycle scripts to run.
+    // `BTreeMap` (not `HashMap`) here and on `auth_header_by_uri`: the overlay's
+    // `Debug` output feeds the config intern cache key, so iteration order must
+    // be stable.
     pub allow_builds: Option<BTreeMap<String, bool>>,
-    /// Allow every dependency's build scripts to run.
+    /// Allow every dependency's build scripts to run, except the ones
+    /// `allow_builds` sets to `false`.
     pub dangerously_allow_all_builds: Option<bool>,
     /// When `true`, skip all dependency and project lifecycle scripts.
     pub ignore_scripts: Option<bool>,
@@ -155,8 +158,7 @@ pub struct ConfigOverlay {
     /// registry. When present, replaces the `.npmrc`-derived `auth_headers` —
     /// the host (which owns the raw `.npmrc`/config credentials) resolves the
     /// `Bearer ...` / `Basic ...` values and passes them in, so the binding never
-    /// reparses npmrc auth. `BTreeMap` (not `HashMap`) so the overlay's `Debug`
-    /// output — which feeds the config intern cache key — is stable.
+    /// reparses npmrc auth.
     pub auth_header_by_uri: Option<BTreeMap<String, String>>,
 }
 
@@ -192,13 +194,10 @@ fn cache_key(dir: &Path, overlay: &ConfigOverlay) -> u64 {
 fn hash_config_sources(dir: &Path, hasher: &mut DefaultHasher) {
     hash_file(&dir.join(".npmrc"), hasher);
 
-    let workspace_dir = std::env::var_os("NPM_CONFIG_WORKSPACE_DIR")
-        .or_else(|| std::env::var_os("npm_config_workspace_dir"))
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
+    let workspace_dir = pnpm_workspace::find_workspace_dir_from_env()
         .or_else(|| pnpm_workspace::find_workspace_dir(dir).ok().flatten());
     if let Some(workspace_dir) = workspace_dir {
-        hash_file(&workspace_dir.join(pnpm_config::WORKSPACE_MANIFEST_FILENAME), hasher);
+        hash_workspace_manifest(&workspace_dir, hasher);
         hash_file(&workspace_dir.join(".npmrc"), hasher);
     }
 
@@ -230,6 +229,17 @@ fn hash_config_sources(dir: &Path, hasher: &mut DefaultHasher) {
         .collect();
     env_vars.sort();
     env_vars.hash(hasher);
+}
+
+/// The workspace manifest with the files and config dependencies it includes
+/// merged in, so a change to any of them misses the cache.
+fn hash_workspace_manifest(workspace_dir: &Path, hasher: &mut DefaultHasher) {
+    let path = workspace_dir.join(pnpm_config::WORKSPACE_MANIFEST_FILENAME);
+    path.hash(hasher);
+    match pnpm_workspace::read_workspace_manifest_document(workspace_dir) {
+        Ok(document) => document.map(|document| document.text).hash(hasher),
+        Err(error) => error.to_string().hash(hasher),
+    }
 }
 
 fn hash_file(path: &Path, hasher: &mut DefaultHasher) {
@@ -308,13 +318,15 @@ fn build_config(dir: &Path, overlay: &ConfigOverlay) -> Result<Config, LoadWorks
     // Overlay fields may invalidate the path derived by `Config::current`.
     if let Some(global_virtual_store_dir) = &overlay.global_virtual_store_dir {
         config.global_virtual_store_dir.clone_from(global_virtual_store_dir);
-    } else if overlay.enable_global_virtual_store.is_some()
+    }
+    if overlay.global_virtual_store_dir.is_some()
+        || overlay.enable_global_virtual_store.is_some()
         || overlay.store_dir.is_some()
         || overlay.pnpm_home_dir.is_some()
     {
         let virtual_store_dir_explicit = config.explicit_settings.contains_key("virtualStoreDir");
-        let global_virtual_store_dir_explicit =
-            config.explicit_settings.contains_key("globalVirtualStoreDir");
+        let global_virtual_store_dir_explicit = overlay.global_virtual_store_dir.is_some()
+            || config.explicit_settings.contains_key("globalVirtualStoreDir");
         config.apply_global_virtual_store_derivation(
             virtual_store_dir_explicit,
             global_virtual_store_dir_explicit,

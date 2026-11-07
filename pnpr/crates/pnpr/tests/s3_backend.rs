@@ -3,17 +3,17 @@
 //! of a real bucket, so it exercises the full publish (stage → upload)
 //! and serve (stream-from-bucket) wiring without a network.
 
-#[path = "common/npm.rs"]
-mod npm;
+use crate::npm;
 
 use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
 use futures_util::StreamExt;
-use npm::{publish_doc, sri_sha512};
-use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path as ObjectPath};
+use npm::{npm_tgz, publish_doc, sri_sha512};
+use object_store::{ObjectStore, memory::InMemory, path::Path as ObjectPath};
 use pnpr::{Config, HostedStoreConfig, MaxUsers, router};
+use pnpr_fixtures::MockConfigPresets;
 use serde_json::{Value, json};
 use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
@@ -22,6 +22,9 @@ use std::{
 };
 use tempfile::TempDir;
 use tower::ServiceExt;
+
+/// Where the default npm namespace keeps its archives, below the prefix.
+const ARCHIVES: &str = "default/npm/archives";
 
 /// A static-serve config whose hosted store is an in-memory object
 /// store rather than the local `storage` directory.
@@ -42,9 +45,9 @@ async fn publishes_to_and_serves_from_the_object_store() {
     let app = router(s3_config(storage.clone(), Arc::clone(&store)));
     let (app, token) = add_user_and_get_token(app, "alice", "secret").await;
 
-    let bytes = b"fake-tarball-bytes";
+    let bytes = &npm_tgz("mypkg", "1.0.0", b"fake-tarball-bytes");
     let body = publish_doc("mypkg", "1.0.0", bytes);
-    let request = Request::put("/mypkg")
+    let request = Request::put("/npm/mypkg")
         .header("content-type", "application/json")
         .header("Authorization", format!("Bearer {token}"))
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
@@ -58,14 +61,18 @@ async fn publishes_to_and_serves_from_the_object_store() {
 
     // The hosted store is the bucket, so nothing lands in the local
     // `storage` directory.
-    assert!(!storage.join("mypkg").exists(), "hosted content must not touch local storage");
+    assert!(
+        crate::storage::namespace_files(&storage, "", pnpr_storage::Ecosystem::Npm).is_empty(),
+        "hosted content must not touch local storage",
+    );
+    assert_eq!(bucket_archives(&store).await.len(), 1, "the tarball is in the bucket");
 
     // The packument round-trips out of the bucket, with the tarball URL
     // rewritten to the public URL.
     let response = app
         .clone()
         .oneshot(
-            Request::get("/mypkg")
+            Request::get("/npm/mypkg")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -75,68 +82,20 @@ async fn publishes_to_and_serves_from_the_object_store() {
     let served = body_json(response.into_body()).await;
     assert_eq!(
         served["versions"]["1.0.0"]["dist"]["tarball"],
-        "http://example.test/mypkg/-/mypkg-1.0.0.tgz",
+        "http://example.test/npm/mypkg@1.0.0",
     );
 
     // The tarball streams back byte-for-byte out of the bucket.
     let response = app
         .oneshot(
-            Request::get("/mypkg/-/mypkg-1.0.0.tgz")
+            Request::get("/npm/mypkg/-/mypkg-1.0.0.tgz")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(body_bytes(response.into_body()).await, bytes);
-}
-
-/// Another writer in the bucket can own the tarball key a publish is about to
-/// write, and its bytes are immutable. The version is left out of the
-/// packument, and the publisher hears about it instead of a 201 for something
-/// the store does not serve.
-#[tokio::test]
-async fn a_publish_that_loses_the_tarball_key_is_refused() {
-    let tmp = TempDir::new().unwrap();
-    let storage = tmp.path().to_path_buf();
-    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    store
-        .put(
-            &ObjectPath::from("mypkg/mypkg-1.0.0.tgz"),
-            axum::body::Bytes::from_static(b"the winning tarball").into(),
-        )
-        .await
-        .unwrap();
-    let app = router(s3_config(storage, Arc::clone(&store)));
-    let (app, token) = add_user_and_get_token(app, "alice", "secret").await;
-
-    let body = publish_doc("mypkg", "1.0.0", b"the losing tarball");
-    let request = Request::put("/mypkg")
-        .header("content-type", "application/json")
-        .header("Authorization", format!("Bearer {token}"))
-        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-        .unwrap();
-    let response = app
-        .clone()
-        .oneshot(request)
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-
-    let response = app
-        .oneshot(
-            Request::get("/mypkg")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(body_json(response.into_body()).await["versions"], json!({}));
-    let winner = store
-        .get(&ObjectPath::from("mypkg/mypkg-1.0.0.tgz"))
-        .await
-        .unwrap();
-    assert_eq!(winner.bytes().await.unwrap(), "the winning tarball");
+    assert_eq!(body_bytes(response.into_body()).await, *bytes);
 }
 
 /// A publish whose tarball fails the integrity check must not leave an
@@ -154,7 +113,7 @@ async fn rejected_publish_uploads_nothing_and_leaves_no_staging_file() {
     // Declare an integrity over different bytes than the body carries,
     // so the server's recomputed hash won't match.
     body["versions"]["1.0.0"]["dist"]["integrity"] = json!(sri_sha512(b"different-bytes"));
-    let request = Request::put("/bad-pkg")
+    let request = Request::put("/npm/bad-pkg")
         .header("content-type", "application/json")
         .header("Authorization", format!("Bearer {token}"))
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
@@ -164,7 +123,7 @@ async fn rejected_publish_uploads_nothing_and_leaves_no_staging_file() {
     let text = String::from_utf8(body_bytes(response.into_body()).await).unwrap();
     assert!(text.contains("EINTEGRITY"), "error body should carry EINTEGRITY: {text}");
 
-    assert!(bucket_keys(&store, "bad-pkg").await.is_empty(), "nothing should be uploaded");
+    assert!(bucket_archives(&store).await.is_empty(), "nothing should be uploaded");
     assert_eq!(staging_file_count(&storage), 0, "no staging tmp file should be left behind");
 }
 
@@ -179,7 +138,7 @@ async fn unpublish_removes_the_package_from_the_bucket() {
     let (app, token) = add_user_and_get_token(app, "alice", "secret").await;
 
     let body = publish_doc("mypkg", "1.0.0", b"fake-tarball-bytes");
-    let request = Request::put("/mypkg")
+    let request = Request::put("/npm/mypkg")
         .header("content-type", "application/json")
         .header("Authorization", format!("Bearer {token}"))
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
@@ -192,9 +151,9 @@ async fn unpublish_removes_the_package_from_the_bucket() {
             .status(),
         StatusCode::CREATED,
     );
-    assert_eq!(bucket_keys(&store, "mypkg").await.len(), 2, "packument + tarball uploaded");
+    assert_eq!(bucket_archives(&store).await.len(), 1, "the tarball uploaded");
 
-    let request = Request::delete("/mypkg/-rev/anything")
+    let request = Request::delete("/npm/mypkg/-rev/anything")
         .header("Authorization", format!("Bearer {token}"))
         .body(Body::empty())
         .unwrap();
@@ -205,15 +164,13 @@ async fn unpublish_removes_the_package_from_the_bucket() {
         StatusCode::CREATED,
     );
 
-    assert!(
-        bucket_keys(&store, "mypkg").await.is_empty(),
-        "package should be gone from the bucket",
-    );
+    assert!(bucket_archives(&store).await.is_empty(), "package should be gone from the bucket");
 }
 
-/// Every object key in the bucket under `<prefix>/`.
-async fn bucket_keys(store: &Arc<dyn ObjectStore>, prefix: &str) -> Vec<String> {
-    let scope = ObjectPath::from(prefix);
+/// Every object key in the bucket where the default npm namespace keeps its
+/// archives.
+async fn bucket_archives(store: &Arc<dyn ObjectStore>) -> Vec<String> {
+    let scope = ObjectPath::from(ARCHIVES);
     store
         .list(Some(&scope))
         .map(|meta| meta.expect("list entry").location.to_string())
@@ -225,7 +182,7 @@ async fn bucket_keys(store: &Arc<dyn ObjectStore>, prefix: &str) -> Vec<String> 
 /// subdirectory of the proxy-cache root, which `static_serve` nests
 /// under `storage`).
 fn staging_file_count(storage: &Path) -> usize {
-    let dir = storage.join(".pnpr-cache").join("pnpr-hosted-staging");
+    let dir = storage.join(".pnpr-cache").join(".staging");
     std::fs::read_dir(dir).map_or(0, std::iter::Iterator::count)
 }
 
@@ -270,9 +227,9 @@ async fn add_user_and_get_token(
 }
 
 /// An embedder supplying its own store gives a prefix in the form a person
-/// writes it. `S3Store` concatenates the prefix onto the package name, so a
-/// raw `packages` has to be normalized on the way in — otherwise every object
-/// lands at `packagesmypkg/...` and nothing that reads by prefix finds it.
+/// writes it. `S3Store` concatenates the prefix onto the key, so a raw
+/// `packages` has to be normalized on the way in — otherwise every object
+/// lands at `packagesdefault/...` and nothing that reads by prefix finds it.
 #[tokio::test]
 async fn a_caller_supplied_prefix_is_normalized_before_it_reaches_the_keys() {
     let tmp = TempDir::new().unwrap();
@@ -295,7 +252,7 @@ async fn a_caller_supplied_prefix_is_normalized_before_it_reaches_the_keys() {
     let response = app
         .clone()
         .oneshot(
-            Request::put("/mypkg")
+            Request::put("/npm/mypkg")
                 .header("content-type", "application/json")
                 .header("Authorization", format!("Bearer {token}"))
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
@@ -312,21 +269,21 @@ async fn a_caller_supplied_prefix_is_normalized_before_it_reaches_the_keys() {
         .await;
     assert!(
         keys.iter()
-            .any(|key| key.starts_with("packages/mypkg/")),
+            .any(|key| key.starts_with(&format!("packages/{ARCHIVES}/"))),
         "objects should be keyed under `packages/`, got {keys:?}",
     );
     assert!(
         !keys
             .iter()
-            .any(|key| key.starts_with("packagesmypkg")),
-        "an unnormalized prefix would run into the package name: {keys:?}",
+            .any(|key| key.starts_with(&format!("packages{ARCHIVES}"))),
+        "an unnormalized prefix would run into the namespace: {keys:?}",
     );
 
     // And the package still serves back through the prefixed keys.
     let response = app
         .clone()
         .oneshot(
-            Request::get("/mypkg")
+            Request::get("/npm/mypkg")
                 .body(Body::empty())
                 .unwrap(),
         )

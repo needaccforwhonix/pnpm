@@ -1,7 +1,7 @@
 //! The `globalShims` record: what it says, and what writing to it must
 //! never do.
 //!
-//! The record in the global `config.yaml` is one of three layers the
+//! The record in the global `config.yaml` is one of the layers the
 //! dispatcher reads — the pnpm home's `pnpm-workspace.yaml` and the
 //! environment both outrank it — so a command that edits it has to ask
 //! what the *resolved* setting would be, not what its own file says. Two
@@ -17,7 +17,7 @@ use crate::{cli_args::shim::ShimError, engine_pm::channel::PackageManager};
 use miette::{Context, IntoDiagnostic};
 use pnpm_config::{
     Config, GLOBAL_CONFIG_YAML_FILENAME, GlobalShims, GlobalShimsSetting, Host, NamedShimPolicy,
-    ShimPolicy, ShimPolicyValue, WorkspaceSettings, default_config_dir,
+    ShimPolicy, ShimPolicyValue, TrustedSettings, default_config_dir,
 };
 use pnpm_workspace_manifest_writer::update_manifest_field;
 use std::{
@@ -84,6 +84,9 @@ pub(super) fn set_policy(
 /// projects that pin nothing. Only a package the user has not decided
 /// about is recorded: an entry of its own, or a `globalShims: false` that
 /// turns every shim off, is a decision and stands.
+///
+/// pnpm itself is left out: its own executable switches to the version a
+/// project pins, so a shim in front of it would dispatch to nothing new.
 pub(crate) fn record_package_manager_shims<'a>(
     config: &Config,
     packages: impl IntoIterator<Item = &'a str>,
@@ -97,7 +100,7 @@ pub(crate) fn record_package_manager_shims<'a>(
     for package in packages {
         // A disable that outranks this record leaves the shim doing
         // nothing, and the entry would outlive the disable.
-        if PackageManager::parse(package).is_none()
+        if PackageManager::parse(package).is_none_or(|pm| pm == PackageManager::Pnpm)
             || recorded.contains_key(package)
             || !would_dispatch(config, package)?
         {
@@ -145,11 +148,11 @@ pub(super) fn dispatches_by_default(package: &str) -> bool {
 /// Recording an opt-in on the user's behalf would quietly undo that;
 /// asking for a shim outright still narrows it to what was asked for.
 pub(super) fn shims_disabled_globally(config_dir: &Path) -> miette::Result<bool> {
-    let settings = WorkspaceSettings::load_global(config_dir)
+    let settings = TrustedSettings::load_global(config_dir)
         .map_err(miette::Report::new)
         .wrap_err("read the global config.yaml")?;
     Ok(matches!(
-        settings.and_then(|settings| settings.global_shims),
+        settings.and_then(|settings| settings.machine.global_shims),
         Some(GlobalShimsSetting::Toggle(false)),
     ))
 }
@@ -160,10 +163,10 @@ pub(super) fn shims_disabled_globally(config_dir: &Path) -> miette::Result<bool>
 pub(super) fn recorded_entries(
     config_dir: &Path,
 ) -> miette::Result<std::collections::HashMap<String, ShimPolicyValue>> {
-    let settings = WorkspaceSettings::load_global(config_dir)
+    let settings = TrustedSettings::load_global(config_dir)
         .map_err(miette::Report::new)
         .wrap_err("read the global config.yaml")?;
-    match settings.and_then(|settings| settings.global_shims) {
+    match settings.and_then(|settings| settings.machine.global_shims) {
         Some(GlobalShimsSetting::Entries(entries)) => Ok(entries),
         Some(GlobalShimsSetting::Toggle(false)) => Ok(std::collections::HashMap::new()),
         Some(GlobalShimsSetting::Toggle(true)) | None => Ok(default_entries()),

@@ -5,8 +5,9 @@
 use axum::body::{Body, to_bytes};
 use pnpr::{
     AccessList, Config, Ecosystem, HostedConfig, PackagePattern, PackageRules, Registries,
-    Registry, Teams, UpstreamConfig,
+    Registry, UpstreamConfig,
 };
+use pnpr_fixtures::MockConfigPresets;
 use reqwest::header::HeaderMap;
 use sha2::{Digest, Sha256};
 use std::{
@@ -44,11 +45,10 @@ pub fn mixed_router_config(
     config.http.packument_ttl = Duration::from_mins(1);
     config.routing.hosted.insert(
         hosted.name.to_string(),
-        HostedConfig {
-            org: hosted.org.to_string(),
-            rules: PackageRules::new(Vec::new(), Some(AccessList::from_tokens([hosted.access]))),
-            teams: Teams::default(),
-        },
+        HostedConfig::new(
+            hosted.org,
+            PackageRules::new(Vec::new(), Some(AccessList::from_tokens([hosted.access]))),
+        ),
     );
     config.routing.upstreams.insert(
         upstream.0.to_string(),
@@ -211,4 +211,44 @@ pub async fn assert_cache_tracks_metadata(ecosystem: Ecosystem) {
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     index.assert_async().await;
+}
+
+/// A wheel carrying the distribution identity used by upload tests.
+pub fn python_wheel(name: &str, version: &str) -> Vec<u8> {
+    python_wheel_with_metadata(
+        name,
+        version,
+        &format!("Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"),
+    )
+}
+
+pub fn python_wheel_with_metadata(name: &str, version: &str, metadata: &str) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    archive
+        .start_file::<_, ()>(
+            format!("{}-{version}.dist-info/METADATA", name.replace('-', "_")),
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+    archive.write_all(metadata.as_bytes()).unwrap();
+    archive.finish().unwrap().into_inner()
+}
+
+pub fn python_sdist(name: &str, version: &str) -> Vec<u8> {
+    let metadata = format!("Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n");
+    let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut archive = tar::Builder::new(encoder);
+    let mut header = tar::Header::new_gnu();
+    header.set_size(metadata.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    archive
+        .append_data(&mut header, format!("{name}-{version}/PKG-INFO"), metadata.as_bytes())
+        .unwrap();
+    archive
+        .into_inner()
+        .unwrap()
+        .finish()
+        .unwrap()
 }

@@ -1,6 +1,6 @@
 use super::{
-    Config, Ecosystem, FeatureOverrides, Identity, Path, PathBuf, RegistryError,
-    hosted_rules_config, listen, user,
+    Config, Ecosystem, FeatureOverrides, Identity, Path, RegistryError, hosted_rules_config,
+    listen, user,
 };
 
 #[test]
@@ -18,20 +18,6 @@ registries:
     let config = Config::from_yaml_str(yaml, Path::new("/x"), listen(), None).unwrap();
     assert!(config.features.registry.enabled);
     assert!(config.features.resolver.enabled);
-}
-
-#[test]
-fn static_constructor_serves_everything_from_one_hosted() {
-    use pnpr_registry::{ConcreteKind, Resolved};
-    let config = Config::static_serve(listen(), PathBuf::from("/tmp"));
-    assert!(config.routing.upstreams.is_empty());
-    // Everything routes to the single local hosted registry, which serves the
-    // flat storage root (its `org` namespace is empty).
-    assert_eq!(config.routing.hosted["local"].org, "");
-    assert_eq!(
-        config.routing.registries.resolve_default(Ecosystem::Npm, "anything"),
-        Resolved::Concrete { registry: "local", kind: ConcreteKind::Hosted },
-    );
 }
 
 /// A router registry routes each package to exactly one concrete source — the
@@ -138,10 +124,11 @@ defaultRegistry: ghost
     assert!(err.to_string().contains("defaultRegistry"), "unexpected error: {err}");
 }
 
-/// Two hosted registries sharing an `org` namespace would alias the same storage, so
-/// the collision must be rejected at load.
+/// Two hosted registries of the same ecosystem sharing an `org` namespace
+/// would alias the same storage, so the collision must be rejected at load,
+/// while two hosted registries of different ecosystems may share an `org`.
 #[test]
-fn from_yaml_str_rejects_duplicate_hosted_org() {
+fn from_yaml_str_rejects_duplicate_hosted_org_within_ecosystem_and_allows_across_ecosystems() {
     let yaml = "\
 storage: ./s
 registries:
@@ -153,8 +140,25 @@ registries:
     org: shared
 ";
     let err = Config::from_yaml_str(yaml, Path::new("/x"), listen(), None)
-        .expect_err("two hosted registries on the same org must be rejected");
+        .expect_err("two hosted registries of the same ecosystem on the same org must be rejected");
     assert!(err.to_string().contains("reuses the `org`"), "unexpected error: {err}");
+
+    let cross_ecosystem = "\
+storage: ./s
+registries:
+  acme-npm:
+    type: hosted
+    org: shared
+  acme-cargo:
+    type: hosted
+    ecosystem: cargo
+    org: shared
+";
+    let mut config =
+        Config::from_yaml_str(cross_ecosystem, Path::new("/x"), listen(), None).unwrap();
+    config.routing.ensure_valid_registry_graph(config.features.registry.enabled).unwrap();
+    assert_eq!(config.routing.hosted["acme-npm"].org, "shared");
+    assert_eq!(config.routing.hosted["acme-cargo"].org, "shared");
 }
 
 /// A dot-prefixed `org` would alias a reserved dot-directory inside the
@@ -162,7 +166,7 @@ registries:
 /// packages under the path operators are told is safe to wipe.
 #[test]
 fn from_yaml_str_rejects_dot_prefixed_hosted_org() {
-    for org in [".pnpr-cache", ".pnpr-journal", ".hidden"] {
+    for org in [".pnpr-cache", ".metadata", ".hidden"] {
         let yaml =
             format!("storage: ./s\nregistries:\n  sneaky:\n    type: hosted\n    org: {org}\n");
         let err = Config::from_yaml_str(&yaml, Path::new("/x"), listen(), None)
@@ -205,6 +209,7 @@ registries:
         disable_registry: true,
         disable_resolver: false,
         disable_artifacts: false,
+        disable_pipeline: false,
     };
     let err =
         Config::from_yaml_str_with_overrides(yaml, Path::new("/x"), listen(), None, overrides)
@@ -238,10 +243,12 @@ fn rules_are_derived_from_the_registry_packages_map() {
         "      '@secret/*':\n        access: $authenticated\n        publish: $authenticated\n        unpublish: admin\n      '**':\n        access: $all\n        publish: $authenticated\n",
     );
     let rules = &config.routing.hosted["local"].rules;
-    let secret = rules.for_package("@secret/thing");
+    let table = rules.snapshot();
+    let secret = table.for_package("@secret/thing");
     assert!(!secret.access.allows(&Identity::Anonymous));
     assert!(secret.access.allows(&user("alice")));
-    let public = rules.for_package("lodash");
+    let table = rules.snapshot();
+    let public = table.for_package("lodash");
     assert!(public.access.allows(&Identity::Anonymous));
     assert!(!public.publish.allows(&Identity::Anonymous));
     assert!(!secret.unpublish.allows(&user("alice")));
@@ -472,4 +479,63 @@ fn ecosystem_default_requires_a_router_source_for_that_ecosystem() {
             assert!(error.to_string().contains("main"), "{error}");
         }
     }
+}
+
+#[test]
+fn tarballs_tar_marks_a_registry_as_a_tar_registry() {
+    let yaml = "
+registries:
+  npmjs:
+    type: upstream
+    url: https://registry.npmjs.org/
+    public: true
+  zstd:
+    type: router
+    sources: [npmjs]
+    tarballs: tar
+";
+    let config = Config::from_yaml_str(yaml, Path::new("/x"), listen(), None).unwrap();
+    assert!(config.routing.tar_registries.contains("zstd"));
+    assert!(!config.routing.tar_registries.contains("npmjs"));
+}
+
+#[test]
+fn a_tgz_router_cannot_list_a_hosted_tar_registry() {
+    let yaml = "
+registries:
+  local:
+    type: hosted
+    tarballs: tar
+    packages:
+      '@acme/*':
+        publish: $authenticated
+  main:
+    type: router
+    sources: [local]
+";
+    let error = Config::from_yaml_str(yaml, Path::new("/x"), listen(), None).unwrap_err();
+    assert!(
+        error.to_string().contains(r#"router "main" serves `.tgz` files but lists "local""#),
+        "{error}",
+    );
+
+    let tar_router = format!("{yaml}    tarballs: tar\n");
+    let config = Config::from_yaml_str(&tar_router, Path::new("/x"), listen(), None).unwrap();
+    assert!(config.routing.tar_registries.contains("local"));
+    assert!(config.routing.tar_registries.contains("main"));
+}
+
+#[test]
+fn tarballs_is_refused_outside_npm() {
+    let yaml = "
+registries:
+  crates:
+    type: upstream
+    ecosystem: cargo
+    url: https://index.crates.io/
+    public: true
+    tarballs: tar
+";
+    let error = Config::from_yaml_str(yaml, Path::new("/x"), listen(), None).unwrap_err();
+    assert!(error.to_string().contains("tarballs"), "{error}");
 }

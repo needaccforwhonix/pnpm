@@ -165,7 +165,7 @@ fn type_git_dependency_reuses_side_effects_on_warm_install() {
     let repo = GitRepoFixture::init(root.path(), "git-side-effects");
     let lifecycle_log = root.path().join("git-side-effects-builds.log");
     let script = format!(
-        r"require('fs').appendFileSync({}, 'built\n')",
+        r"const fs = require('fs'); fs.appendFileSync({}, 'built\n'); fs.writeFileSync('built.txt', '')",
         serde_json::to_string(&lifecycle_log).expect("serialize lifecycle log path"),
     );
     repo.write_file(
@@ -199,6 +199,10 @@ fn type_git_dependency_reuses_side_effects_on_warm_install() {
         fs::read_to_string(&lifecycle_log).expect("read warm-install lifecycle log"),
         builds_after_cold_install,
         "the warm install must materialize cached side effects without rerunning postinstall",
+    );
+    assert!(
+        workspace.join("node_modules/git-side-effects/built.txt").exists(),
+        "the warm install did not restore the cached build output",
     );
 
     drop((root, npmrc_info));
@@ -296,6 +300,7 @@ fn a_git_dependency_is_prepared_with_the_package_manager_it_pins() {
         .with_env("XDG_DATA_HOME", root.path().join("data"))
         .with_env("XDG_STATE_HOME", root.path().join("state"))
         .with_env("XDG_CACHE_HOME", root.path().join("cache-home"))
+        .with_env("YARN_IGNORE_PATH", "1")
         .output()
         .expect("run pnpm install");
     dbg!(&output);
@@ -318,6 +323,52 @@ fn a_git_dependency_is_prepared_with_the_package_manager_it_pins() {
         .flatten()
         .any(|entry| entry.file_name() == "yarn.js");
     assert!(provisioned, "no provisioned yarn under {}", engine_store.display());
+
+    drop((root, npmrc_info));
+}
+
+/// `pmOnFail=ignore` keeps pnpm from switching to the version a project
+/// pins, and a git dependency's pin is no exception: the running pnpm
+/// prepares it. Provisioning the pinned pnpm cannot work on a system that
+/// only runs a pnpm built for it, such as NixOS.
+///
+/// The pinned version is not in the mock registry, so both the provisioning
+/// and a nested install that switched versions on its own would fail.
+#[test]
+fn a_git_dependency_pinning_another_pnpm_is_prepared_by_the_running_pnpm_with_pm_on_fail_ignore() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let repo = GitRepoFixture::init(root.path(), "pins-pnpm");
+    repo.write_file(
+        "package.json",
+        r#"{"name":"pins-pnpm","version":"1.0.0","main":"index.js","packageManager":"pnpm@9.0.0","scripts":{"prepare":"node record-user-agent.js"}}"#,
+    );
+    repo.write_file(
+        "record-user-agent.js",
+        "require('fs').writeFileSync('prepared-by.txt', process.env.npm_config_user_agent || '')\n",
+    );
+    let commit = repo.commit("init");
+    let spec = repo.git_url_at(&commit);
+
+    write_dependencies(&workspace, &[("pins-pnpm", &spec)]);
+    allow_builds(&workspace, &[&format!("pins-pnpm@{spec}")]);
+
+    let output = pnpm_at(&workspace)
+        .with_args(["install", "--pm-on-fail=ignore"])
+        .with_env("PNPM_CONFIG_REGISTRY", npmrc_info.mock_instance.url())
+        .with_env("PNPM_HOME", root.path().join("pnpm-home"))
+        .with_env("XDG_DATA_HOME", root.path().join("data"))
+        .with_env("XDG_STATE_HOME", root.path().join("state"))
+        .with_env("XDG_CACHE_HOME", root.path().join("cache-home"))
+        .output()
+        .expect("run pnpm install");
+    dbg!(&output);
+    assert_success(&output);
+
+    let user_agent = fs::read_to_string(workspace.join("node_modules/pins-pnpm/prepared-by.txt"))
+        .expect("the dependency's prepare script should have run");
+    let running_pnpm = format!("pnpm/{} ", pnpm_config::PNPM_VERSION);
+    assert!(user_agent.starts_with(&running_pnpm), "prepared by {user_agent:?}");
 
     drop((root, npmrc_info));
 }
@@ -417,6 +468,126 @@ fn assert_git_dependency_is_built_on_reinstall(node_linker: Option<&str>) {
     let marker_exists = marker.exists();
     eprintln!("MARKER: {}\nEXISTS: {marker_exists}\n", marker.display());
     assert!(!marker_exists, "--ignore-scripts must keep prepare output out of the install");
+
+    drop((root, npmrc_info));
+}
+
+#[test]
+fn explicitly_denied_git_preparation_keeps_source_and_separates_cached_builds() {
+    let CommandTempCwd {
+        pacquet: _,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let repo = GitRepoFixture::init(root.path(), "denied-prepare");
+    repo.write_file("index.js", "module.exports = 42");
+    repo.write_file("package.json", &json!({
+        "name": "denied-prepare", "version": "1.0.0",
+        "scripts": {
+            "prepare": r#"node -e "require('fs').writeFileSync('prepare.txt', 'prepared')""#,
+            "postinstall": r#"node -e "require('fs').writeFileSync('postinstall.txt', 'built')""#,
+        },
+    }).to_string());
+    let commit = repo.commit("init");
+    let spec = repo.git_url_at(&commit);
+    write_dependencies(&workspace, &[("denied-prepare", &spec)]);
+    let config_path = workspace.join("pnpm-workspace.yaml");
+    let config = fs::read_to_string(&config_path).expect("read workspace config");
+    for allowed in [false, false, true, false] {
+        let modules = workspace.join("node_modules");
+        if modules.exists() {
+            fs::remove_dir_all(&modules).expect("remove node_modules");
+        }
+        let key =
+            if allowed { format!("denied-prepare@{spec}") } else { "denied-prepare".to_string() };
+        fs::write(&config_path, format!("{config}\nallowBuilds:\n  '{key}': {allowed}\n"))
+            .expect("write build policy");
+        pnpm_at(&workspace)
+            .with_arg("install")
+            .assert()
+            .success();
+        assert_eq!(
+            fs::read_to_string(modules.join("denied-prepare/index.js")).unwrap(),
+            "module.exports = 42",
+        );
+        assert_eq!(modules.join("denied-prepare/prepare.txt").exists(), allowed);
+        assert_eq!(modules.join("denied-prepare/postinstall.txt").exists(), allowed);
+    }
+    drop((root, npmrc_info));
+}
+
+/// A git dependency is prepared by running `pnpm install` in its
+/// checkout, where nobody can approve the build scripts of its own
+/// dependencies. That install skips those builds instead of failing with
+/// `ERR_PNPM_IGNORED_BUILDS`, so the dependency is still prepared.
+///
+/// The pnpm under test goes first on `PATH`, so it is also the one that
+/// prepares the dependency. The nested install runs outside this project,
+/// so its registry, store, and cache travel in the environment. So does a
+/// `strictDepBuilds` the user set there, which must not reach it.
+#[test]
+fn a_git_dependency_is_prepared_when_its_own_dependencies_have_unapproved_builds() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let repo = GitRepoFixture::init(root.path(), "has-unapproved-build");
+    repo.write_file(
+        "package.json",
+        r#"{"name":"has-unapproved-build","version":"1.0.0","main":"index.js","scripts":{"prepare":"node record-build.js"},"devDependencies":{"@pnpm.e2e/pre-and-postinstall-scripts-example":"1.0.0"}}"#,
+    );
+    repo.write_file(
+        "record-build.js",
+        "const fs = require('fs')\n\
+         const dependency = 'node_modules/@pnpm.e2e/pre-and-postinstall-scripts-example'\n\
+         if (!fs.existsSync(dependency + '/package.json')) throw new Error('the dependency was not installed')\n\
+         fs.writeFileSync('dependency-was-built.txt', String(fs.existsSync(dependency + '/generated-by-postinstall.js')))\n",
+    );
+    repo.write_file("index.js", "module.exports = 'ok'\n");
+    repo.write_file("pnpm-lock.yaml", "");
+    let commit = repo.commit("init");
+    let spec = repo.git_url_at(&commit);
+
+    write_dependencies(&workspace, &[("has-unapproved-build", &spec)]);
+    allow_builds(&workspace, &[&format!("has-unapproved-build@{spec}")]);
+
+    let pnpm_dir = assert_cmd::cargo::cargo_bin("pnpm")
+        .parent()
+        .expect("the pnpm binary has a parent directory")
+        .to_path_buf();
+    let path = std::env::join_paths(
+        std::iter::once(pnpm_dir)
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())),
+    )
+    .expect("join PATH");
+
+    let output = pacquet
+        .with_args(["install"])
+        .with_env("PATH", path)
+        .with_env("PNPM_CONFIG_REGISTRY", npmrc_info.mock_instance.url())
+        .with_env("PNPM_CONFIG_STORE_DIR", &npmrc_info.store_dir)
+        .with_env("PNPM_CONFIG_CACHE_DIR", &npmrc_info.cache_dir)
+        .with_env("PNPM_CONFIG_FROZEN_LOCKFILE", "false")
+        .with_env("PNPM_CONFIG_STRICT_DEP_BUILDS", "true")
+        .with_env("PNPM_HOME", root.path().join("pnpm-home"))
+        .with_env("XDG_DATA_HOME", root.path().join("data"))
+        .with_env("XDG_STATE_HOME", root.path().join("state"))
+        .with_env("XDG_CACHE_HOME", root.path().join("cache-home"))
+        .output()
+        .expect("run pnpm install");
+    dbg!(&output);
+    assert_success(&output);
+
+    let dependency_was_built = fs::read_to_string(workspace.join(
+        "node_modules/has-unapproved-build/dependency-was-built.txt",
+    ))
+    .expect("the dependency should have been prepared");
+    assert_eq!(dependency_was_built, "false", "the unapproved build must stay skipped");
 
     drop((root, npmrc_info));
 }

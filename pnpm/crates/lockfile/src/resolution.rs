@@ -1,13 +1,20 @@
 pub use git_hosted::is_git_hosted_tarball_url;
+pub use pnpm_crypto_hash::has_complete_sha512_digest;
+pub use pnpm_platform_variants::{AmbiguousSelection, Floor, HostFloors, NodeAbi, host_floors};
 pub use registry::{
-    RegistryContext, RegistryOptions, RegistryServerType, TarballUrlOptions,
-    integrity_addressed_registry_tarball_url, is_integrity_addressed_registry_tarball_url,
-    npm_tarball_url, pick_registry_for_package, registry_server_type, registry_supports_time_field,
+    DeclaredRegistryPrefixes, RegistryContext, RegistryOptions, RegistryServerType,
+    TarballUrlOptions, normalized_registry_key, npm_tarball_url, pick_registry_for_package,
+    registry_for_package, registry_server_type, registry_supports_time_field, same_registry,
 };
+pub use revision_url::{
+    is_on_revision_tarball_route, is_revision_registry_tarball_url, revision_registry_tarball_path,
+    revision_registry_tarball_url,
+};
+pub use variants::{PlatformAssetTarget, variant_registry_tarball_url};
 
+use crate::IntegrityTarget;
 use derive_more::{Display, Error, From, Into, TryInto};
 use pipe_trait::Pipe;
-use pnpm_crypto_hash::integrity_addressed_tarball_path;
 use pnpm_diagnostics::miette::Diagnostic;
 use serde::{Deserialize, Serialize};
 use ssri::Integrity;
@@ -30,11 +37,6 @@ pub struct TarballResolution {
     /// (preparePackage / packlist) on extraction, and their cached content
     /// depends on whether build scripts ran, so they are addressed by a
     /// git-hosted store-index key rather than the integrity-based key.
-    ///
-    /// The git resolver sets this when it produces the resolution; the
-    /// lockfile loader back-fills it on entries whose URL matches a known
-    /// git host for backward compatibility with lockfiles written before
-    /// this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_hosted: Option<bool>,
     /// Sub-directory inside the tarball to pack. The git-hosted tarball
@@ -70,7 +72,8 @@ pub struct RegistryResolution {
 /// Largest registry revision every pnpm implementation can represent exactly.
 pub const MAX_TARBALL_REVISION: u64 = 9_007_199_254_740_991;
 
-/// A positive registry artifact revision in JavaScript's safe-integer range.
+/// A registry artifact revision in JavaScript's safe-integer range. Revision
+/// 0 is the original artifact.
 #[derive(
     Debug, Display, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Into,
 )]
@@ -88,7 +91,7 @@ impl TryFrom<u64> for TarballRevision {
     type Error = InvalidTarballRevisionError;
 
     fn try_from(revision: u64) -> Result<Self, Self::Error> {
-        if (1..=MAX_TARBALL_REVISION).contains(&revision) {
+        if revision <= MAX_TARBALL_REVISION {
             Ok(Self(revision))
         } else {
             Err(InvalidTarballRevisionError { revision })
@@ -97,7 +100,7 @@ impl TryFrom<u64> for TarballRevision {
 }
 
 #[derive(Debug, Display, Error, Clone, Copy)]
-#[display("tarball revision {revision} is not a positive integer at most {MAX_TARBALL_REVISION}")]
+#[display("tarball revision {revision} is not an integer at most {MAX_TARBALL_REVISION}")]
 pub struct InvalidTarballRevisionError {
     pub revision: u64,
 }
@@ -207,22 +210,6 @@ pub struct BinaryResolution {
     pub prefix: Option<String>,
 }
 
-/// One `(os, cpu, libc?)` triple a [`PlatformAssetResolution`] covers.
-///
-/// `libc` is only written for musl-built variants; glibc is the
-/// implicit default on Linux and the field is omitted everywhere
-/// else. `Option<String>` (rather than `Option<Libc>` enum) keeps
-/// future libc values future-compatible without a churning serde
-/// migration if a new one lands.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct PlatformAssetTarget {
-    pub os: String,
-    pub cpu: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub libc: Option<String>,
-}
-
 /// One variant of a [`VariationsResolution`]: an inner [`LockfileResolution`]
 /// paired with the host triples it covers.
 ///
@@ -245,15 +232,25 @@ pub struct PlatformAssetResolution {
 }
 
 /// For a runtime (or any platform-conditioned binary) that has more
-/// than one downloadable artifact, one per `(os, cpu, libc?)` combo.
+/// than one downloadable artifact, one per `(os, cpu, libc?)` combo, or a
+/// registry package version with platform variants.
 ///
-/// At install time, the dispatcher walks `variants` in declaration
-/// order and picks the first whose `targets[]` includes the host
-/// triple — see [`select_platform_variant`] in this module.
+/// At install time, a host gets the variant that fits it best (see
+/// [`VariationsResolution::select`]), or the variant that targets `any`
+/// when no other matches it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct VariationsResolution {
+    /// Every archive. A registry package's archive of every other host,
+    /// the one `dist.tarball` names, is the variant that targets `any`; a runtime,
+    /// and a package version without one, fail on a host no variant
+    /// matches.
     pub variants: Vec<PlatformAssetResolution>,
+    /// The registry revision of a package's archives: each variant is at
+    /// `<registry>/<name>@<version>+r<revision>/variants/<tag>`. Absent for
+    /// a version that is not revision-aware, and for runtimes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
 }
 
 /// The `type` tag of a [`CustomResolution`]. Any tag other than the
@@ -330,6 +327,11 @@ pub struct PlatformSelector {
     pub os: String,
     pub cpu: String,
     pub libc: Option<String>,
+    /// The versions a package variant's floors and ABI are matched
+    /// against: `None` for the running host, probed only when a variant has
+    /// a floor or ABI, and known values for another platform. Runtimes do
+    /// not read them.
+    pub floors: Option<pnpm_platform_variants::HostFloors>,
 }
 
 /// Pick the variant whose target list contains the host triple, or
@@ -337,10 +339,8 @@ pub struct PlatformSelector {
 ///
 /// Iterates `variants` in declaration order and returns the first
 /// [`PlatformAssetResolution`] whose `targets[]` contains an `(os, cpu,
-/// libc?)` triple matching `selector`. Each variant's target list is
-/// scanned linearly — `targets[]` is typically 1–3 entries (one per
-/// architecture combo that shares an artifact), so the nested-loop
-/// cost is negligible.
+/// libc?)` triple matching `selector`, whose version floors and ABI, if it
+/// has any, the host meets.
 #[must_use]
 pub fn select_platform_variant<'a>(
     variants: &'a [PlatformAssetResolution],
@@ -355,6 +355,9 @@ pub fn select_platform_variant<'a>(
                     target.os == selector.os
                         && target.cpu == selector.cpu
                         && libc_matches(target.libc.as_deref(), selector.libc.as_deref())
+                        && target
+                            .platform()
+                            .is_some_and(|platform| platform.meets_host_floors(&selector.host()))
                 })
         })
 }
@@ -410,6 +413,16 @@ impl LockfileResolution {
         }
     }
 
+    /// The `integrity` field a custom resolver wrote, in whatever form it
+    /// wrote it. [`Self::integrity`] leaves it out because pnpm never
+    /// verifies bytes against it, but it still identifies the bytes the
+    /// custom fetcher serves: a changed value means changed contents.
+    #[must_use]
+    pub fn custom_integrity(&self) -> Option<&serde_json::Value> {
+        let LockfileResolution::Custom(custom) = self else { return None };
+        custom.extra.get("integrity")
+    }
+
     /// [`Self::integrity`] narrowed to an integrity that can actually
     /// check downloaded bytes. An `integrity: ''` entry parses into zero
     /// hashes, which pins nothing — pnpm treats that as no integrity at
@@ -418,6 +431,23 @@ impl LockfileResolution {
     pub fn checkable_integrity(&self) -> Option<&'_ Integrity> {
         self.integrity()
             .filter(|integrity| !integrity.hashes.is_empty())
+    }
+
+    /// Which hash this resolution's `integrity` names when the lockfile's
+    /// package tarball entries pin `configured`. A registry revision always
+    /// pins its tar. Git-hosted archives, like every resolution that is not
+    /// a package tarball, keep the resource's hash.
+    #[must_use]
+    pub fn integrity_target(&self, configured: IntegrityTarget) -> IntegrityTarget {
+        match self {
+            LockfileResolution::Registry(RegistryResolution { revision: Some(_), .. })
+            | LockfileResolution::Tarball(TarballResolution { revision: Some(_), .. }) => {
+                IntegrityTarget::Tar
+            }
+            LockfileResolution::Registry(_) => configured,
+            LockfileResolution::Tarball(tarball) if !tarball.is_git_hosted() => configured,
+            _ => IntegrityTarget::Resource,
+        }
     }
 
     /// Convert an in-memory resolution into the form written to the lockfile.
@@ -436,6 +466,9 @@ impl LockfileResolution {
         version: &str,
         opts: LockfileFormOptions<'_>,
     ) -> Result<LockfileResolution, LockfileFormError> {
+        if let LockfileResolution::Variations(variations) = self {
+            return variations.to_lockfile_form(name, version, opts).map(LockfileResolution::from);
+        }
         let LockfileResolution::Tarball(tarball) = self else { return Ok(self.clone()) };
         let Some(integrity) = tarball.integrity.as_ref() else {
             return if tarball.revision.is_some() {
@@ -444,34 +477,9 @@ impl LockfileResolution {
                 Ok(self.clone())
             };
         };
-
+        tarball.verify_revision_url(integrity, name, version, opts.registry)?;
         let git_hosted = tarball.is_git_hosted();
-        let integrity_addressed =
-            is_integrity_addressed_registry_tarball_url(&tarball.tarball, integrity, opts.registry);
-        if let Some(revision) = tarball.revision.filter(|_| !integrity_addressed) {
-            return Err(LockfileFormError::RevisionUrlMismatch { revision });
-        }
-        // A standard registry tarball whose URL can be rebuilt from name+version+
-        // registry is written as just `{integrity}` — pnpm derives the URL on
-        // demand. Every other tarball must keep its URL or it can no longer be
-        // re-fetched on a frozen-lockfile install: `file:` tarballs, git-provider
-        // tarballs, and non-standard registry URLs (npm Enterprise, GitHub Packages
-        // `/download/` URLs). `include_tarball_url` forces the URL to be kept.
-        let rebuildable = !git_hosted
-            && !tarball.tarball.starts_with("file:")
-            && (integrity_addressed
-                || (!opts.include_tarball_url
-                    && tarball.revision.is_none()
-                    && is_canonical_registry_tarball_url(
-                        &tarball.tarball,
-                        name,
-                        version,
-                        TarballUrlOptions {
-                            registry: opts.registry,
-                            server_type: opts.server_type,
-                        },
-                    )));
-        if rebuildable {
+        if tarball.is_rebuildable_registry_url(git_hosted, name, version, opts) {
             return Ok(LockfileResolution::Registry(RegistryResolution {
                 integrity: integrity.clone(),
                 revision: tarball.revision,
@@ -484,6 +492,56 @@ impl LockfileResolution {
         let mut kept = tarball.clone();
         kept.git_hosted = git_hosted.then_some(true);
         Ok(LockfileResolution::Tarball(kept))
+    }
+}
+
+impl TarballResolution {
+    fn verify_revision_url(
+        &self,
+        integrity: &Integrity,
+        name: &str,
+        version: &str,
+        registry: &str,
+    ) -> Result<(), LockfileFormError> {
+        if let Some(revision) = self.revision
+            && (!has_complete_sha512_digest(integrity)
+                || !is_revision_registry_tarball_url(
+                    &self.tarball,
+                    name,
+                    version,
+                    revision,
+                    registry,
+                ))
+        {
+            return Err(LockfileFormError::RevisionUrlMismatch { revision });
+        }
+        Ok(())
+    }
+
+    // A standard registry tarball whose URL can be rebuilt from name+version+
+    // registry is written as just `{integrity}` — pnpm derives the URL on
+    // demand. Every other tarball must keep its URL or it can no longer be
+    // re-fetched on a frozen-lockfile install: `file:` tarballs, git-provider
+    // tarballs, and non-standard registry URLs (npm Enterprise, GitHub Packages
+    // `/download/` URLs).
+    fn is_rebuildable_registry_url(
+        &self,
+        git_hosted: bool,
+        name: &str,
+        version: &str,
+        opts: LockfileFormOptions<'_>,
+    ) -> bool {
+        if git_hosted || self.tarball.starts_with("file:") {
+            return false;
+        }
+        self.revision.is_some()
+            || (!opts.include_tarball_url
+                && is_canonical_registry_tarball_url(
+                    &self.tarball,
+                    name,
+                    version,
+                    TarballUrlOptions { registry: opts.registry, server_type: opts.server_type },
+                ))
     }
 }
 
@@ -574,6 +632,8 @@ impl From<LockfileResolution> for ResolutionSerde {
 mod tests;
 
 mod registry;
+mod revision_url;
+mod variants;
 
 use registry::is_canonical_registry_tarball_url;
 

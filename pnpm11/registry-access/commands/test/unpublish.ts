@@ -12,7 +12,7 @@ const DEFAULT_OPTS = {
   bail: false,
 }
 
-const REGISTRY = `http://localhost:${REGISTRY_MOCK_PORT}`
+const REGISTRY = `http://localhost:${REGISTRY_MOCK_PORT}/npm/`
 
 const CONFIG_BY_URI = {
   [`//localhost:${REGISTRY_MOCK_PORT}/`]: {
@@ -98,6 +98,21 @@ test('unpublish: should refuse to unpublish entire package without --force', asy
       configByUri: CONFIG_BY_URI,
     }, [pkgName])
   }).rejects.toThrow('pnpm unpublish --force')
+})
+
+test('unpublish: should name the range when it matches every version', async () => {
+  const pkgName = 'test-unpublish-only-version'
+  await publishVersion(pkgName, '0.0.1')
+
+  const promise = unpublish.handler({
+    ...DEFAULT_OPTS,
+    cliOptions: {},
+    configByUri: CONFIG_BY_URI,
+  }, [`${pkgName}@0.0.1`])
+  await expect(promise).rejects.toThrow(`${pkgName}@0.0.1 matches every published version (0.0.1).
+Run pnpm unpublish "${pkgName}@0.0.1" --force to remove the whole package from the registry.`)
+
+  expect(await getVersions(pkgName)).toEqual(['0.0.1'])
 })
 
 test('unpublish: should throw error when package not found', async () => {
@@ -210,6 +225,34 @@ describe('unpublish: OTP challenges', () => {
       .resolves.toBe('Successfully unpublished all 2 version(s) of test-pkg')
     expect(deleteHeaders['npm-auth-type']).toBe('legacy')
     expect(deleteHeaders['npm-otp']).toBe('123456')
+  })
+
+  test('a registry mounted under a path gets the tarball delete under that path', async () => {
+    const registryUrl = `${MOCK_REGISTRY}/npm/`
+    const packument = {
+      ...PACKUMENT,
+      versions: {
+        '0.0.1': { name: 'test-pkg', version: '0.0.1', dist: { tarball: `${registryUrl}test-pkg/-/test-pkg-0.0.1.tgz` } },
+        '0.0.2': { name: 'test-pkg', version: '0.0.2', dist: { tarball: `${registryUrl}test-pkg/-/test-pkg-0.0.2.tgz` } },
+      },
+    }
+    getMockAgent().get(MOCK_REGISTRY).intercept({ method: 'GET', path: '/npm/test-pkg' }).reply(200, packument).times(2)
+    getMockAgent().get(MOCK_REGISTRY).intercept({ method: 'PUT', path: '/npm/test-pkg/-rev/3-abc' }).reply(200, {})
+    getMockAgent().get(MOCK_REGISTRY).intercept({ method: 'DELETE', path: '/npm/test-pkg/-/test-pkg-0.0.1.tgz/-rev/3-abc' }).reply(200, {})
+
+    await expect(unpublish.handler({ ...OPTS, registriesByScope: { default: registryUrl }, cliOptions: {} }, ['test-pkg@0.0.1']))
+      .resolves.toBe('Successfully unpublished 1 version(s) of test-pkg')
+  })
+
+  test('getTarballPathname strips registry path prefix only at path segment boundary', () => {
+    expect(unpublish.getTarballPathname('https://registry.example.com/pkg/-/pkg-1.0.0.tgz', 'https://registry.example.com/'))
+      .toBe('pkg/-/pkg-1.0.0.tgz')
+    expect(unpublish.getTarballPathname('https://registry.example.com/npm/pkg/-/pkg-1.0.0.tgz', 'https://registry.example.com/npm/'))
+      .toBe('pkg/-/pkg-1.0.0.tgz')
+    expect(unpublish.getTarballPathname('https://registry.example.com/npm/pkg/-/pkg-1.0.0.tgz', 'https://registry.example.com/npm'))
+      .toBe('pkg/-/pkg-1.0.0.tgz')
+    expect(unpublish.getTarballPathname('https://registry.example.com/npm2/pkg/-/pkg-1.0.0.tgz', 'https://registry.example.com/npm'))
+      .toBe('npm2/pkg/-/pkg-1.0.0.tgz')
   })
 
   test('the web-auth flow answers the challenge and its token is reused by the tarball delete', async () => {

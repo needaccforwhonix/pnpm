@@ -23,6 +23,7 @@ fn preloaded_repair_preserves_the_merge_view() {
         "  pkg@1.0.0:"
         "    resolution: {integrity: sha512-TIE61hcgbI/SlJh/0c1sT1SZbBlpg7WiZcs65WPJhoIZQPhH1SCpcGA7LgrVXT15lwN3HV4GQM/MJ9aKEn3Qfg==}"
         "    deprecated: stale"
+        "    engines: {node: '>=14'}"
     })
     .expect("parse preloaded lockfile");
     let lazy = LazyLockfile::preloaded(Some(lockfile));
@@ -36,7 +37,7 @@ fn preloaded_repair_preserves_the_merge_view() {
         seed.packages
             .as_ref()
             .and_then(|packages| packages.get(&package_key))
-            .is_some_and(|metadata| metadata.deprecated.is_none()),
+            .is_some_and(|metadata| metadata.engines.is_none()),
     );
 
     let merge = MaybeLazyLockfile::Repair(&lazy)
@@ -118,6 +119,7 @@ fn normal_load_does_not_fill_the_repair_cache() {
             "  pkg@1.0.0:"
             "    resolution: {integrity: sha512-TIE61hcgbI/SlJh/0c1sT1SZbBlpg7WiZcs65WPJhoIZQPhH1SCpcGA7LgrVXT15lwN3HV4GQM/MJ9aKEn3Qfg==}"
             "    deprecated: stale"
+            "    engines: {node: '>=14'}"
         },
     )
     .expect("write pnpm-lock.yaml");
@@ -144,7 +146,7 @@ fn normal_load_does_not_fill_the_repair_cache() {
         repaired.packages
             .as_ref()
             .and_then(|packages| packages.get(&package_key))
-            .is_some_and(|metadata| metadata.deprecated.is_none()),
+            .is_some_and(|metadata| metadata.engines.is_none()),
     );
 
     let merge = MaybeLazyLockfile::Repair(&lazy)
@@ -191,11 +193,12 @@ fn repair_merge_preserves_valid_metadata_when_strict_parsing_fails() {
         .expect("repair load succeeds")
         .expect("repair lockfile");
     assert!(repaired.settings.is_none());
-    assert!(
+    assert_eq!(
         repaired.packages
             .as_ref()
             .and_then(|packages| packages.get(&package_key))
-            .is_some_and(|metadata| metadata.deprecated.is_none()),
+            .and_then(|metadata| metadata.deprecated.as_deref()),
+        Some("stale"),
     );
     assert!(
         repaired.snapshots
@@ -380,6 +383,46 @@ fn empty_and_env_only_files_count_as_absent() {
         lazy.get()
             .expect("env-only lockfile loads as None")
             .is_none(),
+    );
+}
+
+#[test]
+fn a_detached_head_candidate_counts_as_the_wanted_lockfile() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // No shared lockfile; only the branch the checked-out commit belongs
+    // to carries one.
+    fs::write(dir.path().join("pnpm-lock.feature.yaml"), "lockfileVersion: '9.0'\n")
+        .expect("write branch lockfile");
+
+    let selection = WantedLockfileSelection {
+        branch_lockfile_candidates: vec!["pnpm-lock.feature.yaml".to_owned()],
+        ..WantedLockfileSelection::default()
+    };
+    let lazy = LazyLockfile::deferred(dir.path().to_path_buf(), selection);
+    assert!(
+        lazy.is_loaded_or_on_disk(),
+        "a candidate's lockfile stands in for the absent shared one",
+    );
+}
+
+#[test]
+fn an_attached_branch_keeps_the_single_file_existence_check() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // Only the shared lockfile is on disk; the checked-out branch has no
+    // lockfile of its own yet.
+    fs::write(dir.path().join(Lockfile::FILE_NAME), "lockfileVersion: '9.0'\n")
+        .expect("write shared lockfile");
+
+    let selection = WantedLockfileSelection {
+        file_name: "pnpm-lock.feature.yaml".to_owned(),
+        ..WantedLockfileSelection::default()
+    };
+    let lazy = LazyLockfile::deferred(dir.path().to_path_buf(), selection);
+    assert!(
+        !lazy.is_loaded_or_on_disk(),
+        "the branch's own lockfile is the only one that counts on a branch",
     );
 }
 

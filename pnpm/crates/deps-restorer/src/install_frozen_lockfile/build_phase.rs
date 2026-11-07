@@ -5,8 +5,11 @@ use super::{
     HashMap, IgnoredScriptsLog, LinkBinsError, Lockfile, LogEvent, LogLevel, OsStr, PackageKey,
     PackageMetadata, PatchKeyConflictError, Reporter, ResolvePatchedDependenciesError,
     SkippedSnapshots, SnapshotEntry, direct_dep_names_for_importer, get_patch_info,
-    importer_root_dir, link_top_level_bins,
+    importer_root_dir,
 };
+use crate::platform_selection::VariantPlatforms;
+
+mod post_build_bins;
 
 #[cfg(test)]
 mod tests;
@@ -19,6 +22,9 @@ mod tests;
 /// a failed build reports identically regardless of which path ran it.
 #[derive(Debug, Display, Error, Diagnostic)]
 pub enum BuildPhaseError {
+    #[display("Failed to refresh CAS command shims: {_0}")]
+    #[diagnostic(code(ERR_PNPM_CAS_BINS))]
+    CasBins(#[error(source)] std::io::Error),
     /// `patchedDependencies` couldn't be resolved from
     /// `pnpm-workspace.yaml`.
     #[diagnostic(transparent)]
@@ -45,6 +51,9 @@ pub enum BuildPhaseError {
     /// `<importer>/node_modules/.bin`.
     #[diagnostic(transparent)]
     TopLevelBinLink(#[error(source)] LinkBinsError),
+    /// A dependency's local bin directory could not be refreshed after a build.
+    #[diagnostic(transparent)]
+    DependencyBinLink(#[error(source)] crate::LinkVirtualStoreBinsError),
 }
 
 /// Resolve `pnpm-workspace.yaml`'s `patchedDependencies` into a
@@ -76,7 +85,8 @@ pub fn resolve_snapshot_patches(
             let mut map = HashMap::new();
             for key in snaps.keys() {
                 let metadata_key = key.without_peer();
-                let (name, version) = crate::name_version_from_package_key(&metadata_key, packages);
+                let (name, version) =
+                    pnpm_lockfile::name_version_from_package_key(&metadata_key, packages);
                 // Propagate `ERR_PNPM_PATCH_KEY_CONFLICT` rather than
                 // silently skipping the snapshot. Failing here makes the
                 // user add an exact-version entry to disambiguate.
@@ -104,6 +114,9 @@ pub struct BuildPhaseInputs<'a> {
     pub policy: crate::BuildPhasePolicy<'a>,
     pub extra_env: &'a HashMap<String, String>,
     pub skipped: &'a SkippedSnapshots,
+    pub pending_bins: Option<&'a crate::linking::PendingBinLinks>,
+    /// The platforms the install links, with the CLI's overrides.
+    pub supported_architectures: Option<&'a pnpm_package_is_installable::SupportedArchitectures>,
 }
 
 /// Run dependency lifecycle scripts, report ignored builds, and
@@ -125,12 +138,14 @@ pub fn run_build_phase<Reporter: self::Reporter>(
         inputs.graph.packages,
     )?;
     let shared_side_effects_publisher =
-        crate::shared_side_effects::shared_side_effects_publisher(config, inputs.graph.snapshots);
+        crate::shared_side_effects::shared_side_effects_publisher(config, inputs.graph.importers);
 
+    let bin_state = crate::build_options::BuildBinState::default();
     let build_output = build_or_defer::<Reporter>(
         inputs,
         patches.as_ref(),
         shared_side_effects_publisher.as_ref(),
+        &bin_state,
     )?;
 
     // Always emit the `pnpm:ignored-scripts` event with the package
@@ -148,37 +163,81 @@ pub fn run_build_phase<Reporter: self::Reporter>(
         strict_dep_builds: config.strict_dep_builds,
     }));
 
+    finish_bin_links(inputs, &build_output, &bin_state)?;
+    Ok(build_output)
+}
+
+fn finish_bin_links(
+    inputs: &BuildPhaseInputs<'_>,
+    build_output: &crate::BuildModulesOutput,
+    bin_state: &crate::build_options::BuildBinState,
+) -> Result<(), BuildPhaseError> {
+    let config = inputs.policy.config;
     // `virtual_store_only` links no importer bins, so there is nothing
     // for the pass below to re-resolve. Dependency *build* scripts still
     // ran above — only the importer-facing linking stops, matching
     // `pnpm fetch`.
     if config.virtual_store_only {
-        return Ok(build_output);
+        return Ok(());
     }
 
-    // Post-`BuildModules` per-importer top-level bin link
-    // (pnpm/pacquet#342). Resolves direct-over-hoisted precedence and
-    // shims lifecycle-script-created bins that didn't exist at extract
-    // time. Idempotent for unchanged shims. Runs after `buildModules`.
-    let modules_dir_basename: &OsStr =
-        config.modules_dir.file_name().unwrap_or_else(|| OsStr::new("node_modules"));
-    for (importer_id, importer_snapshot) in inputs.graph.importers {
-        link_importer_top_level_bins(
+    if config.node_linker == pnpm_config::NodeLinker::Loaded {
+        finish_cas_bin_links(inputs, build_output, bin_state)?;
+        return Ok(());
+    }
+    finish_dependency_bin_links(inputs, build_output, bin_state)?;
+    post_build_bins::finish_importer_top_level_bins(
+        inputs,
+        build_output.mutated_slots,
+        &bin_state.refreshed_hoisted_bins,
+    )
+}
+
+fn finish_cas_bin_links(
+    inputs: &BuildPhaseInputs<'_>,
+    build_output: &crate::BuildModulesOutput,
+    bin_state: &crate::build_options::BuildBinState,
+) -> Result<(), BuildPhaseError> {
+    let config = inputs.policy.config;
+    let selected = inputs.graph.loaded_snapshots.expect("loaded linker selection");
+    let native_inputs = BuildPhaseInputs {
+        graph: crate::BuildPhaseGraph { snapshots: Some(selected), ..inputs.graph },
+        ..*inputs
+    };
+    finish_dependency_bin_links(&native_inputs, build_output, bin_state)?;
+    if build_output.mutated_slots {
+        crate::cas::refresh_bins(&crate::cas::BinInstall {
+            config,
+            root: inputs.directories.workspace_root,
+            importers: inputs.graph.importers,
+            trusted_importer_ids: inputs.graph.trusted_importer_ids,
+        })
+        .map_err(BuildPhaseError::CasBins)?;
+    }
+    Ok(())
+}
+
+fn finish_dependency_bin_links(
+    inputs: &BuildPhaseInputs<'_>,
+    build_output: &crate::BuildModulesOutput,
+    bin_state: &crate::build_options::BuildBinState,
+) -> Result<(), BuildPhaseError> {
+    link_held_back_bins(inputs)?;
+    if build_output.mutated_slots {
+        post_build_bins::relink_dependency_bins(
             inputs,
-            build_output.mutated_slots,
-            modules_dir_basename,
-            importer_id,
-            importer_snapshot,
+            &build_output.mutated_snapshot_keys,
+            &bin_state.refreshed_hoisted_bins,
         )?;
     }
-
-    Ok(build_output)
+    Ok(())
 }
 
 fn build_or_defer<Reporter: self::Reporter>(
     inputs: &BuildPhaseInputs<'_>,
     patches: Option<&HashMap<PackageKey, ExtendedPatchInfo>>,
     shared_side_effects_publisher: Option<&crate::shared_side_effects::SharedSideEffectsPublisher>,
+    bin_state: &crate::build_options::BuildBinState,
 ) -> Result<crate::BuildModulesOutput, BuildPhaseError> {
     let config = inputs.policy.config;
     // BuildModules walks per-snapshot package directories and runs
@@ -190,6 +249,7 @@ fn build_or_defer<Reporter: self::Reporter>(
         && inputs.policy.rebuild.is_none()
         && patches.is_none_or(HashMap::is_empty)
         && (!config.side_effects_cache_read() || inputs.cache.maps_by_snapshot.is_empty());
+    seed_hoisted_bins(inputs, bin_state);
     let build_output = if can_defer_without_build_modules {
         let newly_deferred = inputs.graph.materialized_snapshots
             .iter()
@@ -201,27 +261,75 @@ fn build_or_defer<Reporter: self::Reporter>(
             ignored_builds: Vec::new(),
             deferred_builds: crate::build_modules::deferred_builds(newly_deferred, true),
             mutated_slots: false,
+            mutated_snapshot_keys: std::collections::HashSet::default(),
         }
+    } else if inputs.policy.rebuild.is_none()
+        && patches.is_none_or(HashMap::is_empty)
+        && inputs.graph.snapshots.is_none_or(|snapshots| {
+            snapshots
+                .keys()
+                .filter(|snapshot_key| !inputs.skipped.contains(snapshot_key))
+                .all(|snapshot_key| {
+                    inputs.cache.requires_build_by_snapshot.get(snapshot_key) == Some(&false)
+                })
+        })
+    {
+        crate::BuildModulesOutput::default()
     } else {
-        build_modules(inputs, patches, shared_side_effects_publisher)
-            .run::<Reporter>()
+        let variant_platforms = VariantPlatforms::of(inputs.supported_architectures);
+        build_modules(inputs, patches, (shared_side_effects_publisher, &variant_platforms))
+            .run_with_bin_state::<Reporter>(bin_state)
             .map_err(BuildPhaseError::BuildModules)?
     };
 
     Ok(build_output)
 }
 
+fn seed_hoisted_bins(
+    inputs: &BuildPhaseInputs<'_>,
+    bin_state: &crate::build_options::BuildBinState,
+) {
+    let Some(pending) = inputs.pending_bins else { return };
+    bin_state.refreshed_hoisted_bins.seed(&pending.hoisted_bin_sources);
+    bin_state.refreshed_hoisted_bins.seed_private_hoist(
+        inputs.policy.config.install_state_dir.join("node_modules"),
+        &pending.privately_hoisted_bins,
+    );
+}
+
+/// The lockfile graph `inputs` builds over, with the patches it applies and
+/// the platforms its cache keys select each archive for.
+fn build_graph_inputs<'a>(
+    inputs: &'a BuildPhaseInputs<'a>,
+    patches: Option<&'a HashMap<PackageKey, ExtendedPatchInfo>>,
+    variant_platforms: &'a VariantPlatforms,
+) -> crate::BuildGraphInputs<'a> {
+    crate::BuildGraphInputs {
+        snapshots: inputs.graph.snapshots,
+        packages: inputs.graph.packages,
+        patches,
+        requires_build_by_snapshot: Some(inputs.cache.requires_build_by_snapshot),
+        importers: inputs.graph.importers,
+        dependency_groups: (!inputs.directories.is_hoisted).then_some(
+            inputs.graph.dependency_groups,
+        ),
+        build_scope: inputs.graph.build_scope,
+        variant_platforms: Some(variant_platforms),
+    }
+}
+
 fn build_modules<'a>(
     inputs: &'a BuildPhaseInputs<'a>,
     patches: Option<&'a HashMap<PackageKey, ExtendedPatchInfo>>,
-    shared_side_effects_publisher: Option<
-        &'a crate::shared_side_effects::SharedSideEffectsPublisher,
-    >,
+    (shared_side_effects_publisher, variant_platforms): (
+        Option<&'a crate::shared_side_effects::SharedSideEffectsPublisher>,
+        &'a VariantPlatforms,
+    ),
 ) -> BuildModules<'a> {
     let config = inputs.policy.config;
     BuildModules {
         cache: crate::BuildCacheContext {
-            maps_by_snapshot: Some(inputs.cache.maps_by_snapshot),
+            side_effects: inputs.cache.side_effects(),
             engine_name: inputs.cache.engine_name,
             read: config.side_effects_cache_read()
                 || config.remote_side_effects_cache.is_some(),
@@ -232,6 +340,7 @@ fn build_modules<'a>(
             frozen_store: config.frozen_store,
         },
         directories: crate::BuildLayout {
+            link_options: inputs.directories.link_options,
             layout: inputs.directories.layout,
             pkg_roots_by_key: inputs.directories.hoisted_pkg_roots_by_key,
             gather_ancestor_bin_paths: inputs.directories.is_hoisted,
@@ -240,13 +349,7 @@ fn build_modules<'a>(
             import_method: config.package_import_method,
             logged_methods: inputs.directories.logged_methods,
         },
-        graph: crate::BuildGraphInputs {
-            snapshots: inputs.graph.snapshots,
-            packages: inputs.graph.packages,
-            patches,
-            requires_build_by_snapshot: Some(inputs.cache.requires_build_by_snapshot),
-            importers: inputs.graph.importers,
-        },
+        graph: build_graph_inputs(inputs, patches, variant_platforms),
         scripts: crate::BuildScriptOptions::from_config(config, inputs.extra_env),
 
         allow_build_policy: inputs.policy.allow_build_policy,
@@ -258,14 +361,32 @@ fn build_modules<'a>(
     }
 }
 
+/// Link the bins the hoisted linker held back in nested `.bin` directories,
+/// now that the builds that may create their targets ran.
+fn link_held_back_bins(inputs: &BuildPhaseInputs<'_>) -> Result<(), BuildPhaseError> {
+    let Some(pending) = inputs.pending_bins else {
+        return Ok(());
+    };
+    for held_back in &pending.held_back_bins_dirs {
+        crate::link_direct_dep_bins(
+            &held_back.modules_dir,
+            &held_back.dep_names,
+            inputs.directories.link_options,
+        )
+        .map_err(BuildPhaseError::TopLevelBinLink)?;
+    }
+    Ok(())
+}
+
 /// Re-link one importer's top-level `.bin` after the build phase.
 fn link_importer_top_level_bins(
     inputs: &BuildPhaseInputs<'_>,
     mutated_slots: bool,
-    modules_dir_basename: &OsStr,
+    modules_dir_name: &OsStr,
     importer_id: &str,
     importer_snapshot: &pnpm_lockfile::ProjectSnapshot,
-) -> Result<(), BuildPhaseError> {
+    plans: &crate::build_options::HoistedBinPlans,
+) -> Result<Option<(std::path::PathBuf, std::collections::HashSet<String>)>, BuildPhaseError> {
     // Public-hoist promotes transitives into the workspace root's
     // `<root>/node_modules/<alias>`, so only the root importer's `.bin`
     // sees `BinOrigin::Hoisted` candidates.
@@ -280,20 +401,106 @@ fn link_importer_top_level_bins(
     // candidate set, so re-resolving it would only re-read every direct
     // dep's manifest per importer. Hoisted installs always relink: this
     // pass is their only importer bin pass.
-    if !inputs.directories.is_hoisted && !mutated_slots && hoisted_names.is_empty() {
-        return Ok(());
+    let peer_locations =
+        if inputs.policy.config.auto_install_peers && !inputs.directories.is_hoisted {
+            auto_installed_peer_bin_locations(inputs, importer_snapshot)
+        } else {
+            Vec::new()
+        };
+    let relink_direct = inputs.directories.is_hoisted || mutated_slots || !hoisted_names.is_empty();
+    if !relink_direct && peer_locations.is_empty() {
+        return Ok(None);
     }
     let project_dir = importer_root_dir(inputs.directories.top_level_bin_root, importer_id);
-    let modules_dir = project_dir.join(modules_dir_basename);
+    let modules_dir = project_dir.join(modules_dir_name);
     // Same filter the symlink phase used so the post-build pass sees the
     // same candidate set (skipping installability-skipped deps avoids
     // dangling shims at a slot that was never extracted).
     let direct_names = direct_dep_names_for_importer(
         importer_snapshot,
-        inputs.graph.dependency_groups.iter().copied(),
+        importer_bin_groups(inputs).iter().copied(),
         inputs.skipped,
         false,
     );
-    link_top_level_bins(&modules_dir, &direct_names, hoisted_names, inputs.directories.link_options)
-        .map_err(BuildPhaseError::TopLevelBinLink)
+    let cached =
+        post_build_bins::importer_sources(plans, &modules_dir, &direct_names, hoisted_names);
+    let linked = crate::link_bins::link_top_level_bins_cached(
+        &modules_dir,
+        &direct_names,
+        hoisted_names,
+        &peer_locations,
+        &post_build_bins::link_options(inputs.directories.link_options, mutated_slots),
+        cached.as_ref(),
+    )
+    .map_err(BuildPhaseError::TopLevelBinLink)?;
+    Ok(Some((modules_dir, linked)))
+}
+
+/// In hoisted mode, each importer snapshot already carries its retained groups.
+fn importer_bin_groups<'a>(inputs: &'a BuildPhaseInputs<'a>) -> &'a [super::DependencyGroup] {
+    const ALL_GROUPS: [super::DependencyGroup; 3] = [
+        super::DependencyGroup::Prod,
+        super::DependencyGroup::Dev,
+        super::DependencyGroup::Optional,
+    ];
+    if inputs.directories.is_hoisted { &ALL_GROUPS } else { inputs.graph.dependency_groups }
+}
+
+fn auto_installed_peer_bin_locations(
+    inputs: &BuildPhaseInputs<'_>,
+    importer: &pnpm_lockfile::ProjectSnapshot,
+) -> Vec<std::path::PathBuf> {
+    let (Some(packages), Some(snapshots)) = (inputs.graph.packages, inputs.graph.snapshots) else {
+        return Vec::new();
+    };
+    let mut locations: Vec<_> = importer
+        .dependencies_by_groups(inputs.graph.dependency_groups.iter().copied())
+        .filter_map(|(name, spec)| spec.version.resolved_key(name))
+        .filter(|key| !inputs.skipped.contains(key))
+        .filter_map(|key| Some((packages.get(&key.without_peer())?, snapshots.get(&key)?)))
+        .flat_map(|(metadata, snapshot)| resolved_auto_installed_peers(metadata, snapshot))
+        .filter(|key| !inputs.skipped.contains(key))
+        .filter(|key| {
+            packages
+                .get(&key.without_peer())
+                .is_some_and(crate::link_bins::may_have_bin)
+                || inputs.cache.requires_build_by_snapshot.get(key) == Some(&true)
+        })
+        .map(|key| {
+            inputs.directories.layout
+                .slot_dir(&key)
+                .join("node_modules")
+                .join(key.name.to_string())
+        })
+        .collect();
+    locations.sort_unstable();
+    locations.dedup();
+    locations
+}
+
+fn resolved_auto_installed_peers<'a>(
+    metadata: &'a PackageMetadata,
+    snapshot: &'a SnapshotEntry,
+) -> impl Iterator<Item = PackageKey> + 'a {
+    metadata.peer_dependencies
+        .iter()
+        .flat_map(|peers| peers.keys())
+        .filter(|name| {
+            !metadata.peer_dependencies_meta
+                .as_ref()
+                .and_then(|meta| meta.get(*name))
+                .is_some_and(|meta| meta.optional)
+        })
+        .filter_map(|name| {
+            let alias = name.parse::<pnpm_lockfile::PkgName>().ok()?;
+            snapshot.dependencies
+                .as_ref()
+                .and_then(|deps| deps.get(&alias))
+                .or_else(|| {
+                    snapshot.optional_dependencies
+                        .as_ref()
+                        .and_then(|deps| deps.get(&alias))
+                })
+                .and_then(|reference| reference.resolve(&alias))
+        })
 }

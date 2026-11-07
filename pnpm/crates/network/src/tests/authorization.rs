@@ -1,7 +1,7 @@
 use super::{
-    Arc, AuthHeaders, Duration, EnvGuard, NetworkSettings, PerRegistryTls, ProxyConfig,
-    TEST_CA_PEM, TEST_CLIENT_PKCS1_CERT, TEST_CLIENT_PKCS1_KEY, ThrottledClient, TlsConfig, Url,
-    nerf_dart,
+    Arc, AuthHeaders, Duration, EffectiveTrustRoots, EnvGuard, NetworkSettings, PerRegistryTls,
+    ProxyConfig, TEST_CA_PEM, TEST_CLIENT_PKCS1_CERT, TEST_CLIENT_PKCS1_KEY, ThrottledClient,
+    TlsConfig, TrustRoots, Url, apply_tls, nerf_dart, select_trust_roots,
 };
 
 /// End-to-end check that `for_installs` actually routes HTTP traffic
@@ -174,6 +174,76 @@ async fn secure_auth_is_re_evaluated_for_each_redirect_target() {
     target_mock.assert_async().await;
 }
 
+/// Plain HTTP registries keep their credentials, while a redirect target on
+/// another host gets only its own. A proxy stands in for both hosts, so the
+/// registry URL is not a loopback address.
+#[tokio::test]
+async fn auth_and_retry_sends_plain_http_credentials_for_each_redirect_target() {
+    let mut proxy = mockito::Server::new_async().await;
+    let start_mock = proxy
+        .mock("GET", "/start")
+        .match_header("host", "registry.example")
+        .match_header("authorization", "Bearer registry-token")
+        .with_status(302)
+        .with_header("location", "http://mirror.example/final")
+        .expect(1)
+        .create_async()
+        .await;
+    let final_mock = proxy
+        .mock("GET", "/final")
+        .match_header("host", "mirror.example")
+        .match_header("authorization", mockito::Matcher::Missing)
+        .with_status(200)
+        .with_body("ok")
+        .expect(1)
+        .create_async()
+        .await;
+    let proxy_config =
+        ProxyConfig { https_proxy: None, http_proxy: Some(proxy.url()), no_proxy: None };
+    let client = ThrottledClient::for_installs(
+        &proxy_config,
+        &TlsConfig::default(),
+        &PerRegistryTls::default(),
+        &NetworkSettings::default(),
+    )
+    .expect("valid proxy");
+    let auth_headers = AuthHeaders::from_creds_map([(
+        nerf_dart("http://registry.example/"),
+        "Bearer registry-token".to_string(),
+    )]);
+
+    let response = client
+        .get_limited_bytes_with_auth_and_retry(
+            "http://registry.example/start",
+            &auth_headers,
+            None,
+            crate::RetryOpts::default(),
+            usize::MAX,
+        )
+        .await
+        .expect("follow the redirect through the proxy");
+
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"ok");
+    start_mock.assert_async().await;
+    final_mock.assert_async().await;
+}
+
+#[test]
+fn auth_is_withheld_after_a_downgrade_to_plain_http() {
+    let auth_headers = AuthHeaders::from_creds_map([(
+        nerf_dart("https://registry.example/"),
+        "Bearer registry-token".to_string(),
+    )]);
+    let from_https =
+        crate::requests::authorize_without_downgrade(&auth_headers, "https://registry.example/a");
+    assert_eq!(from_https("https://registry.example/b").as_deref(), Some("Bearer registry-token"));
+    assert_eq!(from_https("http://registry.example/b"), None);
+    let from_http =
+        crate::requests::authorize_without_downgrade(&auth_headers, "http://registry.example/a");
+    assert_eq!(from_http("http://registry.example/b").as_deref(), Some("Bearer registry-token"));
+}
+
 // Regression for <https://github.com/pnpm/pnpm/issues/14646>: an
 // unreadable `ca` entry contributes no trust anchor and the client
 // still builds, the way Node ignores CA material it cannot parse.
@@ -207,6 +277,58 @@ fn for_installs_ignores_ca_entries_that_carry_no_certificate() {
         &NetworkSettings::default(),
     )
     .expect("unreadable CA entries are dropped, not fatal");
+}
+
+#[test]
+fn unreadable_ca_does_not_disable_default_trust_anchors() {
+    let unreadable_tls = TlsConfig {
+        ca: vec!["not a pem certificate".to_string(), String::new()],
+        ..TlsConfig::default()
+    };
+    let applied_unreadable =
+        apply_tls(reqwest::Client::builder(), &unreadable_tls).expect("apply_tls succeeds");
+    assert!(!applied_unreadable.has_custom_ca, "unreadable CA material must not set has_custom_ca");
+    let roots = select_trust_roots(applied_unreadable.has_custom_ca, TrustRoots::Platform);
+    let expected = if cfg!(target_os = "android") {
+        EffectiveTrustRoots::Bundled
+    } else {
+        EffectiveTrustRoots::Platform
+    };
+    assert_eq!(roots, expected, "unreadable CA must retain platform/default trust roots");
+
+    let client = ThrottledClient::for_installs(
+        &ProxyConfig::default(),
+        &unreadable_tls,
+        &PerRegistryTls::default(),
+        &NetworkSettings::default(),
+    );
+    assert!(client.is_ok(), "client with unreadable CA should build with default trust roots");
+
+    let valid_tls = TlsConfig { ca: vec![TEST_CA_PEM.to_string()], ..TlsConfig::default() };
+    let applied_valid =
+        apply_tls(reqwest::Client::builder(), &valid_tls).expect("apply_tls succeeds");
+    assert!(applied_valid.has_custom_ca, "valid CA material must set has_custom_ca");
+    assert_eq!(
+        select_trust_roots(applied_valid.has_custom_ca, TrustRoots::Platform),
+        EffectiveTrustRoots::CustomOnly,
+        "valid custom CA must select CustomOnly roots",
+    );
+
+    let mixed_tls = TlsConfig {
+        ca: vec!["not a pem certificate".to_string(), TEST_CA_PEM.to_string()],
+        ..TlsConfig::default()
+    };
+    let applied_mixed =
+        apply_tls(reqwest::Client::builder(), &mixed_tls).expect("apply_tls succeeds");
+    assert!(
+        applied_mixed.has_custom_ca,
+        "mixed CA containing valid material must set has_custom_ca",
+    );
+    assert_eq!(
+        select_trust_roots(applied_mixed.has_custom_ca, TrustRoots::Platform),
+        EffectiveTrustRoots::CustomOnly,
+        "mixed CA containing valid material must select CustomOnly roots",
+    );
 }
 
 #[test]
@@ -392,7 +514,7 @@ fn a_blank_scoped_cert_shadows_the_top_level_identity() {
 fn blocked_redirect_error_redacts_token() {
     let url = Url::parse("https://cdn.example:8443/asset.tgz?X-Amz-Signature=topsecret#frag")
         .expect("valid url");
-    let message = crate::client_builder::BlockedRedirect(url).to_string();
+    let message = crate::redirect_guard::BlockedRedirect(url).to_string();
     assert!(message.contains("https://cdn.example:8443"), "got: {message}");
     assert!(!message.contains("topsecret"), "token leaked: {message}");
     assert!(!message.contains("asset.tgz"), "path leaked: {message}");

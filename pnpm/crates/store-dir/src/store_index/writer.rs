@@ -1,6 +1,6 @@
 use super::{
     Arc, AtomicBool, CafsFileInfo, HashMap, Ordering, PackageFilesIndex, SideEffectsDiff, StoreDir,
-    StoreIndex, StoreIndexError,
+    StoreIndex, StoreIndexError, StoreIndexFormat,
 };
 
 /// Handle producers use to hand rows off to the batched writer task. Clone
@@ -9,14 +9,15 @@ use super::{
 /// The design follows a queue-and-flush pattern: producers don't touch
 /// `SQLite`, they just push `(key, value)` onto an unbounded channel. A single
 /// [`spawn_blocking`][tokio::task::spawn_blocking] task drains the channel,
-/// collects each non-blocking burst into a batch (capped at 256 entries —
-/// see `MAX_BATCH_SIZE`), and flushes it with one `BEGIN IMMEDIATE` ...
-/// `COMMIT`. That turns the per-snapshot `Connection::open` + 7-PRAGMA +
-/// solo-INSERT pattern into one open + N transactions, amortizes the WAL
-/// commit fsync across the batch, and leaves tokio's blocking pool alone
-/// (one writer thread, not one per tarball).
+/// collects each non-blocking burst into a batch, and flushes it with one
+/// `BEGIN IMMEDIATE` ... `COMMIT`. That turns the per-snapshot
+/// `Connection::open` + 7-PRAGMA + solo-INSERT pattern into one open + N
+/// transactions, amortizes the WAL commit fsync across the batch, and
+/// leaves tokio's blocking pool alone (one writer thread, not one per
+/// tarball).
 pub struct StoreIndexWriter {
     tx: tokio::sync::mpsc::UnboundedSender<WriteMsg>,
+    disabled: bool,
     /// One-shot log guard for the "channel closed" case in [`Self::queue`].
     /// A dead writer (task panicked, [`StoreIndex::open`] failed) means
     /// every subsequent `queue` call fails — without this guard that
@@ -60,15 +61,32 @@ enum WriteMsg {
         current_files: HashMap<String, CafsFileInfo>,
         response: Option<std::sync::mpsc::SyncSender<Option<SideEffectsDiff>>>,
     },
+    /// Send the paths in the `files` of the row at `key`, as the
+    /// messages queued before this one leave it, or `None` when there is
+    /// no such row.
+    ReadFilePaths {
+        key: String,
+        response: std::sync::mpsc::SyncSender<Option<Vec<String>>>,
+    },
     RemoteSideEffects {
         key: String,
         cache_key: String,
         diff: SideEffectsDiff,
     },
+    InvalidateSideEffects {
+        key: String,
+        cache_key: String,
+        response: std::sync::mpsc::SyncSender<Result<(), StoreIndexError>>,
+    },
     QuarantineRemoteSideEffects {
         key: String,
         channel: String,
         envelope_digest: String,
+    },
+    /// Make the row at `target` reachable under `alias` as well.
+    Alias {
+        alias: String,
+        target: String,
     },
 }
 
@@ -88,13 +106,24 @@ impl StoreIndexWriter {
     ///
     /// The writer task owns the [`StoreIndex`] connection for its entire
     /// lifetime; on DB open failure the task returns the error and the
-    /// channel closes on the first producer send.
+    /// channel closes on the first producer send. The index keeps the
+    /// format the store already has.
     pub fn spawn(
         store_dir: &StoreDir,
+    ) -> (Arc<StoreIndexWriter>, tokio::task::JoinHandle<Result<(), StoreIndexError>>) {
+        StoreIndexWriter::spawn_in_format(store_dir, StoreIndexFormat::Sqlite)
+    }
+
+    /// [`StoreIndexWriter::spawn`], after giving the store the index
+    /// `index_format` asks for (see [`StoreIndex::apply_format`]).
+    pub fn spawn_in_format(
+        store_dir: &StoreDir,
+        index_format: StoreIndexFormat,
     ) -> (Arc<StoreIndexWriter>, tokio::task::JoinHandle<Result<(), StoreIndexError>>) {
         let store_root = store_dir.root().to_path_buf();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<WriteMsg>();
         let handle = tokio::task::spawn_blocking(move || -> Result<(), StoreIndexError> {
+            StoreIndex::apply_format(&store_root, index_format)?;
             let mut index = StoreIndex::open(&store_root)?;
             let mut batch: Vec<WriteMsg> = Vec::with_capacity(MAX_BATCH_SIZE);
             while let Some(first) = rx.blocking_recv() {
@@ -104,21 +133,29 @@ impl StoreIndexWriter {
             }
             Ok(())
         });
-        (Arc::new(StoreIndexWriter { tx, warn_on_send_failure: AtomicBool::new(true) }), handle)
+        (
+            Arc::new(StoreIndexWriter {
+                tx,
+                disabled: false,
+                warn_on_send_failure: AtomicBool::new(true),
+            }),
+            handle,
+        )
     }
 
-    /// [`StoreIndexWriter::spawn`], or [`StoreIndexWriter::spawn_disabled`]
-    /// under `frozenStore` where the store is read-only and there is
-    /// nothing to write back.
+    /// [`StoreIndexWriter::spawn_in_format`], or
+    /// [`StoreIndexWriter::spawn_disabled`] under `frozenStore` where the
+    /// store is read-only and there is nothing to write back.
     #[must_use]
     pub fn spawn_for(
         store_dir: &StoreDir,
         frozen_store: bool,
+        index_format: StoreIndexFormat,
     ) -> (Arc<StoreIndexWriter>, tokio::task::JoinHandle<Result<(), StoreIndexError>>) {
         if frozen_store {
             StoreIndexWriter::spawn_disabled()
         } else {
-            StoreIndexWriter::spawn(store_dir)
+            StoreIndexWriter::spawn_in_format(store_dir, index_format)
         }
     }
 
@@ -167,15 +204,17 @@ impl StoreIndexWriter {
             while rx.recv().await.is_some() {}
             Ok::<(), StoreIndexError>(())
         });
-        (Arc::new(StoreIndexWriter { tx, warn_on_send_failure: AtomicBool::new(true) }), handle)
+        (
+            Arc::new(StoreIndexWriter {
+                tx,
+                disabled: true,
+                warn_on_send_failure: AtomicBool::new(true),
+            }),
+            handle,
+        )
     }
 }
 
-/// Fold one queued [`WriteMsg`] into the batch's in-flight
-/// `pending` map. Pure function on `(&mut StoreIndex, &mut
-/// HashMap, WriteMsg)` so the writer-task closure stays a thin
-/// drain loop; correctness of each variant lives here.
-///
 /// Drain whatever else is already queued to maximize batch size without ever
 /// blocking on the channel — a single `recv` by the caller is the only
 /// blocking wait per transaction. Capped at [`MAX_BATCH_SIZE`] so a producer
@@ -195,17 +234,14 @@ fn drain_queued(
 }
 
 /// Coalesce the batch by key and write it in one transaction.
-///
-/// Multiple writes for the same store-index row arriving in the same batch
-/// get applied in order against a single in-memory [`PackageFilesIndex`]
-/// value, which then flushes once. This is what makes two
-/// `SideEffectsUpload`s for the same row commutative: each builds on the
-/// previous one's mutation rather than re-reading the pre-batch state from
-/// `SQLite`.
 fn flush_batch(index: &mut StoreIndex, batch: &mut Vec<WriteMsg>) {
     let mut pending: HashMap<String, PackageFilesIndex> = HashMap::with_capacity(batch.len());
+    let mut aliases: Vec<(String, String)> = Vec::new();
     for msg in batch.drain(..) {
-        apply_write_msg(index, &mut pending, msg);
+        match msg {
+            WriteMsg::Alias { alias, target } => aliases.push((alias, target)),
+            msg => apply_write_msg(index, &mut pending, msg),
+        }
     }
     if let Err(error) = index.set_many(pending.drain()) {
         // Drop the batch and keep going. One failed flush (e.g. a disk-full
@@ -218,13 +254,20 @@ fn flush_batch(index: &mut StoreIndex, batch: &mut Vec<WriteMsg>) {
             ?error,
             "batched store-index write failed; dropping this batch and continuing",
         );
+        // An alias of a row this batch failed to write could replace one
+        // that names a row that exists.
+        return;
+    }
+    if let Err(error) = index.set_aliases(&aliases) {
+        tracing::warn!(
+            target: "pacquet::store_index",
+            ?error,
+            "batched store-index alias write failed; dropping these aliases and continuing",
+        );
     }
 }
 
-/// `Replace` is a straight overwrite. `SideEffectsUpload` does
-/// the read-modify-write: it loads the row from `pending` (if a
-/// prior message in this batch already touched it) or from
-/// `SQLite`, then layers the diff on top. Three short-circuit
+/// `Replace` is a straight overwrite. Three short-circuit
 /// branches log and skip without removing the row from
 /// `pending`, so a same-batch `Replace` for the same key still
 /// flushes — see the docs on
@@ -250,16 +293,27 @@ fn apply_write_msg(
                 let _ = response.send(diff);
             }
         }
+        WriteMsg::ReadFilePaths { key, response } => {
+            let paths = match pending.get(&key) {
+                Some(row) => Some(row.files.keys().cloned().collect()),
+                None => load_index_row(index, &key).map(|row| row.files.into_keys().collect()),
+            };
+            let _ = response.send(paths);
+        }
         WriteMsg::RemoteSideEffects { key, cache_key, diff } => {
             if let Some(row) = load_pending_row(index, pending, &key) {
                 row.side_effects.get_or_insert_with(HashMap::new).insert(cache_key, diff);
             }
+        }
+        WriteMsg::InvalidateSideEffects { key, cache_key, response } => {
+            let _ = response.send(invalidate_side_effects(index, pending, &key, &cache_key));
         }
         WriteMsg::QuarantineRemoteSideEffects { key, channel, envelope_digest } => {
             if let Some(row) = load_pending_row(index, pending, &key) {
                 quarantine_digest(row, channel, envelope_digest);
             }
         }
+        WriteMsg::Alias { .. } => unreachable!("flush_batch collects aliases itself"),
     }
 }
 
@@ -301,6 +355,38 @@ fn quarantine_digest(row: &mut PackageFilesIndex, channel: String, envelope_dige
     }
 }
 
+/// Remove `cache_key` from `key`'s side-effects map and persist the updated row.
+fn invalidate_side_effects(
+    index: &StoreIndex,
+    pending: &mut HashMap<String, PackageFilesIndex>,
+    key: &str,
+    cache_key: &str,
+) -> Result<(), StoreIndexError> {
+    if let Some(row) = pending.get_mut(key) {
+        remove_side_effects(row, cache_key);
+        index.set(key, row)?;
+        pending.remove(key);
+    } else if let Some(mut row) = index.get(key)?
+        && remove_side_effects(&mut row, cache_key)
+    {
+        index.set(key, &row)?;
+    }
+    Ok(())
+}
+
+fn remove_side_effects(row: &mut PackageFilesIndex, cache_key: &str) -> bool {
+    let Some(side_effects) = &mut row.side_effects else {
+        return false;
+    };
+    if side_effects.remove(cache_key).is_none() {
+        return false;
+    }
+    if side_effects.is_empty() {
+        row.side_effects = None;
+    }
+    true
+}
+
 /// Return a mutable reference to the [`PackageFilesIndex`] row for
 /// `key`, loading from `SQLite` when this is the row's first
 /// sighting in the batch. Returns `None` (and logs at `debug!` /
@@ -315,26 +401,30 @@ fn load_pending_row<'a>(
     use std::collections::hash_map::Entry;
     match pending.entry(key.to_string()) {
         Entry::Occupied(o) => Some(o.into_mut()),
-        Entry::Vacant(v) => match index.get(key) {
-            Ok(Some(r)) => Some(v.insert(r)),
-            Ok(None) => {
-                tracing::debug!(
-                    target: "pacquet::store_index",
-                    key = %key,
-                    "no base row for side-effects upload; skip",
-                );
-                None
-            }
-            Err(error) => {
-                tracing::warn!(
-                    target: "pacquet::store_index",
-                    ?error,
-                    key = %key,
-                    "failed to read base row for side-effects upload",
-                );
-                None
-            }
-        },
+        Entry::Vacant(v) => load_index_row(index, key).map(|row| v.insert(row)),
+    }
+}
+
+fn load_index_row(index: &StoreIndex, key: &str) -> Option<PackageFilesIndex> {
+    match index.get(key) {
+        Ok(Some(row)) => Some(row),
+        Ok(None) => {
+            tracing::debug!(
+                target: "pacquet::store_index",
+                key = %key,
+                "no base row for side-effects upload; skip",
+            );
+            None
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "pacquet::store_index",
+                ?error,
+                key = %key,
+                "failed to read base row for side-effects upload",
+            );
+            None
+        }
     }
 }
 
@@ -344,13 +434,15 @@ impl StoreIndexWriter {
     /// Silently drops the entry if the writer task has exited (closed
     /// channel). Matches pnpm's graceful-degradation on failed writes:
     /// the install in flight still completes, the next install misses on
-    /// this cache-key and re-downloads. The "channel closed" warning is
-    /// logged only on the first failure per writer instance — every
-    /// subsequent call would emit the same message, and on a 1352-
-    /// snapshot install that's a thousand identical warnings drowning
-    /// out real diagnostics.
+    /// this cache-key and re-downloads.
     pub fn queue(&self, key: String, value: PackageFilesIndex) {
         self.send_msg(WriteMsg::Replace { key, value });
+    }
+
+    /// Queue an alias: once flushed, a lookup of `alias` reads the row at
+    /// `target`. See [`StoreIndex::set_aliases`].
+    pub fn queue_alias(&self, alias: String, target: String) {
+        self.send_msg(WriteMsg::Alias { alias, target });
     }
 
     /// Queue a side-effects R/M/W: the writer task loads the row,
@@ -393,8 +485,33 @@ impl StoreIndexWriter {
         result.recv().ok().flatten()
     }
 
+    /// The paths in the `files` of the row at `key`, including a row that is
+    /// queued but not yet committed. `None` when there is no such row or the
+    /// writer is not running.
+    pub(crate) fn read_file_paths(&self, key: String) -> Option<Vec<String>> {
+        let (response, result) = std::sync::mpsc::sync_channel(1);
+        self.send_msg(WriteMsg::ReadFilePaths { key, response });
+        result.recv().ok().flatten()
+    }
+
     pub fn queue_remote_side_effects(&self, key: String, cache_key: String, diff: SideEffectsDiff) {
         self.send_msg(WriteMsg::RemoteSideEffects { key, cache_key, diff });
+    }
+
+    /// Wait for this side-effects invalidation to persist on the writer thread.
+    pub(crate) fn queue_side_effects_invalidation(
+        &self,
+        key: String,
+        cache_key: String,
+    ) -> Result<(), StoreIndexError> {
+        if self.disabled {
+            return Err(StoreIndexError::WriterUnavailable);
+        }
+        let (response, result) = std::sync::mpsc::sync_channel(1);
+        self.tx
+            .send(WriteMsg::InvalidateSideEffects { key, cache_key, response })
+            .map_err(|_| StoreIndexError::WriterUnavailable)?;
+        result.recv().map_err(|_| StoreIndexError::WriterUnavailable)?
     }
 
     pub fn queue_remote_side_effects_quarantine(
@@ -418,3 +535,9 @@ impl StoreIndexWriter {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+mod invalidation_tests;

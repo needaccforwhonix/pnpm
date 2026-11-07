@@ -1,26 +1,47 @@
+#[cfg(target_family = "wasm")]
+extern crate pnpm_http as reqwest;
+
+pub use archive_integrity::{ArchiveIntegrity, IntegrityKind};
 pub use archive_options::*;
+pub use archive_request::CacheHeaders;
+pub(crate) use body_hasher::BodyHasher;
+pub use bounded_reader::BoundedReader;
 pub use download::*;
 pub use error::*;
+pub use extract::{
+    ArchiveLimit, DEFAULT_MAX_TARBALL_UNPACKED_SIZE, MAX_PUBLICATION_ARCHIVE_ENTRIES,
+    MAX_PUBLICATION_MANIFEST_BYTES, MAX_PUBLICATION_PATH_BYTES, PublicationArchive,
+    PublicationArchiveError, TarInspection, TarLimits, inspect_tar, read_buffered_tar_entry,
+    read_publication_archive, tar_requires_build,
+};
 pub(crate) use extract::{
-    GZIP_MAGIC, STREAM_ENTRY_BUFFER_MAX, STREAM_EXTRACT_COMPRESSED_THRESHOLD,
+    STREAM_ENTRY_BUFFER_MAX, STREAM_EXTRACT_COMPRESSED_THRESHOLD,
     STREAM_EXTRACT_DURING_DOWNLOAD_THRESHOLD, allocate_tarball_buffer, apply_append_manifest,
-    apply_placeholder_manifest, body_chunk_channel, clean_archive_entry_path, decompress_gzip,
-    extract_gzipped_tarball, is_eager_decode_limit_exceeded, non_gzip_body_error,
-    normalize_bundled_manifest, oversized_manifest_error, stream_extract_gzipped_channel,
-    tar_entry_payload,
+    apply_placeholder_manifest, body_chunk_channel, checked_now, clean_archive_entry_path,
+    decompress_gzip, extract_archive_bytes, extract_resource_stream,
+    is_eager_decode_limit_exceeded, oversized_manifest_error, tar_entry_payload,
+};
+pub use fetch_for_resolution::{
+    FetchTarballForResolution, NotModifiedResponse, ResolutionStore, ResolvedTarball,
+    TarballResolutionFetch,
 };
 pub use local_tarball::*;
 pub use pnpm_network::RetryOpts;
 pub use prefetch::*;
 pub use zip_archive::*;
 
+mod archive_integrity;
 mod archive_options;
 mod archive_request;
 mod archive_retry;
+mod body_hasher;
+mod bounded_reader;
+mod content_coding;
 mod download;
 mod error;
 mod extract;
 mod extraction_task;
+mod fetch_for_resolution;
 mod ingestion;
 mod local_tarball;
 mod prefetch;
@@ -28,7 +49,7 @@ mod zip_archive;
 
 use std::{
     borrow::Cow,
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     io::{self, Cursor, Read},
     path::{Component, Path, PathBuf},
     sync::{Arc, LazyLock},
@@ -37,9 +58,9 @@ use std::{
 
 use dashmap::{DashMap, DashSet};
 use pipe_trait::Pipe;
-use pnpm_network::{AuthHeaders, ThrottledClient, UNPRIORITIZED};
+use pnpm_network::AuthHeaders;
+use pnpm_package_manifest::PackageBin;
 use pnpm_reporter::Reporter;
-use pnpm_store_dir::{StoreDir, StoreIndexWriter, store_index_key};
 use rayon::prelude::*;
 use ssri::Integrity;
 use tokio::sync::{Notify, RwLock, Semaphore};
@@ -55,6 +76,9 @@ use tokio::sync::{Notify, RwLock, Semaphore};
 /// grow their buffer on demand, so an archive larger than the ceiling
 /// still decodes in full.
 const MAX_UNTRUSTED_PREALLOC_BYTES: usize = 64 * 1024 * 1024;
+
+/// Maximum payload size of a buffered TAR metadata extension.
+pub const MAX_TARBALL_METADATA_BYTES: u64 = MAX_UNTRUSTED_PREALLOC_BYTES as u64;
 
 fn auth_header_for_package_download(
     auth_headers: &AuthHeaders,
@@ -106,7 +130,7 @@ fn streaming_extract_semaphore() -> &'static Semaphore {
 }
 
 /// Dedicated rayon pool for the per-file CAS-write phase of extraction
-/// ([`crate::extract::extract_tarball_entries`]).
+/// ([`crate::extract::extract_tarball_entries_with_bins`]).
 ///
 /// Separate from the global pool because the install overlaps
 /// extraction with linking, and the linker runs on the global pool:
@@ -145,11 +169,49 @@ fn cas_write_pool() -> Option<&'static rayon::ThreadPool> {
 /// `pnpm-tarball`; the canonical Node-runtime filter lives at
 /// the install-dispatch site (Slice D) where it's constructed once
 /// per fetch.
-///
-/// The callback receives the *cleaned* path (post-prefix strip,
-/// `to_string_lossy()` already applied), so its inputs are stable
-/// strings keyed the same way pnpm keys the equivalent filter.
 pub type IgnoreEntryFilter = dyn Fn(&str) -> bool + Send + Sync;
+
+/// A settled mem-cache slot: the extracted CAS map, the bundled
+/// manifest, and the build-trigger verdict the extraction recorded. The
+/// install pass reads the map and verdict; a resolve-time archive read
+/// parks on the same slot for the manifest.
+#[derive(Debug, Clone)]
+pub struct CachedTarball {
+    pub files: Arc<pnpm_fs::CasPaths>,
+    pub manifest: Option<serde_json::Value>,
+    pub requires_build: Option<bool>,
+    pub bins: Option<Arc<BTreeMap<String, PackageBin>>>,
+}
+
+impl CachedTarball {
+    /// A settled slot that carries only the CAS map, for callers that
+    /// reconstructed the files without a bundled manifest.
+    #[must_use]
+    pub fn from_files(files: pnpm_fs::CasPaths) -> Arc<Self> {
+        Self::from_files_arc(Arc::new(files))
+    }
+
+    #[must_use]
+    pub fn from_files_arc(files: Arc<pnpm_fs::CasPaths>) -> Arc<Self> {
+        Arc::new(Self { files, manifest: None, requires_build: None, bins: None })
+    }
+
+    /// Whether the extracted archive carries build triggers. Uses the verdict
+    /// recorded during extraction or store-index load when available, falling
+    /// back to the in-memory bundled manifest or the CAS file map.
+    #[must_use]
+    pub fn requires_build(&self) -> bool {
+        self.requires_build.unwrap_or_else(|| {
+            if let Some(manifest) = self.manifest.as_ref() {
+                let mut triggers = pnpm_package_manifest::files_build_triggers(self.files.keys());
+                triggers.read_manifest(manifest);
+                triggers.requires_build()
+            } else {
+                pnpm_package_manifest::requires_build_from_cas_paths(&self.files)
+            }
+        })
+    }
+}
 
 /// Value of the cache.
 #[derive(Debug, Clone)]
@@ -157,15 +219,13 @@ pub enum CacheValue {
     /// The package is being processed.
     InProgress(Arc<Notify>),
     /// The package is saved.
-    Available(Arc<HashMap<String, PathBuf>>),
-    /// The owning fetch failed; concurrent waiters wake up to this
-    /// instead of `Available` and surface a sibling-fetch-failed
-    /// error rather than blocking on the `Notify` forever. The
-    /// originating [`TarballError`] cannot be cloned past the owner
-    /// (it's wrapped in `reqwest::Error` / IO chains that aren't
-    /// `Clone`), so waiters return their own variant — see
-    /// [`TarballError::SiblingFetchFailed`].
-    Failed,
+    Available(Arc<CachedTarball>),
+    /// The owning fetch failed with this rendered error, after its retries
+    /// ran out or on an error it does not retry. The slot stays failed for
+    /// the life of the cache, so every other request for the archive reports
+    /// [`TarballError::SiblingFetchFailed`] instead of spending another retry
+    /// budget. The originating [`TarballError`] is not `Clone`.
+    Failed(Arc<str>),
 }
 
 /// Internal in-memory cache of tarballs.
@@ -192,34 +252,46 @@ pub type ReportedProgressKeys = DashSet<String>;
 /// reporter.
 pub type SharedReportedProgressKeys = Arc<ReportedProgressKeys>;
 
+/// Namespaced marker for a resolution observer that may report this package
+/// after fetch and materialization paths have had the first chance to claim it.
+#[must_use]
+pub fn pending_progress_key(store_index_key: &str) -> String {
+    format!("\0observer:{store_index_key}")
+}
+
 /// A verified archive's CAFS files and bundled package metadata.
 #[derive(Debug, Clone)]
 pub struct FetchedTarball {
+    /// The resource's integrity.
     pub integrity: Integrity,
-    pub files_map: HashMap<String, PathBuf>,
+    /// See [`ArchiveIntegrity::tar`].
+    pub tar_integrity: Option<Integrity>,
+    pub files_map: pnpm_fs::CasPaths,
     pub manifest: Option<serde_json::Value>,
     pub requires_build: bool,
+    pub bins: Option<Arc<BTreeMap<String, PackageBin>>>,
 }
 
 impl<'a> IngestTarballToStore<'a> {
     /// Execute the subroutine with an in-memory cache.
     ///
-    /// # Caller invariant: stable filter per URL
+    /// # Caller invariant: stable filter per archive
     ///
-    /// The cache is keyed on `package_url`, the archive projection, and
-    /// whether the request uses the revision-addressed network policy. Within
-    /// one key, a second caller fetching the same URL with a different
+    /// The cache is keyed on the archive's identity, which
+    /// [`package_mem_cache_key`] spells for an ordinary package. Within
+    /// one key, a second caller fetching the same archive with a different
     /// [`ignore_file_pattern`] silently receives the map the first caller's
-    /// filter produced. Every fetch of a URL must use the same filter. Nothing
-    /// enforces this; today it holds because URLs encode
-    /// `(name, version, integrity)` and filters are keyed by package name.
+    /// filter produced. Every fetch of an archive must use the same filter.
+    /// Nothing enforces this; today it holds because an archive's identity
+    /// determines its package name and filters are keyed by package name.
     ///
     /// [`ignore_file_pattern`]: IngestTarballToStore::ignore_file_pattern
     pub async fn run_with_mem_cache<Reporter: self::Reporter>(
         self,
         mem_cache: &'a MemCache,
-    ) -> Result<Arc<HashMap<String, PathBuf>>, TarballError> {
+    ) -> Result<Arc<pnpm_fs::CasPaths>, TarballError> {
         self.run_with_mem_cache_inner::<Reporter>(mem_cache, false).await
+            .map(|cached| Arc::clone(&cached.files))
     }
 
     /// Execute a registry revision fetch with the shared in-memory cache.
@@ -227,17 +299,31 @@ impl<'a> IngestTarballToStore<'a> {
     pub async fn run_revision_addressed_with_mem_cache<Reporter: self::Reporter>(
         self,
         mem_cache: &'a MemCache,
-    ) -> Result<Arc<HashMap<String, PathBuf>>, TarballError> {
+    ) -> Result<Arc<pnpm_fs::CasPaths>, TarballError> {
         self.run_with_mem_cache_inner::<Reporter>(mem_cache, true).await
+            .map(|cached| Arc::clone(&cached.files))
+    }
+
+    /// Execute with the shared in-memory cache and return the full [`CachedTarball`]
+    /// slot, including the extracted archive's `requires_build` verdict.
+    pub async fn run_cached_with_mem_cache<Reporter: self::Reporter>(
+        self,
+        mem_cache: &'a MemCache,
+        revision_addressed: bool,
+    ) -> Result<Arc<CachedTarball>, TarballError> {
+        self.run_with_mem_cache_inner::<Reporter>(mem_cache, revision_addressed).await
     }
 
     async fn run_with_mem_cache_inner<Reporter: self::Reporter>(
         self,
         mem_cache: &'a MemCache,
         revision_addressed: bool,
-    ) -> Result<Arc<HashMap<String, PathBuf>>, TarballError> {
-        let mem_cache_key =
-            self.store_projection.mem_cache_key(self.package.url, revision_addressed);
+    ) -> Result<Arc<CachedTarball>, TarballError> {
+        let mem_cache_key = self.store_projection.mem_cache_key(
+            self.package.url,
+            self.package.integrity,
+            revision_addressed,
+        );
         let cache_key =
             store_index_cache_key(self.package.integrity, self.package.id, self.store_projection);
         let progress_key = self.progress_reported.as_ref().zip(cache_key.as_deref());
@@ -261,30 +347,23 @@ impl<'a> IngestTarballToStore<'a> {
         match owner_notify {
             None => self.wait_for_owner::<Reporter>(&cache_lock, progress_key).await,
             Some(notify) => {
-                self.fetch_as_owner::<Reporter>(
-                    mem_cache,
-                    &mem_cache_key,
-                    &cache_lock,
-                    &notify,
-                    revision_addressed,
-                )
-                .await
+                self.fetch_as_owner::<Reporter>(&cache_lock, &notify, revision_addressed).await
             }
         }
     }
 
     /// Hands the `Arc` on without deep-cloning the per-file map: on a warm
     /// install every snapshot takes this path, and by 1k+ snapshots that
-    /// clone dominates the memory traffic. The `Arc` is also stashed under a
-    /// projection-aware URL key so peer-resolved variants of one package
+    /// clone dominates the memory traffic. The `Arc` is also stashed under the
+    /// archive's cache identity so peer-resolved variants of one package
     /// share it.
     fn reuse_prefetched<Reporter: self::Reporter>(
         &self,
         mem_cache: &'a MemCache,
         mem_cache_key: String,
-        cas_paths: &Arc<HashMap<String, PathBuf>>,
+        cas_paths: &Arc<pnpm_fs::CasPaths>,
         progress_key: Option<(&SharedReportedProgressKeys, &str)>,
-    ) -> Arc<HashMap<String, PathBuf>> {
+    ) -> Arc<CachedTarball> {
         tracing::info!(
             target: "pacquet::download",
             package_url = ?self.package.url,
@@ -292,10 +371,10 @@ impl<'a> IngestTarballToStore<'a> {
             "Reusing prefetched CAFS entry — skipping download (warm-cache fast path)",
         );
         emit_progress_found_in_store::<Reporter>(self.package.id, self.requester, progress_key);
-        let cas_paths = Arc::clone(cas_paths);
-        let cache_lock = Arc::new(RwLock::new(CacheValue::Available(Arc::clone(&cas_paths))));
+        let cached = CachedTarball::from_files_arc(Arc::clone(cas_paths));
+        let cache_lock = Arc::new(RwLock::new(CacheValue::Available(Arc::clone(&cached))));
         mem_cache.insert(mem_cache_key, cache_lock);
-        cas_paths
+        cached
     }
 
     /// Park until the task that claimed this URL settles the cache slot.
@@ -307,131 +386,74 @@ impl<'a> IngestTarballToStore<'a> {
         &self,
         cache_lock: &RwLock<CacheValue>,
         progress_key: Option<(&SharedReportedProgressKeys, &str)>,
-    ) -> Result<Arc<HashMap<String, PathBuf>>, TarballError> {
-        // Read-lock the state read: the variant inspection below
-        // doesn't mutate anything, and a `write().await` would
-        // serialize every late visitor for a popular tarball
-        // (e.g. dozens of peer-suffix variants of the same
-        // package) behind a single exclusive guard, even though
-        // they're all just observing the in-progress / available
-        // flag. The owner branch is the only writer; the RwLock's
-        // reader-writer fairness guarantees the owner still makes progress.
-        let notify = match &*cache_lock.read().await {
-            CacheValue::Available(cas_paths) => {
-                return Ok(self.settled_by_owner::<Reporter>(cas_paths, progress_key));
-            }
-            CacheValue::InProgress(notify) => Arc::clone(notify),
-            // The owner already finished and failed; surface immediately
-            // rather than parking on the Notify.
-            CacheValue::Failed => return Err(self.sibling_fetch_failed()),
-        };
-
-        tracing::info!(target: "pacquet::download", package_url = ?self.package.url, "Wait for cache");
-        loop {
-            // Register with the `Notify` *before* re-checking the
-            // slot. `notify_waiters` stores no permit — it wakes
-            // only `Notified` futures already registered at that
-            // instant — and the read guard from the `InProgress`
-            // observation above is released before this point, so
-            // the owner's flip-and-notify can land in between.
-            // Checking first and registering after loses that
-            // wakeup and parks this task forever (nothing ever
-            // notifies the slot again once it is terminal).
-            let notified = notify.notified();
-            let mut notified = std::pin::pin!(notified);
-            notified.as_mut().enable();
-            match &*cache_lock.read().await {
-                CacheValue::Available(cas_paths) => {
-                    return Ok(self.settled_by_owner::<Reporter>(cas_paths, progress_key));
-                }
-                CacheValue::Failed => return Err(self.sibling_fetch_failed()),
-                // The owner notifies only after flipping the slot
-                // to `Available` or `Failed`, so a wake with the
-                // slot still `InProgress` cannot happen — but a
-                // stale registration completing early is harmless
-                // either way: re-register and park again.
-                CacheValue::InProgress(_) => {}
-            }
-            notified.await;
-        }
-    }
-
-    /// The first owner already reported its package status. If the caller
-    /// supplied a shared progress set, this emit is skipped for keys the
-    /// owner reported; otherwise the legacy per-caller cache-hit progress is
-    /// preserved.
-    fn settled_by_owner<Reporter: self::Reporter>(
-        &self,
-        cas_paths: &Arc<HashMap<String, PathBuf>>,
-        progress_key: Option<(&SharedReportedProgressKeys, &str)>,
-    ) -> Arc<HashMap<String, PathBuf>> {
+    ) -> Result<Arc<CachedTarball>, TarballError> {
+        let cached = wait_for_cached_tarball(cache_lock, self.package.url).await?;
         emit_progress_found_in_store::<Reporter>(self.package.id, self.requester, progress_key);
-        Arc::clone(cas_paths)
-    }
-
-    fn sibling_fetch_failed(&self) -> TarballError {
-        TarballError::SiblingFetchFailed { url: self.package.url.to_string() }
+        Ok(cached)
     }
 
     /// Run the actual fetch, then settle the cache slot either way. On error
     /// the slot must transition to `Failed` and `notify_waiters` must fire so
     /// concurrent requesters surface a sibling-fetch error instead of parking
     /// on the Notify forever.
-    ///
-    /// Ordinary fetches remove the failed slot so a later caller can retry. A
-    /// revision-addressed fetch keeps it terminal for this install,
-    /// preserving the protocol's one-GET contract.
     async fn fetch_as_owner<Reporter: self::Reporter>(
         &self,
-        mem_cache: &'a MemCache,
-        mem_cache_key: &str,
         cache_lock: &RwLock<CacheValue>,
         notify: &Notify,
         revision_addressed: bool,
-    ) -> Result<Arc<HashMap<String, PathBuf>>, TarballError> {
-        let result = self.run_without_mem_cache_inner::<Reporter>(revision_addressed).await;
+    ) -> Result<Arc<CachedTarball>, TarballError> {
+        let result = self.load_or_fetch::<Reporter>(revision_addressed).await;
         match result {
-            Ok(cas_paths) => {
-                let cas_paths = Arc::new(cas_paths);
-                let mut cache_write = cache_lock.write().await;
-                *cache_write = CacheValue::Available(Arc::clone(&cas_paths));
-                drop(cache_write);
-                notify.notify_waiters();
-                Ok(cas_paths)
+            Ok(loaded) => {
+                let cached = publish_cached_tarball(
+                    cache_lock,
+                    notify,
+                    CachedTarball {
+                        files: loaded.files,
+                        manifest: loaded.manifest,
+                        requires_build: loaded.requires_build,
+                        bins: loaded.bins,
+                    },
+                )
+                .await;
+                Ok(cached)
             }
             Err(err) => {
-                let mut cache_write = cache_lock.write().await;
-                *cache_write = CacheValue::Failed;
-                drop(cache_write);
-                if !revision_addressed {
-                    mem_cache.remove(mem_cache_key);
-                }
-                notify.notify_waiters();
+                publish_cache_failure(cache_lock, notify, &err).await;
                 Err(err)
             }
         }
     }
 
+    async fn load_or_fetch<Reporter: self::Reporter>(
+        &self,
+        revision_addressed: bool,
+    ) -> Result<crate::CachedCasPaths, TarballError> {
+        self.ingestion(revision_addressed).load_or_fetch::<Reporter>().await
+    }
+
+    /// Execute without the in-memory cache and return the CAS map paired with
+    /// the archive's extracted metadata.
+    pub async fn run_cached_without_mem_cache<Reporter: self::Reporter>(
+        &self,
+        revision_addressed: bool,
+    ) -> Result<CachedCasPaths, TarballError> {
+        self.load_or_fetch::<Reporter>(revision_addressed).await
+    }
+
     /// Execute the subroutine without an in-memory cache.
     pub async fn run_without_mem_cache<Reporter: self::Reporter>(
         &self,
-    ) -> Result<HashMap<String, PathBuf>, TarballError> {
-        self.run_without_mem_cache_inner::<Reporter>(false).await
+    ) -> Result<pnpm_fs::CasPaths, TarballError> {
+        self.load_or_fetch::<Reporter>(false).await.map(|cached| Arc::unwrap_or_clone(cached.files))
     }
 
     /// Execute a registry revision fetch without the in-memory cache.
     /// The network path performs exactly one GET and rejects redirects.
     pub async fn run_revision_addressed_without_mem_cache<Reporter: self::Reporter>(
         &self,
-    ) -> Result<HashMap<String, PathBuf>, TarballError> {
-        self.run_without_mem_cache_inner::<Reporter>(true).await
-    }
-
-    async fn run_without_mem_cache_inner<Reporter: self::Reporter>(
-        &self,
-        revision_addressed: bool,
-    ) -> Result<HashMap<String, PathBuf>, TarballError> {
-        self.ingestion(revision_addressed).run::<Reporter>().await
+    ) -> Result<pnpm_fs::CasPaths, TarballError> {
+        self.load_or_fetch::<Reporter>(true).await.map(|cached| Arc::unwrap_or_clone(cached.files))
     }
 
     /// Fetch without cache reuse, indexing unpinned archives by computed integrity.
@@ -462,131 +484,9 @@ impl<'a> IngestTarballToStore<'a> {
     }
 }
 
-/// Outcome of [`FetchTarballForResolution::run`]: the sha512 integrity
-/// computed from the downloaded tarball and the bundled manifest read
-/// from its `package.json`. The extracted CAFS paths are not returned —
-/// they are stashed in the shared [`MemCache`] keyed by URL so the
-/// install pass reuses them without re-downloading.
-#[derive(Debug)]
-pub struct ResolvedTarball {
-    pub integrity: Integrity,
-    pub manifest: Option<serde_json::Value>,
-}
-
-/// Download a remote tarball during *resolution*, compute its sha512
-/// integrity, extract it to the store, and read its bundled manifest.
-///
-/// Remote (non-registry) https-tarball direct dependencies carry no
-/// name/version/integrity at resolve time — those live in the tarball's
-/// `package.json`, learned only after the fetch. pacquet builds the
-/// lockfile before the install pass, so the `TarballResolver` must
-/// fetch here to fill `manifest` + `integrity` into its
-/// `ResolveResult`. Passing a `mem_cache` warms it (keyed by URL) so
-/// the install pass's
-/// [`IngestTarballToStore::run_with_mem_cache`] reuses the extraction
-/// without a second download.
-pub struct FetchTarballForResolution<'a> {
-    pub http_client: &'a ThrottledClient,
-    pub store_dir: &'static StoreDir,
-    pub store_index_writer: Option<Arc<StoreIndexWriter>>,
-    pub package_url: &'a str,
-    /// Package identity used for scoped auth lookup and for the
-    /// store-index row this fetch writes. Must be the `pkg_id` the
-    /// install pass derives from the lockfile entry — the bare URL for a
-    /// remote tarball — or the two passes file the same content under
-    /// two rows.
-    pub package_id: &'a str,
-    pub auth_headers: &'a AuthHeaders,
-    pub retry_opts: RetryOpts,
-    /// Directory *within* the archive holding the package, for a
-    /// git-hosted dep that points at one directory of a repo
-    /// (`#path:/packages/foo`). The archive spans the whole repo, so
-    /// the root `package.json` describes the repo, not the package —
-    /// read the manifest from here instead. `None` reads the root.
-    ///
-    /// Matches the resolution's `path` field verbatim, leading slash
-    /// and all.
-    ///
-    /// Setting this suppresses the store-index row: the extracted
-    /// index describes the archive, not the named subpackage, so
-    /// there is no row to write that the key would honestly describe.
-    pub manifest_subdir: Option<&'a str>,
-}
-
-impl FetchTarballForResolution<'_> {
-    pub async fn run<Reporter: self::Reporter>(
-        self,
-        mem_cache: Option<&MemCache>,
-    ) -> Result<ResolvedTarball, TarballError> {
-        // Resolve-time tarball fetches compute integrity from bytes and
-        // gate the dependency walk, so they use the same priority class as
-        // packument requests instead of queuing behind sized downloads.
-        let (integrity, mut cas_paths, mut pkg_files_idx) =
-            fetch_and_extract_with_retry::<Reporter>(
-                self.http_client,
-                self.package_url,
-                None,
-                None,
-                UNPRIORITIZED,
-                self.package_id,
-                self.package_url,
-                self.store_dir,
-                self.retry_opts,
-                self.auth_headers,
-                None,
-                None,
-                false,
-            )
-            .await?;
-        apply_placeholder_manifest(self.store_dir, &mut cas_paths, &mut pkg_files_idx)?;
-
-        let manifest = match self.manifest_subdir {
-            Some(subdir) => read_subdir_manifest(&cas_paths, subdir).await?,
-            None => pkg_files_idx.manifest.clone(),
-        };
-
-        // A subdirectory package gets no row. Its key would name the
-        // subpackage while `pkg_files_idx` describes the whole archive
-        // — the repo's manifest and every repo file — and a row whose
-        // key and payload disagree is worse than none: consumers that
-        // trust `PackageFilesIndex.manifest` / `files` to match the key
-        // (bin linking, file materialization) would read the repo.
-        // Nothing needs this row. A git-hosted archive — the only shape
-        // carrying a subdirectory — is addressed by
-        // `git_hosted_store_index_key` once the install pass has run
-        // `prepare` over it, and both the graph prefetch and the
-        // warm-store reuse map skip git-hosted entries.
-        if self.manifest_subdir.is_none() {
-            // Key the row by the caller's `package_id` — the same
-            // `pkg_id` the install pass derives from the lockfile entry.
-            // Deriving a `name@version` from the bundled manifest instead
-            // would file a remote tarball under a key nothing ever reads,
-            // leaving the install pass to write a second row for the same
-            // content.
-            let index_key = store_index_key(&integrity.to_string(), self.package_id);
-            if let Some(writer) = self.store_index_writer {
-                writer.queue(index_key, pkg_files_idx);
-            } else {
-                tracing::warn!(
-                    target: "pacquet::download",
-                    ?index_key,
-                    "no shared store-index writer; skipping index row for this resolve-time tarball",
-                );
-            }
-        }
-
-        if let Some(mem_cache) = mem_cache {
-            let cache_lock = Arc::new(RwLock::new(CacheValue::Available(Arc::new(cas_paths))));
-            mem_cache.insert(self.package_url.to_string(), cache_lock);
-        }
-
-        Ok(ResolvedTarball { integrity, manifest })
-    }
-}
-
 /// Claim the single fetch for this key. Releases the entry guard before
 /// the caller awaits either the cache lock or the owning fetch.
-fn claim_cache_entry(
+pub(crate) fn claim_cache_entry(
     mem_cache: &MemCache,
     mem_cache_key: String,
 ) -> (Arc<RwLock<CacheValue>>, Option<Arc<Notify>>) {
@@ -603,6 +503,73 @@ fn claim_cache_entry(
             (cache_lock, Some(notify))
         }
     }
+}
+
+/// Park until the task that claimed this key settles the cache slot.
+///
+/// Register with the `Notify` *before* re-checking the slot.
+/// `notify_waiters` stores no permit — it wakes only `Notified`
+/// futures already registered at that instant — and the read guard
+/// from an `InProgress` observation is released before the loop,
+/// so the owner's flip-and-notify can land in between. Checking
+/// first and registering after loses that wakeup and parks this
+/// task forever (nothing ever notifies the slot again once it is
+/// terminal).
+pub(crate) async fn wait_for_cached_tarball(
+    cache_lock: &RwLock<CacheValue>,
+    package_url: &str,
+) -> Result<Arc<CachedTarball>, TarballError> {
+    // Read-lock the state: the variant inspection doesn't mutate
+    // anything, and a `write().await` would serialize every late
+    // visitor for a popular tarball behind a single exclusive guard.
+    // The owner branch is the only writer; the RwLock's reader-writer
+    // fairness guarantees the owner still makes progress.
+    let notify = match &*cache_lock.read().await {
+        CacheValue::Available(cached) => return Ok(Arc::clone(cached)),
+        CacheValue::InProgress(notify) => Arc::clone(notify),
+        CacheValue::Failed(cause) => return Err(sibling_fetch_failed(cause)),
+    };
+
+    tracing::info!(target: "pacquet::download", package_url = ?package_url, "Wait for cache");
+    loop {
+        let notified = notify.notified();
+        let mut notified = std::pin::pin!(notified);
+        notified.as_mut().enable();
+        match &*cache_lock.read().await {
+            CacheValue::Available(cached) => return Ok(Arc::clone(cached)),
+            CacheValue::Failed(cause) => return Err(sibling_fetch_failed(cause)),
+            // The owner notifies only after flipping the slot to
+            // `Available` or `Failed`, so a wake with the slot still
+            // `InProgress` cannot happen — but a stale registration
+            // completing early is harmless: re-register and park again.
+            CacheValue::InProgress(_) => {}
+        }
+        notified.await;
+    }
+}
+
+pub(crate) async fn publish_cached_tarball(
+    cache_lock: &RwLock<CacheValue>,
+    notify: &Notify,
+    cached: CachedTarball,
+) -> Arc<CachedTarball> {
+    let cached = Arc::new(cached);
+    *cache_lock.write().await = CacheValue::Available(Arc::clone(&cached));
+    notify.notify_waiters();
+    cached
+}
+
+pub(crate) async fn publish_cache_failure(
+    cache_lock: &RwLock<CacheValue>,
+    notify: &Notify,
+    error: &TarballError,
+) {
+    *cache_lock.write().await = CacheValue::Failed(error.to_string().into());
+    notify.notify_waiters();
+}
+
+fn sibling_fetch_failed(cause: &Arc<str>) -> TarballError {
+    TarballError::SiblingFetchFailed { cause: Arc::clone(cause) }
 }
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
 //! Class-aware permit dispenser backing
 //! [`ThrottledClient`](crate::ThrottledClient).
 //!
-//! Three request classes share the pool:
+//! The request classes share the pool:
 //!
 //! * **Latency** ([`crate::UNPRIORITIZED`]) — packument and other
 //!   metadata fetches that gate resolution progress. Served FIFO.
@@ -136,6 +136,15 @@ impl Drop for Permit {
         if self.armed {
             release(&self.state, self.class);
         }
+    }
+}
+
+impl std::fmt::Debug for Permit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Permit")
+            .field("armed", &self.armed)
+            .finish_non_exhaustive()
     }
 }
 

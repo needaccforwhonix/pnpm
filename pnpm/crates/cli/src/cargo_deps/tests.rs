@@ -1,18 +1,22 @@
 #[cfg(windows)]
-use super::ensure_workspace_directory_windows;
+use super::workspace_directory::ensure_workspace_directory_windows;
 use super::{
-    ArchiveStoreProjection, Config, LockedCrate, add_cargo_checksum, discover_workspace_roots,
-    managed_config, parse_lockfile, update_managed_config, workspace_root,
+    ArchiveStoreProjection, Config, LockedCrate, PathBuf, add_cargo_checksum,
+    discover_workspace_roots, parse_lockfile,
+    sources::{managed_config, sources_config, update_managed_config},
+    workspace_root,
 };
 #[cfg(unix)]
 use super::{
-    CRATES_SOURCE_DIRECTORY, ensure_workspace_directory, link_workspace, link_workspace_in,
-    write_cargo_config, write_cargo_config_in,
+    CRATES_SOURCE_DIRECTORY, ensure_workspace_directory, link_workspace,
+    sources::{link_workspace_in, write_cargo_config_in},
+    write_cargo_config,
 };
 use crate::cargo_deps::{
-    materialize::{MaterializeOptions, materialize},
+    materialize::{DownloadOptions, MaterializeOptions, materialize, slot_is_complete},
     sparse_registry::{download_auth_headers, fetch_sparse_index_file, sparse_index_path},
 };
+
 use cargo_util_schemas::index::RegistryConfig;
 use pnpm_cargo_resolver::CRATES_IO_SPARSE_INDEX;
 use pnpm_network::{AuthHeaders, RetryOpts, ThrottledClient};
@@ -30,6 +34,111 @@ use std::{
     sync::{Arc, atomic::AtomicU8},
     time::Duration,
 };
+
+const CHECKSUM: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+fn write_checksum_manifest(slot: &std::path::Path, manifest: &str) {
+    fs::create_dir_all(slot).unwrap();
+    fs::write(slot.join(".cargo-checksum.json"), manifest).unwrap();
+}
+
+#[test]
+fn a_registry_crate_slot_is_complete_once_its_checksum_manifest_names_the_crate() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let slot = temp_dir.path().join("slot");
+    assert!(!slot_is_complete(&slot, Some(CHECKSUM)));
+    fs::create_dir_all(slot.join("src")).unwrap();
+    fs::write(slot.join("Cargo.toml"), "[package]\n").unwrap();
+    assert!(!slot_is_complete(&slot, Some(CHECKSUM)));
+
+    for manifest in ["not json", "{}", r#"{"files":{},"package":null}"#] {
+        write_checksum_manifest(&slot, manifest);
+        assert!(!slot_is_complete(&slot, Some(CHECKSUM)), "{manifest}");
+    }
+    write_checksum_manifest(&slot, &format!(r#"{{"files":{{}},"package":"{CHECKSUM}"}}"#));
+    assert!(!slot_is_complete(&slot, Some("b".repeat(64).as_str())));
+
+    assert!(slot_is_complete(&slot, Some(CHECKSUM)));
+}
+
+#[test]
+fn a_git_crate_slot_is_complete_once_its_checksum_manifest_has_no_package() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let slot = temp_dir.path().join("slot");
+    assert!(!slot_is_complete(&slot, None));
+    write_checksum_manifest(&slot, &format!(r#"{{"files":{{}},"package":"{CHECKSUM}"}}"#));
+    assert!(!slot_is_complete(&slot, None));
+
+    write_checksum_manifest(&slot, r#"{"files":{},"package":null}"#);
+
+    assert!(slot_is_complete(&slot, None));
+}
+
+fn offline_config_without_a_cached_registry(temp_dir: &std::path::Path) -> &'static Config {
+    let mut config = Config::new();
+    config.store_dir = StoreDir::from(temp_dir.join("store"));
+    config.cache_dir = temp_dir.join("cache");
+    config.offline = true;
+    config.indexes_by_ecosystem.insert(
+        pnpm_config::Ecosystem::Cargo,
+        vec!["https://registry.example.test/index/".to_string().into()],
+    );
+    Box::leak(Box::new(config))
+}
+
+fn download_options(config: &'static Config, package: &LockedCrate) -> DownloadOptions {
+    DownloadOptions {
+        config,
+        packages: vec![package.clone()],
+        http_client: Arc::new(ThrottledClient::default()),
+        logged_methods: Arc::new(AtomicU8::new(0)),
+        requester: "test".to_string(),
+    }
+}
+
+#[tokio::test]
+async fn links_a_complete_registry_crate_slot_without_asking_the_registry() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let config = offline_config_without_a_cached_registry(temp_dir.path());
+    let package = LockedCrate {
+        name: "demo".to_string(),
+        version: "1.0.0".to_string(),
+        checksum: CHECKSUM.to_string(),
+    };
+    let slot = package.store_slot(config.store_dir.root());
+    write_checksum_manifest(&slot, &format!(r#"{{"files":{{}},"package":"{CHECKSUM}"}}"#));
+
+    let slots =
+        super::materialize::download_crates::<SilentReporter>(download_options(config, &package))
+            .await
+            .unwrap();
+
+    assert_eq!(slots, vec![(package.link_name(), slot)]);
+}
+
+#[tokio::test]
+async fn force_materializes_a_complete_registry_crate_slot_again() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let config = offline_config_without_a_cached_registry(temp_dir.path());
+    let package = LockedCrate {
+        name: "demo".to_string(),
+        version: "1.0.0".to_string(),
+        checksum: CHECKSUM.to_string(),
+    };
+    let slot = package.store_slot(config.store_dir.root());
+    write_checksum_manifest(&slot, &format!(r#"{{"files":{{}},"package":"{CHECKSUM}"}}"#));
+    let mut forced = config.clone();
+    forced.force = true;
+    let forced: &'static Config = Box::leak(Box::new(forced));
+
+    let error =
+        super::materialize::download_crates::<SilentReporter>(download_options(forced, &package))
+            .await
+            .unwrap_err();
+
+    eprintln!("The registry is asked again with --force: {error:?}");
+    assert!(format!("{error:?}").contains("Cargo registry config"), "{error:?}");
+}
 
 #[test]
 fn parses_crates_io_packages_and_ignores_workspace_packages() {
@@ -69,11 +178,13 @@ checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 "#;
 
     let error = parse_lockfile(lockfile, CRATES_IO_SPARSE_INDEX).unwrap_err().to_string();
-    assert!(error.contains("does not match the configured Cargo registry"), "{error}");
+    assert!(error.contains("is neither crates.io nor the configured"), "{error}");
 }
 
+/// A dependency that names no registry belongs to crates.io, whichever
+/// registry the declared Cargo index points the fetch at.
 #[test]
-fn rejects_a_crates_io_source_under_a_configured_registry() {
+fn accepts_a_crates_io_source_under_a_configured_registry() {
     let lockfile = r#"
 [[package]]
 name = "serde"
@@ -82,10 +193,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
 "#;
 
-    let error =
-        parse_lockfile(lockfile, "https://registry.example.test/index/").unwrap_err().to_string();
-
-    assert!(error.contains("does not match the configured Cargo registry"), "{error}");
+    assert_eq!(
+        parse_lockfile(lockfile, "https://registry.example.test/index/").unwrap().crates.len(),
+        1,
+    );
 }
 
 #[test]
@@ -171,25 +282,63 @@ fn crate_store_slots_are_grouped_by_name_version_and_content() {
 #[test]
 fn appends_the_managed_config_without_changing_user_settings() {
     let existing = "[alias]\ncodecov = \"llvm-cov\"\n";
-    let updated = update_managed_config(existing, CRATES_IO_SPARSE_INDEX, &[]).unwrap();
+    let updated = update_managed_config(existing).unwrap();
 
-    assert_eq!(updated, format!("{existing}\n{}\n", managed_config(CRATES_IO_SPARSE_INDEX, &[])));
+    assert_eq!(updated, format!("{existing}\n{}\n", managed_config()));
 }
 
 #[test]
 fn replaces_only_the_existing_managed_config() {
     let existing = "before\n# >>> pnpm-managed cargo sources >>>\nstale\n# <<< pnpm-managed cargo sources <<<\nafter\n";
-    let updated = update_managed_config(existing, CRATES_IO_SPARSE_INDEX, &[]).unwrap();
+    let updated = update_managed_config(existing).unwrap();
 
+    assert_eq!(updated, format!("before\n{}\nafter\n", managed_config()));
+}
+
+#[test]
+fn includes_the_sources_config_optionally() {
+    let parsed: toml::Table = toml::from_str(&managed_config()).unwrap();
+
+    let expected: toml::Table =
+        toml::from_str("[[include]]\npath = \"../.pnpm/crates/config.toml\"\noptional = true\n")
+            .unwrap();
+    assert_eq!(parsed["include"], expected["include"]);
+    eprintln!("The sources must stay out of .cargo/config.toml: {parsed:?}");
+    assert!(!parsed.contains_key("source"));
+}
+
+#[test]
+fn extends_the_include_tables_of_the_user() {
+    let existing = "[[include]]\npath = \"local.toml\"\n";
+    let updated = update_managed_config(existing).unwrap();
+
+    let parsed: toml::Table = toml::from_str(&updated).unwrap();
     assert_eq!(
-        updated,
-        format!("before\n{}\nafter\n", managed_config(CRATES_IO_SPARSE_INDEX, &[])),
+        parsed["include"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2,
     );
 }
 
 #[test]
+fn rejects_an_inline_include_it_cannot_extend() {
+    let error = update_managed_config("include = [\"local.toml\"]\n").unwrap_err().to_string();
+
+    assert!(error.contains("[[include]]"), "{error}");
+}
+
+#[test]
+fn points_the_sources_at_the_directories_below_the_config() {
+    let parsed: toml::Table = toml::from_str(&sources_config(CRATES_IO_SPARSE_INDEX, &[])).unwrap();
+
+    assert_eq!(parsed["source"]["pnpm-crates-io"]["directory"].as_str(), Some("crates/crates-io"));
+}
+
+#[test]
 fn configures_the_selected_sparse_registry_as_the_vendored_source() {
-    let config = managed_config("https://registry.example.test/index/", &[]);
+    let config = sources_config("https://registry.example.test/index/", &[]);
 
     assert!(config.contains("[source.crates-io]\nreplace-with = \"pnpm-registry\""));
     assert!(config.contains("[source.pnpm-registry]"));
@@ -199,7 +348,7 @@ fn configures_the_selected_sparse_registry_as_the_vendored_source() {
 
 #[test]
 fn escapes_a_registry_url_that_is_not_a_bare_toml_string() {
-    let config = managed_config("https://registry.example.test/o'brien/index", &[]);
+    let config = sources_config("https://registry.example.test/o'brien/index", &[]);
 
     let parsed: toml::Table = toml::from_str(&config).expect("managed config is valid TOML");
     assert_eq!(
@@ -210,13 +359,8 @@ fn escapes_a_registry_url_that_is_not_a_bare_toml_string() {
 
 #[test]
 fn rejects_an_incomplete_managed_config() {
-    let error = update_managed_config(
-        "# >>> pnpm-managed cargo sources >>>\n",
-        CRATES_IO_SPARSE_INDEX,
-        &[],
-    )
-    .unwrap_err()
-    .to_string();
+    let error =
+        update_managed_config("# >>> pnpm-managed cargo sources >>>\n").unwrap_err().to_string();
 
     assert!(error.contains("incomplete"), "{error}");
 }
@@ -225,8 +369,8 @@ fn rejects_an_incomplete_managed_config() {
 fn creates_the_cargo_checksum_manifest_from_cas_files() {
     let temp_dir = tempfile::tempdir().unwrap();
     let store_dir = StoreDir::from(temp_dir.path().join("store"));
-    let (cargo_toml, _) = store_dir.write_cas_file(b"[package]\nname = \"demo\"\n", false).unwrap();
-    let (source, _) = store_dir.write_cas_file(b"fn main() {}\n", false).unwrap();
+    let cargo_toml = store_dir.write_cas_file(b"[package]\nname = \"demo\"\n", false).unwrap().file;
+    let source = store_dir.write_cas_file(b"fn main() {}\n", false).unwrap().file;
     let mut cas_paths = HashMap::from([
         ("Cargo.toml".to_string(), cargo_toml),
         ("src/main.rs".to_string(), source),
@@ -263,8 +407,16 @@ async fn repairs_a_preseeded_slot_from_verified_store_metadata() {
     store_dir.init().unwrap();
     let cargo_toml = b"[package]\nname = \"demo\"\nversion = \"1.0.0\"\n";
     let source = b"pub fn trusted() {}\n";
-    let (cargo_toml_path, cargo_toml_hash) = store_dir.write_cas_file(cargo_toml, false).unwrap();
-    let (source_path, source_hash) = store_dir.write_cas_file(source, false).unwrap();
+    let pnpm_store_dir::WrittenFile {
+        file: cargo_toml_path,
+        hash: cargo_toml_hash,
+        ..
+    } = store_dir.write_cas_file(cargo_toml, false).unwrap();
+    let pnpm_store_dir::WrittenFile {
+        file: source_path,
+        hash: source_hash,
+        ..
+    } = store_dir.write_cas_file(source, false).unwrap();
     let files = HashMap::from([
         (
             "Cargo.toml".to_string(),
@@ -300,6 +452,7 @@ async fn repairs_a_preseeded_slot_from_verified_store_metadata() {
                 files,
                 side_effects: None,
                 remote_side_effects_quarantine: None,
+                tar_integrity: None,
             },
         )
         .unwrap();
@@ -314,6 +467,7 @@ async fn repairs_a_preseeded_slot_from_verified_store_metadata() {
     fs::write(slot.join("Cargo.toml"), "attacker controlled").unwrap();
     fs::write(slot.join("src/lib.rs"), "pub fn substituted() {}\n").unwrap();
     fs::write(slot.join(".cargo-checksum.json"), "{}").unwrap();
+    assert!(!slot_is_complete(&slot, Some(checksum)));
     let (store_index_writer, writer_task) = StoreIndexWriter::spawn(store_dir);
 
     materialize::<SilentReporter>(MaterializeOptions {
@@ -329,6 +483,7 @@ async fn repairs_a_preseeded_slot_from_verified_store_metadata() {
                 max_timeout: Duration::ZERO,
             },
             offline: true,
+            tar_limits: pnpm_tarball::TarLimits::default(),
             requester: "test".to_string(),
         },
         store: crate::cargo_deps::materialize::CrateStore {
@@ -364,7 +519,10 @@ fn maps_crate_names_to_sparse_index_paths() {
 
 fn config_with_cargo_credentials(index_url: &str) -> Config {
     let mut config = Config::new();
-    config.cargo.index_url = index_url.to_string();
+    config.indexes_by_ecosystem.insert(
+        pnpm_config::Ecosystem::Cargo,
+        vec![index_url.to_string().into()],
+    );
     config.auth_headers = Arc::new(AuthHeaders::from_creds_map([
         ("//registry.example.test/".to_string(), "Bearer crate-token".to_string()),
         ("//cdn.example.test/".to_string(), "Bearer unrelated-token".to_string()),
@@ -461,6 +619,14 @@ async fn sparse_index_fetch_uses_configured_request_auth() {
     request.assert_async().await;
 }
 
+async fn discovered_roots(manifests: &[PathBuf]) -> Vec<PathBuf> {
+    discover_workspace_roots(manifests, None).await
+        .unwrap()
+        .into_iter()
+        .map(|workspace| workspace.root)
+        .collect()
+}
+
 #[tokio::test]
 async fn asks_cargo_for_the_workspace_root_of_a_member() {
     let repository = tempfile::tempdir().unwrap();
@@ -479,12 +645,11 @@ async fn asks_cargo_for_the_workspace_root_of_a_member() {
     .unwrap();
     fs::write(member.join("src/lib.rs"), "").unwrap();
 
-    assert_eq!(workspace_root(&member.join("Cargo.toml")).await.unwrap(), cargo_root);
+    let canonical_root = dunce::canonicalize(&cargo_root).unwrap();
+    assert_eq!(workspace_root(&member.join("Cargo.toml"), None).await.unwrap(), canonical_root);
     assert_eq!(
-        discover_workspace_roots(&[member.join("Cargo.toml"), cargo_root.join("Cargo.toml")])
-            .await
-            .unwrap(),
-        [dunce::canonicalize(cargo_root).unwrap()],
+        discovered_roots(&[member.join("Cargo.toml"), cargo_root.join("Cargo.toml")]).await,
+        [canonical_root],
     );
 }
 
@@ -510,12 +675,8 @@ async fn discovers_independent_workspaces_nested_under_workspace_members() {
     }
 
     assert_eq!(
-        discover_workspace_roots(&[
-            root.join("member/Cargo.toml"),
-            root.join("member/nested/Cargo.toml"),
-        ])
-        .await
-        .unwrap(),
+        discovered_roots(&[root.join("member/Cargo.toml"), root.join("member/nested/Cargo.toml")])
+            .await,
         [
             dunce::canonicalize(root).unwrap(),
             dunce::canonicalize(root.join("member/nested")).unwrap()
@@ -547,8 +708,7 @@ fn rejects_a_symlinked_cargo_config_parent() {
     fs::write(&external_config, "unchanged\n").unwrap();
     symlink(outside.path(), workspace.path().join(".cargo")).unwrap();
 
-    let error =
-        write_cargo_config(workspace.path(), CRATES_IO_SPARSE_INDEX, &[]).unwrap_err().to_string();
+    let error = write_cargo_config(workspace.path()).unwrap_err().to_string();
 
     assert!(error.contains("must be a real directory"), "{error}");
     assert_eq!(fs::read_to_string(external_config).unwrap(), "unchanged\n");
@@ -565,13 +725,13 @@ fn config_write_stays_in_the_directory_pinned_before_a_parent_swap() {
     fs::write(outside.path().join("config.toml"), "unchanged\n").unwrap();
     symlink(outside.path(), workspace.path().join(".cargo")).unwrap();
 
-    write_cargo_config_in(&cargo_dir, CRATES_IO_SPARSE_INDEX, &[]).unwrap();
+    write_cargo_config_in(&cargo_dir).unwrap();
 
     assert_eq!(fs::read_to_string(outside.path().join("config.toml")).unwrap(), "unchanged\n");
     assert!(
         fs::read_to_string(pinned_path.join("config.toml"))
             .unwrap()
-            .contains(&managed_config(CRATES_IO_SPARSE_INDEX, &[])),
+            .contains(&managed_config()),
     );
 }
 

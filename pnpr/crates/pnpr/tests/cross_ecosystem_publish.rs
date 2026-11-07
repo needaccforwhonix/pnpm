@@ -2,20 +2,19 @@
 //! carrying packages of more than one ecosystem. Static-mode (no upstream) to
 //! keep the tests hermetic.
 
-#[path = "common/npm.rs"]
-#[expect(dead_code, reason = "this suite needs part of the shared npm fixtures")]
-mod npm;
+use crate::npm;
 
 use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use npm::sri_sha512;
+use npm::{npm_tgz, publishable_tgz, sri_sha512};
 use pnpr::{
     AccessList, AuthState, Config, Ecosystem, HostedConfig, MaxUsers, PackagePattern, PackageRules,
-    Registries, Registry, Teams, router_with_auth,
+    Registries, Registry, router_with_auth,
 };
+use pnpr_fixtures::MockConfigPresets;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -33,14 +32,13 @@ fn tri_ecosystem_config(storage: PathBuf) -> Config {
     let mut config = Config::static_serve(listen, storage);
     config.http.public_url = "http://pnpr.test".to_string();
     config.identity.auth.htpasswd.max_users = MaxUsers::Unlimited;
-    for (name, org) in [("crates", "crates"), ("python", "python")] {
+    for (name, org) in [("crates", ""), ("python", "")] {
         config.routing.hosted.insert(
             name.to_string(),
-            HostedConfig {
-                org: org.to_string(),
-                rules: PackageRules::new(Vec::new(), Some(AccessList::from_tokens(["$all"]))),
-                teams: Teams::default(),
-            },
+            HostedConfig::new(
+                org,
+                PackageRules::new(Vec::new(), Some(AccessList::from_tokens(["$all"]))),
+            ),
         );
     }
     let mut graph: indexmap::IndexMap<String, Registry> = config.routing
@@ -102,6 +100,7 @@ fn publish_request(path: &str, body: &Value, token: Option<&str>) -> Request<Bod
 
 /// An npm publish document, the same one the npm batch endpoint takes.
 fn npm_entry(name: &str, version: &str, tarball: &[u8]) -> Value {
+    let tarball = &publishable_tgz(name, version, tarball);
     let filename = format!("{name}-{version}.tgz");
     json!({
         "_id": name,
@@ -212,9 +211,9 @@ async fn publishes_a_package_a_crate_and_a_wheel_in_one_transaction() {
     let storage = tmp.path().to_path_buf();
     let app = router_with_auth(tri_ecosystem_config(storage.clone()), AuthState::in_memory());
     let token = token_for(&app, "alice").await;
-    let tarball = b"npm-tarball-bytes";
+    let tarball = &npm_tgz("mixed-pkg", "1.0.0", b"npm-tarball-bytes");
     let archive = crate_archive("demo", "0.1.0");
-    let wheel = b"PK\x03\x04 pretend wheel";
+    let wheel = &crate::ecosystem::python_wheel("demo-pkg", "1.0.0");
 
     let body = json!({
         "packages": [
@@ -251,7 +250,7 @@ async fn publishes_a_package_a_crate_and_a_wheel_in_one_transaction() {
         .await
         .unwrap();
     assert_eq!(npm_tarball.status(), StatusCode::OK);
-    assert_eq!(body_bytes(npm_tarball.into_body()).await, tarball);
+    assert_eq!(body_bytes(npm_tarball.into_body()).await, *tarball);
 
     let index = app
         .clone()
@@ -298,10 +297,9 @@ async fn publishes_a_package_a_crate_and_a_wheel_in_one_transaction() {
         )
         .await
         .unwrap();
-    assert_eq!(body_bytes(file.into_body()).await, wheel);
+    assert_eq!(body_bytes(file.into_body()).await, wheel.as_slice());
 
     // One transaction, and it left nothing behind.
-    assert_eq!(journal_entries(&storage), Vec::<PathBuf>::new());
 }
 
 #[tokio::test]
@@ -310,7 +308,7 @@ async fn a_batch_with_one_bad_entry_publishes_none_of_it() {
     let storage = tmp.path().to_path_buf();
     let app = router_with_auth(tri_ecosystem_config(storage.clone()), AuthState::in_memory());
     let token = token_for(&app, "alice").await;
-    let wheel = b"PK\x03\x04 pretend wheel";
+    let wheel = &crate::ecosystem::python_wheel("demo-pkg", "1.0.0");
 
     // The archive belongs to another version than the metadata claims, which
     // the Cargo surface refuses.
@@ -341,85 +339,6 @@ async fn a_batch_with_one_bad_entry_publishes_none_of_it() {
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
     }
     assert_eq!(staged_files(&storage), Vec::<PathBuf>::new());
-    assert_eq!(journal_entries(&storage), Vec::<PathBuf>::new());
-}
-
-/// A blob whose immutable slot another writer already owns is the one thing a
-/// batch cannot roll back: the bytes that won are someone's published release.
-/// The package that lost is reported, and the rest of the batch stays
-/// published. An npm packument is written even when a version drops out of
-/// it, so this case is only visible in the blobs the transaction lost.
-#[tokio::test]
-async fn a_package_that_loses_its_blob_is_reported_and_the_rest_stays() {
-    use object_store::{ObjectStoreExt, memory::InMemory, path::Path as ObjectPath};
-    use pnpr::HostedStoreConfig;
-    use std::sync::Arc;
-
-    let tmp = TempDir::new().unwrap();
-    let storage = tmp.path().to_path_buf();
-    let store = Arc::new(InMemory::new());
-    // Another writer already published this tarball, with other bytes.
-    store
-        .put(
-            &ObjectPath::from("mixed-pkg/mixed-pkg-1.0.0.tgz"),
-            axum::body::Bytes::from_static(b"the winning tarball").into(),
-        )
-        .await
-        .unwrap();
-    let mut config = tri_ecosystem_config(storage.clone());
-    config.storage.hosted_backend = HostedStoreConfig::ObjectStore {
-        store: Arc::<InMemory>::clone(&store),
-        prefix: String::new(),
-    };
-    let app = router_with_auth(config, AuthState::in_memory());
-    let token = token_for(&app, "alice").await;
-
-    let body = json!({
-        "packages": [
-            npm_entry("mixed-pkg", "1.0.0", b"the losing tarball"),
-            cargo_entry("demo", "0.1.0", &crate_archive("demo", "0.1.0")),
-        ],
-    });
-    let response = app
-        .clone()
-        .oneshot(publish_request("/-/pnpr/v0/publish", &body, Some(&token)))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-    let reason = String::from_utf8(body_bytes(response.into_body()).await).unwrap();
-    assert!(reason.contains("mixed-pkg"), "{reason}");
-
-    let packument = app
-        .clone()
-        .oneshot(
-            Request::get("/npm/mixed-pkg")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(packument.status(), StatusCode::OK);
-    let packument = body_json(packument.into_body()).await;
-    assert_eq!(packument["versions"], json!({}), "the version that lost is not advertised");
-    let index = app
-        .oneshot(
-            Request::get("/cargo/index/de/mo/demo")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(index.status(), StatusCode::OK, "the crate beside it stays published");
-    assert_eq!(
-        store
-            .get(&ObjectPath::from("mixed-pkg/mixed-pkg-1.0.0.tgz"))
-            .await
-            .unwrap()
-            .bytes()
-            .await
-            .unwrap(),
-        "the winning tarball",
-    );
 }
 
 /// The failure that matters most is the one after other packages have already
@@ -438,7 +357,7 @@ async fn a_failure_while_staging_takes_the_staged_blobs_with_it() {
     let body = json!({
         "packages": [
             cargo_entry("demo", "0.1.0", &crate_archive("demo", "0.1.0")),
-            pypi_entry("demo-pkg", "1.0.0", WHEEL, b"PK\x03\x04 pretend wheel"),
+            pypi_entry("demo-pkg", "1.0.0", WHEEL, &crate::ecosystem::python_wheel("demo-pkg", "1.0.0")),
             broken,
         ],
     });
@@ -464,7 +383,6 @@ async fn a_failure_while_staging_takes_the_staged_blobs_with_it() {
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
     }
     assert_eq!(staged_files(&storage), Vec::<PathBuf>::new());
-    assert_eq!(journal_entries(&storage), Vec::<PathBuf>::new());
 }
 
 /// A version that is already published stops the batch before anything is
@@ -575,7 +493,7 @@ async fn an_uppercase_digest_is_accepted() {
     let app =
         router_with_auth(tri_ecosystem_config(tmp.path().to_path_buf()), AuthState::in_memory());
     let token = token_for(&app, "alice").await;
-    let wheel = b"PK\x03\x04 pretend wheel";
+    let wheel = &crate::ecosystem::python_wheel("demo-pkg", "1.0.0");
     let mut entry = pypi_entry("demo-pkg", "1.0.0", WHEEL, wheel);
     entry["sha256_digest"] = json!(sha256_hex(wheel).to_uppercase());
 
@@ -652,17 +570,6 @@ async fn a_repeated_package_is_refused_but_a_shared_name_across_ecosystems_is_no
     assert_eq!(response.status(), StatusCode::CREATED);
 }
 
-/// The transactions the publish journal still holds. A journal a publish
-/// never reached has no directory at all.
-fn journal_entries(storage: &std::path::Path) -> Vec<PathBuf> {
-    match std::fs::read_dir(storage.join(".pnpr-journal")) {
-        Ok(entries) => entries
-            .map(|entry| entry.unwrap().path())
-            .collect(),
-        Err(_) => Vec::new(),
-    }
-}
-
 /// Every staged file left under `root`, by the marker the storage layer puts
 /// in a staged file's name.
 fn staged_files(root: &std::path::Path) -> Vec<PathBuf> {
@@ -679,4 +586,50 @@ fn staged_files(root: &std::path::Path) -> Vec<PathBuf> {
         }
     }
     staged
+}
+
+#[tokio::test]
+async fn another_file_of_a_published_python_version_takes_no_publish_time_note() {
+    let tmp = TempDir::new().unwrap();
+    let mut config = tri_ecosystem_config(tmp.path().to_path_buf());
+    config.storage.metadata =
+        pnpr_config::MetadataBackend::Sqlite(tmp.path().join("metadata.sqlite"));
+    let app = router_with_auth(config, AuthState::in_memory());
+    let token = token_for(&app, "alice").await;
+    let first = json!({ "packages": [pypi_entry("demo-pkg", "1.0.0", WHEEL, &crate::ecosystem::python_wheel("demo-pkg", "1.0.0"))] });
+    let published = app
+        .clone()
+        .oneshot(publish_request("/-/pnpr/v0/publish", &first, Some(&token)))
+        .await
+        .unwrap();
+    assert_eq!(published.status(), StatusCode::CREATED);
+
+    let mut sdist = pypi_entry(
+        "demo-pkg",
+        "1.0.0",
+        "demo_pkg-1.0.0.tar.gz",
+        &crate::ecosystem::python_sdist("demo-pkg", "1.0.0"),
+    );
+    sdist["filetype"] = json!("sdist");
+    sdist["notes"] = json!("- late\n");
+    let second = json!({ "packages": [sdist] });
+    let refused = app
+        .clone()
+        .oneshot(publish_request("/-/pnpr/v0/publish", &second, Some(&token)))
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::CONFLICT);
+
+    // Without the note, the same file publishes.
+    let mut quiet = second;
+    quiet["packages"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("notes");
+    let accepted = app
+        .clone()
+        .oneshot(publish_request("/-/pnpr/v0/publish", &quiet, Some(&token)))
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), StatusCode::CREATED);
 }

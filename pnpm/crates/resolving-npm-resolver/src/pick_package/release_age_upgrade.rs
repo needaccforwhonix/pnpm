@@ -1,19 +1,36 @@
 use super::{
-    Arc, FetchFullMetadataOptions, FetchFullMetadataOutcome, Package, PackageMetaCache,
-    PackumentFetchLocker, Path, PickPackageContext, PickPackageError, PickPackageOptions,
-    PolicyMatch, RegistryPackageSpec, Semaphore, clear_meta, fetch_full_metadata, load_meta,
-    parse_packument_timestamp, save_meta_indexed, save_meta_ndjson,
+    Arc, FetchMetadataError, Package, PackageMetaCache, PackumentFetchLocker, PickPackageContext,
+    PickPackageError, PickPackageOptions, RegistryPackageSpec, Semaphore,
+    parse_packument_timestamp,
+};
+use crate::{
+    FetchFullMetadataCachedOptions, fetch_full_metadata_cached::fetch_release_age_upgrade,
 };
 
-/// Outcome of [`maybe_upgrade_abbreviated_meta_for_release_age`].
+/// Outcome of [`maybe_upgrade_abbreviated_meta_for_release_age`]. Its `meta`
+/// is marked as checked whether or not the upgrade happened: a registry
+/// whose full form is no more complete than its abbreviated one still
+/// answers `200`, and without the mark every later pick in the install
+/// would ask for the same full document again.
 pub(super) struct UpgradeOutcome {
     /// The packument the orchestrator should pick from. Either the
     /// original meta (no-upgrade arm — same `Arc` as the input) or
-    /// a freshly fetched full meta wrapped in a new `Arc`.
+    /// the full meta the upgrade fetched, already in the abbreviated mirror
+    /// unless this is a dry run.
     pub(super) meta: Arc<Package>,
-    /// `true` when the orchestrator should persist `meta` to the
-    /// abbreviated mirror and write it back to the in-memory cache.
-    pub(super) upgraded: bool,
+    upgraded: bool,
+}
+
+impl UpgradeOutcome {
+    fn unchanged(meta: Arc<Package>) -> Self {
+        UpgradeOutcome { meta, upgraded: false }
+    }
+
+    /// `true` when the orchestrator should write `meta` back to the
+    /// in-memory cache.
+    pub(super) fn upgraded(&self) -> bool {
+        self.upgraded
+    }
 }
 
 pub(super) async fn maybe_upgrade_abbreviated_meta_for_release_age<Cache: PackageMetaCache>(
@@ -25,7 +42,7 @@ pub(super) async fn maybe_upgrade_abbreviated_meta_for_release_age<Cache: Packag
     mut meta: Arc<Package>,
 ) -> Result<UpgradeOutcome, PickPackageError> {
     if !release_age_upgrade_needed(ctx, spec, opts, full_metadata, cache_key, &meta) {
-        return Ok(UpgradeOutcome { meta, upgraded: false });
+        return Ok(UpgradeOutcome::unchanged(meta));
     }
     let limit = release_age_upgrade_limit(ctx.metadata.fetch_locker, cache_key);
     let _permit =
@@ -42,40 +59,52 @@ pub(super) async fn maybe_upgrade_abbreviated_meta_for_release_age<Cache: Packag
     if ctx.metadata.fetch_locker.release_age_upgrade_was_checked(cache_key, &meta)
         || meta.time.is_some()
     {
-        return Ok(UpgradeOutcome { meta, upgraded: false });
+        return Ok(UpgradeOutcome::unchanged(meta));
     }
-    let fetch_opts = FetchFullMetadataOptions {
+    // The cached fetcher sends the abbreviated mirror's validators only when
+    // it recorded the full document: an entity tag and a `Last-Modified` date
+    // describe one representation.
+    let fetch_opts = FetchFullMetadataCachedOptions {
+        pnpr_format: super::serves_pnpr_format(ctx, opts.registry),
         registry: opts.registry,
-        full_metadata: true,
-        etag: meta.etag.as_deref(),
-        modified: meta.modified.as_deref(),
+        cache_dir: ctx.metadata.cache_dir,
+        full_metadata: false,
+        filter_metadata: false,
+        offline: false,
+        priority: pnpm_network::UNPRIORITIZED,
         http: ctx.metadata.http,
     };
-    match fetch_full_metadata(&spec.name, &fetch_opts).await? {
-        FetchFullMetadataOutcome::Modified(upgraded) => {
-            Ok(UpgradeOutcome { meta: Arc::new(*upgraded), upgraded: true })
-        }
-        // 304: the full-form representation matched the conditional
-        // headers, so the abbreviated meta is still the freshest
-        // signal we have. Keep it (the downstream picker falls through
-        // to its warn-and-skip path on the missing `time` map) and
-        // mark it so no later pick in this install repeats the round trip.
-        // The 304 also registry-validated the document, so it may enter the
-        // shared metadata cache as verified.
-        FetchFullMetadataOutcome::NotModified => {
+    match fetch_release_age_upgrade(&spec.name, &fetch_opts, !opts.request.dry_run).await {
+        Ok(upgraded) => {
+            let meta = Arc::new(upgraded);
             ctx.metadata.fetch_locker.mark_release_age_upgrade_checked(cache_key, &meta);
-            // A `Modified` outcome is marked by the caller instead: it persists
-            // the response to the mirror and may hand back a reloaded document,
-            // so only the caller knows the `Arc` that ends up in the cache.
-            // Both outcomes must be marked — a registry whose full form is no
-            // more complete than its abbreviated one would otherwise be
-            // re-asked once per dependency edge.
-            if !opts.request.dry_run {
-                ctx.metadata.meta_cache.set(cache_key.to_string(), Arc::clone(&meta));
-            }
-            Ok(UpgradeOutcome { meta, upgraded: false })
+            Ok(UpgradeOutcome { meta, upgraded: true })
         }
+        Err(error) if !matches!(error, FetchMetadataError::NotModifiedWithoutCache { .. }) => {
+            Err(error.into())
+        }
+        // The registry declined to hand over a body. To a request without
+        // validators it says so by repeating an unsolicited `304` until the
+        // fetcher gives up with `NotModifiedWithoutCache`. It has no fuller
+        // form of this document, and an upgrade that cannot happen must not
+        // fail an install that would otherwise succeed: the maturity check
+        // falls back to the warn-or-error gate
+        // `minimum_release_age_ignore_missing_time` already governs.
+        Err(_) => declined_upgrade(ctx, opts, cache_key, meta),
     }
+}
+
+fn declined_upgrade<Cache: PackageMetaCache>(
+    ctx: &PickPackageContext<'_, Cache>,
+    opts: &PickPackageOptions<'_>,
+    cache_key: &str,
+    meta: Arc<Package>,
+) -> Result<UpgradeOutcome, PickPackageError> {
+    ctx.metadata.fetch_locker.mark_release_age_upgrade_checked(cache_key, &meta);
+    if !opts.request.dry_run {
+        ctx.metadata.meta_cache.set(cache_key.to_string(), Arc::clone(&meta));
+    }
+    Ok(UpgradeOutcome::unchanged(meta))
 }
 
 /// Upgrade abbreviated metadata to full when the maturity check needs
@@ -91,16 +120,17 @@ pub(super) async fn maybe_upgrade_abbreviated_meta_for_release_age<Cache: Packag
 ///
 /// The early returns are guard rails:
 ///
-/// - `ctx.offline`: no network allowed. Stick with what we have.
+/// - a policy that forbids the registry: no fetch is available, so what
+///   we have stands.
 /// - `opts.published_by.is_none()`: maturity check disabled.
 /// - `meta.time.is_some()`: the packument carries per-version publish
 ///   timestamps. Documents whose `time` could not decide maturity are
 ///   normalized to `None` at the parse boundary (see
 ///   [`Package::drop_incomplete_publish_times`]), so a map that is here
 ///   is complete. Nothing to upgrade.
-/// - this document already got a `304` from an upgrade fetch earlier in
-///   the install (see [`PackumentFetchState`](super::metadata_cache::PackumentFetchState)): the registry has no
-///   fuller form of it, so asking again is pure waste.
+/// - an upgrade fetch already ran for this document earlier in the
+///   install (see [`PackumentFetchState`](super::metadata_cache::PackumentFetchState)): its outcome stands for
+///   every later pick, so asking again is pure waste.
 /// - `opts.published_by_exclude` matches the package: caller has
 ///   opted this package out of the policy.
 /// - `meta.modified.is_some()` and parses as a date `<= cutoff`:
@@ -109,18 +139,9 @@ pub(super) async fn maybe_upgrade_abbreviated_meta_for_release_age<Cache: Packag
 ///   boundary on purpose, matching the per-version `<=` filter in
 ///   [`filter_pkg_metadata_by_publish_date`](crate::filter_pkg_metadata_by_publish_date).
 ///
-/// On upgrade the call uses the network-only [`fetch_full_metadata()`]
-/// (not the cached variant) so the response writes back to the
-/// abbreviated mirror via [`persist_upgraded_to_mirror`], which
-/// intentionally updates the *abbreviated* cache file with full data so
-/// the next install sees `time` populated and skips the upgrade fetch.
-///
-/// The upgrade fetch forwards `meta.etag` and `meta.modified` as
-/// conditional headers. When the registry's full-form representation
-/// hasn't changed it answers `304 Not Modified` and the abbreviated
-/// meta is returned untouched.
-/// Whether a `minimumReleaseAge` check needs the full packument this
-/// abbreviated one cannot answer from.
+/// On upgrade the call fetches through [`fetch_release_age_upgrade`],
+/// which stores the full document in the *abbreviated* mirror, so the next
+/// install sees `time` populated and skips the upgrade fetch.
 pub(super) fn release_age_upgrade_needed<Cache: PackageMetaCache>(
     ctx: &PickPackageContext<'_, Cache>,
     spec: &RegistryPackageSpec,
@@ -129,19 +150,21 @@ pub(super) fn release_age_upgrade_needed<Cache: PackageMetaCache>(
     cache_key: &str,
     meta: &Arc<Package>,
 ) -> bool {
-    if ctx.cache_policy.offline || full_metadata {
-        return false;
-    }
-    let Some(cutoff) = opts.policy.published_by else { return false };
-    if meta.time.is_some()
+    // pnpr's own document already gives every publish time and trust rank
+    // pnpr has, so npm's full document could add nothing to it.
+    if ctx.cache_policy.network.forbids_registry()
+        || full_metadata
+        || meta.time.is_some()
+        || super::serves_pnpr_format(ctx, opts.registry)
         || ctx.metadata.fetch_locker.release_age_upgrade_was_checked(cache_key, meta)
     {
         return false;
     }
-    let fully_excluded = opts.policy.published_by_exclude.is_some_and(|policy| {
-        matches!(policy.matches(&spec.name), PolicyMatch::AnyVersion)
-    });
-    if fully_excluded {
+    if opts.policy.trust_policy == Some(super::TrustPolicy::NoDowngrade) {
+        return true;
+    }
+    let Some(cutoff) = opts.policy.published_by else { return false };
+    if !opts.policy.release_age_applies_to(&spec.name) {
         return false;
     }
     // Inclusive `<=` at the boundary: matches the per-version `<=` filter in
@@ -153,54 +176,6 @@ pub(super) fn release_age_upgrade_needed<Cache: PackageMetaCache>(
         .and_then(parse_packument_timestamp)
         .is_some_and(|modified| modified <= cutoff);
     !modified_before_cutoff
-}
-
-/// Write the upgraded full metadata back to `pkg_mirror` (which
-/// points at the abbreviated cache because the picker is in
-/// abbreviated mode). A write failure logs at debug and the install
-/// proceeds — the next install simply re-triggers the upgrade fetch.
-///
-/// On a successful indexed save, returns the just-persisted mirror
-/// reloaded in its file-backed form so the caller can cache *it*
-/// instead of the response-body-backed document — upgraded packuments
-/// are the largest documents an install handles, and caching the
-/// in-memory form kept every full body resident for the rest of the
-/// resolution.
-pub(super) fn persist_upgraded_to_mirror(
-    pkg_mirror: &Path,
-    meta: &Package,
-    filter_metadata: bool,
-) -> Option<Package> {
-    let save_result = if filter_metadata {
-        let meta_for_cache = match clear_meta(meta) {
-            Ok(meta_for_cache) => meta_for_cache,
-            Err(error) => {
-                tracing::debug!(
-                    target: "pnpm_resolving_npm_resolver::pick_package",
-                    ?error,
-                    path = %pkg_mirror.display(),
-                    "could not filter upgraded mirror metadata",
-                );
-                return None;
-            }
-        };
-        save_meta_ndjson(pkg_mirror, &meta_for_cache, meta.etag.as_deref())
-    } else {
-        save_meta_indexed(pkg_mirror, meta, meta.etag.as_deref())
-    };
-    match save_result {
-        Ok(()) if !filter_metadata => load_meta(pkg_mirror),
-        Ok(()) => None,
-        Err(error) => {
-            tracing::debug!(
-                target: "pnpm_resolving_npm_resolver::pick_package",
-                ?error,
-                path = %pkg_mirror.display(),
-                "could not write upgraded meta to mirror; skipping persist",
-            );
-            None
-        }
-    }
 }
 
 /// Coalesce concurrent upgrades separately from the packument fetch permit,

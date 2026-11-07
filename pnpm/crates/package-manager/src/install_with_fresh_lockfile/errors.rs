@@ -17,6 +17,8 @@ pub enum InstallWithFreshLockfileError {
     /// same code and message from `requireHooks`.
     #[diagnostic(code(ERR_PNPM_PNPMFILE_NOT_FOUND))]
     MissingPnpmfile(#[error(not(source))] pnpm_hooks::finder::MissingPnpmfileError),
+    #[diagnostic(code(ERR_PNPM_PNPMFILE_FAIL))]
+    PnpmfileHook(#[error(not(source))] pnpm_hooks::HookError),
     /// The concurrent pre-resolve verification of the existing lockfile
     /// rejected it. The orchestrator maps this back to
     /// `InstallError::LockfileVerification` so the failure keeps the
@@ -61,6 +63,12 @@ pub enum InstallWithFreshLockfileError {
     /// `InstallFrozenLockfileError::LinkHoistedModules`.
     #[diagnostic(transparent)]
     LinkHoistedModules(#[error(source)] crate::LinkHoistedModulesError),
+
+    #[diagnostic(transparent)]
+    ReadModules(#[error(source)] pnpm_modules_yaml::ReadModulesError),
+
+    #[diagnostic(transparent)]
+    WriteModules(#[error(source)] pnpm_modules_yaml::WriteModulesError),
 
     #[display("failed to write package map: {_0}")]
     #[diagnostic(code(ERR_PNPM_PACKAGE_MANAGER_WRITE_PACKAGE_MAP))]
@@ -164,7 +172,7 @@ pub enum InstallWithFreshLockfileError {
     UnusedPatch(#[error(source)] pnpm_patching::UnusedPatchError),
 
     /// A user-defined `namedRegistries` entry mapped an alias to a
-    /// non-http(s) URL. Surfaced at resolver construction so the
+    /// URL that is not HTTP or HTTPS. Surfaced at resolver construction so the
     /// install fails fast with a specific error code instead of a
     /// downstream 404. Surfaced as
     /// `ERR_PNPM_INVALID_NAMED_REGISTRY_URL`.
@@ -248,8 +256,23 @@ impl From<crate::install_frozen_lockfile::HoistedLinkerError> for InstallWithFre
             HoistedLinkerError::SymlinkDirectDependencies(error) => {
                 InstallWithFreshLockfileError::SymlinkDirectDependencies(error)
             }
+            HoistedLinkerError::ReadModules(error) => {
+                InstallWithFreshLockfileError::ReadModules(error)
+            }
+            HoistedLinkerError::WriteModules(error) => {
+                InstallWithFreshLockfileError::WriteModules(error)
+            }
             HoistedLinkerError::WritePackageMap(error) => {
                 InstallWithFreshLockfileError::WritePackageMap(error)
+            }
+            HoistedLinkerError::PruneStaleLinks(error) => {
+                InstallWithFreshLockfileError::PruneStaleModules(error)
+            }
+            HoistedLinkerError::HoistSymlink(error) => {
+                InstallWithFreshLockfileError::HoistSymlink(error)
+            }
+            HoistedLinkerError::HoistLinkBins(error) => {
+                InstallWithFreshLockfileError::HoistLinkBins(error)
             }
         }
     }

@@ -6,11 +6,16 @@ pub use comver::*;
 pub use env_lockfile::*;
 pub use filter_by_importers::*;
 pub use freshness::*;
+pub use injected_deps::*;
+pub use integrity_target::*;
 pub use lazy_lockfile::*;
 pub use load_lockfile::*;
 pub use lockfile_version::*;
 pub use merge_lockfile_changes::*;
 pub use package_metadata::*;
+pub use patched_dep_paths::*;
+pub use peer_bindings::*;
+pub use peer_edges::*;
 pub use pkg_id_with_patch_hash::*;
 pub use pkg_name::*;
 pub use pkg_name_suffix::*;
@@ -18,9 +23,11 @@ pub use pkg_name_ver::*;
 pub use pkg_name_ver_peer::*;
 pub use pkg_ver_peer::*;
 pub use project_snapshot::*;
+pub use prune_env_lockfile::*;
 pub use prune_time::*;
 pub use prune_undeclared_importer_deps::*;
 pub use resolution::*;
+pub use resolution_settings::*;
 pub use resolved_dependency::*;
 pub use save_lockfile::*;
 pub use snapshot_dep_ref::*;
@@ -33,11 +40,17 @@ mod env_lockfile;
 mod filter_by_importers;
 mod freshness;
 mod git_branch_lockfile;
+mod git_merge_file;
+mod injected_deps;
+mod integrity_target;
 mod lazy_lockfile;
 mod load_lockfile;
 mod lockfile_version;
 mod merge_lockfile_changes;
 mod package_metadata;
+mod patched_dep_paths;
+mod peer_bindings;
+mod peer_edges;
 mod pkg_id_with_patch_hash;
 mod pkg_name;
 mod pkg_name_suffix;
@@ -45,9 +58,11 @@ mod pkg_name_ver;
 mod pkg_name_ver_peer;
 mod pkg_ver_peer;
 mod project_snapshot;
+mod prune_env_lockfile;
 mod prune_time;
 mod prune_undeclared_importer_deps;
 mod resolution;
+mod resolution_settings;
 mod resolved_dependency;
 mod save_lockfile;
 mod serialize_yaml;
@@ -66,13 +81,18 @@ use std::collections::{BTreeMap, HashMap};
 pub type PackageKey = PkgNameVerPeer;
 
 /// Default `peersSuffixMaxLength` an unset `settings.peersSuffixMaxLength`
-/// in the lockfile decays to. This value is also the threshold below which
-/// the field is stripped on serialization: when `peersSuffixMaxLength`
-/// equals this default it is omitted from the serialized file.
+/// in the lockfile decays to.
 pub const DEFAULT_PEERS_SUFFIX_MAX_LENGTH: u64 = 1000;
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    dylint_lib = "perfectionist",
+    expect(
+        perfectionist::too_many_struct_fields,
+        reason = "The fields mirror the `settings` block of pnpm-lock.yaml."
+    )
+)]
 pub struct LockfileSettings {
     pub auto_install_peers: bool,
     /// Recorded as `Some(true)` when the install ran with
@@ -83,6 +103,15 @@ pub struct LockfileSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dedupe_peers: Option<bool>,
     pub exclude_links_from_lockfile: bool,
+    /// Recorded as `Some(true)` when the install ran with
+    /// `addMissingPeerTypes` on, omitted otherwise, like
+    /// [`Self::dedupe_peers`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub add_missing_peer_types: Option<bool>,
+    /// Recorded as `Some(true)` while `projectScopedOptionalPeers` takes
+    /// effect, omitted otherwise, like [`Self::dedupe_peers`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_scoped_optional_peers: Option<bool>,
     /// `injectWorkspacePackages` recorded by the install that wrote
     /// this lockfile. `false` round-trips as a missing key — the key
     /// is stripped on save so historic v9 lockfiles (which never
@@ -96,6 +125,32 @@ pub struct LockfileSettings {
     /// so existing lockfiles round-trip byte-for-byte.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peers_suffix_max_length: Option<u64>,
+    /// Recorded as `Some(Tar)` when the lockfile's package tarball
+    /// entries pin tar hashes, omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrity_target: Option<IntegrityTarget>,
+    #[serde(flatten)]
+    pub resolution: ResolutionSettings,
+}
+
+impl LockfileSettings {
+    /// Which hash the lockfile's package tarball entries pin.
+    #[must_use]
+    pub fn integrity_target(&self) -> IntegrityTarget {
+        self.integrity_target.unwrap_or_default()
+    }
+}
+
+impl Lockfile {
+    /// Which hash the lockfile's package tarball entries pin. A lockfile
+    /// without a `settings` block pins the resource.
+    #[must_use]
+    pub fn integrity_target(&self) -> IntegrityTarget {
+        self.settings
+            .as_ref()
+            .map(LockfileSettings::integrity_target)
+            .unwrap_or_default()
+    }
 }
 
 /// Top-level lockfile keys pnpm itself does not define, in the order they
@@ -150,8 +205,7 @@ pub struct Lockfile {
     /// wire shape, serialized right after `packageExtensionsChecksum`
     /// in the root-key order. `None` when the project has no pnpmfile
     /// (or one without a `hooks` export) — the key is omitted in that
-    /// case, and the `skip_serializing_if` below does the same so the
-    /// lockfile round-trips byte-for-byte.
+    /// case.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pnpmfile_checksum: Option<String>,
 
@@ -169,9 +223,6 @@ pub struct Lockfile {
     /// patch file. Top-level in the v9 wire shape, sitting between
     /// `pnpmfileChecksum` and `importers` in the root-key order.
     /// A [`BTreeMap`] so the entries serialize sorted by key.
-    ///
-    /// Loading also accepts the `{hash, path}` shape pnpm 10 wrote,
-    /// collapsing it to the hash.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -249,25 +300,38 @@ impl<'a> From<&'a Lockfile> for LockfileEntries<'a> {
 }
 
 impl<'a> LockfileEntries<'a> {
-    /// The previous install's entries as the warm-reinstall skip reads
-    /// them: a snapshot whose wiring and integrity are unchanged and
-    /// whose virtual-store slot still exists is dropped from the
-    /// install graph.
-    ///
-    /// `--force` relinks every package, so under it the skip must see
-    /// nothing — pnpm's `lockfileToDepGraph(..., opts.force ? null :
-    /// currentLockfile)`. The current lockfile itself still reaches the
-    /// prune, which runs on the real one even under `--force`.
-    pub fn of_previous_install(lockfile: Option<&'a Lockfile>, force: bool) -> Self {
-        if force {
-            LockfileEntries::default()
-        } else {
-            lockfile.map(LockfileEntries::from).unwrap_or_default()
-        }
+    /// Entries recorded by the previous install, including under `--force`.
+    /// Consumers decide whether to reuse packages; cleanup always needs the
+    /// previous dependency records. Empty when no current lockfile exists.
+    pub fn of_previous_install(lockfile: Option<&'a Lockfile>) -> Self {
+        lockfile.map(LockfileEntries::from).unwrap_or_default()
     }
 }
 
 impl Lockfile {
+    const UNTRACKED_PNPMFILE_READ_PACKAGE_HOOK: &'static str = "untrackedPnpmfileReadPackageHook";
+
+    #[must_use]
+    pub fn untracked_pnpmfile_read_package_hook(&self) -> Option<bool> {
+        self.extra
+            .get(Self::UNTRACKED_PNPMFILE_READ_PACKAGE_HOOK)
+            .and_then(serde_json::Value::as_bool)
+    }
+
+    pub fn set_untracked_pnpmfile_read_package_hook(&mut self, value: Option<bool>) {
+        match value {
+            Some(value) => {
+                self.extra.insert(
+                    Self::UNTRACKED_PNPMFILE_READ_PACKAGE_HOOK.to_string(),
+                    serde_json::Value::Bool(value),
+                );
+            }
+            None => {
+                self.extra.shift_remove(Self::UNTRACKED_PNPMFILE_READ_PACKAGE_HOOK);
+            }
+        }
+    }
+
     /// Base file name of the lockfile.
     pub const FILE_NAME: &str = "pnpm-lock.yaml";
 
@@ -289,8 +353,6 @@ impl Lockfile {
                 metadata.cpu = None;
                 metadata.os = None;
                 metadata.libc = None;
-                metadata.deprecated = None;
-                metadata.has_bin = None;
                 metadata.prepare = None;
                 metadata.bundled_dependencies = None;
                 metadata.peer_dependencies = None;
@@ -351,7 +413,7 @@ impl Lockfile {
                     return None;
                 }
                 let VersionPart::File(path) = metadata_key.suffix.version() else { return None };
-                if is_local_tarball_path(path) {
+                if pnpm_local_spec::is_tarball_filename(path) {
                     return None;
                 }
                 let directory = path.clone();
@@ -381,21 +443,6 @@ impl Lockfile {
                 });
         }
     }
-}
-
-/// Whether `path` ends in a tarball extension (`.tgz`, `.tar.gz`, or
-/// `.tar`, case-insensitively) — the directory-vs-tarball boundary the
-/// resolver applies to a `file:` spec at resolve time. Public so
-/// consumers classifying a `file:` snapshot key (such as the hoister's
-/// identity function) draw the same line.
-#[must_use]
-pub fn is_local_tarball_path(path: &str) -> bool {
-    let lower = path.as_bytes();
-    let ends_with_ci = |suffix: &str| {
-        let bytes = suffix.as_bytes();
-        lower.len() >= bytes.len() && lower[lower.len() - bytes.len()..].eq_ignore_ascii_case(bytes)
-    };
-    ends_with_ci(".tgz") || ends_with_ci(".tar.gz") || ends_with_ci(".tar")
 }
 
 /// Accepts both shapes a lockfile can carry for a `patchedDependencies`

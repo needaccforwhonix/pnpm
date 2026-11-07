@@ -1,9 +1,9 @@
 use super::{
-    AncestorIds, Arc, BTreeMap, CacheHitContext, ChildChains, ChildEdge, ChildOutputs,
-    ChildParentRefs, ChildrenWalk, DeferredChildren, DepPath, HashMap, MissingSummary, NodeEntry,
-    NodeId, NodeOutput, NodePeersContext, NodeWalkContext, ParentPkgInfo, ParentRefs,
+    Arc, BTreeMap, CacheHitContext, ChildChains, ChildEdge, ChildOutputs, ChildParentRefs,
+    ChildrenWalk, DeferredChildren, DepPath, HashMap, MissingSummary, NodeEntry, NodeId,
+    NodeOutput, NodePeersContext, NodeWalkContext, ParentPkgInfo, ParentRefs, PeerWalkMode,
     PeersCacheItem, SettledPeers, SharedChain, WalkResult, WalkedNode, Walker, chain_with_pkg_id,
-    merge_realize_undo, pkg_name_version,
+    merge_realize_undo,
 };
 
 impl Walker<'_> {}
@@ -57,8 +57,11 @@ impl Walker<'_> {
         self.record_node(node_id, &entry, walk, &mut walked, &settled);
 
         let output = settled.node_output(&mut walked);
-        if self.traversal.discovery {
-            self.undo_realize(node_id, walked.realize_undo, Some(&output));
+        match self.traversal.mode {
+            PeerWalkMode::Discovery => {
+                self.undo_realize(node_id, walked.realize_undo, Some(&output));
+            }
+            PeerWalkMode::Final => {}
         }
         output
     }
@@ -79,18 +82,18 @@ impl Walker<'_> {
     }
 
     pub(super) fn enter_package(&mut self, node_id: &NodeId) -> NodeEntry {
-        let (pkg_id, depth, installable) = {
+        let (pkg_id, depth, children_are_lazy) = {
             let tree_node = &self.tree.dependencies_tree[node_id];
             (
                 Arc::<str>::clone(&tree_node.resolved_package_id),
                 tree_node.depth,
-                tree_node.installable,
+                matches!(tree_node.children, crate::resolved_tree::TreeChildren::Lazy),
             )
         };
         let pkg = self.owned_package(&pkg_id);
         let (provider_children, preview_undo) = self.preview_peer_provider_children(node_id);
-        let (pkg_name, _pkg_version) = pkg_name_version(&pkg.result);
-        NodeEntry { pkg, pkg_name, depth, installable, provider_children, preview_undo }
+        let pkg_name = Arc::clone(pkg.name());
+        NodeEntry { pkg, pkg_name, depth, children_are_lazy, provider_children, preview_undo }
     }
 
     /// Recurse into children first (post-order). Discovery walks lazy
@@ -111,7 +114,7 @@ impl Walker<'_> {
         };
         let realize_undo = merge_realize_undo(entry.preview_undo.take(), realize_undo);
         let chains = ChildChains {
-            names: walk.chain_names.pushed(entry.pkg_name.clone()),
+            names: walk.chain_names.pushed(Arc::clone(&entry.pkg_name)),
             node_ids: walk.parent_node_ids.pushed(node_id.clone()),
             pkg_ids: chain_with_pkg_id(walk.parent_pkg_ids, &entry.pkg.id),
         };
@@ -127,22 +130,26 @@ impl Walker<'_> {
     pub(super) fn resolve_children_of(
         &mut self,
         entry: &NodeEntry,
-        discovery_children: Option<&(Arc<Vec<ChildEdge>>, AncestorIds)>,
+        discovery_children: Option<&Arc<Vec<ChildEdge>>>,
         children_map: &BTreeMap<String, NodeId>,
         child_walk: &NodeWalkContext<'_>,
     ) -> ChildOutputs {
         match discovery_children {
-            Some((children, parent_ids)) => self.resolve_deferred_children(
+            Some(children) => self.resolve_deferred_children(
                 DeferredChildren {
                     pkg_id: &entry.pkg.id,
                     children,
-                    parent_ids,
                     provider_children: &entry.provider_children,
                     depth: entry.depth,
                 },
                 child_walk,
             ),
-            None => self.resolve_realized_children(&entry.pkg.id, children_map, child_walk),
+            None => self.resolve_realized_children(
+                &entry.pkg.id,
+                children_map,
+                &entry.provider_children,
+                child_walk,
+            ),
         }
     }
 
@@ -162,28 +169,19 @@ impl Walker<'_> {
             external_from_children: std::mem::take(&mut walked.outputs.external_peers),
             missing_from_children: &walked.outputs.missing_peers,
         });
+        if entry.children_are_lazy {
+            walked.outputs.auto_install_resolved_peers.clear();
+        }
         walked.outputs.auto_install_resolved_peers.extend(
             peers.own_resolved
                 .iter()
                 .map(|(peer_name, peer_node_id)| (peer_name.clone(), peer_node_id.clone())),
         );
-        let own_missing = (!walked.outputs.missing_peers.is_empty()).then(|| {
-            (
-                entry.pkg.id.to_string(),
-                walked.outputs.missing_peers
-                    .keys()
-                    .cloned()
-                    .collect(),
-            )
-        });
-        let subtree_missing_by_pkg = match (own_missing, walked.outputs.missing_summaries.len()) {
-            (None, 0) => None,
-            (None, 1) => walked.outputs.missing_summaries.pop(),
-            (own, _) => Some(Arc::new(MissingSummary {
-                own,
-                children: std::mem::take(&mut walked.outputs.missing_summaries),
-            })),
-        };
+        let subtree_missing_by_pkg = build_subtree_missing_summary(
+            &entry.pkg.id,
+            &walked.outputs.missing_peers,
+            &mut walked.outputs.missing_summaries,
+        );
         SettledPeers {
             is_pure: peers.all_resolved.is_empty() && peers.all_missing.is_empty(),
             dep_path: peers.dep_path,
@@ -220,26 +218,28 @@ impl Walker<'_> {
                 is_pure: settled.is_pure,
             },
         );
-        if !self.traversal.discovery {
-            self.record_walked_node(WalkedNode {
-                node_id,
-                pkg: &entry.pkg,
-                dep_path: &settled.dep_path,
-                children: &walked.children_map,
-                child_dep_paths: std::mem::take(&mut walked.outputs.dep_paths),
-                installable: entry.installable,
-                ancestry: crate::resolve_peers::finalize::WalkedNodeAncestry {
-                    parent_node_ids: walk.parent_node_ids,
-                    parent_pkg_ids_chain: walk.parent_pkg_ids,
-                    depth: entry.depth,
-                },
-                peers: crate::resolve_peers::finalize::WalkedNodePeers {
-                    resolved: &settled.all_resolved,
-                    missing: &settled.all_missing,
-                    own_resolved: &settled.own_resolved,
-                    is_pure: settled.is_pure,
-                },
-            });
+        match self.traversal.mode {
+            PeerWalkMode::Final => {
+                self.record_walked_node(WalkedNode {
+                    node_id,
+                    pkg: &entry.pkg,
+                    dep_path: &settled.dep_path,
+                    children: &walked.children_map,
+                    child_dep_paths: std::mem::take(&mut walked.outputs.dep_paths),
+                    ancestry: crate::resolve_peers::finalize::WalkedNodeAncestry {
+                        parent_node_ids: walk.parent_node_ids,
+                        parent_pkg_ids_chain: walk.parent_pkg_ids,
+                        depth: entry.depth,
+                    },
+                    peers: crate::resolve_peers::finalize::WalkedNodePeers {
+                        resolved: &settled.all_resolved,
+                        missing: &settled.all_missing,
+                        own_resolved: &settled.own_resolved,
+                        is_pure: settled.is_pure,
+                    },
+                });
+            }
+            PeerWalkMode::Discovery => {}
         }
         self.traversal.in_progress.remove(node_id);
     }
@@ -250,8 +250,8 @@ impl Walker<'_> {
         &mut self,
         node_id: &NodeId,
         parent_refs: &ParentRefs,
-        parent_chain_names: &SharedChain<String>,
-        parent_pkg_ids_chain: &SharedChain<String>,
+        parent_chain_names: &SharedChain<Arc<str>>,
+        parent_pkg_ids_chain: &SharedChain<Arc<str>>,
     ) -> Option<NodeOutput> {
         if let Some((tree_node_depth, dep_path)) = self.context_free_dep_path(node_id) {
             self.remember_resolved_node(node_id, &dep_path);
@@ -314,16 +314,19 @@ impl Walker<'_> {
                 DepPath::from(Arc::<str>::clone(&tree_node.resolved_package_id)),
             ));
         }
+        if !super::super::cache::reuse_peer_subtrees(&self.opts) {
+            return None;
+        }
         let dep_path = self.caches.pure_pkgs.get(&*tree_node.resolved_package_id)?;
-        let own_peers_bind = !self.tree.packages[&tree_node.resolved_package_id]
-            .peer_dependencies
-            .is_empty();
-        if own_peers_bind
-            || (!self.traversal.discovery
-                && self.output.graph
-                    .get(dep_path)
-                    .is_none_or(|graph_node| graph_node.depth > tree_node.depth))
-        {
+        let own_peers_bind =
+            !self.tree.packages[&tree_node.resolved_package_id].peer_set.taken().is_empty();
+        let final_graph_lacks_shallower_node = match self.traversal.mode {
+            PeerWalkMode::Final => self.output.graph
+                .get(dep_path)
+                .is_none_or(|graph_node| graph_node.depth > tree_node.depth),
+            PeerWalkMode::Discovery => false,
+        };
+        if own_peers_bind || final_graph_lacks_shallower_node {
             return None;
         }
         Some((tree_node.depth, dep_path.clone()))
@@ -367,5 +370,22 @@ impl Walker<'_> {
             );
         }
         parent_dep_paths
+    }
+}
+
+fn build_subtree_missing_summary(
+    pkg_id: &str,
+    missing_peers: &HashMap<String, super::walk_context::MissingPeerInfo>,
+    missing_summaries: &mut Vec<Arc<MissingSummary>>,
+) -> Option<Arc<MissingSummary>> {
+    let own_missing = (!missing_peers.is_empty()).then(|| {
+        (pkg_id.to_string(), missing_peers.keys().cloned().collect())
+    });
+    match (own_missing, missing_summaries.len()) {
+        (None, 0) => None,
+        (None, 1) => missing_summaries.pop(),
+        (own, _) => {
+            Some(Arc::new(MissingSummary { own, children: std::mem::take(missing_summaries) }))
+        }
     }
 }

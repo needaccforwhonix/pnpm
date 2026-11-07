@@ -1,14 +1,26 @@
 use super::{
-    DEFAULT_INDENT, InitOptions, NamedTempFile, PackageManifest, PackageManifestError, Path,
-    PathBuf, Serialize, Value, Write, convert_engines_runtime_to_dependencies, fs, io,
+    BlankLines, DEFAULT_INDENT, InitOptions, PackageManifest, PackageManifestError, Path, PathBuf,
+    Serialize, Value, Write, convert_engines_runtime_to_dependencies, fs, io,
 };
+
+const DEPENDENCY_FIELDS: [&str; 4] =
+    ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"];
+
+/// The dependency fields `manifest` declares as empty objects. A save keeps
+/// these in place and only drops a field pnpm itself emptied.
+pub(super) fn empty_dependency_fields(manifest: &Value) -> Vec<&'static str> {
+    DEPENDENCY_FIELDS
+        .into_iter()
+        .filter(|field| matches!(manifest.get(field), Some(Value::Object(deps)) if deps.is_empty()))
+        .collect()
+}
 
 /// pnpm's on-write manifest normalization: within each dependency field,
 /// sort the entries by name, and drop the field entirely when it holds no
-/// entries.
-pub(super) fn normalize_dependency_fields(manifest: &mut Value) {
+/// entries, unless `keep_empty` lists it.
+pub(super) fn normalize_dependency_fields(manifest: &mut Value, keep_empty: &[&str]) {
     let Some(manifest) = manifest.as_object_mut() else { return };
-    for field in ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"] {
+    for field in DEPENDENCY_FIELDS {
         let is_empty_object = match manifest.get_mut(field) {
             Some(Value::Object(deps)) => {
                 deps.sort_keys();
@@ -16,7 +28,7 @@ pub(super) fn normalize_dependency_fields(manifest: &mut Value) {
             }
             _ => continue,
         };
-        if is_empty_object {
+        if is_empty_object && !keep_empty.contains(&field) {
             manifest.remove(field);
         }
     }
@@ -62,15 +74,12 @@ pub(super) fn serialize_with_indent(
 
 /// Read `<dir>/package.json` if it exists, returning `Ok(None)` when the file
 /// is absent. Other IO errors and JSON parse errors propagate.
-///
-/// A missing file is the only case that maps to `Ok(None)`; malformed JSON
-/// surfaces as a `BAD_PACKAGE_JSON` error and other IO errors propagate.
 pub fn safe_read_package_json_from_dir(dir: &Path) -> Result<Option<Value>, PackageManifestError> {
     let path = dir.join("package.json");
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(PackageManifestError::Io(err)),
+        Err(err) if pnpm_fs::is_not_found(&err) => return Ok(None),
+        Err(source) => return Err(PackageManifestError::Read { path, source }),
     };
     parse_manifest(&text)
         .map(Some)
@@ -98,34 +107,113 @@ fn strip_utf8_bom(contents: &str) -> &str {
     contents.strip_prefix('\u{feff}').unwrap_or(contents)
 }
 
+pub(super) fn parse_project_manifest(
+    path: &Path,
+    contents: &str,
+) -> Result<Value, PackageManifestError> {
+    let contents = strip_utf8_bom(contents);
+    let value = if is_yaml_path(path) {
+        pnpm_yaml_document_sync::parse(contents)
+            .map_err(|source| PackageManifestError::ParseYaml {
+                path: path.to_path_buf(),
+                source,
+            })?
+    } else if is_json5_path(path) {
+        crate::json5::parse(contents)
+            .map_err(|source| PackageManifestError::ParseJson5 {
+                path: path.to_path_buf(),
+                source,
+            })?
+    } else {
+        parse_manifest(contents)
+            .map_err(|source| PackageManifestError::Parse { path: path.to_path_buf(), source })?
+    };
+    if is_yaml_path(path) && value.is_null() {
+        return Ok(serde_json::json!({}));
+    }
+    if !value.is_object() {
+        return Err(if is_yaml_path(path) {
+            PackageManifestError::InvalidAttribute(format!(
+                "{}: the manifest root must be an object",
+                path.display(),
+            ))
+        } else {
+            PackageManifestError::InvalidRoot { path: path.to_path_buf() }
+        });
+    }
+    Ok(value)
+}
+
 impl PackageManifest {
     pub(super) fn write_to_file(
         path: &Path,
         manifest: &Value,
     ) -> Result<String, PackageManifestError> {
-        let contents = serialize_with_indent(manifest, DEFAULT_INDENT)?;
-        fs::write(path, format!("{contents}\n"))?; // TODO: forbid overwriting existing files
+        let contents = if is_yaml_path(path) {
+            let mut contents = pnpm_yaml_document_sync::serialize(manifest)
+                .map_err(|source| PackageManifestError::EditYaml {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+            if contents.ends_with('\n') {
+                contents.pop();
+            }
+            contents
+        } else {
+            serialize_with_indent(manifest, DEFAULT_INDENT)?
+        };
+        Self::write_atomic(path, &format!("{contents}\n"))?;
         Ok(contents)
+    }
+
+    /// The permissions of the file at `path`, or `None` where nothing is
+    /// there yet.
+    fn existing_permissions(path: &Path) -> io::Result<Option<pnpm_fs::CopyPermissions>> {
+        #[cfg(not(target_os = "wasi"))]
+        let read =
+            fs::metadata(path).map(|metadata| pnpm_fs::CopyPermissions::of_metadata(&metadata));
+        #[cfg(target_os = "wasi")]
+        let read = pnpm_fs::copy_permissions(path);
+        match read {
+            Ok(permissions) => Ok(Some(permissions)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     /// Write `contents` to `path` atomically: a sibling temp file is written
     /// and fsynced, then renamed over `path`. A crash or write error therefore
-    /// never leaves a truncated or partial `package.json` behind, matching the
-    /// `write-file-atomic` guarantee.
+    /// never leaves a truncated or partial manifest behind, matching the
+    /// `write-file-atomic` guarantee. New Unix files respect the process umask;
+    /// existing files keep their permissions.
     pub(super) fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
         let dir = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        let mut tmp = NamedTempFile::new_in(dir)?;
+        let permissions = Self::existing_permissions(path)?;
+        #[cfg(target_os = "wasi")]
+        let mut tmp = tempfile::Builder::new()
+            .make_in(dir, |temporary| {
+                pnpm_fs::create_new_with_mode(
+                    temporary,
+                    permissions.as_ref().map_or(0o666, pnpm_fs::CopyPermissions::mode),
+                )
+            })?;
+        #[cfg(unix)]
+        let mut tmp = {
+            let mode = permissions
+                .as_ref()
+                .map_or(0o666, |existing| existing.mode() & 0o777);
+            pnpm_fs::named_tempfile_with_mode_in(dir, mode)?
+        };
+        #[cfg(not(any(unix, target_os = "wasi")))]
+        let mut tmp = pnpm_fs::umask_named_tempfile_in(dir)?;
         tmp.write_all(contents.as_bytes())?;
-        tmp.as_file().sync_all()?;
-        // A NamedTempFile is created 0o600; preserve the original file's mode
-        // when overwriting an existing package.json (write-file-atomic does the
-        // same) so the rename doesn't silently tighten its permissions.
-        if let Ok(metadata) = fs::metadata(path) {
-            tmp.as_file().set_permissions(metadata.permissions())?;
+        if let Some(permissions) = permissions {
+            permissions.apply_to_file(tmp.as_file())?;
         }
+        pnpm_fs::sync_file(tmp.as_file())?;
         tmp.persist(path).map_err(|err| err.error)?;
         Ok(())
     }
@@ -133,18 +221,27 @@ impl PackageManifest {
     pub(super) fn read_from_file(path: PathBuf) -> Result<PackageManifest, PackageManifestError> {
         let file_contents = fs::read_to_string(&path)?;
         let contents = strip_utf8_bom(&file_contents);
-        let mut value: Value = parse_manifest(contents)
-            .map_err(|source| PackageManifestError::Parse { path: path.clone(), source })?;
+        let mut value = parse_project_manifest(&path, contents)?;
+        let empty_dependency_fields = empty_dependency_fields(&value);
         let mut on_disk = value.clone();
-        normalize_dependency_fields(&mut on_disk);
+        normalize_dependency_fields(&mut on_disk, &empty_dependency_fields);
         convert_engines_runtime_to_dependencies(&mut value, "devEngines", "devDependencies");
         convert_engines_runtime_to_dependencies(&mut value, "engines", "dependencies");
+        let crlf = file_contents.contains("\r\n");
+        let blank_lines = if is_yaml_path(&path) || is_json5_path(&path) {
+            BlankLines::default()
+        } else {
+            BlankLines::detect(contents)
+        };
         Ok(PackageManifest {
             path,
             value,
             insert_final_newline: contents.ends_with('\n'),
+            crlf,
             indent: detect_indent(contents).to_string(),
+            blank_lines,
             on_disk: Some(on_disk),
+            empty_dependency_fields,
         })
     }
 
@@ -164,6 +261,17 @@ impl PackageManifest {
             })
     }
 
+    /// The manifest at `path`, or the scaffold [`Self::create_if_needed`]
+    /// would write there. The scaffold stays in memory until the caller
+    /// saves it.
+    pub fn load_or_init(path: PathBuf) -> Result<PackageManifest, PackageManifestError> {
+        if !path.exists() {
+            let scaffold = PackageManifest::init_value_for(&path, InitOptions::default());
+            return Ok(PackageManifest::from_value(path, scaffold));
+        }
+        PackageManifest::from_path(path)
+    }
+
     pub fn create_if_needed(path: PathBuf) -> Result<PackageManifest, PackageManifestError> {
         if !path.exists() {
             let scaffold = PackageManifest::init_value_for(&path, InitOptions::default());
@@ -174,4 +282,80 @@ impl PackageManifest {
         // the file the same way as for a pre-existing manifest.
         PackageManifest::read_from_file(path)
     }
+}
+
+fn is_yaml_path(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("package.yaml"))
+}
+
+fn is_json5_path(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("package.json5"))
+}
+
+impl PackageManifest {
+    pub(super) fn is_json5(&self) -> bool {
+        is_json5_path(&self.path)
+    }
+
+    pub(super) fn serialize_json5(&self, value: &Value) -> Result<String, PackageManifestError> {
+        let serialized = crate::json5::stringify(value, &self.indent);
+        let text = match fs::read_to_string(&self.path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(serialized),
+            Err(source) => {
+                return Err(PackageManifestError::Read { path: self.path.clone(), source });
+            }
+        };
+        parse_project_manifest(&self.path, &text)?;
+        let restored = crate::json5::restore_comments(strip_utf8_bom(&text), &serialized);
+        if parse_project_manifest(&self.path, &restored)? != *value {
+            return Err(PackageManifestError::InvalidAttribute(format!(
+                "{}: preserving JSON5 comments changed the manifest value",
+                self.path.display(),
+            )));
+        }
+        Ok(restored)
+    }
+
+    pub(super) fn is_yaml(&self) -> bool {
+        is_yaml_path(&self.path)
+    }
+
+    pub(super) fn serialize_yaml(&self, value: &Value) -> Result<String, PackageManifestError> {
+        let text = match fs::read_to_string(&self.path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return pnpm_yaml_document_sync::serialize(value)
+                    .map_err(|source| PackageManifestError::EditYaml {
+                        path: self.path.clone(),
+                        source,
+                    });
+            }
+            Err(source) => {
+                return Err(PackageManifestError::Read { path: self.path.clone(), source });
+            }
+        };
+        pnpm_yaml_document_sync::sync(strip_utf8_bom(&text), value)
+            .map_err(|source| PackageManifestError::EditYaml { path: self.path.clone(), source })
+    }
+}
+
+pub(super) fn normalize_crlf(input: &str) -> String {
+    let mut output = String::with_capacity(input.len() + input.len() / 30);
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\r' {
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            output.push_str("\r\n");
+        } else if ch == '\n' {
+            output.push_str("\r\n");
+        } else {
+            output.push(ch);
+        }
+    }
+    output
 }

@@ -1,32 +1,42 @@
 use super::{
     AtomicUsize, Config, ExecutionStatus, GraphPkg, HashMap, IndexMap, Instant, LogEvent, Mutex,
     Ordering, Path, ProcessTracker, ProjectGraph, RecursiveRun, RunArgs, RunContext, RunResults,
-    ScriptOutput, Status, TaskCompletion, TaskGraph, TaskKey, TaskNode, env,
-    make_node_package_map_option, make_node_require_option, package_map_path_for_execution,
-    pnp_path_for_execution, run_stages, task_summary_key,
+    ScriptBudget, ScriptOutput, ScriptPermit, Status, TaskCompletion, TaskGraph, TaskKey, TaskNode,
+    env, make_node_package_map_option, make_node_require_option, package_map_path_for_execution,
+    pnp_path_for_execution, run_stages, script_concurrency, task_summary_key,
 };
+use crate::cli_args::reporter::script_output_colors;
+use pnpm_executor::ScriptExit;
 
 /// The slots the tasks record into while they run.
 pub(super) struct RunSlots {
     pub(super) result: Mutex<IndexMap<String, ExecutionStatus>>,
     pub(super) has_command: AtomicUsize,
     pub(super) first_failure: Mutex<Option<String>>,
+    pub(super) interrupted: Mutex<Option<ScriptExit>>,
     pub(super) abort: Mutex<Option<miette::Report>>,
 }
 
 impl RunSlots {
-    pub(super) fn queued(task_graph: &TaskGraph) -> Self {
+    pub(super) fn queued(task_graph: &TaskGraph, script_name: &str) -> Self {
         RunSlots {
             result: Mutex::new(
                 task_graph
                     .values()
-                    .map(|node| (task_summary_key(node), ExecutionStatus::queued()))
+                    .map(|node| (task_summary_key(node, script_name), ExecutionStatus::queued()))
                     .collect(),
             ),
             has_command: AtomicUsize::new(0),
             first_failure: Mutex::new(None),
+            interrupted: Mutex::new(None),
             abort: Mutex::new(None),
         }
+    }
+
+    pub(super) fn mark_skipped(&self, node: &TaskNode, script_name: &str) {
+        self.result.lock().expect("summary lock is not poisoned")
+            [&task_summary_key(node, script_name)]
+            .status = Status::Skipped;
     }
 
     pub(super) fn into_results(self, bail: bool) -> miette::Result<RunResults> {
@@ -39,6 +49,9 @@ impl RunSlots {
             statuses: self.result.into_inner().expect("summary lock is not poisoned"),
             ran_a_command: self.has_command.load(Ordering::Relaxed) > 0,
             first_failure: bail.then_some(first_failure).flatten(),
+            interrupted: self.interrupted
+                .into_inner()
+                .expect("interrupted slot lock is not poisoned"),
         })
     }
 }
@@ -49,6 +62,7 @@ pub(super) struct TaskRunner<'a, 'run, 'project> {
     pub(super) outcome: RunOutcome<'a>,
     pub(super) extra_env: &'a HashMap<String, String>,
     pub(super) bail: bool,
+    pub(super) script_budget: &'a ScriptBudget,
     /// pnpm pipes unless the output cannot interleave: `--stream` off, and
     /// the graph cannot put two scripts in flight at once.
     pub(super) inherit_output: bool,
@@ -57,7 +71,7 @@ pub(super) struct TaskRunner<'a, 'run, 'project> {
 
 impl TaskRunner<'_, '_, '_> {
     pub(super) fn run_task(&self, node: &TaskNode) -> TaskCompletion {
-        let summary_key = task_summary_key(node);
+        let summary_key = task_summary_key(node, self.run.script.script_name);
         let on_started = || {
             self.outcome.result.lock().expect("summary lock is not poisoned")[&summary_key]
                 .status = Status::Running;
@@ -77,6 +91,7 @@ impl TaskRunner<'_, '_, '_> {
             process: RunProjectProcess {
                 bail: self.bail,
                 process_tracker: self.outcome.process_tracker,
+                script_budget: self.script_budget,
                 on_started: &on_started,
             },
         });
@@ -89,6 +104,7 @@ pub(super) struct RunOutcome<'a> {
     pub(super) result: &'a Mutex<IndexMap<String, ExecutionStatus>>,
     pub(super) has_command: &'a AtomicUsize,
     pub(super) first_failure: &'a Mutex<Option<String>>,
+    pub(super) interrupted: &'a Mutex<Option<ScriptExit>>,
     pub(super) abort: &'a Mutex<Option<miette::Report>>,
     pub(super) process_tracker: Option<&'a ProcessTracker>,
     pub(super) task_run_state: &'a crate::cli_args::task_run_state::TaskRunState,
@@ -112,6 +128,12 @@ impl RunOutcome<'_> {
         let failed = execution.status.status == Status::Failure;
         let cancelled = execution.cancelled;
         let recursion_guarded = execution.recursion_guarded;
+        if let Some(exit) = execution.interrupted {
+            self.interrupted
+                .lock()
+                .expect("interrupted slot lock is not poisoned")
+                .get_or_insert(exit);
+        }
         self.result.lock().expect("summary lock is not poisoned")[summary_key] = execution.status;
         if cancelled {
             return TaskCompletion::Cancelled;
@@ -130,7 +152,7 @@ impl RunOutcome<'_> {
             return TaskCompletion::Passed;
         }
         let key = TaskKey { project: node.project.clone(), task_name: node.task_name.clone() };
-        match self.task_run_state.record_passed(&key, node, self.workspace_root) {
+        match self.task_run_state.record_passed(key, node, self.workspace_root) {
             Ok(()) => TaskCompletion::Passed,
             Err(error) => self.abort(error),
         }
@@ -155,6 +177,8 @@ struct ProjectExecution {
     has_command: usize,
     cancelled: bool,
     recursion_guarded: bool,
+    /// How the first script the user's interrupt ended exited.
+    interrupted: Option<ScriptExit>,
 }
 
 #[derive(Clone, Copy)]
@@ -180,9 +204,14 @@ pub(crate) struct RunProjectOutput {
 pub(crate) struct RunProjectProcess<'a> {
     bail: bool,
     process_tracker: Option<&'a ProcessTracker>,
-    on_started: &'a dyn Fn(),
+    script_budget: &'a ScriptBudget,
+    on_started: &'a (dyn Fn() + Sync),
 }
 
+/// Run the task's scripts — concurrently when the run's script-level
+/// concurrency allows it, one at a time otherwise, like the
+/// single-project `run` does through `run_selected_scripts`. Either way
+/// each script waits for a permit from the run's [`ScriptBudget`] first.
 fn run_project(options: &RunProjectOptions<'_, '_>) -> miette::Result<ProjectExecution> {
     let root = options.node.project.as_path();
     let manifest = &options.graph[root].package.project.manifest;
@@ -192,83 +221,156 @@ fn run_project(options: &RunProjectOptions<'_, '_>) -> miette::Result<ProjectExe
     // run's lifecycle events; the reporter renders `wd` and only groups
     // by this.
     let root_str = root.to_string_lossy().into_owned();
-    let mut execution = ProjectExecution {
-        status: ExecutionStatus::queued(),
-        has_command: 0,
-        cancelled: false,
-        recursion_guarded: false,
+    let run = ProjectScripts {
+        options,
+        manifest,
+        extra_env: &extra_env,
+        root_str: &root_str,
+        concurrency: script_concurrency(
+            options.config,
+            options.node.scripts.len(),
+            options.args.workspace.parallel,
+            options.args.sequential,
+        ),
     };
-    let mut project_failed = false;
-    for selected in &options.node.scripts {
-        let Some(script) = runnable_project_script(manifest, selected, options.args)? else {
-            continue;
-        };
-        // Running the script pnpm is already inside would recurse; the
-        // guard is what `pnpm -r test` from within a `test` script needs.
-        if reenters_running_script(selected, root) {
-            execution.recursion_guarded = true;
-            continue;
-        }
-
-        (options.process.on_started)();
-        if !project_failed {
-            execution.status.status = Status::Running;
-        }
-        execution.has_command += 1;
-        let ctx = options.run_context(manifest, root, &extra_env, &root_str);
-        let ran = run_one_project_script(
-            &ctx,
-            selected,
-            &script,
-            options.args,
-            &mut execution,
-            &mut project_failed,
-        )?;
-        // A cancelled run ends the project outright; `--bail` stops it
-        // at the first script that failed.
-        if !ran || (project_failed && options.process.bail) {
-            break;
-        }
+    if options.node.scripts.len() > 1 && run.concurrency > 1 {
+        return concurrent::run_scripts(&run);
     }
-    Ok(execution)
+    sequential::run_scripts(&run)
 }
 
-/// Run one of a project's scripts and record its verdict. `Ok(false)`
-/// when the run was cancelled, which ends the project outright.
-fn run_one_project_script(
+/// One task's script run: the shared run settings plus the per-task
+/// bits both execution modes need.
+struct ProjectScripts<'a, 'run, 'project> {
+    options: &'a RunProjectOptions<'run, 'project>,
+    manifest: &'a pnpm_package_manifest::PackageManifest,
+    extra_env: &'a HashMap<String, String>,
+    root_str: &'a str,
+    concurrency: usize,
+}
+
+/// The mutable outcome of one task's script run. A sequential run holds
+/// it directly; a concurrent run guards it in a [`Mutex`] and applies
+/// the same transitions. A `RegExp` selector can match several scripts in
+/// one task, but the summary carries a single status per task and the
+/// exit code derives from it: once one of the task's scripts has
+/// failed, nothing a later one does may overwrite that — under
+/// `--no-bail` the run would otherwise report itself green.
+struct ScriptRunState {
+    execution: ProjectExecution,
+    failed: bool,
+}
+
+impl ScriptRunState {
+    fn queued() -> Self {
+        ScriptRunState {
+            execution: ProjectExecution {
+                status: ExecutionStatus::queued(),
+                has_command: 0,
+                cancelled: false,
+                recursion_guarded: false,
+                interrupted: None,
+            },
+            failed: false,
+        }
+    }
+
+    /// Book a script that is about to run.
+    fn before_script(&mut self) {
+        if !self.failed {
+            self.execution.status.status = Status::Running;
+        }
+        self.execution.has_command += 1;
+    }
+
+    /// Book a script the run's cancellation ended. A task one of whose
+    /// own scripts already failed keeps that verdict: the cancellation
+    /// is what that failure asked for, and the summary reads the task as
+    /// cancelled rather than failed otherwise.
+    fn cancelled_script(&mut self) {
+        if !self.failed {
+            self.execution.cancelled = true;
+        }
+    }
+
+    /// Book a script the user's interrupt ended. The run ends with it, so
+    /// the task stops like a cancelled one, and the siblings the same
+    /// interrupt reached are left to shut down on their own.
+    fn interrupted_script(&mut self, exit: ScriptExit) {
+        self.cancelled_script();
+        self.execution.interrupted.get_or_insert(exit);
+    }
+}
+
+/// How one script settled.
+#[derive(Clone, Copy)]
+struct SettledScript {
+    status: ScriptExit,
+    /// Whether the user's interrupt ended the stage that ended the script.
+    interrupted: bool,
+    duration: f64,
+}
+
+/// Run one selected script's stages and time them.
+fn run_settled_script(
     ctx: &RunContext<'_>,
     selected: &str,
     script: &str,
-    args: &RunArgs,
-    execution: &mut ProjectExecution,
-    project_failed: &mut bool,
-) -> miette::Result<bool> {
-    let process_tracker = ctx.process_tracker;
+    args: &[String],
+) -> miette::Result<SettledScript> {
     let start = Instant::now();
-    let status = run_stages(ctx, selected, script, args.script_args())?;
-    let duration = start.elapsed().as_secs_f64() * 1e3;
+    let exit = run_stages(ctx, selected, script, args)?;
+    Ok(SettledScript {
+        status: exit.status,
+        interrupted: exit.interrupted,
+        duration: start.elapsed().as_secs_f64() * 1e3,
+    })
+}
 
-    if process_tracker.is_some_and(ProcessTracker::is_cancelled) {
-        execution.cancelled = true;
-        return Ok(false);
+/// Apply one settled script's verdict to the run state. `false` when
+/// the run was cancelled, which ends the project outright: both the
+/// tracker's own cancellation and a failure that arrives after the
+/// tracker already cancelled are that cancellation, not new outcomes.
+fn apply_script_result(
+    state: &mut ScriptRunState,
+    ctx: &RunContext<'_>,
+    settled: SettledScript,
+) -> bool {
+    let SettledScript { status, interrupted, duration } = settled;
+    if interrupted {
+        state.interrupted_script(status);
+        return false;
+    }
+    if ctx.process_tracker.is_some_and(ProcessTracker::is_cancelled) {
+        state.cancelled_script();
+        return false;
     }
     if status.success() {
-        // A project that already failed keeps that verdict, whatever its
-        // later scripts do.
-        if !*project_failed {
-            record_script_pass(&mut execution.status, duration);
+        if !state.failed {
+            record_script_pass(&mut state.execution.status, duration);
         }
-        return Ok(true);
+        return true;
     }
-    // A failure after the tracker already cancelled is that cancellation,
-    // not a new one.
-    if process_tracker.is_some_and(|process_tracker| !process_tracker.cancel()) {
-        execution.cancelled = true;
-        return Ok(false);
+    if ctx.process_tracker.is_some_and(|process_tracker| !process_tracker.cancel()) {
+        state.cancelled_script();
+        return false;
     }
-    *project_failed = true;
-    record_script_failure(&mut execution.status, ctx.dir, status, duration);
-    Ok(true)
+    state.failed = true;
+    record_script_failure(&mut state.execution.status, ctx.dir, status, duration);
+    true
+}
+
+/// Take the run's permission to start one more script. `None` when the
+/// run was cancelled while this script waited for a permit: a script
+/// that only reached the front of the queue after the run gave up was
+/// dispatched in name only, and starting it would grow a run that is
+/// already unwinding.
+fn start_script<'a>(process: &RunProjectProcess<'a>) -> Option<ScriptPermit<'a>> {
+    let permit = process.script_budget.acquire();
+    if process.process_tracker.is_some_and(ProcessTracker::is_cancelled) {
+        return None;
+    }
+    Some(permit)
 }
 
 /// The script body to run for one selected name. `None` when the
@@ -296,6 +398,7 @@ fn project_extra_env(
     extra_env: &HashMap<String, String>,
 ) -> HashMap<String, String> {
     let mut extra_env = extra_env.clone();
+    config.add_cas_loader_env(root, &mut extra_env);
     if let Some(pnp_path) = pnp_path_for_execution(config, root) {
         let node_options = extra_env.get("NODE_OPTIONS").map(String::as_str);
         extra_env.insert(
@@ -328,7 +431,7 @@ fn script_output(inherit_output: bool, root_str: &str, emit: fn(&LogEvent)) -> S
     if inherit_output {
         ScriptOutput::Inherit
     } else {
-        ScriptOutput::Streamed { dep_path: root_str, emit }
+        ScriptOutput::Streamed { dep_path: root_str, emit, color: script_output_colors() }
     }
 }
 
@@ -367,6 +470,15 @@ impl RunProjectOptions<'_, '_> {
             silent: self.output.silent,
             output: script_output(self.output.inherit_output, root_str, self.output.emit),
             process_tracker: self.process.process_tracker,
+            emit: self.output.emit,
         }
     }
 }
+
+mod concurrent;
+mod github_group;
+
+mod sequential;
+
+#[cfg(test)]
+mod tests;

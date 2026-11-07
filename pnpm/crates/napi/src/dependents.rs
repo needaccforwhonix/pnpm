@@ -25,7 +25,9 @@ use napi_derive::napi;
 use pnpm_deps_inspection::{
     MAX_WALK_DEPTH,
     build::{LoadedState, importer_root_ids, read_project_manifest, safe_importer_dir},
-    dependents::{BuildDependentsOptions, DependentsTree, ImporterInfo, build_dependents_tree},
+    dependents::{
+        BuildDependentsOptions, DependentNode, DependentsTree, ImporterInfo, build_dependents_tree,
+    },
     dependents_render::{
         RenderDependentsOptions, render_dependents_json, render_dependents_parseable,
         render_dependents_tree,
@@ -33,13 +35,13 @@ use pnpm_deps_inspection::{
     graph::{BuildGraphOptions, build_dependency_graph},
     search::Searcher,
 };
-use pnpm_lockfile::Lockfile;
+use pnpm_lockfile::{Lockfile, PeerEdgeOptions};
 use pnpm_matcher::create_matcher;
 use pnpm_modules_yaml::{DEFAULT_VIRTUAL_STORE_DIR_MAX_LENGTH, IncludedDependencies};
 
 use crate::error::report_to_napi_error;
 
-/// Inputs for [`get_dependents`]. Mirrors [`DependentsOptions`] in `index.d.ts`.
+/// Inputs for [`get_dependents`].
 #[napi(object)]
 #[cfg_attr(
     dylint_lib = "perfectionist",
@@ -79,10 +81,13 @@ pub struct DependentsOptions {
     /// tree, as `manifest`. Nodes whose manifest is missing (and every
     /// workspace-project node) carry none.
     pub manifest_fields: Option<Vec<String>>,
+    /// Whether a `devDependencies` entry of the root importer provides a peer to
+    /// every importer when a walk that leaves out a group decides which
+    /// optional-peer edges to skip. Defaults to `false`.
+    pub resolve_peers_from_workspace_root: Option<bool>,
 }
 
-/// Inputs for [`render_dependents`]. Mirrors [`RenderDependentsOptions`]
-/// in `index.d.ts`.
+/// Inputs for [`render_dependents`].
 #[napi(object)]
 pub struct RenderDependentsInput {
     /// `"tree"` (the default), `"parseable"`, or `"json"`.
@@ -99,6 +104,7 @@ pub struct RenderDependentsInput {
 /// which is an answer, not an error.
 #[napi]
 pub async fn get_dependents(options: DependentsOptions) -> napi::Result<serde_json::Value> {
+    pnpm_package_manager::configure_rayon_pool();
     tokio::task::spawn_blocking(move || build_trees(&options)).await
         .map_err(|join_error| {
             napi::Error::from_reason(format!(
@@ -123,7 +129,7 @@ pub fn render_dependents(
     options: Option<RenderDependentsInput>,
 ) -> napi::Result<String> {
     reject_over_deep_trees(&trees)?;
-    let trees: Vec<DependentsTree> = serde_json::from_value(trees)
+    let trees: Vec<DependentsTree> = deserialize_trees(trees)
         .map_err(|err| {
             napi::Error::from_reason(format!("the trees argument is not a dependents tree: {err}"))
         })?;
@@ -175,6 +181,50 @@ fn reject_over_deep_trees(trees: &serde_json::Value) -> napi::Result<()> {
     Ok(())
 }
 
+/// Deserialize each node's flat fields before recursing into its
+/// `dependents` array so the generated `serde::Deserialize` visitor frame
+/// does not remain on the stack across `MAX_WALK_DEPTH` levels.
+fn deserialize_trees(trees: serde_json::Value) -> Result<Vec<DependentsTree>, serde_json::Error> {
+    let serde_json::Value::Array(items) = trees else {
+        return serde_json::from_value(trees);
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for mut item in items {
+        let dependents = item
+            .as_object_mut()
+            .and_then(|obj| match obj.get("dependents") {
+                Some(serde_json::Value::Array(_)) => obj.remove("dependents"),
+                _ => None,
+            });
+        let mut tree: DependentsTree = serde_json::from_value(item)?;
+        if let Some(serde_json::Value::Array(children)) = dependents {
+            tree.dependents = deserialize_nodes(children)?;
+        }
+        out.push(tree);
+    }
+    Ok(out)
+}
+
+fn deserialize_nodes(
+    children: Vec<serde_json::Value>,
+) -> Result<Vec<DependentNode>, serde_json::Error> {
+    let mut out = Vec::with_capacity(children.len());
+    for mut value in children {
+        let dependents = value
+            .as_object_mut()
+            .and_then(|obj| match obj.get("dependents") {
+                Some(serde_json::Value::Array(_)) => obj.remove("dependents"),
+                _ => None,
+            });
+        let mut node: DependentNode = serde_json::from_value(value)?;
+        if let Some(serde_json::Value::Array(nested)) = dependents {
+            node.dependents = Some(deserialize_nodes(nested)?);
+        }
+        out.push(node);
+    }
+    Ok(out)
+}
+
 fn build_trees(options: &DependentsOptions) -> napi::Result<Vec<DependentsTree>> {
     let lockfile_dir = PathBuf::from(&options.dir);
     let loaded =
@@ -188,6 +238,7 @@ fn build_trees(options: &DependentsOptions) -> napi::Result<Vec<DependentsTree>>
         virtual_store_dir_max_length(options),
         &registries,
         BTreeMap::new(),
+        peer_edge_options(options),
     ) else {
         return Ok(Vec::new());
     };
@@ -201,6 +252,7 @@ fn build_trees(options: &DependentsOptions) -> napi::Result<Vec<DependentsTree>>
             lockfile,
             include: included_dependencies(options),
             only_projects: false,
+            peer_edges: peer_edge_options(options),
         },
     );
     let searcher =
@@ -280,6 +332,14 @@ fn included_dependencies(options: &DependentsOptions) -> IncludedDependencies {
         dependencies: options.include_dependencies.unwrap_or(true),
         dev_dependencies: options.include_dev_dependencies.unwrap_or(true),
         optional_dependencies: options.include_optional_dependencies.unwrap_or(true),
+    }
+}
+
+fn peer_edge_options(options: &DependentsOptions) -> PeerEdgeOptions {
+    PeerEdgeOptions {
+        resolve_peers_from_workspace_root: options
+            .resolve_peers_from_workspace_root
+            .unwrap_or(false),
     }
 }
 

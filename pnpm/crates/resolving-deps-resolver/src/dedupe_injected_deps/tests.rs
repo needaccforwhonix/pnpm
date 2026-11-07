@@ -1,5 +1,8 @@
 use super::{DirectByImporter, dedupe_injected_deps};
-use crate::dependencies_graph::{DependenciesGraph, DependenciesGraphNode};
+use crate::{
+    dependencies_graph::{DependenciesGraph, DependenciesGraphNode},
+    peer_dependents_dedupe::UnboundOptionalPeers,
+};
 use pnpm_deps_path::DepPath;
 use pnpm_lockfile::{DirectoryResolution, LockfileResolution};
 use pnpm_resolving_resolver_base::{PkgResolutionId, ResolveResult};
@@ -24,16 +27,16 @@ fn make_node(id: &str, children: BTreeMap<String, DepPath>) -> DependenciesGraph
                 latest: None,
                 published_at: None,
                 manifest: None,
+                non_deprecated_alternative: None,
             },
         }),
         depth: 0,
-        installable: true,
         is_pure: true,
         optional: false,
         edges: crate::ResolvedDependencyEdges {
             children,
             optional_children: HashSet::default(),
-            peer_dependencies: BTreeMap::new(),
+            peer_set: crate::PeerSet::default(),
             transitive_peer_dependencies: HashSet::default(),
             resolved_peer_names: HashSet::default(),
         },
@@ -58,7 +61,13 @@ fn rewrites_childless_injected_dep_to_link() {
     roots.insert("project-1".to_string(), p1_root);
     roots.insert("project-2".to_string(), p2_root);
 
-    dedupe_injected_deps(&mut graph, &mut direct, &roots, &lockfile_dir);
+    dedupe_injected_deps(
+        &mut graph,
+        &mut direct,
+        &roots,
+        &lockfile_dir,
+        &UnboundOptionalPeers::default(),
+    );
 
     let after = direct
         .get("project-2")
@@ -94,7 +103,13 @@ fn rewrites_scoped_injected_dep_to_link() {
     roots.insert("fixtures/host".to_string(), host_root);
     roots.insert("fixtures/host/pkg".to_string(), pkg_root);
 
-    dedupe_injected_deps(&mut graph, &mut direct, &roots, &lockfile_dir);
+    dedupe_injected_deps(
+        &mut graph,
+        &mut direct,
+        &roots,
+        &lockfile_dir,
+        &UnboundOptionalPeers::default(),
+    );
 
     let after = direct
         .get("fixtures/host")
@@ -131,7 +146,13 @@ fn leaves_injected_dep_when_children_differ() {
     roots.insert("project-1".to_string(), p1_root);
     roots.insert("project-2".to_string(), p2_root);
 
-    dedupe_injected_deps(&mut graph, &mut direct, &roots, &lockfile_dir);
+    dedupe_injected_deps(
+        &mut graph,
+        &mut direct,
+        &roots,
+        &lockfile_dir,
+        &UnboundOptionalPeers::default(),
+    );
 
     let after = direct
         .get("project-2")
@@ -168,7 +189,13 @@ fn rewrites_when_children_subset_of_target_direct_deps() {
     roots.insert("project-1".to_string(), p1_root);
     roots.insert("project-2".to_string(), p2_root);
 
-    dedupe_injected_deps(&mut graph, &mut direct, &roots, &lockfile_dir);
+    dedupe_injected_deps(
+        &mut graph,
+        &mut direct,
+        &roots,
+        &lockfile_dir,
+        &UnboundOptionalPeers::default(),
+    );
 
     let after = direct
         .get("project-2")
@@ -224,7 +251,13 @@ fn rewrites_when_shared_dep_differs_only_by_peer_suffix() {
     roots.insert("project-1".to_string(), p1_root);
     roots.insert("project-2".to_string(), p2_root);
 
-    dedupe_injected_deps(&mut graph, &mut direct, &roots, &lockfile_dir);
+    dedupe_injected_deps(
+        &mut graph,
+        &mut direct,
+        &roots,
+        &lockfile_dir,
+        &UnboundOptionalPeers::default(),
+    );
 
     let after = direct
         .get("project-2")
@@ -248,7 +281,13 @@ fn ignores_non_workspace_file_deps() {
     let mut roots = BTreeMap::new();
     roots.insert(".".to_string(), lockfile_dir.clone());
 
-    dedupe_injected_deps(&mut graph, &mut direct, &roots, &lockfile_dir);
+    dedupe_injected_deps(
+        &mut graph,
+        &mut direct,
+        &roots,
+        &lockfile_dir,
+        &UnboundOptionalPeers::default(),
+    );
 
     let after = direct
         .get(".")

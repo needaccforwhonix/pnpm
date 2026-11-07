@@ -4,7 +4,7 @@ use pnpm_lockfile::LockfileResolution;
 use pnpr_route::RouteContext;
 
 use super::{
-    json_error,
+    json_error, json_error_with_code,
     protocol::{ProjectDeps, ResolveRequest},
 };
 
@@ -57,14 +57,17 @@ pub(super) fn reject_off_allowlist_fetches(
 
 /// Every spec of the request that could name a fetch target: direct-URL
 /// dependency specs, catalog and package-extension entries, and input-lockfile
-/// tarball URLs. They reach the network only when they carry an http(s)/git
+/// tarball URLs. They reach the network only when they carry an HTTP, HTTPS, or git
 /// URL, which the caller decides.
 fn fetchable_specs<'a>(request: &'a ResolveRequest, projects: &'a [ProjectDeps]) -> Vec<&'a str> {
     let mut url_specs: Vec<&str> = Vec::new();
     for project in projects {
-        for map in
-            [&project.dependencies, &project.dev_dependencies, &project.optional_dependencies]
-        {
+        for map in [
+            &project.dependencies,
+            &project.dev_dependencies,
+            &project.optional_dependencies,
+            &project.peer_dependencies,
+        ] {
             url_specs.extend(map.values().map(String::as_str));
         }
     }
@@ -189,6 +192,42 @@ pub(super) fn reject_invalid_patch_hashes(request: &ResolveRequest) -> Option<Re
     ))
 }
 
+/// Reject a project whose `publishConfig.directory` escapes the project it
+/// belongs to. The resolver joins the value onto the project dir to build a
+/// workspace link, and the request is untrusted, so an absolute, drive- or
+/// UNC-bearing, or `..`-carrying value must not reach that join. Runs before
+/// every resolve path, including the frozen fast path that returns the caller's
+/// input lockfile without walking the tree.
+///
+/// Unlike the importer dir this value is not an identity that two builds have
+/// to agree on, so a benign non-canonical form such as `./dist` stays accepted:
+/// a local install resolves it, and failing only through a server would break
+/// installs that work without one.
+/// Returns a `400` response when one is found.
+pub(super) fn reject_unsafe_publish_directories(request: &ResolveRequest) -> Option<Response> {
+    let directory = request.projects
+        .as_deref()?
+        .iter()
+        .filter_map(|project| project.publish_config.as_ref()?.directory.as_deref())
+        .find(|directory| escapes_its_project(directory))?;
+    Some(json_error(
+        StatusCode::BAD_REQUEST,
+        &format!("publishConfig.directory {directory:?} points outside its project"),
+    ))
+}
+
+/// Whether a client-supplied publish directory could address a path outside the
+/// project it is joined onto: absolute, drive- or UNC-bearing (a backslash or a
+/// colon), or carrying a `..` component.
+fn escapes_its_project(directory: &str) -> bool {
+    directory.starts_with('/')
+        || directory.contains('\\')
+        || directory.contains(':')
+        || directory
+            .split('/')
+            .any(|component| component == "..")
+}
+
 /// Reject a request whose client-supplied URLs carry inline
 /// `user:pass@host` credentials, before any fetch or cache write. Covers
 /// the default and named registries, every dependency spec, catalog and
@@ -242,4 +281,19 @@ fn overrides_have_inline_url_auth(value: &serde_json::Value) -> bool {
         serde_json::Value::Object(map) => map.values().any(overrides_have_inline_url_auth),
         _ => false,
     }
+}
+
+pub(super) fn reject_incompatible_lockfile_format(request: &ResolveRequest) -> Option<Response> {
+    let formats = request.accepted_lockfile_formats.as_ref()?;
+    if !formats
+        .iter()
+        .any(|format| format == "9.0" || format == "9")
+    {
+        return Some(json_error_with_code(
+            StatusCode::BAD_REQUEST,
+            "incompatible lockfile format: server supports format 9.0",
+            Some("ERR_PNPR_INCOMPATIBLE_LOCKFILE_FORMAT"),
+        ));
+    }
+    None
 }

@@ -175,10 +175,7 @@ fn hoist_false_clears_the_hoist_pattern() {
 
 /// pnpm 11 does the same: a project entry's `hoist: true` reaches the
 /// install as a bare boolean, and the pattern the workspace's
-/// `hoist: false` cleared is gone by then. Re-enabling hoisting for one
-/// project of a workspace that turned it off would be a pnpm 12-only
-/// behavior, so it waits for a decision rather than arriving as a side
-/// effect of this parity fix.
+/// `hoist: false` cleared is gone by then.
 #[test]
 fn hoist_true_does_not_restore_a_cleared_hoist_pattern() {
     let workspace = tempfile::tempdir().unwrap();
@@ -205,5 +202,5 @@ fn modules_dir_resolves_against_the_project_and_carries_the_virtual_store() {
         ProjectConfig { modules_dir: Some("modules".to_string()), ..ProjectConfig::default() },
     );
     assert_eq!(config.modules_dir, project_dir.join("modules"));
-    assert_eq!(config.virtual_store_dir, project_dir.join("modules").join(".pnpm"));
+    assert_eq!(config.install_state_dir, project_dir.join("modules").join(".pnpm"));
 }

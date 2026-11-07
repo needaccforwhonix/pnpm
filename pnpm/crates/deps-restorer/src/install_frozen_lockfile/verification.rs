@@ -1,5 +1,6 @@
 use super::{InstallFrozenLockfileError, LockfileVerificationOverride};
-use crate::{CreateVirtualStore, CreateVirtualStoreOutput};
+use crate::{CheckVerdict, ConcurrentCheck, CreateVirtualStore, CreateVirtualStoreOutput};
+use pnpm_config::Config;
 use pnpm_lockfile::Lockfile;
 use pnpm_lockfile_verification::{VerifyLockfileResolutionsOptions, verify_lockfile_resolutions};
 use pnpm_reporter::Reporter;
@@ -22,39 +23,30 @@ pub(super) struct ConcurrentVerification<'a> {
 /// Materialize the virtual store while verifying the lockfile, and
 /// return the fetch's output once the lockfile is known trusted.
 ///
-/// The two run concurrently so the verifiers' per-entry registry round
-/// trips overlap the downloads. A rejected lockfile aborts the fetch in
-/// flight, and a verdict is always reached before this returns, so no
-/// dependency lifecycle script can run on an unverified lockfile.
+/// The verification is the fetch's concurrent check, so the verifiers'
+/// per-entry registry round trips overlap the downloads. A rejected
+/// lockfile aborts the fetch in flight, and the fetch drives the check
+/// to its verdict before returning, so no dependency lifecycle script
+/// can run on an unverified lockfile.
 ///
-/// The verification verdict takes precedence over a fetch error: a plain
-/// `try_join!` would surface whichever error landed first, letting an
-/// unrelated fetch failure mask a rejected lockfile. So a fetch failure
-/// waits for the verdict and only surfaces once the lockfile is trusted.
+/// The verification verdict takes precedence over a fetch error, so an
+/// unrelated fetch failure never masks a rejected lockfile: a fetch
+/// failure waits for the verdict and only surfaces once the lockfile is
+/// trusted.
 pub(super) async fn fetch_verified<Reporter: self::Reporter>(
     create_virtual_store: CreateVirtualStore<'_>,
     verification: ConcurrentVerification<'_>,
 ) -> Result<CreateVirtualStoreOutput, InstallFrozenLockfileError> {
-    let verify = verification.run::<Reporter>();
-    let fetch = async {
-        create_virtual_store
-            .run::<Reporter>()
-            .await
-            .map_err(InstallFrozenLockfileError::CreateVirtualStore)
-    };
-
-    let mut verify = std::pin::pin!(verify);
-    let mut fetch = std::pin::pin!(fetch);
-    tokio::select! {
-        verdict = &mut verify => {
-            verdict?;
-            fetch.await
-        }
-        output = &mut fetch => {
-            verify.await?;
-            output
-        }
-    }
+    let mut verdict = None;
+    let check: ConcurrentCheck<'_> = Box::pin(async {
+        let outcome = verification.run::<Reporter>().await;
+        let decision = if outcome.is_ok() { CheckVerdict::Continue } else { CheckVerdict::Abort };
+        verdict = Some(outcome);
+        decision
+    });
+    let output = create_virtual_store.run_with_check::<Reporter>(Some(check)).await;
+    verdict.expect("the fetch drives its concurrent check to its verdict")?;
+    output.map_err(InstallFrozenLockfileError::CreateVirtualStore)
 }
 /// Load custom fetchers from the install's pnpmfiles, if any.
 /// Returns `Ok(None)` when no pnpmfile exists or it exports no
@@ -63,6 +55,7 @@ pub(super) async fn fetch_verified<Reporter: self::Reporter>(
 /// the custom-resolver load on the fresh-lockfile path.
 pub(super) async fn load_custom_fetcher_session(
     hook: Option<&Arc<dyn pnpm_hooks::PnpmfileHooks>>,
+    config: &Config,
 ) -> Result<Option<Arc<crate::CustomFetcherSession>>, InstallFrozenLockfileError> {
     let Some(hook) = hook else { return Ok(None) };
     let fetchers = hook
@@ -78,7 +71,10 @@ pub(super) async fn load_custom_fetcher_session(
     if fetchers.is_empty() {
         return Ok(None);
     }
-    Ok(Some(Arc::new(crate::CustomFetcherSession::new(fetchers))))
+    Ok(Some(Arc::new(
+        crate::CustomFetcherSession::with_config(fetchers, config)
+            .map_err(InstallFrozenLockfileError::VersionPolicy)?,
+    )))
 }
 
 impl ConcurrentVerification<'_> {
@@ -103,6 +99,8 @@ impl ConcurrentVerification<'_> {
                 concurrency: None,
                 lockfile_path,
                 cache_dir: Some(cache_dir),
+                replaced: None,
+                repairs_lockfile: false,
             },
         )
         .await

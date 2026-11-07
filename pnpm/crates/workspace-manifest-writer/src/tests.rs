@@ -11,7 +11,8 @@ use pnpm_package_manifest::PackageManifest;
 use tempfile::TempDir;
 
 use crate::{
-    UpdateWorkspaceManifestOptions, WORKSPACE_MANIFEST_FILENAME, update_workspace_manifest,
+    CatalogReferenceSources, UpdateWorkspaceManifestOptions, WORKSPACE_MANIFEST_FILENAME,
+    update_workspace_manifest,
 };
 
 fn catalogs(entries: &[(&str, &[(&str, &str)])]) -> Catalogs {
@@ -58,7 +59,10 @@ fn run_cleanup(
         &UpdateWorkspaceManifestOptions {
             updated_catalogs: updated,
             catalog_prune: true,
-            all_projects: projects,
+            catalog_references: CatalogReferenceSources {
+                all_projects: projects,
+                ..Default::default()
+            },
             ..Default::default()
         },
     )
@@ -243,7 +247,10 @@ fn run_update_field(
 /// assert the parsed shape; these assert the format-preserving text the
 /// pacquet writer produces for the same inputs.
 mod remove_unused_catalogs {
-    use super::{PackageManifest, catalogs, project, run_cleanup};
+    use super::{
+        CatalogReferenceSources, PackageManifest, UpdateWorkspaceManifestOptions, catalogs,
+        project, run_cleanup, run_with,
+    };
 
     /// TS: `remove the default catalog if it is empty`.
     #[test]
@@ -401,6 +408,30 @@ mod remove_unused_catalogs {
             ),
         );
     }
+
+    #[test]
+    fn keeps_unreferenced_entries_listed_in_kept_catalogs() {
+        let consumer = project(serde_json::json!({ "dependencies": { "abc": "catalog:foo" } }));
+        let kept = catalogs(&[("default", &[("bar", "3.2.1")]), ("foo", &[("ghi", "7.8.9")])]);
+        let out = run_with(
+            Some(
+                "catalog:\n  bar: 3.2.1\n  baz: 1.0.0\n\
+                 catalogs:\n  foo:\n    abc: 0.1.2\n    ghi: 7.8.9\n    jkl: 1.0.0\n",
+            ),
+            &UpdateWorkspaceManifestOptions {
+                catalog_prune: true,
+                catalog_references: CatalogReferenceSources {
+                    all_projects: &[&consumer],
+                    kept_catalogs: Some(&kept),
+                },
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            out.as_deref(),
+            Some("catalog:\n  bar: 3.2.1\ncatalogs:\n  foo:\n    abc: 0.1.2\n    ghi: 7.8.9\n"),
+        );
+    }
 }
 
 /// The `minimumReleaseAgeExcludePrune` pass: entries of
@@ -459,6 +490,19 @@ mod minimum_release_age_exclude_prune {
         let original = "minimumReleaseAgeExclude:\n  - foo@1.0.0 || 2.0.0\n";
         let out = run_age_cleanup(Some(original), Some(&resolved(&[("foo", &["2.0.0"])])));
         assert_eq!(out.as_deref(), Some("minimumReleaseAgeExclude:\n  - foo@2.0.0\n"));
+    }
+
+    #[test]
+    fn rewrites_a_narrowed_version_union_with_double_quotes_when_workspace_manifest_uses_double_quotes()
+     {
+        let original = "trustPolicy: \"no-downgrade\"\nminimumReleaseAgeExclude:\n  - \"@scope/foo@1.0.0 || 2.0.0\"\n";
+        let out = run_age_cleanup(Some(original), Some(&resolved(&[("@scope/foo", &["2.0.0"])])));
+        assert_eq!(
+            out.as_deref(),
+            Some(
+                "trustPolicy: \"no-downgrade\"\nminimumReleaseAgeExclude:\n  - \"@scope/foo@2.0.0\"\n",
+            ),
+        );
     }
 
     #[test]
@@ -529,6 +573,46 @@ mod minimum_release_age_exclude_prune {
         let out = run_age_cleanup(Some(original), Some(&resolved(&[])));
         assert_eq!(out.as_deref(), Some(original));
     }
+
+    #[test]
+    fn prunes_entries_with_zero_indentation() {
+        let original = "minimumReleaseAgeExclude:\n- foo@1.0.0\n- bar@2.0.0\n";
+        let out = run_age_cleanup(Some(original), Some(&resolved(&[("foo", &["1.0.0"])])));
+        assert_eq!(out.as_deref(), Some("minimumReleaseAgeExclude:\n- foo@1.0.0\n"));
+    }
+
+    #[test]
+    fn prunes_entries_with_zero_indentation_and_tab_separation() {
+        let original = "minimumReleaseAgeExclude:\n-\tfoo@1.0.0\n-\tbar@2.0.0\n";
+        let out = run_age_cleanup(Some(original), Some(&resolved(&[("foo", &["1.0.0"])])));
+        assert_eq!(out.as_deref(), Some("minimumReleaseAgeExclude:\n-\tfoo@1.0.0\n"));
+    }
+
+    #[test]
+    fn prunes_entries_with_zero_indentation_and_preserves_comments() {
+        let original = "minimumReleaseAgeExcludePrune: true\nminimumReleaseAgeExclude:\n# header\n- foo@1.0.0 # kept\n- bar@2.0.0 # pruned\npackages:\n  - '*'\n";
+        let out = run_age_cleanup(Some(original), Some(&resolved(&[("foo", &["1.0.0"])])));
+        assert_eq!(
+            out.as_deref(),
+            Some(
+                "minimumReleaseAgeExcludePrune: true\nminimumReleaseAgeExclude:\n# header\n- foo@1.0.0 # kept\npackages:\n  - '*'\n"
+            ),
+        );
+    }
+
+    #[test]
+    fn prunes_entries_with_four_space_indentation() {
+        let original = "minimumReleaseAgeExclude:\n    - foo@1.0.0\n    - bar@2.0.0\n";
+        let out = run_age_cleanup(Some(original), Some(&resolved(&[("foo", &["1.0.0"])])));
+        assert_eq!(out.as_deref(), Some("minimumReleaseAgeExclude:\n    - foo@1.0.0\n"));
+    }
+
+    #[test]
+    fn emptying_zero_indentation_block_removes_it_cleanly() {
+        let original = "packages:\n  - '*'\nminimumReleaseAgeExclude:\n- foo@1.0.0\n";
+        let out = run_age_cleanup(Some(original), Some(&resolved(&[])));
+        assert_eq!(out.as_deref(), Some("packages:\n  - '*'\n"));
+    }
 }
 
 /// The `trustPolicyExcludePrune` pass: entries of `trustPolicyExclude`
@@ -586,6 +670,17 @@ mod trust_policy_exclude_prune {
         let original = "trustPolicyExclude:\n  - foo@1.0.0 || 2.0.0\n";
         let out = run_trust_cleanup(Some(original), Some(&resolved(&[("foo", &["2.0.0"])])));
         assert_eq!(out.as_deref(), Some("trustPolicyExclude:\n  - foo@2.0.0\n"));
+    }
+
+    #[test]
+    fn rewrites_a_narrowed_version_union_with_double_quotes_when_workspace_manifest_uses_double_quotes()
+     {
+        let original = "trustPolicy: \"no-downgrade\"\ntrustPolicyExclude:\n  - \"@scope/foo@1.0.0 || 2.0.0\"\n";
+        let out = run_trust_cleanup(Some(original), Some(&resolved(&[("@scope/foo", &["2.0.0"])])));
+        assert_eq!(
+            out.as_deref(),
+            Some("trustPolicy: \"no-downgrade\"\ntrustPolicyExclude:\n  - \"@scope/foo@2.0.0\"\n",),
+        );
     }
 
     #[test]
@@ -726,6 +821,13 @@ mod trust_policy_exclude_prune {
         let out = run_trust_cleanup(Some(original), Some(&resolved(&[("bar", &["2.0.0"])])));
         assert_eq!(out.as_deref(), Some("trustPolicyExclude:\n\n  - bar@2.0.0\n"));
     }
+
+    #[test]
+    fn keeps_document_end_marker_footer_when_an_entry_is_pruned() {
+        let original = "trustPolicyExclude:\n- foo@1.0.0\n- bar@2.0.0\n...\n";
+        let out = run_trust_cleanup(Some(original), Some(&resolved(&[("foo", &["1.0.0"])])));
+        assert_eq!(out.as_deref(), Some("trustPolicyExclude:\n- foo@1.0.0\n...\n"));
+    }
 }
 
 fn run_prune_allow_builds(original: Option<&str>, resolved: &[&str]) -> Option<String> {
@@ -771,3 +873,10 @@ mod manifests;
 mod dependencies;
 
 mod integrity;
+
+mod render;
+mod scalar_aliases;
+
+mod permissions;
+
+mod includes;

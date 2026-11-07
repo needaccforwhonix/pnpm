@@ -1,11 +1,34 @@
 use super::{
-    AddMockedRegistry, CommandTempCwd, GitRepoFixture, IS_POSITIVE_BINDING_GYP_PATCH,
-    IS_POSITIVE_HOOKS_FILE_PATCH, IS_POSITIVE_POSTINSTALL_PATCH, MARKER_PATCH, Value,
+    AddMockedRegistry, BINDING_GYP_DELETION_HUNK, CommandTempCwd, GYPFILE_FALSE_REMOVAL_PATCH,
+    GitRepoFixture, IS_POSITIVE_BINDING_GYP_PATCH, IS_POSITIVE_HOOKS_FILE_PATCH,
+    IS_POSITIVE_POSTINSTALL_PATCH, MANIFEST_DELETION_PATCH, MARKER_PATCH, Path, Value,
     append_workspace_yaml_key, assert_patch_apply_failure, assert_patch_install_scenario, fs,
     is_positive_store_row, pacquet, patch_file_hash, read_installed_index, read_wanted_lockfile,
     remove_dir_if_exists, setup_configured_patch, setup_configured_patch_with_yaml, snapshot_keys,
 };
 use assert_cmd::assert::OutputAssertExt;
+use pnpm_testing_utils::fs::bump_mtime;
+
+/// The map records the hash bare, so replacing the parenthesized form reaches
+/// only the segments and leaves `patchedDependencies` alone.
+fn rewrite_patch_hash_segments(workspace: &Path, patch_hash: &str, replacement: &str) {
+    rewrite_lockfile_patch_hash_segments(
+        &workspace.join("pnpm-lock.yaml"),
+        patch_hash,
+        replacement,
+    );
+}
+
+fn rewrite_lockfile_patch_hash_segments(lockfile_path: &Path, patch_hash: &str, replacement: &str) {
+    let text = fs::read_to_string(lockfile_path).expect("read the lockfile");
+    let rewritten = text.replace(&format!("(patch_hash={patch_hash})"), replacement);
+    assert_ne!(rewritten, text, "the lockfile must carry a patch hash to rewrite");
+    fs::write(lockfile_path, rewritten).expect("write the lockfile");
+    bump_mtime(lockfile_path);
+}
+
+const STALE_PATCH_HASH_SEGMENT: &str =
+    "(patch_hash=0000000000000000000000000000000000000000000000000000000000000000)";
 
 /// TS: `patch package with exact version` (`patch.ts:24`).
 #[test]
@@ -63,23 +86,19 @@ fn install_level_patch_that_adds_install_scripts_asks_for_approval() {
     eprintln!("unapproved install:\n{combined}");
     assert!(!output.status.success(), "an unapproved build must fail under strictDepBuilds");
     // The package name is not matched here: the diagnostic wraps it
-    // across lines. The `allowBuilds` entry asserted below names it.
+    // across lines.
     assert!(
         combined.contains("ERR_PNPM_IGNORED_BUILDS") && combined.contains("Ignored build scripts"),
         "expected the patched package to be reported as an ignored build; got:\n{combined}",
     );
     assert!(!marker.exists(), "the postinstall must not run before it is approved");
 
-    // The failed install left an `allowBuilds` entry for the user to
-    // decide on; answering it is what `pnpm approve-builds` writes.
-    let yaml_path = workspace.join("pnpm-workspace.yaml");
-    let yaml = fs::read_to_string(&yaml_path).expect("read pnpm-workspace.yaml");
-    assert!(
-        yaml.contains("is-positive: set this to true or false"),
-        "expected an undecided allowBuilds entry; got:\n{yaml}",
+    // Approving the build is what `pnpm approve-builds` writes.
+    append_workspace_yaml_key(
+        &workspace,
+        "allowBuilds",
+        serde_json::json!({ "is-positive": true }),
     );
-    fs::write(&yaml_path, yaml.replace("set this to true or false", "true"))
-        .expect("write pnpm-workspace.yaml");
     remove_dir_if_exists(&workspace.join("node_modules"));
     pacquet(&workspace, ["install", "--reporter=silent"]).assert().success();
     assert!(marker.exists(), "the approved postinstall must run");
@@ -250,8 +269,23 @@ fn git_dependency_patch_applies_on_fresh_and_frozen_install() {
 /// (`patch.ts:269`).
 #[test]
 fn install_level_modified_patch_is_reapplied() {
-    let (root, workspace, npmrc_info) =
-        setup_configured_patch("is-positive@1.0.0", "is-positive@1.0.0.patch");
+    assert_modified_patch_is_reapplied("");
+}
+
+/// The hoisted linker leaves a package already in place alone, a patched
+/// one included. The edited patch changes the `patch_hash` in its dep
+/// path, which is what sends it to the linker again.
+#[test]
+fn install_level_modified_patch_is_reapplied_with_hoisted_linker() {
+    assert_modified_patch_is_reapplied("nodeLinker: hoisted\n");
+}
+
+fn assert_modified_patch_is_reapplied(extra_yaml: &str) {
+    let (root, workspace, npmrc_info) = setup_configured_patch_with_yaml(
+        "is-positive@1.0.0",
+        "is-positive@1.0.0.patch",
+        extra_yaml,
+    );
     let AddMockedRegistry { mock_instance, .. } = npmrc_info;
 
     pacquet(&workspace, ["install", "--reporter=silent"]).assert().success();
@@ -430,6 +464,119 @@ fn hoisted_patch_reaches_every_nested_copy_of_a_package() {
     drop((root, mock_instance));
 }
 
+/// Prepends a line to `index.js`. The hunk's context still matches, at an
+/// offset, on a copy that already carries the patch, so a second
+/// application duplicates the line instead of being rejected.
+const IS_POSITIVE_PREPEND_PATCH: &str = concat!(
+    "diff --git a/index.js b/index.js\n",
+    "--- a/index.js\n",
+    "+++ b/index.js\n",
+    "@@ -1,3 +1,4 @@\n",
+    "+// patched\n",
+    " 'use strict';\n",
+    " \n",
+    " module.exports = function (n) {\n",
+);
+
+/// Regression test for <https://github.com/pnpm/pnpm/issues/7565>.
+///
+/// Under the hoisted linker, a workspace project's dependency whose
+/// version conflicts with the root's version of the same package nests a
+/// copy under EACH consumer. Every copy has to carry the patch exactly
+/// once, and a reinstall must not apply the patch a second time on top
+/// of the copies the previous install already patched.
+#[test]
+fn hoisted_patch_reaches_every_workspace_projects_copy_exactly_once() {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({
+            "name": "root",
+            "version": "0.0.0",
+            "private": true,
+            "dependencies": {
+                "is-positive": "3.1.0",
+            },
+        })
+        .to_string(),
+    )
+    .expect("write root package.json");
+    fs::create_dir_all(workspace.join("patches")).expect("create patches dir");
+    fs::write(workspace.join("patches/is-positive@1.0.0.patch"), IS_POSITIVE_PREPEND_PATCH)
+        .expect("write patch file");
+    let workspace_yaml_path = workspace.join("pnpm-workspace.yaml");
+    let mut workspace_yaml =
+        fs::read_to_string(&workspace_yaml_path).expect("read pnpm-workspace.yaml");
+    if !workspace_yaml.ends_with('\n') {
+        workspace_yaml.push('\n');
+    }
+    workspace_yaml.push_str("packages:\n  - 'packages/*'\nnodeLinker: hoisted\n");
+    workspace_yaml.push_str(
+        "patchedDependencies:\n  is-positive@1.0.0: patches/is-positive@1.0.0.patch\n",
+    );
+    fs::write(&workspace_yaml_path, workspace_yaml).expect("write pnpm-workspace.yaml");
+
+    for project in ["pkg-a", "pkg-b"] {
+        let dir = workspace.join("packages").join(project);
+        fs::create_dir_all(&dir).expect("create workspace project");
+        fs::write(
+            dir.join("package.json"),
+            serde_json::json!({
+                "name": project,
+                "version": "0.0.0",
+                "private": true,
+                "dependencies": {
+                    "is-positive": "1.0.0",
+                },
+            })
+            .to_string(),
+        )
+        .expect("write project package.json");
+    }
+
+    let assert_patched_copies = |workspace: &Path| {
+        for project in ["pkg-a", "pkg-b"] {
+            let nested = workspace
+                .join("packages")
+                .join(project)
+                .join("node_modules/is-positive");
+            assert_eq!(
+                fs::read_to_string(nested.join("package.json"))
+                    .ok()
+                    .and_then(|manifest| serde_json::from_str::<Value>(&manifest).ok())
+                    .and_then(|manifest| manifest["version"].as_str().map(ToOwned::to_owned)),
+                Some("1.0.0".to_string()),
+                "expected the conflicting is-positive@1.0.0 to nest under {project}",
+            );
+            let index_js =
+                fs::read_to_string(nested.join("index.js")).expect("read the patched index.js");
+            assert_eq!(
+                index_js.matches("// patched").count(),
+                1,
+                "the patch must reach the nested copy under {project} exactly once: {index_js}",
+            );
+        }
+    };
+
+    pacquet(&workspace, ["install", "--reporter=silent"]).assert().success();
+    assert_patched_copies(&workspace);
+
+    // A reinstall touches nothing, so it must neither lose the patch nor
+    // apply it a second time.
+    pacquet(&workspace, ["install", "--reporter=silent"]).assert().success();
+    assert_patched_copies(&workspace);
+
+    // A reinstall that restores one wiped project's copy must patch that
+    // copy from pristine files and leave the surviving copy untouched.
+    remove_dir_if_exists(&workspace.join("packages/pkg-a/node_modules"));
+    pacquet(&workspace, ["install", "--reporter=silent"]).assert().success();
+    assert_patched_copies(&workspace);
+
+    drop((root, mock_instance));
+}
+
 /// TS: `patch package should fail when the exact version patch fails to
 /// apply` (`patch.ts:508`).
 #[test]
@@ -449,4 +596,216 @@ fn install_level_range_patch_that_does_not_apply_fails() {
 #[test]
 fn install_level_name_only_patch_that_does_not_apply_fails() {
     assert_patch_apply_failure("is-positive");
+}
+
+/// TS: `patch package should fail when the patch file is missing`
+/// (`patch.ts:928`).
+#[test]
+fn install_level_missing_patch_file_fails() {
+    let (root, workspace, npmrc_info) =
+        setup_configured_patch("is-positive@1.0.0", "is-positive.patch");
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    fs::remove_file(workspace.join("patches/is-positive.patch")).expect("remove patch file");
+
+    let output = pacquet(&workspace, ["install"]).output().expect("run install");
+
+    assert!(!output.status.success(), "a missing patch file should fail the install");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("ERR_PNPM_PATCH_NOT_FOUND"), "stderr: {stderr}");
+    assert!(stderr.contains("Patch file not found"), "stderr: {stderr}");
+    // miette wraps the report at the terminal width, splitting the temp path.
+    let unwrapped: String = stderr
+        .chars()
+        .filter(|&c| !c.is_whitespace() && c != '│')
+        .collect();
+    assert!(unwrapped.contains("is-positive.patch"), "stderr: {stderr}");
+
+    drop((root, mock_instance));
+}
+
+/// Install `@pnpm.e2e/gypfile-false` under `patch`, with no `allowBuilds` entry
+/// for it, and report whether the install succeeded alongside its output.
+fn install_gypfile_false_under_patch(patch: &str) -> (bool, String) {
+    let CommandTempCwd { root, workspace, npmrc_info, .. } =
+        CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({ "dependencies": { "@pnpm.e2e/gypfile-false": "1.0.0" } }).to_string(),
+    )
+    .expect("write package.json");
+    fs::create_dir_all(workspace.join("patches")).expect("create patches dir");
+    fs::write(workspace.join("patches/gypfile-false.patch"), patch)
+        .expect("write the gypfile patch");
+    append_workspace_yaml_key(
+        &workspace,
+        "patchedDependencies",
+        "\n  \"@pnpm.e2e/gypfile-false@1.0.0\": patches/gypfile-false.patch",
+    );
+
+    let output = pacquet(&workspace, ["install"]).output().expect("run install");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    eprintln!("install:\n{combined}");
+
+    drop((root, mock_instance));
+    (output.status.success(), combined)
+}
+
+/// A package can ship a `binding.gyp` *and* `gypfile: false`, which leaves it
+/// build-free. A patch that drops the opt-out puts that `binding.gyp` back in
+/// scope, so the build it enables needs approval like any other. The
+/// `binding.gyp` is one the package already had rather than one the patch wrote,
+/// so the preview has to answer for the whole patched package.
+#[test]
+fn install_level_patch_that_drops_gypfile_false_asks_for_approval() {
+    let (succeeded, output) = install_gypfile_false_under_patch(GYPFILE_FALSE_REMOVAL_PATCH);
+
+    assert!(!succeeded, "an unapproved native build must fail the install");
+    assert!(
+        output.contains("ERR_PNPM_IGNORED_BUILDS"),
+        "expected the patched package to be reported as an ignored build; got:\n{output}",
+    );
+}
+
+/// Deleting the manifest takes the opt-out with it, and a `binding.gyp` no
+/// manifest speaks for is build work.
+#[test]
+fn install_level_patch_that_deletes_the_manifest_asks_for_approval() {
+    let (succeeded, output) = install_gypfile_false_under_patch(MANIFEST_DELETION_PATCH);
+
+    assert!(!succeeded, "an unapproved native build must fail the install");
+    assert!(
+        output.contains("ERR_PNPM_IGNORED_BUILDS"),
+        "expected the patched package to be reported as an ignored build; got:\n{output}",
+    );
+}
+
+/// The mirror of [`install_level_patch_that_drops_gypfile_false_asks_for_approval`]:
+/// a patch that takes the `binding.gyp` away along with the opt-out leaves
+/// nothing to build, so the install must not stop for an approval.
+#[test]
+fn install_level_patch_that_drops_gypfile_false_and_its_binding_gyp_needs_no_approval() {
+    let (succeeded, output) = install_gypfile_false_under_patch(&format!(
+        "{GYPFILE_FALSE_REMOVAL_PATCH}{BINDING_GYP_DELETION_HUNK}",
+    ));
+
+    assert!(succeeded, "the patched package has no build to approve:\n{output}");
+    assert!(
+        !output.contains("ERR_PNPM_IGNORED_BUILDS"),
+        "a deleted binding.gyp must not hold the install for approval; got:\n{output}",
+    );
+}
+
+/// TS: `stale patch_hash depPaths are repaired when the patchedDependencies
+/// header is already up to date` (`deps-installer/test/install/patch.ts`).
+#[test]
+fn an_install_repairs_stale_patch_hash_dep_paths() {
+    let (root, workspace, npmrc_info) =
+        setup_configured_patch("is-positive@1.0.0", "is-positive@1.0.0.patch");
+    pacquet(&workspace, ["install", "--reporter=silent"]).assert().success();
+
+    let patch_hash = patch_file_hash(&workspace, "is-positive@1.0.0.patch");
+    rewrite_patch_hash_segments(&workspace, &patch_hash, STALE_PATCH_HASH_SEGMENT);
+
+    pacquet(&workspace, ["install", "--reporter=silent"]).assert().success();
+
+    let snapshots = snapshot_keys(&read_wanted_lockfile(&workspace));
+    assert!(
+        snapshots.contains(&format!("is-positive@1.0.0(patch_hash={patch_hash})")),
+        "the install must rewrite the stale segments: {snapshots:?}",
+    );
+    let installed = read_installed_index(&workspace);
+    assert!(installed.contains("// patched"), "installed: {installed}");
+
+    drop((root, npmrc_info)); // cleanup
+}
+
+/// TS: `a lockfile whose patch_hash depPaths disagree with the
+/// patchedDependencies header is rejected with frozenLockfile`
+/// (`deps-installer/test/install/patch.ts`).
+#[test]
+fn a_frozen_install_rejects_stale_patch_hash_dep_paths() {
+    let (root, workspace, npmrc_info) =
+        setup_configured_patch("is-positive@1.0.0", "is-positive@1.0.0.patch");
+    pacquet(&workspace, ["install", "--reporter=silent"]).assert().success();
+
+    let patch_hash = patch_file_hash(&workspace, "is-positive@1.0.0.patch");
+    rewrite_patch_hash_segments(&workspace, &patch_hash, STALE_PATCH_HASH_SEGMENT);
+
+    let output = pacquet(&workspace, ["install", "--frozen-lockfile", "--reporter=silent"])
+        .output()
+        .expect("run the frozen install");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "the frozen install should fail: {stderr}");
+    assert!(
+        stderr.contains("ERR_PNPM_INCONSISTENT_PATCH_HASH"),
+        "the frozen install should name the inconsistency: {stderr}",
+    );
+
+    drop((root, npmrc_info)); // cleanup
+}
+
+#[test]
+fn a_frozen_install_rejects_dep_paths_missing_their_patch_hash() {
+    let (root, workspace, npmrc_info) =
+        setup_configured_patch("is-positive@1.0.0", "is-positive@1.0.0.patch");
+    pacquet(&workspace, ["install", "--reporter=silent"]).assert().success();
+
+    let patch_hash = patch_file_hash(&workspace, "is-positive@1.0.0.patch");
+    rewrite_patch_hash_segments(&workspace, &patch_hash, "");
+
+    let output = pacquet(&workspace, ["install", "--frozen-lockfile", "--reporter=silent"])
+        .output()
+        .expect("run the frozen install");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "the frozen install should fail: {stderr}");
+    assert!(
+        stderr.contains("ERR_PNPM_INCONSISTENT_PATCH_HASH"),
+        "the frozen install should name the inconsistency: {stderr}",
+    );
+
+    drop((root, npmrc_info)); // cleanup
+}
+
+/// The wanted and current lockfiles are rewritten alike, as an install by a
+/// pnpm without this check leaves them, so only the patch-hash check can
+/// tell the manifest's content check that anything is wrong.
+#[cfg(unix)]
+#[test]
+fn verify_deps_before_run_rejects_stale_patch_hash_dep_paths() {
+    let (root, workspace, npmrc_info) =
+        setup_configured_patch("is-positive@1.0.0", "is-positive@1.0.0.patch");
+    pacquet(&workspace, ["install", "--reporter=silent"]).assert().success();
+
+    let patch_hash = patch_file_hash(&workspace, "is-positive@1.0.0.patch");
+    rewrite_patch_hash_segments(&workspace, &patch_hash, STALE_PATCH_HASH_SEGMENT);
+    rewrite_lockfile_patch_hash_segments(
+        &workspace.join("node_modules/.pnpm/lock.yaml"),
+        &patch_hash,
+        STALE_PATCH_HASH_SEGMENT,
+    );
+    let marker = workspace.join("marker.txt");
+    let manifest = serde_json::json!({
+        "dependencies": { "is-positive": "1.0.0" },
+        "scripts": { "hello": format!(r#"touch "{}""#, marker.display()) },
+    });
+    fs::write(workspace.join("package.json"), manifest.to_string()).expect("write package.json");
+    bump_mtime(&workspace.join("package.json"));
+
+    let output = pacquet(&workspace, ["--config.verify-deps-before-run=error", "run", "hello"])
+        .output()
+        .expect("run the script");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "the pre-run check should fail: {stderr}");
+    assert!(
+        stderr.contains("ERR_PNPM_VERIFY_DEPS_BEFORE_RUN") && stderr.contains("patch hashes"),
+        "the pre-run check should name the stale patch hashes: {stderr}",
+    );
+    assert!(!marker.exists(), "the script must not run");
+
+    drop((root, npmrc_info)); // cleanup
 }

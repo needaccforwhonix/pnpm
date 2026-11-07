@@ -1,13 +1,17 @@
+pub(super) mod json;
+
+pub(super) use json::{render_json, render_recursive_json, report_keys};
+
 use super::{
-    DependencyGroup, IntoDiagnostic, OutdatedInWorkspace, OutdatedPackage, SortBy, Stream, Version,
-    Write, sanitize_inline,
+    DependencyGroup, OutdatedInWorkspace, OutdatedPackage, SortBy, Stream, Version, Write,
+    sanitize_inline,
 };
 use owo_colors::OwoColorize;
 
 pub(super) fn write_output(output: &str) -> miette::Result<()> {
     let mut stdout = std::io::stdout();
-    writeln!(stdout, "{output}").into_diagnostic()?;
-    stdout.flush().into_diagnostic()
+    pnpm_diagnostics::stdout::check(writeln!(stdout, "{output}").and_then(|()| stdout.flush()));
+    Ok(())
 }
 
 /// The kind of semver bump from `current` to `target`. Drives the default
@@ -83,9 +87,8 @@ fn compare_outdated(
     by_change
         .then_with(|| left.package_name.cmp(&right.package_name))
         .then_with(|| {
-            left.current
-                .to_string()
-                .cmp(&right.current.to_string())
+            left.current_str()
+                .cmp(&right.current_str())
         })
 }
 
@@ -107,7 +110,8 @@ pub(super) fn render_table(outdated: &[OutdatedPackage], long: bool) -> String {
     let mut builder = Builder::default();
     builder.push_record(header);
     for pkg in outdated {
-        let mut row = vec![render_package_name(pkg), pkg.current.to_string(), render_latest(pkg)];
+        let mut row =
+            vec![render_package_name(pkg), pkg.current_str().into_owned(), render_latest(pkg)];
         if long {
             row.push(render_details(pkg));
         }
@@ -125,7 +129,7 @@ pub(super) fn render_list(outdated: &[OutdatedPackage], long: bool) -> String {
             let mut info = format!(
                 "{}\n{} {} {}",
                 bold(&render_package_name(pkg)),
-                pkg.current,
+                pkg.current_str(),
                 grey("=>"),
                 render_latest(pkg),
             );
@@ -140,32 +144,6 @@ pub(super) fn render_list(outdated: &[OutdatedPackage], long: bool) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n\n")
-}
-
-pub(super) fn render_json(outdated: &[OutdatedPackage], long: bool) -> String {
-    let mut map = serde_json::Map::new();
-    for pkg in outdated {
-        let dependency_type: &'static str =
-            if pkg.github_action { "githubAction" } else { pkg.belongs_to.into() };
-        let mut entry = serde_json::json!({
-            "current": pkg.current.to_string(),
-            "latest": pkg.target.to_string(),
-            "wanted": pkg.wanted.to_string(),
-            "isDeprecated": pkg.metadata.deprecated.is_some(),
-            "dependencyType": dependency_type,
-        });
-        if long {
-            entry["latestManifest"] = serde_json::json!({
-                "name": pkg.package_name,
-                "version": pkg.target.to_string(),
-                "deprecated": pkg.metadata.deprecated,
-                "homepage": pkg.metadata.homepage,
-            });
-        }
-        map.insert(pkg.package_name.clone(), entry);
-    }
-    serde_json::to_string_pretty(&serde_json::Value::Object(map))
-        .expect("serialize outdated report to JSON")
 }
 
 /// A dependency shared by every project of a large workspace lists all of
@@ -195,7 +173,7 @@ pub(super) fn render_recursive_table(outdated: &[OutdatedInWorkspace], long: boo
     for entry in outdated {
         let mut row = vec![
             render_package_name(&entry.package),
-            entry.package.current.to_string(),
+            entry.package.current_str().into_owned(),
             render_latest(&entry.package),
             render_dependents(entry),
         ];
@@ -222,7 +200,7 @@ pub(super) fn render_recursive_list(outdated: &[OutdatedInWorkspace], long: bool
             let mut info = format!(
                 "{}\n{} {} {}\n{} {}",
                 bold(&render_package_name(package)),
-                package.current,
+                package.current_str(),
                 grey("=>"),
                 render_latest(package),
                 bold(label),
@@ -241,37 +219,6 @@ pub(super) fn render_recursive_list(outdated: &[OutdatedInWorkspace], long: bool
         .join("\n\n")
 }
 
-pub(super) fn render_recursive_json(outdated: &[OutdatedInWorkspace], long: bool) -> String {
-    let mut map = serde_json::Map::new();
-    for entry in outdated {
-        let package = &entry.package;
-        let dependency_type: &'static str =
-            if package.github_action { "githubAction" } else { package.belongs_to.into() };
-        let mut value = serde_json::json!({
-            "current": package.current.to_string(),
-            "latest": package.target.to_string(),
-            "wanted": package.current.to_string(),
-            "isDeprecated": package.metadata.deprecated.is_some(),
-            "dependencyType": dependency_type,
-            "dependentPackages": entry.dependents.iter().map(|dependent| serde_json::json!({
-                "name": dependent.name,
-                "location": dependent.location.to_string_lossy(),
-            })).collect::<Vec<_>>(),
-        });
-        if long {
-            value["latestManifest"] = serde_json::json!({
-                "name": package.package_name,
-                "version": package.target.to_string(),
-                "deprecated": package.metadata.deprecated,
-                "homepage": package.metadata.homepage,
-            });
-        }
-        map.insert(package.package_name.clone(), value);
-    }
-    serde_json::to_string_pretty(&serde_json::Value::Object(map))
-        .expect("serialize recursive outdated report to JSON")
-}
-
 pub(super) fn render_dependents(entry: &OutdatedInWorkspace) -> String {
     let mut names: Vec<String> = entry.dependents
         .iter()
@@ -282,13 +229,23 @@ pub(super) fn render_dependents(entry: &OutdatedInWorkspace) -> String {
 }
 
 fn render_package_name(pkg: &OutdatedPackage) -> String {
+    match dependency_type_label(pkg) {
+        Some(label) => format!("{} {}", pkg.package_name, dimmed(&format!("({label})"))),
+        None => pkg.package_name.clone(),
+    }
+}
+
+/// The qualifier shown after a package name for anything but a production
+/// dependency.
+pub(super) fn dependency_type_label(pkg: &OutdatedPackage) -> Option<&'static str> {
     if pkg.github_action {
-        return format!("{} {}", pkg.package_name, dimmed("(github action)"));
+        return Some("github action");
     }
     match pkg.belongs_to {
-        DependencyGroup::Dev => format!("{} {}", pkg.package_name, dimmed("(dev)")),
-        DependencyGroup::Optional => format!("{} {}", pkg.package_name, dimmed("(optional)")),
-        _ => pkg.package_name.clone(),
+        DependencyGroup::Dev => Some("dev"),
+        DependencyGroup::Optional => Some("optional"),
+        DependencyGroup::Peer => Some("peer"),
+        DependencyGroup::Prod => None,
     }
 }
 
@@ -298,9 +255,9 @@ fn render_package_name(pkg: &OutdatedPackage) -> String {
 pub(crate) fn colorize_target(pkg: &OutdatedPackage) -> String {
     let change = classify(&pkg.current, &pkg.target);
     if change == Change::None {
-        return pkg.target.to_string();
+        return pkg.target_str().into_owned();
     }
-    colorize_version(&pkg.target, change)
+    colorize_version(&pkg.target_str(), change)
 }
 
 pub(super) fn render_latest(pkg: &OutdatedPackage) -> String {
@@ -309,10 +266,10 @@ pub(super) fn render_latest(pkg: &OutdatedPackage) -> String {
         return if pkg.metadata.deprecated.is_some() {
             red_bold("Deprecated")
         } else {
-            pkg.target.to_string()
+            pkg.target_str().into_owned()
         };
     }
-    let colored = colorize_version(&pkg.target, change);
+    let colored = colorize_version(&pkg.target_str(), change);
     if pkg.metadata.deprecated.is_some() {
         format!("{colored} {}", red("(deprecated)"))
     } else {
@@ -323,8 +280,7 @@ pub(super) fn render_latest(pkg: &OutdatedPackage) -> String {
 /// Highlight the version segment that changed: the whole string for a
 /// breaking bump, from the minor field for a feature bump, from the patch
 /// field for a fix.
-fn colorize_version(version: &Version, change: Change) -> String {
-    let text = version.to_string();
+fn colorize_version(text: &str, change: Change) -> String {
     let split = match change {
         Change::Breaking => 0,
         Change::Feature => text.find('.').map_or(0, |i| i + 1),
@@ -338,7 +294,7 @@ fn colorize_version(version: &Version, change: Change) -> String {
             .unwrap_or(0),
         // Nothing is highlighted for an `unknown` (or no) change, so the
         // version renders plain.
-        Change::None | Change::Unknown => return text,
+        Change::None | Change::Unknown => return text.to_string(),
     };
     let (head, tail) = text.split_at(split);
     let painted = match change {
@@ -355,10 +311,10 @@ fn render_details(pkg: &OutdatedPackage) -> String {
     if let Some(reason) = &pkg.metadata.deprecated
         && !reason.is_empty()
     {
-        outputs.push(red(reason));
+        outputs.push(red(&sanitize_inline(reason)));
     }
     if let Some(homepage) = &pkg.metadata.homepage {
-        outputs.push(underline(homepage));
+        outputs.push(underline(&sanitize_inline(homepage)));
     }
     outputs.join("\n")
 }

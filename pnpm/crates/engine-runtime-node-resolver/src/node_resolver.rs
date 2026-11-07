@@ -27,9 +27,10 @@ use pnpm_lockfile::{
 };
 use pnpm_network::{AuthHeaders, ThrottledClient};
 use pnpm_resolving_resolver_base::{
-    LatestInfo, LatestQuery, ResolveError, ResolveFuture, ResolveLatestFuture, ResolveOptions,
-    ResolveResult, Resolver, WantedDependency,
+    LatestInfo, LatestQuery, PkgResolutionId, ResolveError, ResolveFuture, ResolveLatestFuture,
+    ResolveOptions, ResolveResult, Resolver, UpdateBehavior, WantedDependency,
 };
+use pnpm_tool_protocol::{RUNTIME_PROTOCOL, strip_tool_protocol};
 use ssri::Integrity;
 
 use crate::{
@@ -42,7 +43,6 @@ use crate::{
 };
 
 const RESOLVED_VIA: &str = "nodejs.org";
-const BARE_SPEC_PREFIX: &str = "runtime:";
 
 /// Errors emitted by [`NodeResolver::resolve`] / [`NodeResolver::resolve_latest`].
 ///
@@ -97,6 +97,11 @@ pub struct NodeResolver {
     pub http_client: Arc<ThrottledClient>,
     pub auth_headers: Arc<AuthHeaders>,
     pub node_download_mirrors: HashMap<String, String>,
+    /// `tools.node.mirror`: the base every release channel hangs off.
+    pub mirror: Option<String>,
+    /// `tools.node.channels`: where one release channel comes from when
+    /// it does not come from the same place as the rest.
+    pub channel_mirrors: HashMap<String, String>,
     pub offline: bool,
     /// The pnpm cache directory backing the per-version SHASUMS disk
     /// cache. `None` disables the cache and every resolve fetches the
@@ -119,6 +124,8 @@ impl NodeResolver {
             http_client,
             auth_headers,
             node_download_mirrors: HashMap::new(),
+            mirror: None,
+            channel_mirrors: HashMap::new(),
             offline: false,
             cache_dir: None,
         }
@@ -147,50 +154,47 @@ impl NodeResolver {
     async fn resolve_impl(
         &self,
         wanted_dependency: &WantedDependency,
-        _opts: &ResolveOptions,
+        opts: &ResolveOptions,
     ) -> Result<Option<ResolveResult>, ResolveError> {
         let Some(version_spec) = bare_runtime_spec(wanted_dependency, "node") else {
             return Ok(None);
         };
-
-        // A fast path could reuse the lockfile-pinned
-        // VariationsResolution unchanged when the current package is
-        // already pinned and no update is requested. Pacquet doesn't
-        // thread that signal through `ResolveOptions` yet, so every
-        // resolve re-fetches the asset list. Add the fast path once the
-        // seam carries it.
+        if let Some((current, version)) = opts.refresh.kept_runtime() {
+            parse_node_specifier(version_spec)
+                .map_err(|err| {
+                    Box::new(NodeResolverError::InvalidReleaseChannel(err)) as ResolveError
+                })?;
+            return Ok(Some(node_resolve_result(
+                wanted_dependency,
+                current.id.clone(),
+                current.resolution.clone(),
+                version,
+                None,
+            )));
+        }
 
         let picked = self
-            .pick_node_version(version_spec)
+            .pick_node_version(version_spec, opts.refresh.update)
             .await
             .map_err(|err| Box::new(err) as ResolveError)?;
-        let variants = self.read_picked_assets(&picked, version_spec).await?;
+        let variants = if opts.specifier.calc_specifier {
+            Vec::new()
+        } else {
+            self.read_picked_assets(&picked, version_spec).await?
+        };
         let PickedNodeVersion { version, .. } = picked;
         let range = normalize_node_runtime_version_specifier(
             version_spec,
             &version,
             wanted_dependency.prev_specifier.as_deref(),
         );
-        let resolution = LockfileResolution::Variations(VariationsResolution { variants });
-        let manifest = serde_json::json!({
-            "name": "node",
-            "version": version,
-            "bin": node_bins_for_current_os(current_platform()),
-        });
-        Ok(Some(ResolveResult {
-            id: format!("node@runtime:{version}").into(),
-            resolution,
-            resolved_via: RESOLVED_VIA.to_string(),
-            normalized_bare_specifier: Some(format!("runtime:{range}")),
-            alias: wanted_dependency.alias.clone(),
-            policy_violation: None,
-            package: pnpm_resolving_resolver_base::ResolvedPackageInfo {
-                name_ver: None,
-                latest: None,
-                published_at: None,
-                manifest: Some(std::sync::Arc::new(manifest)),
-            },
-        }))
+        Ok(Some(node_resolve_result(
+            wanted_dependency,
+            format!("node@runtime:{version}").into(),
+            VariationsResolution::new(variants).into(),
+            &version,
+            Some(format!("{RUNTIME_PROTOCOL}{range}")),
+        )))
     }
 
     /// A failed exact-version asset lookup consults the release index to
@@ -234,13 +238,22 @@ impl NodeResolver {
     async fn pick_node_version(
         &self,
         version_spec: &str,
+        update: UpdateBehavior,
     ) -> Result<PickedNodeVersion, NodeResolverError> {
         if self.offline {
             return Err(NodeResolverError::Offline);
         }
-        let parsed =
+        let mut parsed =
             parse_node_specifier(version_spec).map_err(NodeResolverError::InvalidReleaseChannel)?;
-        let mirror = get_node_mirror(Some(&self.node_download_mirrors), &parsed.release_channel);
+        if update == UpdateBehavior::Latest {
+            "latest".clone_into(&mut parsed.version_specifier);
+        }
+        let mirror = get_node_mirror(
+            self.mirror.as_deref(),
+            self.channel_mirrors.get(&parsed.release_channel).map(String::as_str),
+            Some(&self.node_download_mirrors),
+            &parsed.release_channel,
+        );
         if let Some(version) = exact_release_version(&parsed) {
             return Ok(PickedNodeVersion {
                 version,
@@ -266,7 +279,7 @@ impl NodeResolver {
         })
     }
 
-    /// The specifier an `add node@runtime:<spec>` request saves to the
+    /// The specifier an `add node@tool:<spec>` request saves to the
     /// manifest: `runtime:` plus the picked version, pinned exactly unless
     /// the previous specifier (or the requested spec) carries a `^`/`~`
     /// operator. This is the same normalization [`Resolver::resolve`]
@@ -285,12 +298,12 @@ impl NodeResolver {
         let parsed =
             parse_node_specifier(version_spec).map_err(NodeResolverError::InvalidReleaseChannel)?;
         if let Some(version) = exact_release_version(&parsed) {
-            return Ok(format!("{BARE_SPEC_PREFIX}{version}"));
+            return Ok(format!("{RUNTIME_PROTOCOL}{version}"));
         }
-        let picked = self.pick_node_version(version_spec).await?;
+        let picked = self.pick_node_version(version_spec, UpdateBehavior::Off).await?;
         let range =
             normalize_node_runtime_version_specifier(version_spec, &picked.version, prev_specifier);
-        Ok(format!("{BARE_SPEC_PREFIX}{range}"))
+        Ok(format!("{RUNTIME_PROTOCOL}{range}"))
     }
 
     async fn resolve_latest_impl(
@@ -301,18 +314,22 @@ impl NodeResolver {
         let Some(manifest_spec) = bare_runtime_spec(&query.wanted_dependency, "node") else {
             return Ok(None);
         };
-        let spec_owned;
-        let version_spec = if query.compatible {
-            manifest_spec
-        } else {
-            spec_owned = "latest";
-            spec_owned
-        };
-        let parsed = parse_node_specifier(version_spec)
+        if self.offline {
+            return Err(Box::new(NodeResolverError::Offline));
+        }
+        let mut parsed = parse_node_specifier(manifest_spec)
             .map_err(|err| {
                 Box::new(NodeResolverError::InvalidReleaseChannel(err)) as ResolveError
             })?;
-        let mirror = get_node_mirror(Some(&self.node_download_mirrors), &parsed.release_channel);
+        if !query.compatible {
+            "latest".clone_into(&mut parsed.version_specifier);
+        }
+        let mirror = get_node_mirror(
+            self.mirror.as_deref(),
+            self.channel_mirrors.get(&parsed.release_channel).map(String::as_str),
+            Some(&self.node_download_mirrors),
+            &parsed.release_channel,
+        );
         let version = resolve_node_version_with_auth(
             &self.http_client,
             &self.auth_headers,
@@ -338,8 +355,8 @@ impl NodeResolver {
     ///
     /// The musl branch only fires when the active mirror is the
     /// default one (custom mirrors are assumed to publish their own
-    /// musl-or-not policy), and musl-fetch failures are swallowed
-    /// because old releases simply don't have musl builds.
+    /// musl-or-not policy). See [`read_musl_assets`] for which musl
+    /// failures are tolerated.
     async fn read_node_assets(
         &self,
         mirror: &str,
@@ -356,19 +373,17 @@ impl NodeResolver {
             self.cache_dir.as_deref(),
         )
         .await?;
-        if mirror == DEFAULT_NODE_MIRROR_BASE_URL
-            && let Ok(mut musl_assets) = read_node_assets_from_mirror(
-                &self.http_client,
-                &self.auth_headers,
-                UNOFFICIAL_NODE_MIRROR_BASE_URL,
-                version,
-                /* musl_only */ true,
-                /* verify_signature */ false,
-                self.cache_dir.as_deref(),
-            )
-            .await
-        {
-            assets.append(&mut musl_assets);
+        if mirror == DEFAULT_NODE_MIRROR_BASE_URL {
+            assets.extend(
+                read_musl_assets(
+                    &self.http_client,
+                    &self.auth_headers,
+                    UNOFFICIAL_NODE_MIRROR_BASE_URL,
+                    version,
+                    self.cache_dir.as_deref(),
+                )
+                .await?,
+            );
         }
         Ok(assets)
     }
@@ -403,19 +418,54 @@ struct PickedNodeVersion {
     resolved_without_index: bool,
 }
 
-/// Strip `runtime:` from a `(alias, bareSpecifier)` pair when both
-/// halves match the runtime contract. Returns `None` (defer to the
-/// next resolver) for any other shape.
+fn node_resolve_result(
+    wanted_dependency: &WantedDependency,
+    id: PkgResolutionId,
+    resolution: LockfileResolution,
+    version: &str,
+    normalized_bare_specifier: Option<String>,
+) -> ResolveResult {
+    let manifest = serde_json::json!({
+        "name": "node",
+        "version": version,
+        "bin": node_bins_for_current_os(current_platform()),
+    });
+    ResolveResult {
+        id,
+        resolution,
+        resolved_via: RESOLVED_VIA.to_string(),
+        normalized_bare_specifier,
+        alias: wanted_dependency.alias.clone(),
+        policy_violation: None,
+        package: pnpm_resolving_resolver_base::ResolvedPackageInfo {
+            name_ver: None,
+            latest: None,
+            published_at: None,
+            manifest: Some(std::sync::Arc::new(manifest)),
+            non_deprecated_alternative: None,
+        },
+    }
+}
+
+/// The version selector of a `tool:` / `runtime:` `(alias, bareSpecifier)`
+/// pair naming `expected_alias`. `None` (defer to the next resolver) for any
+/// other shape.
 fn bare_runtime_spec<'a>(wanted: &'a WantedDependency, expected_alias: &str) -> Option<&'a str> {
     if wanted.alias.as_deref() != Some(expected_alias) {
         return None;
     }
-    wanted.bare_specifier
-        .as_deref()
-        .and_then(|spec| spec.strip_prefix(BARE_SPEC_PREFIX))
+    wanted.bare_specifier.as_deref().and_then(strip_tool_protocol)
 }
 
-fn normalize_node_runtime_version_specifier(
+/// The selector a `runtime:` declaration saves for `resolved_version`.
+///
+/// A stable pick keeps the `^`/`~` operator the previous specifier (or the
+/// requested one) pins. A prerelease is pinned exactly, which is what keeps the
+/// release channel it came from: `parse_node_specifier` reads that channel back
+/// out of an `X.Y.Z-<channel>...` version. A release channel written in front
+/// of the selector is not part of what gets saved.
+#[must_use]
+pub fn normalize_node_runtime_version_specifier(
     version_spec: &str,
     resolved_version: &str,
     prev_specifier: Option<&str>,
@@ -425,9 +475,7 @@ fn normalize_node_runtime_version_specifier(
     {
         return resolved_version.to_string();
     }
-    let source = prev_specifier
-        .and_then(|specifier| specifier.strip_prefix(BARE_SPEC_PREFIX))
-        .unwrap_or(version_spec);
+    let source = prev_specifier.and_then(strip_tool_protocol).unwrap_or(version_spec);
     let spec = source.split_once('/').map_or(source, |(_, spec)| spec);
     let prefix = if spec.starts_with('^') {
         "^"
@@ -443,4 +491,6 @@ fn normalize_node_runtime_version_specifier(
 mod tests;
 
 mod assets;
-use assets::{current_platform, node_bins_for_current_os, read_node_assets_from_mirror};
+use assets::{
+    current_platform, node_bins_for_current_os, read_musl_assets, read_node_assets_from_mirror,
+};

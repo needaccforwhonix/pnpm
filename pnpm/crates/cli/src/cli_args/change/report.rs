@@ -1,34 +1,52 @@
 use super::{
     AssembleReleasePlanOptions, Config, HashMap, HashSet, Path, ReleasePlan, VersioningError,
     WorkspaceProject, assemble_release_plan, check_versioning_invariants, read_change_intents,
-    read_ledger, unpublished_release_dirs,
+    read_ledger,
 };
+use crate::cli_args::changelog::{ReleaseRegistryOptions, unpublished_release_dirs};
 
-pub(super) async fn render_status(
-    workspace_dir: &Path,
-    projects: &[WorkspaceProject],
-    published_names: &HashMap<String, String>,
-    config: &Config,
-) -> miette::Result<String> {
-    let intents = read_change_intents(workspace_dir)?;
-    let ledger = read_ledger(workspace_dir)?;
+pub(super) struct RenderStatusOptions<'a> {
+    pub workspace_dir: &'a Path,
+    pub projects: &'a [WorkspaceProject],
+    pub published_names: &'a HashMap<String, String>,
+    pub private_dirs: &'a HashSet<String>,
+    pub config: &'a Config,
+}
+
+pub(super) async fn render_status(options: RenderStatusOptions<'_>) -> miette::Result<String> {
+    let intents = read_change_intents(options.workspace_dir)?;
+    let ledger = read_ledger(options.workspace_dir)?;
     let assemble = |unpublished_dirs: HashSet<String>| {
         assemble_release_plan(
-            projects,
-            workspace_dir,
+            options.projects,
+            options.workspace_dir,
             &intents,
             &ledger,
-            Some(&config.versioning),
+            Some(&options.config.versioning),
             &AssembleReleasePlanOptions { unpublished_dirs, ..Default::default() },
         )
     };
     // Probe as the release does, so the preview matches it.
-    let unpublished_dirs =
-        unpublished_release_dirs(config, &assemble(HashSet::new())?, published_names).await?;
+    let unpublished_dirs = unpublished_release_dirs(
+        &assemble(HashSet::new())?,
+        &ReleaseRegistryOptions {
+            config: options.config,
+            published_names: options.published_names,
+            private_dirs: options.private_dirs,
+        },
+    )
+    .await?;
     let plan = assemble(unpublished_dirs)?;
     if plan.releases.is_empty() {
         return Ok("No pending changes.".to_string());
     }
+    Ok(render_pending_change_intents(&intents, &plan))
+}
+
+fn render_pending_change_intents(
+    intents: &[pnpm_versioning::ChangeIntent],
+    plan: &ReleasePlan,
+) -> String {
     let consumed_ids: std::collections::HashSet<&str> = plan.releases
         .iter()
         .flat_map(|release| release.intents.iter().map(|intent| intent.id.as_str()))
@@ -42,20 +60,39 @@ pub(super) async fn render_status(
         writeln!(output, "  .changeset/{}.md", intent.id).expect("write to string");
     }
     output.push('\n');
-    output.push_str(&render_release_plan(&plan));
-    Ok(output)
+    output.push_str(&render_release_plan(plan));
+    output
 }
 
-/// Fails with every violation [`check_versioning_invariants`] found, listed.
+/// What a release run validates before it needs the registry: the pending
+/// change intents resolve to workspace packages that can take the release they
+/// ask for, the `versioning` configuration they run through is well-formed, and
+/// the committed versions still satisfy the invariants it declares. A malformed
+/// intent or configuration fails the way it would at release time; drifted
+/// versions are listed as violations. Internal dependencies still on a plain
+/// range are left alone, as they are for `pnpm change status`.
 pub(super) fn run_check(
     workspace_dir: &Path,
     projects: &[WorkspaceProject],
     config: &Config,
 ) -> miette::Result<()> {
+    let intents = read_change_intents(workspace_dir)?;
+    let ledger = read_ledger(workspace_dir)?;
+    assemble_release_plan(
+        projects,
+        workspace_dir,
+        &intents,
+        &ledger,
+        Some(&config.versioning),
+        &AssembleReleasePlanOptions::default(),
+    )?;
     let violations =
         check_versioning_invariants(projects, workspace_dir, Some(&config.versioning))?;
     if violations.is_empty() {
-        println!("All package versions satisfy the configured versioning invariants.");
+        pnpm_diagnostics::println!("{}", describe_checked_intents(intents.len()));
+        pnpm_diagnostics::println!(
+            "All package versions satisfy the configured versioning invariants.",
+        );
         return Ok(());
     }
     use std::fmt::Write as _;
@@ -68,6 +105,17 @@ pub(super) fn run_check(
         write!(message, "\n  - {}", violation.message).expect("write to string");
     }
     Err(VersioningError::InvariantsViolated { message }.into())
+}
+
+/// The one-line summary of what [`run_check`] validated.
+fn describe_checked_intents(intent_count: usize) -> String {
+    if intent_count == 0 {
+        return "No pending change intents to check.".to_string();
+    }
+    format!(
+        "Checked {intent_count} pending change intent{}: every one resolves to a workspace package.",
+        if intent_count == 1 { "" } else { "s" },
+    )
 }
 
 /// Renders the plan the way the TypeScript CLI prints it, one line per

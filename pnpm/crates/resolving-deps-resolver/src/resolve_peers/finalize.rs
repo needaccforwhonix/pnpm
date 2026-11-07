@@ -4,6 +4,9 @@
 //! suffix, and the [`DependenciesGraph`] built from the per-node records
 //! keyed by those depPaths.
 
+pub(crate) use final_paths::{FinalDepPaths, PeerIdRecording};
+pub(crate) use graph_edges::merge_additional_edges;
+
 mod peer_scc;
 use peer_scc::PeerSccPass;
 
@@ -16,15 +19,12 @@ use crate::{
     dependencies_graph::{DependenciesGraph, DependenciesGraphNode},
     node_id::NodeId,
     resolve_peers::{
-        context::{
-            SharedChain, link_node_id_as_dep_path, peer_id_pair, peer_segment_names, pkg_name,
-            pkg_name_version,
-        },
+        context::{SharedChain, link_node_id_as_dep_path, peer_id_pair, peer_segment_names},
         walker::{MissingPeerInfo, Walker},
     },
-    resolved_tree::ResolvedPackage,
+    resolved_tree::{ResolvedPackage, pkg_name_version},
 };
-use pnpm_deps_path::{DepPath, PeerId, create_peer_dep_graph_hash, link_path_to_peer_version};
+use pnpm_deps_path::{DepPath, PeerId, link_path_to_peer_version};
 use pnpm_resolving_resolver_base::ResolveResult;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::{
@@ -36,12 +36,6 @@ use std::{
 /// [`Walker::build_final_dep_paths`] pass can recompute each node's
 /// depPath with its resolved peers' *full* suffixes, collapsing to
 /// `name@version` only for genuinely detected cycles.
-///
-/// The walk itself is left untouched: it still computes the provisional
-/// depPaths that [`Walker::find_hit`] reads, so peer-resolution and
-/// cache decisions are byte-for-byte identical. Only the rendered
-/// depPaths change, which is why a node whose suffix was previously
-/// collapsed by the cycle fallback now splits into its own graph entry.
 pub(super) struct NodeRecord {
     /// `alias → child/peer NodeId` edges, in the same shape the inline
     /// `graph_children` map carries (children overlaid with resolved-peer
@@ -51,7 +45,6 @@ pub(super) struct NodeRecord {
     pub(super) optional_child_aliases: HashSet<String>,
     pub(super) transitive_peer_dependencies: HashSet<String>,
     pub(super) depth: i32,
-    pub(super) installable: bool,
     pub(super) is_pure: bool,
     pub(super) order: u64,
 }
@@ -68,14 +61,13 @@ pub(super) struct WalkedNode<'a> {
     pub(super) children: &'a BTreeMap<String, NodeId>,
     /// The depPaths those same children resolved to.
     pub(super) child_dep_paths: BTreeMap<String, DepPath>,
-    pub(super) installable: bool,
     pub(super) ancestry: WalkedNodeAncestry<'a>,
     pub(super) peers: WalkedNodePeers<'a>,
 }
 
 pub(super) struct WalkedNodeAncestry<'a> {
     pub(super) parent_node_ids: &'a SharedChain<NodeId>,
-    pub(super) parent_pkg_ids_chain: &'a SharedChain<String>,
+    pub(super) parent_pkg_ids_chain: &'a SharedChain<Arc<str>>,
     pub(super) depth: i32,
 }
 
@@ -106,9 +98,9 @@ struct FinalPeerContext<'a> {
 impl Walker<'_> {
     /// Return the fully walked occurrence whose peer-resolution verdict
     /// `node_id` reused. The cache hit is the same semantic node for
-    /// final depPath construction even though it remains a distinct tree
-    /// occurrence for traversal and edge labels.
-    fn cache_owner_node_id<'a>(&'a self, node_id: &'a NodeId) -> &'a NodeId {
+    /// provider comparisons and final depPath construction even though it
+    /// remains a distinct tree occurrence for traversal and edge labels.
+    pub(super) fn cache_owner_node_id<'a>(&'a self, node_id: &'a NodeId) -> &'a NodeId {
         self.nodes.cache_owners.get(node_id).unwrap_or(node_id)
     }
 
@@ -144,7 +136,6 @@ impl Walker<'_> {
                 optional_child_aliases: optional_child_aliases.clone(),
                 transitive_peer_dependencies: transitive_peer_dependencies.clone(),
                 depth: node.ancestry.depth,
-                installable: node.installable,
                 is_pure: node.peers.is_pure,
                 order: record_order,
             },
@@ -176,15 +167,14 @@ impl Walker<'_> {
             .or_insert(DependenciesGraphNode {
                 dep_path: node.dep_path.clone(),
                 resolved_package_id: node.pkg.id.to_string(),
-                resolve_result: Arc::clone(&node.pkg.result),
+                resolve_result: Arc::clone(node.pkg.result()),
                 depth: node.ancestry.depth,
-                installable: node.installable,
                 is_pure: node.peers.is_pure,
                 optional: node.pkg.optional,
                 edges: crate::ResolvedDependencyEdges {
                     children: graph_children,
                     optional_children: optional_child_aliases,
-                    peer_dependencies: node.pkg.peer_dependencies.clone(),
+                    peer_set: node.pkg.peer_set.clone(),
                     transitive_peer_dependencies,
                     resolved_peer_names: node.peers.resolved
                         .keys()
@@ -312,9 +302,7 @@ impl Walker<'_> {
     /// Rebuild the depPath-keyed graph from the per-`NodeId`
     /// [`NodeRecord`]s using the corrected `final_dep_paths`. Nodes that
     /// resolve to the same final depPath merge (taking the smallest
-    /// `depth`, like the inline build); nodes whose suffix was
-    /// previously collapsed by the cycle fallback now split into
-    /// distinct entries.
+    /// `depth`, like the inline build).
     ///
     /// Every edge — a regular child or a resolved peer — points at the
     /// depPath the edge's own node resolved to, matching upstream's
@@ -414,15 +402,14 @@ impl Walker<'_> {
         DependenciesGraphNode {
             dep_path,
             resolved_package_id: pkg_id.to_string(),
-            resolve_result: Arc::clone(&pkg.result),
+            resolve_result: Arc::clone(pkg.result()),
             depth,
-            installable: record.installable,
             is_pure: record.is_pure,
             optional: pkg.optional,
             edges: crate::ResolvedDependencyEdges {
                 children,
                 optional_children: record.optional_child_aliases.clone(),
-                peer_dependencies: pkg.peer_dependencies.clone(),
+                peer_set: pkg.peer_set.clone(),
                 transitive_peer_dependencies: record
                     .transitive_peer_dependencies
                     .clone(),

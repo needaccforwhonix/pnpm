@@ -18,19 +18,78 @@ pub struct FrozenInstallDrivers<'a> {
 
     /// Install-scoped shared in-flight tarball cache, threaded down to
     /// [`crate::CreateVirtualStore`]'s cold-batch downloads. `Some` on
-    /// the pnpr client path so the materialization reuses the
+    /// the pnpr client path so the materialization reuses
     /// the package manager's `TarballPrefetcher` background downloads instead of
     /// re-fetching every tarball; `None` for installs without a shared
     /// prefetch in flight.
     pub tarball_mem_cache: Option<&'a Arc<MemCache>>,
+
+    /// The store-side caches this install shares with the other installs
+    /// of the same command. `None` gives the install caches of its own.
+    pub fetch_caches: Option<&'a SharedFetchCaches>,
+}
+
+impl FrozenInstallDrivers<'_> {
+    /// [`crate::CasPrefetch::start`] for this install, verifying store files
+    /// against the shared cache when it shares one.
+    pub(crate) async fn start_cas_prefetch(
+        &self,
+        entries: LockfileEntries<'_>,
+        allow_build_policy: &crate::AllowBuildPolicy,
+        supported_architectures: Option<&pnpm_package_is_installable::SupportedArchitectures>,
+    ) -> crate::CasPrefetch {
+        let store_context = self.fetch_caches.map(SharedFetchCaches::store_context);
+        crate::CasPrefetch::start(
+            self.config,
+            entries,
+            allow_build_policy,
+            supported_architectures,
+            store_context.as_ref(),
+        )
+        .await
+    }
+
+    /// The git sources the install fetches through: the shared ones, or
+    /// its own.
+    pub(crate) fn git_source_cache(&self) -> Arc<pnpm_git_fetcher::GitSourceCache> {
+        self.fetch_caches.map_or_else(Default::default, |caches| Arc::clone(&caches.git_sources))
+    }
+}
+
+/// The store-side caches an install otherwise builds for itself: the store
+/// files it has verified and the git sources it has fetched. Installs that
+/// share one reuse each other's work, which is sound because both caches
+/// are keyed by content that one command cannot see change.
+#[derive(Default, Clone)]
+pub struct SharedFetchCaches {
+    pub verified_files: pnpm_store_dir::SharedVerifiedFilesCache,
+    pub git_sources: Arc<pnpm_git_fetcher::GitSourceCache>,
+}
+
+impl SharedFetchCaches {
+    /// What [`crate::CasPrefetch::start`] takes to verify store files
+    /// against this cache, with no store index opened ahead of it.
+    #[must_use]
+    pub fn store_context(&self) -> crate::CreateVirtualStoreStoreContext<'_> {
+        crate::CreateVirtualStoreStoreContext {
+            index: None,
+            verified_files_cache: &self.verified_files,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
 pub struct FrozenLockfileInputs<'a> {
-    /// The fully-deserialized wanted lockfile. Its `importers`,
-    /// `packages` and `snapshots` are read straight off it, so a caller
-    /// cannot pair one lockfile's entries with another's maps.
+    /// The wanted lockfile narrowed to what this install materializes:
+    /// the closure of its importers under the included dependency
+    /// groups. Its `importers`, `packages` and `snapshots` are read
+    /// straight off it, so a caller cannot pair one lockfile's entries
+    /// with another's maps.
     pub wanted: &'a Lockfile,
+    /// The whole wanted lockfile, before [`Self::wanted`] was narrowed to
+    /// the materialization closure. The verification gates read this one
+    /// so a narrower install scope can never narrow what gets checked.
+    pub verified: &'a Lockfile,
     /// Absolute path of the lockfile being verified, for the on-disk
     /// verification cache. `None` disables the cache.
     pub path: Option<&'a Path>,
@@ -39,19 +98,15 @@ pub struct FrozenLockfileInputs<'a> {
     /// diff). `None` on a first install.
     pub current: Option<&'a Lockfile>,
     /// Entries from the previous install's `lock.yaml`, threaded through
-    /// to [`crate::CreateVirtualStore`] to drive the per-snapshot skip
-    /// decision. See [`LockfileEntries::of_previous_install`], which is
-    /// how a caller builds this: it is empty on a first install and
-    /// under `--force`.
+    /// to [`crate::CreateVirtualStore`] for reuse decisions and child-link
+    /// cleanup. See [`LockfileEntries::of_previous_install`].
     pub current_entries: LockfileEntries<'a>,
     /// Resolution verifiers to re-apply to every lockfile entry. Run
     /// concurrently with the fetch phase ([`crate::CreateVirtualStore`])
     /// and awaited before any dependency lifecycle script executes, so a
     /// rejected lockfile aborts before [`crate::BuildModules`] runs. Empty
     /// when verification is disabled (`trustLockfile`), in which case the
-    /// gate is a no-op. The non-blocking sequencing runs
-    /// `verifyLockfileResolutions` concurrently with the fetch and gates
-    /// the build on `verifyLockfile`.
+    /// gate is a no-op.
     pub resolution_verifiers: &'a [Arc<dyn ResolutionVerifier>],
     /// Fetch-evidence cell `CreateVirtualStore` fills after its
     /// warm/cold partition so the concurrent verification fan-out's
@@ -90,6 +145,9 @@ pub struct FrozenProjectInputs<'a> {
     /// [`workspace_root`]: Self::workspace_root
     pub requester: &'a str,
     pub dependency_groups: &'a [DependencyGroup],
+    /// [`Self::dependency_groups`] with the peer-satisfaction edges the
+    /// caller classified on the wanted lockfile.
+    pub groups: &'a crate::GroupSelection,
     pub manifests: &'a [(PathBuf, &'a pnpm_package_manifest::PackageManifest)],
     pub package_map_manifests: &'a [(PathBuf, &'a pnpm_package_manifest::PackageManifest)],
 }
@@ -147,6 +205,8 @@ pub struct PriorMaterialization<'a> {
     /// `None` on a first install or when the file couldn't be fully
     /// parsed.
     pub hoisted_locations: Option<&'a crate::HoistedLocations>,
+    /// See [`crate::PriorLinkState::previously_skipped`].
+    pub previously_skipped: &'a crate::SkippedSnapshots,
     /// `allowBuilds` changed since the previous install: a build it
     /// ignored may now be allowed, or one it ran may no longer be. The
     /// hoisted linker then hands every package to the build phase, present
@@ -155,7 +215,11 @@ pub struct PriorMaterialization<'a> {
     /// See [`crate::PriorHoistedState::unbuilt_builds`].
     pub unbuilt_builds: &'a crate::UnbuiltBuilds,
     /// See [`crate::PruneStaleModules::prune_orphans`].
-    pub prune_orphans: bool,
+    pub prune: crate::PruneTreeOptions<'a>,
+    /// Relink the bins of every slot the lockfile records, not only of the
+    /// slots this install materializes. A tree that moved with its project
+    /// needs it, because its other slots may hold bins naming where it was.
+    pub relink_every_slot_bin: bool,
 }
 
 #[derive(Default)]
@@ -178,16 +242,19 @@ pub struct FrozenInstallSeed<'a> {
     /// the server's `/-/pnpr/v0/verify-lockfile` while the fetch runs locally. The
     /// same concurrent sequencing and build gate apply.
     pub lockfile_verification_override: Option<LockfileVerificationOverride<'a>>,
+    /// Pre-verified `requiresBuild` flags from `pnpr` resolution.
+    pub known_requires_build: Option<crate::RequiresBuildBySnapshot>,
 }
 
 impl<'a> PriorMaterialization<'a> {
     pub(crate) fn link_state(self) -> crate::PriorLinkState<'a> {
         crate::PriorLinkState {
-            prune_orphans: self.prune_orphans,
+            prune: self.prune,
             hoisted_dependencies: self.hoisted_dependencies,
             hoisted_locations: self.hoisted_locations,
             build_present_packages: self.rebuild.is_some() || self.allow_builds_changed,
             unbuilt_builds: self.unbuilt_builds,
+            previously_skipped: self.previously_skipped,
         }
     }
 }

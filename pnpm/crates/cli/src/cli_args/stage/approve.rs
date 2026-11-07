@@ -11,7 +11,10 @@ use super::{
     stage_request_in_session, summarize_tarball::read_tarball_manifest,
 };
 use crate::cli_args::{recursive::sequence_graph, sanitize::sanitize_inline};
+#[cfg(target_family = "wasm")]
+use crate::dialoguer_wasm::MultiSelect;
 use derive_more::{Display, Error};
+#[cfg(not(target_family = "wasm"))]
 use dialoguer::MultiSelect;
 use miette::{Diagnostic, IntoDiagnostic};
 use node_semver::Version;
@@ -325,10 +328,13 @@ async fn approve_staged_packages<Reporter: self::Reporter>(
         // pnpm prints this summary and exits 1. A command here either returns
         // output or an error, never both, so print it the way the dispatcher
         // prints a command's output and exit with the failing status.
-        #[expect(clippy::exit, reason = "an incomplete approval batch exits 1, mirroring pnpm")]
+        // An incomplete approval batch exits 1, mirroring pnpm.
         {
-            println!("Approved {approved} of {}.", render_package_count(items.len()));
-            std::process::exit(1);
+            pnpm_diagnostics::println!(
+                "Approved {approved} of {}.",
+                render_package_count(items.len()),
+            );
+            pnpm_executor::exit(1);
         }
     }
     Ok(Some(format!("Approved {} successfully.", render_package_count(approved))))

@@ -183,11 +183,19 @@ pub fn render_index(entries: &[IndexEntry]) -> String {
     text
 }
 
+pub const CRATE_DOCUMENT_FORMAT_VERSION: u32 = 1;
+
+const fn default_format_version() -> u32 {
+    CRATE_DOCUMENT_FORMAT_VERSION
+}
+
 /// The hosted document pnpr stores per crate: the crate's published
 /// versions as index entries. The sparse-index file is rendered from it on
 /// read, and yank flips an entry in place.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CrateDocument {
+    #[serde(rename = "formatVersion", default = "default_format_version")]
+    pub format_version: u32,
     pub name: String,
     pub versions: Vec<IndexEntry>,
     /// The description of the most recently published version, which is
@@ -200,7 +208,12 @@ pub struct CrateDocument {
 impl CrateDocument {
     #[must_use]
     pub fn new(name: &str) -> Self {
-        Self { name: name.to_string(), versions: Vec::new(), description: None }
+        Self {
+            format_version: CRATE_DOCUMENT_FORMAT_VERSION,
+            name: name.to_string(),
+            versions: Vec::new(),
+            description: None,
+        }
     }
 
     /// The version the crates API reports as `max_version`: the highest
@@ -208,14 +221,18 @@ impl CrateDocument {
     /// is yanked. `None` for a document with no parsable version.
     #[must_use]
     pub fn max_version(&self) -> Option<String> {
-        let highest = |yanked_allowed: bool| {
+        let parsed = |entry: &IndexEntry| semver::Version::parse(&entry.vers).ok();
+        let unyanked = || {
             self.versions
                 .iter()
-                .filter(|entry| yanked_allowed || !entry.yanked)
-                .filter_map(|entry| semver::Version::parse(&entry.vers).ok())
-                .max()
+                .filter(|entry| !entry.yanked)
+                .filter_map(parsed)
         };
-        highest(false).or_else(|| highest(true)).map(|version| version.to_string())
+        let every = || self.versions.iter().filter_map(parsed);
+        unyanked()
+            .max()
+            .or_else(|| every().max())
+            .map(|version| version.to_string())
     }
 
     /// This crate as one row of a search response.
@@ -263,8 +280,7 @@ impl CrateDocument {
 pub const MAX_DESCRIPTION_LEN: usize = 1_000;
 
 /// A publish's description, cut to [`MAX_DESCRIPTION_LEN`] characters. Cut
-/// rather than refused: the description was accepted and discarded before
-/// crate documents kept one, and a publish that worked should keep working.
+/// rather than refused: a publish that worked should keep working.
 #[must_use]
 pub fn bounded_description(description: Option<&str>) -> Option<String> {
     description.map(|description| {
@@ -275,7 +291,7 @@ pub fn bounded_description(description: Option<&str>) -> Option<String> {
     })
 }
 
-/// One row of `GET api/v1/crates`. `cargo search` reads exactly these three
+/// One row of `GET api/v1/crates`. `cargo search` reads exactly these
 /// fields, so the response stays that narrow rather than modelling all of
 /// what crates.io returns.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

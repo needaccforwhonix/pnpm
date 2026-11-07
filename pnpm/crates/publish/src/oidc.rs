@@ -106,14 +106,8 @@ where
         .ok_or(GitHubRequestTokenError::MissingValue)
 }
 
-/// Percent-encode the scope separator so the
-/// package name is a single URL path segment (`@scope/name` → `@scope%2fname`).
-pub(crate) fn escaped_package_name(name: &str) -> String {
-    name.replace('/', "%2f")
-}
-
 /// The fetch-retry / timeout knobs the OIDC requests forward, sourced from the
-/// publish options, shared by all three OIDC steps.
+/// publish options.
 #[derive(Debug, Default, Clone)]
 pub struct OidcHttpOptions {
     pub fetch_retries: Option<u32>,

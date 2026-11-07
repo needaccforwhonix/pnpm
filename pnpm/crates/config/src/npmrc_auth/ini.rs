@@ -1,8 +1,9 @@
 use super::{
-    Cow, EnvVar, NpmrcAuth, Path, apply_creds_field, apply_tls_field, env_replace_lossy,
-    expand_inline_pem, is_auth_value_key, normalize_registry_url, parse_bool, resolve_cafile,
-    split_ini_creds_key, split_ssl_key,
+    Cow, EnvVar, NpmrcAuth, NpmrcRoutes, Path, apply_creds_field, apply_tls_field,
+    env_replace_lossy, expand_inline_pem, is_auth_value_key, parse_bool, redact_npm_auth_key,
+    resolve_cafile, split_ini_creds_key, split_ssl_key,
 };
+use pnpm_network::{canonicalize_npm_registry_url, normalize_registry_url};
 
 #[derive(Clone, Copy)]
 struct ParseOptions {
@@ -10,15 +11,40 @@ struct ParseOptions {
     expand_request_destination_env: bool,
 }
 
-/// One `key=value` line, with comments and blanks skipped and the value
-/// decoded.
-fn split_ini_line(line: &str) -> Option<(&str, std::borrow::Cow<'_, str>)> {
+/// One `key=value` line, with comments and blanks skipped and the key and
+/// value decoded.
+///
+/// A key holding `=` is written as a JSON string, as the `ini` package and
+/// `pnpm login` write it, so its separator is the first `=` after the closing
+/// quote.
+fn split_ini_line(line: &str) -> Option<(Cow<'_, str>, Cow<'_, str>)> {
     let line = line.trim();
     if line.is_empty() || line.starts_with([';', '#']) {
         return None;
     }
-    let (raw_key, raw_value) = line.split_once('=')?;
-    Some((raw_key.trim(), decode_ini_value(raw_value.trim())))
+    let (raw_key, raw_value) = match json_string_end(line) {
+        Some(end) => (&line[..end], line[end..].trim_start().strip_prefix('=')?),
+        None => line.split_once('=')?,
+    };
+    Some((decode_ini_value(raw_key.trim()), decode_ini_value(raw_value.trim())))
+}
+
+/// The byte index just past the JSON string `line` starts with, or `None`
+/// when it starts with none.
+fn json_string_end(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    if bytes.first() != Some(&b'"') {
+        return None;
+    }
+    let mut index = 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 2,
+            b'"' => return Some(index + 1),
+            _ => index += 1,
+        }
+    }
+    None
 }
 
 fn decode_ini_value(value: &str) -> Cow<'_, str> {
@@ -87,9 +113,8 @@ impl NpmrcAuth {
     /// blow up parsing.
     ///
     /// `npmrc_dir` is the directory of the `.npmrc` file the `text`
-    /// came from. A relative `cafile=` resolves against it so a
-    /// project `.npmrc` reachable via `pacquet --dir <proj>` from a
-    /// different cwd still finds its CA bundle (pnpm/pnpm#11726).
+    /// came from. A relative `cafile=` resolves against it, not against
+    /// the current directory.
     pub fn from_ini<Sys: EnvVar>(text: &str, npmrc_dir: &Path) -> Self {
         Self::from_ini_with_options::<Sys>(
             text,
@@ -98,17 +123,43 @@ impl NpmrcAuth {
         )
     }
 
+    /// Read the command line's settings
+    /// ([`CliLayer::npmrc_tokens`](crate::CliLayer::npmrc_tokens)) as the
+    /// top `.npmrc` layer. Values are used as given: the shell has expanded them.
+    /// Unscoped credentials pin to [`CliLayer::registry`](crate::CliLayer::registry) when set, else to
+    /// the tokens' own `registry`.
+    pub fn from_cli_config(cli: &crate::CliLayer) -> Self {
+        let mut auth = NpmrcAuth::default();
+        for (key, value) in &cli.npmrc_tokens {
+            if crate::config_types::is_ini_config_key(key) {
+                auth.raw_ini_config.insert(key.clone(), value.clone());
+            }
+            // The empty base leaves a relative `cafile` to the current directory.
+            auth.apply_ini_entry(key, value.clone(), Path::new(""));
+        }
+        if let Some(registry) = &cli.registry {
+            auth.routes.default = Some(registry.clone());
+        }
+        auth.rescope_unscoped("<command line>");
+        // `Config::apply_cli_registries` applies the routes over the
+        // workspace yaml, which the `.npmrc` routes rank below.
+        auth.routes = NpmrcRoutes::default();
+        auth
+    }
+
     fn from_ini_with_options<Sys: EnvVar>(
         text: &str,
         npmrc_dir: &Path,
         opts: ParseOptions,
     ) -> Self {
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
         let mut auth = NpmrcAuth::default();
         for line in text.lines() {
             let Some((raw_key, raw_value)) = split_ini_line(line) else {
                 continue;
             };
-            let Some((key, value)) = auth.expand_ini_entry::<Sys>(raw_key, &raw_value, opts) else {
+            let Some((key, value)) = auth.expand_ini_entry::<Sys>(&raw_key, &raw_value, opts)
+            else {
                 continue;
             };
 
@@ -153,8 +204,14 @@ impl NpmrcAuth {
             return None;
         }
         let (value, value_unresolved) = env_replace_lossy::<Sys>(raw_value);
+        let context = if is_auth_value_key(&key) {
+            let field = key.rsplit(':').next().unwrap_or(&key);
+            format!(" in .npmrc key {field:?}")
+        } else {
+            String::new()
+        };
         for placeholder in key_unresolved.into_iter().chain(value_unresolved) {
-            self.warnings.push(format!("Failed to replace env in config: {placeholder}"));
+            self.warnings.push(format!("Failed to replace env in config: {placeholder}{context}"));
         }
         Some((key, value))
     }
@@ -181,6 +238,13 @@ impl NpmrcAuth {
         }
         if !opts.expand_request_destination_env
             && has_env_placeholder(raw_value)
+            && is_registry_key(key)
+        {
+            self.unexpanded_registry.get_or_insert_with(|| redact_npm_auth_key(key));
+            return false;
+        }
+        if !opts.expand_request_destination_env
+            && has_env_placeholder(raw_value)
             && is_request_destination_value_key(key)
         {
             self.warn_ignored_request_destination_env(key);
@@ -200,15 +264,17 @@ impl NpmrcAuth {
             return;
         }
         if let Some(scope) = scoped_registry_key(key) {
-            self.routes.scoped.insert(scope.to_string(), normalize_registry_url(&value));
+            self.routes.scoped.insert(
+                scope.to_string(),
+                normalize_registry_url(&value).into_owned(),
+            );
             return;
         }
         if self.apply_network_key(key, &value, npmrc_dir) {
             return;
         }
         if let Some((uri, suffix)) = split_ini_creds_key(key) {
-            let entry = self.creds_entry_mut(uri);
-            apply_creds_field(entry, suffix, value);
+            self.apply_uri_creds_field(uri, suffix, &value);
             return;
         }
         if let Some((uri, field, is_file)) = split_ssl_key(key) {
@@ -250,19 +316,26 @@ impl NpmrcAuth {
         } else {
             expand_inline_pem(value)
         };
-        let entry = self.tls.by_uri.entry(uri.to_owned()).or_default();
-        apply_tls_field(entry, field, resolved);
+        let canonical_uri = canonicalize_npm_registry_url(uri);
+        let alias = (canonical_uri != uri).then_some(canonical_uri.as_ref());
+        for uri in std::iter::once(uri).chain(alias) {
+            let entry = self.tls.by_uri.entry(uri.to_owned()).or_default();
+            apply_tls_field(entry, field, resolved.clone());
+        }
     }
 
     pub(super) fn warn_ignored_request_destination_env(&mut self, key: &str) {
+        let key = redact_npm_auth_key(key);
         self.warnings.push(format!(
             "Ignored project-level request destination {key:?}: environment variables are not expanded in repository-controlled registry or proxy URLs.",
         ));
     }
 
     pub(super) fn warn_ignored_auth_value_env(&mut self, key: &str) {
+        let key = redact_npm_auth_key(key);
         self.warnings.push(format!(
-            "Ignored project-level auth setting {key:?}: environment variables are not expanded in repository-controlled registry credentials.",
+            "Ignored project-level auth setting {key:?}: environment variables are not expanded in repository-controlled registry credentials. \
+             See https://pnpm.io/npmrc",
         ));
     }
 }

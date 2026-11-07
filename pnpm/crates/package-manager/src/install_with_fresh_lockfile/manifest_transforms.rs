@@ -1,5 +1,5 @@
 //! pnpm's built-in read-package hook chain: `packageExtensions` (the
-//! compatibility DB plus the user's), legacy deploy's workspace
+//! compatibility DB plus the user's), `addMissingPeerTypes`, legacy deploy's workspace
 //! injection, `pnpm.overrides`, and `ignoredOptionalDependencies`.
 //!
 //! Owns the *transform* half of the resolve inputs. The seeds, options,
@@ -12,6 +12,7 @@ use super::{
 };
 use crate::{
     VersionsOverrider, apply_deploy_manifest_hook, install::apply_deploy_manifest_hook_to_arc,
+    package_extender::InvalidPackageExtensionSelector,
 };
 use indexmap::IndexMap;
 use pnpm_catalogs_types::Catalogs;
@@ -25,8 +26,9 @@ use std::{collections::BTreeMap, path::Path, sync::Arc};
 /// pnpm's built-in read-package hook chain for the manifests fresh
 /// resolution consumes, plus the pieces later phases read off it.
 ///
-/// The order matches `createReadPackageHook`: packageExtensions first,
-/// then the pnpmfile and deploy hook, then overrides, then the
+/// The order matches `createReadPackageHook`: packageExtensions first
+/// (followed by `addMissingPeerTypes`, so it also covers peers an extension
+/// adds), then the pnpmfile and deploy hook, then overrides, then the
 /// `ignoredOptionalDependencies` removal. The hooks stay separate because
 /// the resolver interleaves the pnpmfile's `readPackage` between them:
 /// packageExtensions → readPackage → deploy → overrides → ignored optionals.
@@ -54,9 +56,12 @@ pub(super) fn build_manifest_transforms(
     let parsed_overrides = parse_config_overrides(config, catalogs)?;
     let versions_overrider = parsed_overrides
         .as_ref()
-        .map(|parsed| Arc::new(VersionsOverrider::new(parsed, lockfile_dir)));
+        .map(|parsed| {
+            Arc::new(VersionsOverrider::new(parsed, config.root_project_manifest_dir(lockfile_dir)))
+        });
     let transforms =
-        ImporterTransforms::new(config, versions_overrider.clone(), deploy_manifest_hook)?;
+        ImporterTransforms::new(config, versions_overrider.clone(), deploy_manifest_hook)
+            .map_err(InstallWithFreshLockfileError::InvalidPackageExtensionSelector)?;
     let effective_importer_manifests = transforms.apply_to_all(importer_manifests);
     Ok(ManifestTransforms {
         resolved_overrides: parsed_overrides.as_deref().map(resolved_overrides_map),
@@ -68,13 +73,43 @@ pub(super) fn build_manifest_transforms(
     })
 }
 
+/// The manifests a `--no-save` run writes the lockfile's importer specifiers
+/// from, rewritten through `pnpm.overrides` the way the resolve's own
+/// manifests are. The frozen-lockfile gate applies the same overrides to
+/// what is on disk before comparing, so specifiers left as declared would
+/// fail the very lockfile that wrote them.
+pub(super) fn apply_overrides_to_specifier_manifests(
+    manifests: Option<BTreeMap<String, PackageManifest>>,
+    overrider: Option<&VersionsOverrider>,
+) -> Option<BTreeMap<String, PackageManifest>> {
+    let mut manifests = manifests?;
+    if let Some(overrider) = overrider.filter(|overrider| !overrider.is_empty()) {
+        for manifest in manifests.values_mut() {
+            let manifest_dir = manifest
+                .path()
+                .parent()
+                .map(Path::to_path_buf);
+            overrider.apply(manifest, manifest_dir.as_deref());
+        }
+    }
+    Some(manifests)
+}
+
+/// The hooks [`build_manifest_transforms`] gives the resolver, for a lockfile
+/// check that reads a manifest the way the resolver does.
+pub(crate) fn resolver_manifest_hooks(
+    config: &Config,
+    versions_overrider: Option<Arc<VersionsOverrider>>,
+) -> Result<ManifestHooks, InvalidPackageExtensionSelector> {
+    Ok(ImporterTransforms::new(config, versions_overrider, false)?.into_hooks())
+}
+
 /// The user's `packageExtensions`, when they extend anything at all.
 fn configured_package_extender(
     config: &Config,
-) -> Result<Option<Arc<crate::PackageExtender>>, InstallWithFreshLockfileError> {
+) -> Result<Option<Arc<crate::PackageExtender>>, InvalidPackageExtensionSelector> {
     let Some(extensions) = config.package_extensions.as_ref() else { return Ok(None) };
-    let extender = crate::PackageExtender::new(extensions)
-        .map_err(InstallWithFreshLockfileError::InvalidPackageExtensionSelector)?;
+    let extender = crate::PackageExtender::new(extensions)?;
     Ok((!extender.is_empty()).then(|| Arc::new(extender)))
 }
 
@@ -84,6 +119,7 @@ fn configured_package_extender(
 struct ImporterTransforms {
     compat_package_extender: Option<&'static crate::PackageExtender>,
     package_extender: Option<Arc<crate::PackageExtender>>,
+    add_missing_peer_types: bool,
     versions_overrider: Option<Arc<VersionsOverrider>>,
     deploy_manifest_hook: bool,
     ignored_optional_matcher: Matcher,
@@ -91,10 +127,24 @@ struct ImporterTransforms {
 
 /// The read-package hooks the resolver runs on every manifest, and the
 /// bare-specifier override for dependencies a manifest does not declare.
-pub(super) struct ManifestHooks {
+pub(crate) struct ManifestHooks {
     pub manifest_hook: Option<ManifestHook>,
     pub overrides_hook: Option<ManifestHook>,
     pub override_bare_specifier: Option<Arc<DependencyOverrider>>,
+}
+
+impl ManifestHooks {
+    /// The resolver's hooks, with `pnpmfile_hook` run between these two.
+    pub(crate) fn with_pnpmfile(
+        &self,
+        pnpmfile_hook: Option<Arc<dyn pnpm_hooks::PnpmfileHooks>>,
+    ) -> pnpm_resolving_deps_resolver::ManifestTransformHooks {
+        pnpm_resolving_deps_resolver::ManifestTransformHooks {
+            manifest_hook: self.manifest_hook.clone(),
+            overrides_hook: self.overrides_hook.clone(),
+            pnpmfile_hook,
+        }
+    }
 }
 
 impl ImporterTransforms {
@@ -102,12 +152,13 @@ impl ImporterTransforms {
         config: &Config,
         versions_overrider: Option<Arc<VersionsOverrider>>,
         deploy_manifest_hook: bool,
-    ) -> Result<Self, InstallWithFreshLockfileError> {
+    ) -> Result<Self, InvalidPackageExtensionSelector> {
         Ok(Self {
             compat_package_extender: (!config.ignore_compatibility_db).then(
                 crate::compat_package_extensions::compat_package_extender,
             ),
             package_extender: configured_package_extender(config)?,
+            add_missing_peer_types: config.add_missing_peer_types,
             versions_overrider: versions_overrider.filter(|overrider| !overrider.is_empty()),
             deploy_manifest_hook,
             ignored_optional_matcher: create_matcher(
@@ -117,16 +168,13 @@ impl ImporterTransforms {
     }
 
     fn is_active(&self) -> bool {
-        self.compat_package_extender.is_some()
-            || self.package_extender.is_some()
+        self.package_extender.is_some()
             || self.versions_overrider.is_some()
             || self.deploy_manifest_hook
             || !self.ignored_optional_matcher.is_empty()
     }
 
-    /// Every importer's manifest with the transforms applied; empty when
-    /// nothing transforms them, so the caller resolves against the
-    /// originals.
+    /// Every importer's manifest with the transforms applied.
     fn apply_to_all(
         &self,
         importer_manifests: &BTreeMap<String, &PackageManifest>,
@@ -158,7 +206,12 @@ impl ImporterTransforms {
                 let extender = Arc::clone(extender);
                 Arc::new(move |manifest| extender.apply_to_arc(manifest)) as ManifestHook
             });
-        compose_manifest_hooks(compat_package_extensions_hook, package_extensions_hook)
+        let add_missing_peer_types_hook: Option<ManifestHook> = self
+            .add_missing_peer_types
+            .then(|| Arc::new(crate::missing_peer_types::add_missing_peer_types) as ManifestHook);
+        [compat_package_extensions_hook, package_extensions_hook, add_missing_peer_types_hook]
+            .into_iter()
+            .fold(None, compose_manifest_hooks)
     }
 
     fn override_bare_specifier(&self) -> Option<Arc<DependencyOverrider>> {
@@ -210,9 +263,6 @@ fn transform_importer_manifest(
     transforms: &ImporterTransforms,
 ) -> PackageManifest {
     let mut cloned = manifest.clone();
-    if let Some(extender) = transforms.compat_package_extender {
-        extender.apply(cloned.value_mut());
-    }
     if let Some(extender) = transforms.package_extender.as_deref() {
         extender.apply(cloned.value_mut());
     }

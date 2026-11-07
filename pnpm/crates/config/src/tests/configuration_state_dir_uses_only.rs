@@ -178,6 +178,80 @@ pub fn pnpm_config_request_destinations_expand_env() {
     assert_eq!(config.registry, "https://env.example.com/npm/");
 }
 
+/// A dropped registry URL would resolve its packages from another registry.
+/// <https://github.com/pnpm/pnpm/issues/17762>
+#[test]
+pub fn repository_registry_with_env_placeholder_aborts_the_load() {
+    for (file_name, contents, expected_setting) in [
+        ("pnpm-workspace.yaml", "registry: http://localhost:${MOCK_PORT}/\n", "registry"),
+        (".npmrc", "registry=http://localhost:${MOCK_PORT}/\n", "registry"),
+        (
+            "pnpm-workspace.yaml",
+            "registries:\n  '@acme': http://localhost:${MOCK_PORT}/\n",
+            "registries['@acme']",
+        ),
+        (".npmrc", "@acme:registry=http://localhost:${MOCK_PORT}/\n", "@acme:registry"),
+    ] {
+        let project = tempdir().expect("project tempdir");
+        write_file(&project.path().join(file_name), contents);
+
+        let result = Config::default().current::<HostNoHome>(project.path());
+        eprintln!("{file_name}: {result:?}");
+        assert!(matches!(
+            result,
+            Err(LoadWorkspaceYamlError::RegistryEnvNotExpanded { setting, .. })
+                if setting == expected_setting
+        ));
+    }
+}
+
+/// The load that switches to the pinned pnpm leaves out what this pnpm
+/// refuses, so a newer or older pinned pnpm still gets to decide.
+#[test]
+pub fn readable_load_leaves_out_a_registry_with_env_placeholder() {
+    let project = tempdir().expect("project tempdir");
+    write_file(
+        &project.path().join("pnpm-workspace.yaml"),
+        "registry: http://localhost:${MOCK_PORT}/\nregistries:\n  '@acme': http://localhost:${MOCK_PORT}/\n  '@good': https://good.example/\nlockfile: false\n",
+    );
+    write_file(
+        &project.path().join(".npmrc"),
+        "registry=http://localhost:${MOCK_PORT}/\n@other:registry=http://localhost:${MOCK_PORT}/\n",
+    );
+
+    let config = Config { settings_read: crate::SettingsRead::Readable, ..Config::default() }
+        .current::<HostNoHome>(project.path())
+        .expect("load config");
+
+    assert!(!config.lockfile);
+    assert_eq!(config.registry, "https://registry.npmjs.org/");
+    assert_eq!(config.registries_by_scope.get("@acme"), None);
+    assert_eq!(
+        config.registries_by_scope.get("@good").map(String::as_str),
+        Some("https://good.example/"),
+    );
+    assert_eq!(config.registries_by_scope.get("@other"), None);
+}
+
+#[test]
+pub fn repository_proxy_with_env_placeholder_warns() {
+    let project = tempdir().expect("project tempdir");
+    write_file(
+        &project.path().join("pnpm-workspace.yaml"),
+        "httpsProxy: http://localhost:${MOCK_PORT}/\n",
+    );
+
+    let config = Config::default().current::<HostNoHome>(project.path()).expect("load config");
+
+    assert_eq!(config.proxy, pnpm_network::ProxyConfig::default());
+    dbg!(&config.npmrc_warnings);
+    assert!(
+        config.npmrc_warnings
+            .iter()
+            .any(|warning| warning.starts_with(r#"Ignored "httpsProxy" in pnpm-workspace.yaml"#)),
+    );
+}
+
 /// End-to-end: malformed `pnpm_config__auth` JSON aborts the load with an
 /// error rather than silently dropping the auth.
 #[test]
@@ -613,16 +687,11 @@ pub fn unscoped_creds_in_project_npmrc_warn_naming_that_file() {
 }
 
 /// `default_store_dir`'s `PNPM_HOME` branch, exercised through the
-/// generic capability seam — no process-environment mutation, no
-/// `EnvGuard` lock, no `unsafe` block. With the DI seam from
-/// pnpm/pacquet#339 + pnpm/pnpm#11708 the precedence is checked by
-/// passing a per-test unit struct that satisfies [`EnvVar`],
-/// [`GetHomeDir`], and [`GetCurrentDir`].
+/// generic capability seam.
 ///
 /// The `home_dir` and `current_dir` capability impls both call
 /// `unreachable!` because `default_store_dir` short-circuits on
-/// `PNPM_HOME` before consulting either — the panic-on-call
-/// documents that precondition. Tracks pnpm/pacquet#343.
+/// `PNPM_HOME` before consulting either.
 #[test]
 pub fn should_use_pnpm_home_env_var() {
     struct EnvWithPnpmHome;
@@ -650,10 +719,7 @@ pub fn should_use_pnpm_home_env_var() {
 
 /// Companion to [`should_use_pnpm_home_env_var`]: when
 /// `PNPM_HOME` is unset, `default_store_dir` falls through to
-/// `XDG_DATA_HOME`. Exercised through the DI seam with a fake
-/// `Sys` that only returns a value for `XDG_DATA_HOME`. No
-/// process-environment mutation, no `EnvGuard`, no `unsafe`.
-/// Tracks pnpm/pacquet#343.
+/// `XDG_DATA_HOME`.
 #[test]
 pub fn should_use_xdg_data_home_env_var() {
     struct EnvWithXdgDataHome;

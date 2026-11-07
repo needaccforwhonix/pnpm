@@ -1,0 +1,52 @@
+use super::locked_child_admits;
+use node_semver::{Range, Version};
+use pnpm_lockfile::{PkgName, PkgNameVerPeer, Prefix, RegistryContext, ResolvedDependencySpec};
+use pnpm_tool_protocol::strip_tool_protocol;
+
+/// Whether `bare_specifier` admits the version `spec` locked as `key` for
+/// the importer dependency `alias`. `None` when the locked version or the
+/// specifier has no comparable form.
+pub(super) fn admits_locked_version(
+    spec: &ResolvedDependencySpec,
+    (alias, key): (&PkgName, &PkgNameVerPeer),
+    bare_specifier: &str,
+    registries: &RegistryContext,
+) -> Option<bool> {
+    let ver_peer = spec.version.ver_peer()?;
+    if ver_peer.prefix() == Prefix::Runtime {
+        return Some(runtime_selector_keeps_locked_version(
+            &spec.specifier,
+            bare_specifier,
+            ver_peer.version_semver()?,
+        ));
+    }
+    locked_child_admits(alias, key, bare_specifier, registries)
+}
+
+/// Whether a `tool:` / `runtime:` dependency keeps its locked version: a range selector
+/// names the locked release channel (`rc/^24` keeps only an `rc/` pin) and
+/// admits `locked_version`, and any other selector is unchanged.
+fn runtime_selector_keeps_locked_version(
+    locked_specifier: &str,
+    bare_specifier: &str,
+    locked_version: &Version,
+) -> bool {
+    let (Some(locked), Some(wanted)) =
+        (strip_tool_protocol(locked_specifier), strip_tool_protocol(bare_specifier))
+    else {
+        return locked_specifier == bare_specifier;
+    };
+    let (locked_channel, _) = split_release_channel(locked);
+    let (wanted_channel, wanted_range) = split_release_channel(wanted);
+    match wanted_range.parse::<Range>() {
+        Ok(range) => locked_channel == wanted_channel && range.satisfies(locked_version),
+        Err(_) => locked == wanted,
+    }
+}
+
+fn split_release_channel(selector: &str) -> (Option<&str>, &str) {
+    match selector.split_once('/') {
+        Some((channel, range)) => (Some(channel), range),
+        None => (None, selector),
+    }
+}

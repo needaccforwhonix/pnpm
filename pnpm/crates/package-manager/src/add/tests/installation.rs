@@ -1,6 +1,6 @@
 use super::{
     super::{Add, AddError},
-    add_jsr_selector, add_npm_selector, package_body,
+    add_jsr_selector, add_npm_selector, add_npm_selector_with_ranges, package_body,
 };
 use crate::{ResolvedPackages, add::specifier::ProtocolSelector};
 use pnpm_config::Config;
@@ -81,6 +81,74 @@ async fn add_saves_an_npm_selector_without_a_version_at_the_default_pin() {
     assert_eq!(add_npm_selector("npm:foo").await, Some("^1.0.0".to_string()));
 }
 #[tokio::test]
+async fn add_saves_an_npm_alias_with_the_resolved_target_range() {
+    assert_eq!(add_npm_selector("v2@npm:foo").await, Some("npm:foo@^1.0.0".to_string()));
+}
+#[tokio::test]
+async fn add_keeps_the_range_operator_of_an_npm_alias() {
+    assert_eq!(add_npm_selector("v2@npm:foo@~1.0.0").await, Some("npm:foo@~1.0.0".to_string()));
+}
+#[tokio::test]
+async fn add_saves_an_npm_alias_partial_version_as_the_resolved_range() {
+    assert_eq!(add_npm_selector("v2@npm:foo@1").await, Some("npm:foo@^1.0.0".to_string()));
+}
+#[tokio::test]
+async fn add_uses_a_workspace_declared_range_before_the_default_tag() {
+    assert_eq!(
+        add_npm_selector_with_ranges("foo", Some("~1.0.0"), None).await,
+        Some("~1.0.0".to_string()),
+    );
+}
+#[tokio::test]
+async fn add_uses_the_range_of_a_workspace_it_discovers() {
+    assert_eq!(
+        super::add_npm_selector_in_workspace("foo", (Some("~1.0.0"), None), false).await,
+        Some("~1.0.0".to_string()),
+    );
+}
+#[tokio::test]
+async fn add_uses_a_workspace_declared_range_for_an_npm_protocol_selector() {
+    assert_eq!(
+        add_npm_selector_with_ranges("npm:foo", Some("~1.0.0"), None).await,
+        Some("~1.0.0".to_string()),
+    );
+}
+#[tokio::test]
+async fn add_uses_a_workspace_declared_range_for_an_npm_alias() {
+    assert_eq!(
+        add_npm_selector_with_ranges("alias@npm:foo", Some("~1.0.0"), None).await,
+        Some("npm:foo@~1.0.0".to_string()),
+    );
+}
+#[tokio::test]
+async fn add_prefers_a_workspace_declared_range_over_a_matching_override() {
+    assert_eq!(
+        add_npm_selector_with_ranges("foo", Some("~1.0.0"), Some("^1.0.0")).await,
+        Some("~1.0.0".to_string()),
+    );
+}
+#[tokio::test]
+async fn add_ignores_an_override_of_the_target_of_an_npm_alias() {
+    assert_eq!(
+        add_npm_selector_with_ranges("alias@npm:foo", None, Some("~1.0.0")).await,
+        Some("npm:foo@^1.0.0".to_string()),
+    );
+}
+#[tokio::test]
+async fn add_rebases_a_relative_override_path_onto_the_project() {
+    assert_eq!(
+        add_npm_selector_with_ranges("foo", None, Some("link:./vendor/foo")).await,
+        Some("link:../vendor/foo".to_string()),
+    );
+}
+#[tokio::test]
+async fn add_uses_a_matching_override_before_the_default_tag() {
+    assert_eq!(
+        add_npm_selector_with_ranges("foo", None, Some("~1.0.0")).await,
+        Some("~1.0.0".to_string()),
+    );
+}
+#[tokio::test]
 async fn add_reuses_shared_packument_state_for_every_selector_path() {
     #[derive(Default)]
     struct PackumentRequestState {
@@ -118,7 +186,7 @@ async fn add_reuses_shared_packument_state_for_every_selector_path() {
             state.lock().unwrap().active -= 1;
             result
         })
-        .expect(2)
+        .expect(1)
         .create_async()
         .await;
 
@@ -126,7 +194,7 @@ async fn add_reuses_shared_packument_state_for_every_selector_path() {
     config.store_dir = dir.path().join("pacquet-store").into();
     config.cache_dir = dir.path().join("cache");
     config.modules_dir = modules_dir;
-    config.virtual_store_dir = virtual_store_dir;
+    config.install_state_dir = virtual_store_dir;
     config.registry = registry_url;
     config.minimum_release_age = Some(24 * 60);
     config.minimum_release_age_exclude = Some(vec![package_name.to_string()]);
@@ -145,16 +213,17 @@ async fn add_reuses_shared_packument_state_for_every_selector_path() {
             resolved_packages: &resolved_packages,
             http_client: &http_client,
             config,
-            lockfile: None,
-            lockfile_path: None,
+            lockfile: crate::CommandLockfile::loaded(None, None),
             package_names: &package_names,
             range_spec_style: RangeSpecStyle::Patch,
             lockfile_only: true,
+            save_types: false,
         },
         resources: crate::AddResources {
             tarball_mem_cache: Arc::default(),
             http_client_arc: Arc::new(ThrottledClient::default()),
             dependency_groups: Some([DependencyGroup::Prod]),
+            included_groups: None,
             save_catalog_name: None,
             supported_architectures: None,
         },
@@ -165,10 +234,13 @@ async fn add_reuses_shared_packument_state_for_every_selector_path() {
 
     {
         let requests = request_state.lock().unwrap();
+        // The name is exempt from `minimumReleaseAge`, so the install reuses
+        // the mirror without an `ETag` that the selectors wrote moments ago
+        // instead of fetching it again.
         assert_eq!(
             (requests.max_active, requests.total),
-            (1, 2),
-            "every selector path should share one fetch before the follow-up install fetch",
+            (1, 1),
+            "every selector path and the follow-up install should share one fetch",
         );
     }
     packument.assert_async().await;
@@ -191,7 +263,7 @@ async fn add_does_not_wait_for_a_slower_later_resolution_after_an_error() {
     let mut config = Config::new();
     config.store_dir = dir.path().join("pacquet-store").into();
     config.modules_dir = modules_dir;
-    config.virtual_store_dir = virtual_store_dir;
+    config.install_state_dir = virtual_store_dir;
     config.minimum_release_age = None;
     let mut servers = Vec::new();
     let mut mocks = Vec::new();
@@ -228,16 +300,17 @@ async fn add_does_not_wait_for_a_slower_later_resolution_after_an_error() {
                 resolved_packages: &resolved_packages,
                 http_client: &http_client,
                 config,
-                lockfile: None,
-                lockfile_path: None,
+                lockfile: crate::CommandLockfile::loaded(None, None),
                 package_names: &package_names,
                 range_spec_style: RangeSpecStyle::Patch,
                 lockfile_only: true,
+                save_types: false,
             },
             resources: crate::AddResources {
                 tarball_mem_cache: Arc::default(),
                 http_client_arc: Arc::new(ThrottledClient::default()),
                 dependency_groups: Some([DependencyGroup::Prod]),
+                included_groups: None,
                 save_catalog_name: None,
                 supported_architectures: None,
             },

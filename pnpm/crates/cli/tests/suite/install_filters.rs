@@ -110,6 +110,40 @@ fn filtered_install_materializes_the_workspace_root() {
     );
 }
 
+#[test]
+fn update_config_hook_filter_selects_the_installed_projects() {
+    let (fixture, selected, unselected, _) = workspace_with_installable_root(ManifestDeps {
+        prod: &[(PARENT, "100.0.0")],
+        ..Default::default()
+    });
+    fs::write(
+        fixture.workspace.join(".pnpmfile.mjs"),
+        "export const hooks = { updateConfig (config) { return Object.assign(config, { filter: config.filter ?? ['selected'] }) } }\n",
+    )
+    .expect("write updateConfig hook");
+
+    fixture.run(["install"]);
+
+    assert_root_and_selected_are_materialized(&fixture, &selected, &unselected, PARENT);
+}
+
+#[test]
+fn command_line_filter_outranks_update_config_hook_filter() {
+    let (fixture, selected, unselected, _) = workspace_with_installable_root(ManifestDeps {
+        prod: &[(PARENT, "100.0.0")],
+        ..Default::default()
+    });
+    fs::write(
+        fixture.workspace.join(".pnpmfile.mjs"),
+        "export const hooks = { updateConfig (config) { return Object.assign(config, { filter: ['unselected'] }) } }\n",
+    )
+    .expect("write updateConfig hook");
+
+    fixture.run(["--filter", "selected", "install"]);
+
+    assert_root_and_selected_are_materialized(&fixture, &selected, &unselected, PARENT);
+}
+
 fn compatible_update_scenario(selected_dir: &str, unselected_dir: &str) {
     let fixture = WorkspaceFixture::new();
     let selected = fixture.project(
@@ -308,10 +342,16 @@ fn filtered_frozen_install_checks_only_selected_manifest_specifiers() {
     );
     assert!(!output.status.success(), "selected manifest mismatch must fail");
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let error: Value = stderr
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("stderr records are JSON"))
+        .find(|record| record["level"] == "error")
+        .expect("fatal error record");
+    let message = error["message"].as_str().expect("error message");
     assert!(
-        stderr.contains("ERR_PNPM_OUTDATED_LOCKFILE")
-            && stderr.contains(r#"Cannot install with "frozen-lockfile""#)
-            && stderr.contains("pnpm-lock.yaml is not up"),
+        error["code"] == "ERR_PNPM_OUTDATED_LOCKFILE"
+            && message.contains(r#"Cannot install with "frozen-lockfile""#)
+            && message.contains("pnpm-lock.yaml is not up"),
         "expected the existing frozen-lockfile mismatch diagnostic:\n{stderr}",
     );
 }
@@ -411,18 +451,18 @@ fn filtered_prod_install_preserves_shallow_workspace_link_targets() {
 }
 
 #[test]
-fn filtered_install_keeps_full_cleanup_for_shared_layout_drift() {
+fn filtered_install_refuses_a_shared_layout_drift() {
     let fixture = WorkspaceFixture::new();
     // The drift lives in `.modules.yaml`, which the repeat-install fast
-    // path never reads; this test is about what the pipeline cleans up
-    // once it runs, so keep the pipeline in play.
+    // path never reads; this test is about what the pipeline does once
+    // it runs, so keep the pipeline in play.
     fixture.append_workspace_yaml("optimisticRepeatInstall: false\n");
     let selected = fixture.project(
         "selected",
         "selected",
         ManifestDeps { prod: &[(HELLO, "1.0.0")], ..Default::default() },
     );
-    let _unselected = fixture.project(
+    let unselected = fixture.project(
         "unselected",
         "unselected",
         ManifestDeps { prod: &[(PARENT, "100.0.0")], ..Default::default() },
@@ -443,28 +483,30 @@ fn filtered_install_keeps_full_cleanup_for_shared_layout_drift() {
     )
     .expect("write incompatible .modules.yaml");
 
-    fixture.run(["--filter", "selected", "install"]);
+    let output = fixture.command_at(&fixture.workspace, ["--filter", "selected", "install"]);
+    assert!(
+        !output.status.success(),
+        "the filtered install recreated the shared modules directory",
+    );
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(report.contains("MODULES_BREAKING_CHANGE"), "{report}");
+    assert!(root_sentinel.exists());
+    assert!(slot_sentinel.exists());
+    assert!(has_link(&unselected, PARENT));
+
+    fixture.run(["install"]);
     assert!(!root_sentinel.exists());
     assert!(!slot_sentinel.exists());
     assert!(has_link(&selected, HELLO));
-    let current = fixture.current();
-    assert_eq!(importer_ids(&current), BTreeSet::from(["packages/selected".to_string()]));
-    assert!(!has_snapshot(&current, PARENT, "100.0.0"));
-    let modules = fixture.modules();
-    assert!(
-        !modules.pending_builds
-            .iter()
-            .any(|entry| entry.contains(PARENT)),
-    );
-    assert!(
-        !modules.hoisted_dependencies
-            .keys()
-            .any(|entry| entry.contains(PARENT)),
-    );
+    assert!(has_link(&unselected, PARENT));
 }
 
 #[test]
-fn filtered_hoisted_install_materializes_full_shared_graph_but_links_only_selected_projects() {
+fn filtered_hoisted_install_materializes_only_selected_projects_dependencies() {
     let fixture = WorkspaceFixture::new();
     fixture.append_workspace_yaml("nodeLinker: hoisted\nnodeExperimentalPackageMap: true\n");
     let selected = fixture.project(
@@ -479,13 +521,20 @@ fn filtered_hoisted_install_materializes_full_shared_graph_but_links_only_select
     );
     fixture.run(["--filter", "selected", "install"]);
 
-    for dependency in [HELLO, PARENT, DEP] {
+    assert!(
+        fixture.workspace
+            .join("node_modules")
+            .join(HELLO)
+            .is_dir(),
+        "hoisted shared graph is missing {HELLO}",
+    );
+    for dependency in [PARENT, DEP] {
         assert!(
-            fixture.workspace
+            !fixture.workspace
                 .join("node_modules")
                 .join(dependency)
-                .is_dir(),
-            "hoisted shared graph is missing {dependency}",
+                .exists(),
+            "hoisted shared graph should not contain unselected dependency {dependency}",
         );
     }
     // The selected project's dependency won the workspace-root slot, so
@@ -500,14 +549,19 @@ fn filtered_hoisted_install_materializes_full_shared_graph_but_links_only_select
     assert!(!unselected.join("node_modules").exists());
     assert_full_wanted(&fixture.wanted(), &["packages/selected", "packages/unselected"]);
     let current = fixture.current();
-    assert_full_wanted(&current, &["packages/selected", "packages/unselected"]);
-    assert!(has_snapshot(&current, PARENT, "100.0.0"));
-    assert!(has_snapshot(&current, DEP, "100.1.0"));
+    assert_eq!(importer_ids(&current), BTreeSet::from(["packages/selected".to_string()]));
+    assert!(!has_snapshot(&current, PARENT, "100.0.0"));
+    assert!(!has_snapshot(&current, DEP, "100.1.0"));
     let package_map = fixture.package_map();
     assert_eq!(
-        package_map["packages"]["../packages/unselected"]["dependencies"]["unselected"],
-        json!("../packages/unselected"),
+        package_map["packages"]["../packages/selected"]["dependencies"]["selected"],
+        json!("../packages/selected"),
     );
+    assert_eq!(
+        package_map["packages"]["../packages/selected"]["dependencies"][HELLO],
+        json!(HELLO),
+    );
+    assert!(package_map["packages"].get("../packages/unselected").is_none());
 }
 
 #[test]
@@ -773,8 +827,11 @@ fn filtered_install_refreshes_unselected_catalog_importers_when_catalog_changes(
     assert_eq!(catalog.version, "2.0.0");
 }
 
+/// `--filter` does not put a left-out project back in the workspace: it
+/// selects among the standalone project, the same way it does under
+/// `--ignore-workspace` (<https://github.com/pnpm/pnpm/issues/3561>).
 #[test]
-fn active_manifest_outside_workspace_patterns_keeps_install_filtered() {
+fn a_filtered_install_outside_the_workspace_patterns_installs_only_that_project() {
     let fixture = WorkspaceFixture::new();
     let member = fixture.project(
         "member",
@@ -790,20 +847,30 @@ fn active_manifest_outside_workspace_patterns_keeps_install_filtered() {
 
     fixture.run_at(&local, ["--filter", "*", "install"]);
 
-    let state = fixture.state();
-    assert!(state.filtered_install);
-    assert_eq!(
-        state.projects
-            .keys()
-            .cloned()
-            .collect::<BTreeSet<_>>(),
-        [&member, &local]
-            .into_iter()
-            .map(|path| canonical_path(path))
-            .collect(),
+    assert!(has_link(&local, PARENT));
+    assert!(local.join("pnpm-lock.yaml").is_file());
+    assert!(!member.join("node_modules").exists());
+    assert!(!fixture.workspace.join("pnpm-lock.yaml").exists());
+}
+
+#[test]
+fn filtered_install_reincludes_package_after_exclusion() {
+    let fixture = WorkspaceFixture::new();
+    let pkg_a = fixture.project(
+        "pkg-a",
+        "pkg-a",
+        ManifestDeps { prod: &[(HELLO, "1.0.0")], ..Default::default() },
     );
-    assert!(has_link(&member, HELLO));
-    assert!(!local.join("node_modules").exists());
+    let pkg_b = fixture.project(
+        "pkg-b",
+        "pkg-b",
+        ManifestDeps { prod: &[(DEP, "100.0.0")], ..Default::default() },
+    );
+
+    fixture.run(["--filter", "!./packages/**", "--filter", "pkg-a", "install"]);
+
+    assert!(has_link(&pkg_a, HELLO), "re-included package must be installed");
+    assert!(!pkg_b.join("node_modules").exists(), "excluded package must not be installed");
 }
 
 mod mutations;

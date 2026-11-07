@@ -4,35 +4,33 @@
 //! of re-run, and a machine-readable account of what happened.
 //!
 //! Proof of concept for the `pnpm ci` RFC (pnpm/rfcs — "pnpm as the CI
-//! engine"), with the task cache of pnpm/rfcs#22 in a local-tier-only
-//! form. The command name is `pipeline` because `pnpm ci` is already the
-//! clean-install command.
+//! engine"), with the task cache of pnpm/rfcs#22 as a local tier and an
+//! optional remote one. The command name is `pipeline` because `pnpm ci`
+//! is already the clean-install command.
 
 pub(crate) use agent::WatchPolling;
 pub use agent::{WatchInvocation, run_watch};
-pub use arguments::{PipelineReportArgs, WatchArgs};
+pub use arguments::{DEFAULT_PIPELINE_NAME, PipelineArgs, PipelineInvocation};
 pub use report::RunUpload;
 pub use selection::{Selection, SelectionMode};
 
 mod arguments;
 
 use super::{
-    install::InstallArgs,
-    recursive::{ExecutionStatus, Status, discover_workspace_projects},
+    recursive::{ExecutionStatus, Status, discover_workspace_projects, keeps_workspace_root},
     reporter::{ReporterType, reporter_emit},
     run::{RunContext, ScriptSelector, run_stages},
 };
-use crate::cli_args::recursive::filtered_projects_dependencies;
+use crate::{cli_args::recursive::filtered_projects_dependencies, process::Command};
 
 use cache::{CacheDisposition, TaskCache};
-use clap::Args;
 use derive_more::{Display, Error};
 use execution::{RunTaskOptions, run_pipeline_task, task_environment};
 use indexmap::IndexMap;
 use miette::{Diagnostic, IntoDiagnostic};
 use pnpm_config::Config;
 use pnpm_executor::ScriptOutput;
-use pnpm_injected_deps_syncer::{SyncInjectedDeps, sync_injected_deps};
+use pnpm_injected_deps_syncer::{BinLinkSettings, CopyFiles, SyncInjectedDeps, sync_injected_deps};
 use pnpm_package_manager::{
     make_node_package_map_option, make_node_require_option, package_map_path_for_execution,
     pnp_path_for_execution,
@@ -50,6 +48,8 @@ use pnpm_workspace_task_scheduler::{
 };
 use report::RunReport;
 
+use cache_tiers::CacheTiers;
+use remote_cache::RemoteTaskCache;
 use reporting::{StatusCounts, compute_task_keys, print_dry_run, record_task_outcome};
 use selection::{
     SelectAffectedOptions, build_full_graph, git_stdout, select_affected_projects,
@@ -61,68 +61,22 @@ use std::{
     collections::{HashMap, HashSet},
     env,
     path::{Path, PathBuf},
-    process::Command,
     sync::Mutex,
     time::Instant,
 };
 
 mod agent;
 mod cache;
+mod cache_tiers;
 mod capture;
 mod cargo_cache;
 mod paths;
+mod remote_cache;
 mod report;
 
 /// The base ref the affected selection falls back to when neither
 /// `--base` nor the `pipelineBase` setting names one.
 const DEFAULT_PIPELINE_BASE: &str = "origin/main";
-
-/// The pipeline `pnpm pipeline` runs when no name is given.
-const DEFAULT_PIPELINE_NAME: &str = "default";
-
-#[derive(Debug, Args)]
-pub struct PipelineArgs {
-    /// The pipeline to run, from the `pipelines` section of
-    /// `pnpm-workspace.yaml`. Defaults to "default".
-    pub name: Option<String>,
-    /// The install `pnpm pipeline` performs first is always a frozen
-    /// install; these flags tune the rest of it. `--dry-run` prints the
-    /// task graph without installing or running anything.
-    #[clap(flatten)]
-    pub install_args: InstallArgs,
-    /// With `--dry-run`, print the tasks and their resolved dependency
-    /// edges as JSON.
-    #[clap(long)]
-    pub json: bool,
-    /// Run every task without reading or writing cached results or Cargo snapshots.
-    #[clap(long = "no-cache")]
-    pub no_cache: bool,
-    /// Run the pipeline over every workspace project instead of the
-    /// affected-since-base selection.
-    #[clap(long)]
-    pub full: bool,
-    /// The git ref the affected selection diffs against (its merge base
-    /// with HEAD). Overrides the `pipelineBase` setting.
-    #[clap(long)]
-    pub base: Option<String>,
-    #[clap(flatten)]
-    pub agent: WatchArgs,
-    #[clap(flatten)]
-    pub reporting: PipelineReportArgs,
-}
-
-/// The pipeline-specific inputs of one invocation, split off
-/// [`PipelineArgs`] once the install half has been consumed.
-pub struct PipelineInvocation {
-    pub name: Option<String>,
-    pub dry_run: bool,
-    pub json: bool,
-    pub no_cache: bool,
-    pub full: bool,
-    pub base: Option<String>,
-    pub report: bool,
-    pub report_to: Option<String>,
-}
 
 /// How the run ended, and what a `--report` submission would carry. The
 /// failure exit is raised by the dispatcher after any reporting, so a
@@ -181,13 +135,14 @@ pub fn run_pipeline(
     };
     let (name, requested_tasks) = run.requested_tasks()?;
 
-    let (projects, _) = discover_workspace_projects(run.workspace_root, config)?;
-    let graph = build_full_graph(&projects, config);
+    let (projects, patterns) = discover_workspace_projects(run.workspace_root, config)?;
+    let graph = build_full_graph(&projects, config)?;
 
     let base = pipeline_base(invocation, config);
     let selection = select_affected_projects(&SelectAffectedOptions {
         graph: &graph,
         workspace_root: run.workspace_root,
+        keeps_workspace_root: keeps_workspace_root(config, patterns.as_deref()),
         base: &base,
         full: invocation.full,
         config,
@@ -202,8 +157,7 @@ pub fn run_pipeline(
     )?;
 
     if selection.requested.is_empty() {
-        run.info(format!("No projects are affected since {base} — nothing to run."));
-        return run.conclude(&report, None, 0);
+        return run.conclude_empty_selection(&report, selection.mode, &base);
     }
     run.execute(&PipelinePlan {
         name,
@@ -238,6 +192,14 @@ impl<'a> PipelineRun<'a> {
     fn info(&self, message: String) {
         (self.emit)(&LogEvent::Pnpm(PnpmLog {
             level: LogLevel::Info,
+            message,
+            prefix: self.workspace_root.to_string_lossy().into_owned(),
+        }));
+    }
+
+    fn warn(&self, message: String) {
+        (self.emit)(&LogEvent::Pnpm(PnpmLog {
+            level: LogLevel::Warn,
             message,
             prefix: self.workspace_root.to_string_lossy().into_owned(),
         }));
@@ -286,23 +248,17 @@ impl<'a> PipelineRun<'a> {
         }
 
         let cache = TaskCache::open(&self.data_dir(), self.workspace_root)?;
-        // Keys are computed for every task before anything runs, walking the
-        // sequenced order so a task's dependency keys exist when its own is
-        // built. This is also what a distributed tier would need: the whole
-        // plan, priced, without executing. `--no-cache` skips the pricing
-        // altogether: nothing reads a key, and hashing every tracked file of
-        // every project is the bulk of what the flag exists to avoid.
-        let task_keys = if self.invocation.no_cache {
-            HashMap::new()
-        } else {
-            compute_task_keys(&task_graph, &sequenced_tasks, plan.graph, &cache, self.config)?
-        };
+        let task_keys = self.compute_task_keys(&task_graph, &sequenced_tasks, plan, &cache)?;
+        let remote_cache =
+            cache_tiers::open_remote_tier(self.config, self.invocation.no_cache, |message| {
+                self.warn(message);
+            });
 
         capture::install_forward(self.emit);
         let runner = TaskRunner {
             run: self,
             graph: plan.graph,
-            cache: &cache,
+            cache: CacheTiers { local: &cache, remote: remote_cache.as_ref() },
             task_keys: &task_keys,
             report: plan.report,
             environment: PipelineEnvironment {
@@ -312,9 +268,31 @@ impl<'a> PipelineRun<'a> {
             results: PipelineResults::new(&task_graph, self.workspace_root),
         };
         runner.schedule(&task_graph);
+        for failure in remote_cache.iter().flat_map(RemoteTaskCache::finish_uploads) {
+            self.warn(format!("Failed to upload a task to the remote cache: {failure}"));
+        }
 
         let statuses = runner.finish()?;
         self.finish_plan(plan, &statuses, &task_keys)
+    }
+
+    /// Keys are computed for every task before anything runs, walking the
+    /// sequenced order so a task's dependency keys exist when its own is
+    /// built. This is also what a distributed tier would need: the whole
+    /// plan, priced, without executing. `--no-cache` skips the pricing
+    /// altogether: nothing reads a key, and hashing every tracked file of
+    /// every project is the bulk of what the flag exists to avoid.
+    fn compute_task_keys(
+        &self,
+        task_graph: &TaskGraph,
+        sequenced_tasks: &[TaskKey],
+        plan: &PipelinePlan<'_, '_>,
+        cache: &TaskCache,
+    ) -> miette::Result<HashMap<TaskKey, Option<String>>> {
+        if self.invocation.no_cache {
+            return Ok(HashMap::new());
+        }
+        compute_task_keys(task_graph, sequenced_tasks, plan.graph, cache, self.config, self.emit)
     }
 
     fn finish_plan(
@@ -396,7 +374,7 @@ impl<'a> PipelineRun<'a> {
 struct TaskRunner<'a, 'graph> {
     run: &'a PipelineRun<'a>,
     graph: &'a ProjectGraph<GraphPkg<'graph>>,
-    cache: &'a TaskCache,
+    cache: CacheTiers<'a>,
     task_keys: &'a HashMap<TaskKey, Option<String>>,
     report: &'a RunReport,
     environment: PipelineEnvironment,

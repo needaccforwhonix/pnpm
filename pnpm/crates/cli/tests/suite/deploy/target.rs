@@ -226,3 +226,473 @@ fn deployed_files_field_does_not_match_at_depth() {
 
     drop((root, mock_instance));
 }
+
+#[test]
+fn deploy_respects_package_import_method() {
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    write_workspace(&workspace, true);
+    write_project(
+        &workspace,
+        "app",
+        &serde_json::json!({
+            "name": "app",
+            "version": "1.0.0",
+            "files": ["index.js"],
+            "dependencies": { "@pnpm.e2e/foo": "100.0.0" },
+        }),
+    );
+
+    pacquet
+        .with_arg("install")
+        .assert()
+        .success();
+
+    let output = pacquet_cmd(&workspace)
+        .with_args([
+            "--filter",
+            "app",
+            "deploy",
+            "--prod",
+            "--package-import-method=copy",
+            "deploy-copy",
+        ])
+        .output()
+        .expect("spawn pacquet deploy copy");
+    assert!(output.status.success(), "deploy with copy must succeed");
+    let copy_stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        copy_stdout.contains(
+            "Packages are copied from the content-addressable store to the virtual store."
+        ),
+        "stdout should report copy: {copy_stdout}",
+    );
+
+    let output_hardlink = pacquet_cmd(&workspace)
+        .with_args([
+            "--filter",
+            "app",
+            "deploy",
+            "--prod",
+            "--package-import-method=hardlink",
+            "deploy-hardlink",
+        ])
+        .output()
+        .expect("spawn pacquet deploy hardlink");
+    assert!(output_hardlink.status.success(), "deploy with hardlink must succeed");
+    let hardlink_stdout = String::from_utf8_lossy(&output_hardlink.stdout);
+    assert!(
+        hardlink_stdout.contains(
+            "Packages are hard linked from the content-addressable store to the virtual store."
+        ),
+        "stdout should report hardlink: {hardlink_stdout}",
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let copy_index_js = workspace.join("deploy-copy/index.js");
+        assert_eq!(fs::metadata(copy_index_js).unwrap().nlink(), 1);
+
+        let hardlink_index_js = workspace.join("deploy-hardlink/index.js");
+        assert_eq!(fs::metadata(hardlink_index_js).unwrap().nlink(), 1);
+
+        let copy_dep_json = workspace.join("deploy-copy/node_modules/@pnpm.e2e/foo/package.json");
+        assert_eq!(fs::metadata(copy_dep_json).unwrap().nlink(), 1);
+
+        let hardlink_dep_json =
+            workspace.join("deploy-hardlink/node_modules/@pnpm.e2e/foo/package.json");
+        assert!(fs::metadata(hardlink_dep_json).unwrap().nlink() >= 2);
+    }
+
+    assert!(
+        !same_file::is_same_file(
+            workspace.join("packages/app/index.js"),
+            workspace.join("deploy-hardlink/index.js"),
+        )
+        .unwrap(),
+        "deployed project file must not be hardlinked to source file",
+    );
+
+    drop((root, mock_instance));
+}
+
+#[cfg(unix)]
+#[test]
+fn deploy_preserves_internal_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    write_workspace(&workspace, true);
+    write_project(
+        &workspace,
+        "app-with-symlinks",
+        &serde_json::json!({
+            "name": "app-with-symlinks",
+            "version": "1.0.0",
+        }),
+    );
+    let project = workspace.join("packages/app-with-symlinks");
+    fs::write(project.join("real-file.txt"), "hello from real file").unwrap();
+    fs::create_dir_all(project.join("sub")).unwrap();
+    fs::write(project.join("sub/nested.txt"), "nested content").unwrap();
+    symlink("real-file.txt", project.join("symlink-file.txt")).unwrap();
+    symlink("sub", project.join("symlink-dir")).unwrap();
+
+    pacquet
+        .with_arg("install")
+        .assert()
+        .success();
+    pacquet_cmd(&workspace)
+        .with_args(["--filter", "app-with-symlinks", "deploy", "deploy"])
+        .assert()
+        .success();
+
+    let deploy_dir = workspace.join("deploy");
+    let file_symlink = deploy_dir.join("symlink-file.txt");
+    let dir_symlink = deploy_dir.join("symlink-dir");
+
+    assert!(file_symlink.is_symlink(), "file symlink must be preserved");
+    assert_eq!(fs::read_link(&file_symlink).unwrap(), std::path::Path::new("real-file.txt"));
+    assert_eq!(fs::read_to_string(&file_symlink).unwrap(), "hello from real file");
+
+    assert!(dir_symlink.is_symlink(), "directory symlink must be preserved");
+    assert_eq!(fs::read_link(&dir_symlink).unwrap(), std::path::Path::new("sub"));
+    assert_eq!(fs::read_to_string(dir_symlink.join("nested.txt")).unwrap(), "nested content");
+
+    drop((root, mock_instance));
+}
+
+#[cfg(unix)]
+#[test]
+fn deploy_all_files_preserves_internal_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    write_workspace(&workspace, true);
+    let mut workspace_yaml = fs::read_to_string(workspace.join("pnpm-workspace.yaml")).unwrap();
+    workspace_yaml.push_str("deployAllFiles: true\n");
+    fs::write(workspace.join("pnpm-workspace.yaml"), workspace_yaml).unwrap();
+    write_project(
+        &workspace,
+        "app-with-symlinks",
+        &serde_json::json!({
+            "name": "app-with-symlinks",
+            "version": "1.0.0",
+        }),
+    );
+    let project = workspace.join("packages/app-with-symlinks");
+    fs::write(project.join("real-file.txt"), "hello from real file").unwrap();
+    fs::create_dir_all(project.join("sub")).unwrap();
+    fs::write(project.join("sub/nested.txt"), "nested content").unwrap();
+    symlink("real-file.txt", project.join("symlink-file.txt")).unwrap();
+    symlink("sub", project.join("symlink-dir")).unwrap();
+
+    pacquet
+        .with_arg("install")
+        .assert()
+        .success();
+    pacquet_cmd(&workspace)
+        .with_args(["--filter", "app-with-symlinks", "deploy", "deploy"])
+        .assert()
+        .success();
+
+    let deploy_dir = workspace.join("deploy");
+    let file_symlink = deploy_dir.join("symlink-file.txt");
+    let dir_symlink = deploy_dir.join("symlink-dir");
+
+    assert!(file_symlink.is_symlink(), "file symlink must be preserved");
+    assert_eq!(fs::read_link(&file_symlink).unwrap(), std::path::Path::new("real-file.txt"));
+    assert_eq!(fs::read_to_string(&file_symlink).unwrap(), "hello from real file");
+
+    assert!(dir_symlink.is_symlink(), "directory symlink must be preserved");
+    assert_eq!(fs::read_link(&dir_symlink).unwrap(), std::path::Path::new("sub"));
+    assert_eq!(fs::read_to_string(dir_symlink.join("nested.txt")).unwrap(), "nested content");
+
+    drop((root, mock_instance));
+}
+
+/// The layout a Nitro build writes: dependencies linked into a nested
+/// `node_modules` from a dot directory next to them.
+#[cfg(unix)]
+#[test]
+fn deploy_preserves_symlinks_in_nested_node_modules_listed_in_files() {
+    use std::os::unix::fs::symlink;
+
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    write_workspace(&workspace, true);
+    write_project(
+        &workspace,
+        "nitro-app",
+        &serde_json::json!({
+            "name": "nitro-app",
+            "version": "1.0.0",
+            "files": [".output"],
+        }),
+    );
+    let server_modules = workspace.join("packages/nitro-app/.output/server/node_modules");
+    for name in ["foo", "bar"] {
+        let store_dir = server_modules.join(format!(".nitro/{name}@1.0.0"));
+        fs::create_dir_all(&store_dir).unwrap();
+        fs::write(store_dir.join("index.js"), format!(r#"module.exports = "{name}""#)).unwrap();
+    }
+    fs::create_dir_all(server_modules.join("@scope")).unwrap();
+    symlink(".nitro/foo@1.0.0", server_modules.join("foo")).unwrap();
+    symlink("../.nitro/bar@1.0.0", server_modules.join("@scope/bar")).unwrap();
+
+    pacquet
+        .with_arg("install")
+        .assert()
+        .success();
+    pacquet_cmd(&workspace)
+        .with_args(["--filter", "nitro-app", "deploy", "deploy"])
+        .assert()
+        .success();
+
+    let deployed_modules = workspace.join("deploy/.output/server/node_modules");
+    for (link, target, name) in
+        [("foo", ".nitro/foo@1.0.0", "foo"), ("@scope/bar", "../.nitro/bar@1.0.0", "bar")]
+    {
+        let link = deployed_modules.join(link);
+        assert!(link.is_symlink(), "{} must be deployed as a symlink", link.display());
+        assert_eq!(fs::read_link(&link).unwrap(), std::path::Path::new(target));
+        assert_eq!(
+            fs::read_to_string(link.join("index.js")).unwrap(),
+            format!(r#"module.exports = "{name}""#),
+        );
+    }
+
+    drop((root, mock_instance));
+}
+
+#[test]
+fn deploy_through_symlinked_ancestor_finds_patches_and_workspace_dependencies() {
+    const LEGACY_NODE_ENGINES_PATCH: &str = "\
+diff --git a/package.json b/package.json
+--- a/package.json
++++ b/package.json
+@@ -2,6 +2,6 @@
+   \"name\": \"@pnpm.e2e/for-legacy-node\",
+   \"version\": \"1.0.0\",
+   \"engines\": {
+-    \"node\": \"0.10\"
++    \"node\": \"patched\"
+   }
+ }
+";
+
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    write_workspace(&workspace, false);
+    let manifest_path = workspace.join("packages/app/package.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    manifest["dependencies"]["@pnpm.e2e/for-legacy-node"] = "1.0.0".into();
+    fs::write(&manifest_path, manifest.to_string()).unwrap();
+    fs::create_dir_all(workspace.join("patches")).unwrap();
+    fs::write(workspace.join("patches/for-legacy-node.patch"), LEGACY_NODE_ENGINES_PATCH).unwrap();
+    let workspace_yaml_path = workspace.join("pnpm-workspace.yaml");
+    let mut workspace_yaml = fs::read_to_string(&workspace_yaml_path).unwrap();
+    workspace_yaml.push_str(
+        "patchedDependencies:\n  '@pnpm.e2e/for-legacy-node@1.0.0': patches/for-legacy-node.patch\n",
+    );
+    fs::write(workspace_yaml_path, workspace_yaml).unwrap();
+    pacquet
+        .with_arg("install")
+        .assert()
+        .success();
+
+    // The link is shallower than its target, so on Unix `..` steps counted
+    // from the link's path stop short of the workspace once the kernel
+    // follows it. Windows links with a junction and collapses `..` lexically.
+    let deep_dir = root.path().join("deep/nested/dir");
+    fs::create_dir_all(&deep_dir).unwrap();
+    let link = root.path().join("link");
+    pnpm_fs::symlink_dir(&deep_dir, &link).unwrap();
+    let deploy_dir = link.join("deploy");
+    pacquet_cmd(&workspace)
+        .with_args(["--filter", "app", "deploy", "--prod"])
+        .with_arg(&deploy_dir)
+        .assert()
+        .success();
+
+    let patched_manifest =
+        fs::read_to_string(deploy_dir.join("node_modules/@pnpm.e2e/for-legacy-node/package.json"))
+            .unwrap();
+    assert!(patched_manifest.contains(r#""patched""#), "patch not applied:\n{patched_manifest}");
+    assert!(deploy_dir.join("node_modules/lib/index.js").exists());
+
+    drop((root, mock_instance));
+}
+
+#[cfg(unix)]
+#[test]
+fn deploy_preserves_links_to_dependencies_and_copies_file_links_to_unselected_targets() {
+    use std::{os::unix::fs::symlink, path::Path};
+
+    let CommandTempCwd { pacquet, root, workspace, .. } = CommandTempCwd::init();
+    fs::write(
+        workspace.join("pnpm-workspace.yaml"),
+        "packages: [.]\ninjectWorkspacePackages: true\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({
+            "name": "app", "version": "1.0.0", "files": [".next"],
+            "dependencies": {"local-dep": "file:vendor/local-dep"}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::create_dir_all(workspace.join("vendor/local-dep")).unwrap();
+    fs::write(
+        workspace.join("vendor/local-dep/package.json"),
+        r#"{"name":"local-dep","version":"1.0.0","main":"index.cjs"}"#,
+    )
+    .unwrap();
+    fs::write(workspace.join("vendor/local-dep/index.cjs"), "module.exports = 42").unwrap();
+    pacquet
+        .with_args(["install", "--offline", "--ignore-scripts"])
+        .assert()
+        .success();
+    fs::create_dir_all(workspace.join(".next/node_modules/@scope")).unwrap();
+    fs::write(workspace.join("omitted.txt"), "omitted").unwrap();
+    fs::write(workspace.join(".next/control.txt"), "control").unwrap();
+    let links = [
+        ("node_modules/alias", "../../node_modules/local-dep"),
+        ("node_modules/@scope/alias", "../../../node_modules/local-dep"),
+        ("control-link", "control.txt"),
+        ("chain", "node_modules/alias"),
+    ];
+    for (name, target) in links {
+        symlink(target, workspace.join(".next").join(name)).unwrap();
+    }
+    symlink("../omitted.txt", workspace.join(".next/file-link")).unwrap();
+    assert_eq!(
+        fs::read_to_string(workspace.join(".next/node_modules/alias/index.cjs")).unwrap(),
+        "module.exports = 42",
+    );
+    // A build restored without its `node_modules` leaves the aliases dangling.
+    for source_modules in ["installed", "removed"] {
+        if source_modules == "removed" {
+            fs::remove_dir_all(workspace.join("node_modules")).unwrap();
+        }
+        for (mode, flags) in [("default", &[][..]), ("legacy", &["--legacy"][..])] {
+            let destination = root
+                .path()
+                .join(format!("{mode}-{source_modules}"));
+            let command = pacquet_cmd(&workspace)
+                .with_args([
+                    "--filter",
+                    "app",
+                    "deploy",
+                    "--prod",
+                    "--offline",
+                    "--ignore-scripts",
+                ]);
+            command
+                .with_args(flags)
+                .with_arg(&destination)
+                .assert()
+                .success();
+            for (name, target) in links {
+                assert_eq!(
+                    fs::read_link(destination.join(".next").join(name)).unwrap(),
+                    Path::new(target),
+                );
+            }
+            let file_link = destination.join(".next/file-link");
+            assert!(fs::symlink_metadata(&file_link).unwrap().is_file());
+            assert_eq!(fs::read_to_string(&file_link).unwrap(), "omitted");
+            let dependency = destination.join(".next/node_modules/alias/index.cjs");
+            assert_eq!(fs::read_to_string(&dependency).unwrap(), "module.exports = 42");
+            assert!(
+                fs::canonicalize(&dependency)
+                    .unwrap()
+                    .starts_with(fs::canonicalize(&destination).unwrap()),
+                "{dependency:?} must resolve inside {destination:?}",
+            );
+            assert!(
+                !destination.join("omitted.txt").exists(),
+                "unselected target must stay omitted",
+            );
+        }
+    }
+}
+
+/// Deploy writes its files with the mode the umask gives any new file, not 0600.
+#[cfg(unix)]
+#[test]
+fn deployed_files_get_the_umask_mode() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = |path: &std::path::Path| {
+        fs::metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    };
+
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    write_workspace(&workspace, true);
+
+    pacquet
+        .with_arg("install")
+        .assert()
+        .success();
+    pacquet_cmd(&workspace)
+        .with_args(["--filter", "app", "deploy", "deploy"])
+        .assert()
+        .success();
+
+    let reference = workspace.join("reference");
+    fs::File::create(&reference).unwrap();
+    let deploy_dir = workspace.join("deploy");
+    for file in ["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"] {
+        let path = deploy_dir.join(file);
+        assert_eq!(mode(&path), mode(&reference), "{file} is {:o}", mode(&path));
+    }
+
+    drop((root, mock_instance));
+}

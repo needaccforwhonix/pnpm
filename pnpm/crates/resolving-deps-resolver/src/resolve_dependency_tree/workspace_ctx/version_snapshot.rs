@@ -1,11 +1,33 @@
 use super::{
-    Arc, ChildrenOwnerEntry, DirectDep, FirstWalkMissing, HashMap, MissingNames, MutexGuard,
-    OwnerMissingRecord, ResolvedTree, RunVersionsCache, WorkspaceTreeCtx, collect_newly_visited,
-    fold_version, fold_visited_versions, lock_recoverable, take_locked, walk_reachable_children,
-    walk_reachable_nodes,
+    Arc, ChildrenOwnerEntry, DirectDep, FirstWalkMissing, HashMap, HashSet, MissingNames,
+    MutexGuard, OwnerMissingRecord, ResolvedTree, RunVersionsCache, WorkspaceTreeCtx,
+    collect_newly_visited, fold_version, fold_visited_versions, lock_recoverable, take_locked,
+    take_write_locked, walk_reachable_children, walk_reachable_nodes,
 };
 
 impl WorkspaceTreeCtx {
+    /// Runs `inspect` on the package recorded under `pkg_id`, if any.
+    pub(crate) fn inspect_package<Output>(
+        &self,
+        pkg_id: &str,
+        inspect: impl FnOnce(&crate::ResolvedPackage) -> Output,
+    ) -> Option<Output> {
+        lock_recoverable(&self.tree.packages).get(pkg_id).map(inspect)
+    }
+
+    /// Calls `visit` on every recorded package.
+    pub(crate) fn for_each_package(&self, visit: impl FnMut(&crate::ResolvedPackage)) {
+        lock_recoverable(&self.tree.packages).values().for_each(visit);
+    }
+
+    pub(crate) fn duplicate_versions(&self) -> pnpm_resolving_resolver_base::PreferredVersions {
+        self.run_preferred_versions().versions
+            .iter()
+            .filter(|(_, versions)| versions.len() > 1)
+            .map(|(name, versions)| (name.clone(), versions.clone()))
+            .collect()
+    }
+
     /// Snapshot the workspace context into a [`ResolvedTree`] without
     /// consuming `self`. `direct` carries the combined direct-dep
     /// envelopes the caller built up across importers; multi-importer
@@ -93,22 +115,9 @@ impl WorkspaceTreeCtx {
     /// [`pnpm_resolving_resolver_base::PreferredVersions`] entries the
     /// peer-hoist pickers bias toward.
     ///
-    /// Derived from the settled tree — the recorded roots plus the
-    /// children edges the deterministic children owners recorded — not
-    /// from resolution arrival order. Concurrent importer waves can
-    /// transiently walk (and resolve versions inside) a subtree whose
-    /// children ownership a better-placed occurrence later takes over;
-    /// whether such a walk happens at all depends on thread
-    /// interleaving, so an arrival-ordered fold gives the pickers
-    /// run-to-run varying candidates and reshuffles peer bindings on
-    /// every install. The reachable closure is interleaving-independent
-    /// because both the roots and the surviving children records are.
-    ///
-    /// The closure is cached and extended incrementally: shared-map
-    /// growth (`revision`) only ever hangs new subtrees under new
-    /// roots, so previously visited packages keep their entries; a
-    /// children-ownership rewrite (`children_rewrites`) can restructure
-    /// existing subtrees, so it rebuilds the closure from scratch.
+    /// Reachability is decided by the settled tree, not by the order
+    /// resolutions arrive in, so a package the run resolved but nothing
+    /// reaches any more is not a candidate.
     pub(in super::super) fn run_preferred_versions(&self) -> MutexGuard<'_, RunVersionsCache> {
         let revision = self.tree.revision();
         let children_rewrites = self.tree.children_rewrites();
@@ -145,6 +154,62 @@ impl WorkspaceTreeCtx {
         cache.revision = revision;
         cache.children_rewrites = children_rewrites;
         cache
+    }
+
+    /// `name → versions` of `names` among the packages reachable from
+    /// `roots`, the pkg ids of one importer's direct dependencies.
+    pub(crate) fn versions_reachable_from<'id>(
+        &self,
+        roots: impl Iterator<Item = &'id str>,
+        names: &HashSet<&str>,
+    ) -> HashMap<String, HashSet<String>> {
+        let mut queue: Vec<String> = roots.map(str::to_owned).collect();
+        let reached = {
+            let children_by_id = lock_recoverable(&self.children.by_id);
+            collect_newly_visited(&children_by_id, &mut queue, &mut HashSet::default())
+        };
+        let mut versions: HashMap<String, HashSet<String>> = HashMap::default();
+        for (name, version) in self.names_and_versions_of(reached) {
+            if names.contains(name.as_str()) {
+                versions
+                    .entry(name)
+                    .or_default()
+                    .insert(version);
+            }
+        }
+        versions
+    }
+
+    /// The name and version of each of `pkg_ids`. A workspace package
+    /// without a `name_ver` is identified by its recorded manifest
+    /// identity.
+    fn names_and_versions_of(&self, pkg_ids: Vec<String>) -> Vec<(String, String)> {
+        let mut name_versions = Vec::new();
+        let mut unnamed = Vec::new();
+        {
+            let packages = lock_recoverable(&self.tree.packages);
+            for pkg_id in pkg_ids {
+                match packages
+                    .get(pkg_id.as_str())
+                    .and_then(|pkg| pkg.result().package.name_ver.as_ref())
+                {
+                    Some(name_ver) => {
+                        name_versions.push((
+                            name_ver.name.to_string(),
+                            name_ver.suffix.to_string(),
+                        ));
+                    }
+                    None => unnamed.push(pkg_id),
+                }
+            }
+        }
+        let identities = lock_recoverable(&self.versions.workspace_manifest_identities);
+        name_versions.extend(
+            unnamed
+                .iter()
+                .filter_map(|pkg_id| identities.get(pkg_id).cloned()),
+        );
+        name_versions
     }
 
     /// Fold the versions of the workspace packages whose manifest
@@ -188,7 +253,7 @@ impl WorkspaceTreeCtx {
             take_locked(&mut self.cache.resolved_by_wanted),
             take_locked(&mut self.cache.resolved_workspace_by_wanted),
             take_locked(&mut self.cache.resolved_workspace_final_by_wanted),
-            take_locked(&mut self.children.specs_by_id),
+            take_write_locked(&mut self.children.specs_by_id),
         );
         pnpm_fs::background_drop(dedup_caches);
         tree

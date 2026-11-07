@@ -7,24 +7,42 @@ use super::{
     install::{InstallArgs, resolve_bool_override},
     list::RecursionLimit,
     package_manager::{
-        current_source_pnpm_version, package_manager_to_sync, parse_package_manager,
+        current_source_pnpm_version, package_manager_to_sync_for_version, parse_package_manager,
         read_manifest_json,
     },
+    parse_depth_limit,
+    remove::RemoveArgs,
     reporter::{LogLevelSetting, ReporterType},
     store::StoreCommand,
+    tasks::{TasksArgs, TasksCommand},
     unlink::UnlinkArgs,
     version::VersionArgs,
 };
 use clap::Parser;
-use pnpm_config::ColorMode;
+use pnpm_config::{ColorMode, PNPM_VERSION, PmOnFail};
 use pnpm_default_reporter::SummaryScope;
 use std::path::Path;
 use tempfile::TempDir;
+
+fn package_manager_to_sync(
+    manifest: &serde_json::Value,
+    root_dir: &Path,
+    on_fail: Option<PmOnFail>,
+) -> Option<super::package_manager::PackageManagerToSync> {
+    package_manager_to_sync_for_version(manifest, root_dir, on_fail, PNPM_VERSION)
+}
 
 fn install_args(argv: &[&str]) -> InstallArgs {
     match CliArgs::try_parse_from(argv).expect("parses").command {
         CliCommand::Install(install) => install,
         other => panic!("expected install, got {other:?}"),
+    }
+}
+
+fn remove_args(argv: &[&str]) -> RemoveArgs {
+    match CliArgs::try_parse_from(argv).expect("parses").command {
+        CliCommand::Remove(remove) => remove,
+        other => panic!("expected remove, got {other:?}"),
     }
 }
 
@@ -47,6 +65,14 @@ fn version_args(argv: &[&str]) -> VersionArgs {
 }
 
 #[test]
+fn setup_accepts_no_modify_path() {
+    match CliArgs::try_parse_from(["pnpm", "setup", "--no-modify-path"]).expect("parses").command {
+        CliCommand::Setup(setup) => assert!(setup.no_modify_path),
+        other => panic!("expected setup, got {other:?}"),
+    }
+}
+
+#[test]
 fn prefix_is_an_alias_of_dir() {
     for argv in [
         ["pacquet", "--prefix", "project", "run", "test"].as_slice(),
@@ -56,6 +82,28 @@ fn prefix_is_an_alias_of_dir() {
         let parsed = CliArgs::try_parse_from(argv).expect("parses --prefix");
         assert_eq!(parsed.paths.dir, std::path::PathBuf::from("project"));
     }
+}
+
+#[test]
+fn progress_is_a_universal_global_option() {
+    for (argv, progress, no_progress) in [
+        (["pacquet", "--progress", "install"].as_slice(), true, false),
+        (["pacquet", "install", "--progress"].as_slice(), true, false),
+        (["pacquet", "--no-progress", "install"].as_slice(), false, true),
+        (["pacquet", "install", "--no-progress"].as_slice(), false, true),
+    ] {
+        let parsed = CliArgs::try_parse_from(argv).expect("parses progress option");
+        assert_eq!(parsed.output.presentation.progress, progress);
+        assert_eq!(parsed.output.presentation.no_progress, no_progress);
+    }
+}
+
+#[test]
+fn repeated_progress_flags_resolve_to_the_last_spelling() {
+    let enabled = CliArgs::try_parse_from(["pacquet", "install", "--no-progress", "--progress"])
+        .expect("parses --progress");
+    assert!(enabled.output.presentation.progress);
+    assert!(!enabled.output.presentation.no_progress);
 }
 
 #[test]
@@ -318,6 +366,19 @@ fn trust_lockfile_pair_resolves_last_one_wins() {
     );
 }
 
+#[test]
+fn remove_trust_lockfile_pair_resolves_last_one_wins() {
+    assert!(remove_args(&["pacquet", "remove", "foo", "--no-trust-lockfile"]).no_trust_lockfile);
+    assert!(remove_args(&["pacquet", "remove", "foo", "--trust-lockfile"]).trust_lockfile);
+
+    let last_off =
+        remove_args(&["pacquet", "remove", "foo", "--trust-lockfile", "--no-trust-lockfile"]);
+    assert!(last_off.no_trust_lockfile && !last_off.trust_lockfile, "--no wins when last");
+    let last_on =
+        remove_args(&["pacquet", "remove", "foo", "--no-trust-lockfile", "--trust-lockfile"]);
+    assert!(last_on.trust_lockfile && !last_on.no_trust_lockfile, "--trust wins when last");
+}
+
 /// Returns the canonicalized root too: a temp dir is a symlink on some
 /// platforms, so a `--dir` redirect would not compare equal otherwise.
 fn workspace_fixture() -> (TempDir, std::path::PathBuf) {
@@ -331,7 +392,7 @@ fn workspace_fixture() -> (TempDir, std::path::PathBuf) {
 
 /// Every subcommand declaring `--global`. A new one added without wiring
 /// it into [`CliCommand::is_global`] slips past the conflict check.
-const GLOBAL_SUBCOMMAND_ARGV: [&[&str]; 12] = [
+const GLOBAL_SUBCOMMAND_ARGV: [&[&str]; 13] = [
     &["add", "foo"],
     &["approve-builds"],
     &["bin"],
@@ -339,6 +400,7 @@ const GLOBAL_SUBCOMMAND_ARGV: [&[&str]; 12] = [
     &["list"],
     &["ll"],
     &["outdated"],
+    &["peers", "check"],
     &["prefix"],
     &["remove", "foo"],
     &["root"],
@@ -636,6 +698,90 @@ fn store_status_and_add_are_subcommands_of_store() {
     assert_eq!(add.packages, ["express@4", "typescript@2.1.0"]);
 }
 
+#[test]
+fn tasks_status_accepts_group_names() {
+    let CliCommand::Tasks(TasksArgs {
+        command: Some(TasksCommand::Status(args)),
+        ..
+    }) = command(&["pacquet", "tasks", "status", "cargo", "typescript"])
+    else {
+        panic!("expected tasks status");
+    };
+    assert_eq!(args.groups, ["cargo", "typescript"]);
+}
+
+#[test]
+fn tasks_status_accepts_no_group_names() {
+    let CliCommand::Tasks(TasksArgs {
+        command: Some(TasksCommand::Status(args)),
+        ..
+    }) = command(&["pacquet", "tasks", "status"])
+    else {
+        panic!("expected tasks status");
+    };
+    assert_eq!(args.groups, Vec::<String>::new());
+}
+
+#[test]
+fn tasks_accepts_script_arguments_before_resolving_an_override() {
+    for args in [vec![], vec!["custom", "--flag"], vec!["--custom-flag"]] {
+        let argv: Vec<_> = ["pacquet", "tasks"]
+            .into_iter()
+            .chain(args.iter().copied())
+            .collect();
+        let CliCommand::Tasks(parsed) = command(&argv) else {
+            panic!("expected tasks");
+        };
+        assert_eq!(parsed.script_args(), args);
+    }
+}
+
+#[test]
+fn tasks_status_help_describes_concurrency_groups() {
+    let error = CliArgs::try_parse_from(["pacquet", "tasks", "status", "--help"]).unwrap_err();
+    assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+    let help = error.to_string();
+    eprintln!("{help}");
+    assert!(help.contains("Show running and waiting tasks in concurrency groups"));
+    assert!(help.contains("tasks status"));
+    assert!(help.contains("[GROUPS]"));
+}
+
+/// [pnpm/pnpm#16580](https://github.com/pnpm/pnpm/issues/16580)
+#[test]
+fn runtime_help_names_the_set_subcommand() {
+    let error = CliArgs::try_parse_from(["pacquet", "runtime", "--help"]).unwrap_err();
+    assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+    let help = error.to_string();
+    eprintln!("{help}");
+    assert!(help.contains("`set <name> [<version>]`"));
+}
+
+/// `--force` keeps skipping optional dependencies built for other
+/// platforms, so its help must not claim otherwise
+/// ([pnpm/pnpm#16435](https://github.com/pnpm/pnpm/issues/16435)).
+#[test]
+fn force_help_says_platform_mismatched_optionals_stay_skipped() {
+    let command = <CliArgs as clap::CommandFactory>::command();
+    for subcommand in ["install", "add"] {
+        let force = command
+            .find_subcommand(subcommand)
+            .and_then(|sub| {
+                sub.get_arguments()
+                    .find(|arg| arg.get_id() == "force")
+            })
+            .unwrap_or_else(|| panic!("`{subcommand}` has a `--force` flag"));
+        let help = force
+            .get_long_help()
+            .or_else(|| force.get_help())
+            .expect("has help")
+            .to_string();
+        eprintln!("{subcommand}: {help}");
+        assert!(help.contains("stay skipped unless `forceIgnoresPlatform` is set"));
+        assert!(help.contains("`--os` / `--cpu` / `--libc`"));
+    }
+}
+
 /// `--production` is the setting name behind `--prod`, and pnpm accepts
 /// it wherever `--prod` selects dependency groups — in a command line
 /// typed by hand as much as in the install the verify-deps-before-run
@@ -672,4 +818,62 @@ fn command(argv: &[&str]) -> CliCommand {
     CliArgs::try_parse_from(argv).expect("parses").command
 }
 
+/// The names npm reports in `npm_command`. pnpm 11 mirrors them, so scripts
+/// that branch on the variable behave alike on both CLIs: a command that runs
+/// a script reports `run-script`, and the variants that spell an alias report
+/// the name their command is registered under.
+#[test]
+fn npm_command_name_reports_the_command_the_way_pnpm_11_does() {
+    for (argv, expected) in [
+        (&["pacquet", "run", "dev"][..], "run-script"),
+        (&["pacquet", "run-script", "dev"][..], "run-script"),
+        (&["pacquet", "test"][..], "run-script"),
+        (&["pacquet", "start"][..], "run-script"),
+        (&["pacquet", "stop"][..], "run-script"),
+        (&["pacquet", "dev"][..], "run-script"),
+        (&["pacquet", "install"][..], "install"),
+        (&["pacquet", "i"][..], "install"),
+        (&["pacquet", "pack"][..], "pack"),
+        (&["pacquet", "list"][..], "list"),
+        (&["pacquet", "ll"][..], "list"),
+        (&["pacquet", "rb"][..], "rebuild"),
+        (&["pacquet", "purge"][..], "clean"),
+    ] {
+        assert_eq!(command(argv).npm_command_name(), expected, "argv: {argv:?}");
+    }
+}
+
+#[test]
+fn depth_limit_accepts_infinity() {
+    assert_eq!(parse_depth_limit("Infinity"), Ok(usize::MAX));
+    assert_eq!(parse_depth_limit("infinity"), Ok(usize::MAX));
+    assert_eq!(parse_depth_limit("0"), Ok(0));
+    assert_eq!(parse_depth_limit("3"), Ok(3));
+    assert!(parse_depth_limit("-1").is_err());
+    assert!(parse_depth_limit("many").is_err());
+}
+
+#[test]
+fn update_and_why_accept_depth_infinity() {
+    let CliCommand::Update(update) =
+        CliArgs::try_parse_from(["pacquet", "update", "--depth", "Infinity"])
+            .expect("parses update --depth Infinity")
+            .command
+    else {
+        panic!("expected update command");
+    };
+    assert_eq!(update.selection.depth, Some(usize::MAX));
+
+    let CliCommand::Why(why) =
+        CliArgs::try_parse_from(["pacquet", "why", "--depth=Infinity", "ms"])
+            .expect("parses why --depth=Infinity")
+            .command
+    else {
+        panic!("expected why command");
+    };
+    assert_eq!(why.depth, Some(usize::MAX));
+}
+
 mod global_options;
+
+mod docs_command_pages;

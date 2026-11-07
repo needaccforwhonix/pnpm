@@ -1,7 +1,8 @@
 //! Deciding which packages are allowed to run build scripts.
 
 use super::{
-    Config, Cow, HashSet, VersionPolicyError, expand_package_version_specs,
+    Config, Cow, HashMap, HashSet, PackageKey, PackageVersionPolicy, PolicyMatch,
+    VersionPolicyError, create_package_version_policy, expand_package_version_specs,
     get_pkg_id_with_patch_hash, index_of_dep_path_suffix, parse_name_version_from_key,
     remove_suffix,
 };
@@ -24,6 +25,7 @@ pub struct AllowBuildPolicy {
     allowed_git_repos: HashSet<String>,
     disallowed_git_repos: HashSet<String>,
     dangerously_allow_all: bool,
+    side_effects_cache_exclude: Option<PackageVersionPolicy>,
 }
 
 impl AllowBuildPolicy {
@@ -45,6 +47,7 @@ impl AllowBuildPolicy {
             allowed_git_repos: HashSet::new(),
             disallowed_git_repos: HashSet::new(),
             dangerously_allow_all,
+            side_effects_cache_exclude: None,
         }
     }
 
@@ -64,6 +67,7 @@ impl AllowBuildPolicy {
             allowed_git_repos: HashSet::new(),
             disallowed_git_repos: HashSet::new(),
             dangerously_allow_all,
+            side_effects_cache_exclude: None,
         }
     }
 
@@ -73,9 +77,23 @@ impl AllowBuildPolicy {
     /// from `pnpm-workspace.yaml`. pnpm v11 stopped reading these
     /// from `package.json#pnpm` — see pnpm/pacquet#397 item 5.
     pub fn from_config(config: &Config) -> Result<Self, VersionPolicyError> {
+        Self::from_approvals(&config.allow_builds, config.dangerously_allow_all_builds)?
+            .with_side_effects_cache_exclude(
+                config.side_effects_cache_exclude.as_deref().unwrap_or_default(),
+            )
+    }
+
+    /// Build the policy from a map of `allowBuilds`-shaped keys to
+    /// decisions. The same keys decide every capability of `permissions`,
+    /// so the policy for agent skills is built here from
+    /// [`Config::allow_skills`].
+    pub fn from_approvals(
+        approvals: &HashMap<String, bool>,
+        dangerously_allow_all: bool,
+    ) -> Result<Self, VersionPolicyError> {
         let mut allowed = BuildKeys::default();
         let mut disallowed = BuildKeys::default();
-        for (spec, &value) in &config.allow_builds {
+        for (spec, &value) in approvals {
             let keys = if value { &mut allowed } else { &mut disallowed };
             keys.add(spec);
         }
@@ -84,9 +102,47 @@ impl AllowBuildPolicy {
             expand_package_version_specs(disallowed.specs)?,
             allowed.dep_paths,
             disallowed.dep_paths,
-            config.dangerously_allow_all_builds,
+            dangerously_allow_all,
         )
         .with_git_repo_rules(allowed.git_repos, disallowed.git_repos))
+    }
+
+    /// Add the `sideEffectsCache.exclude` rules [`Self::caches_build`]
+    /// reads.
+    pub fn with_side_effects_cache_exclude(
+        mut self,
+        patterns: &[String],
+    ) -> Result<Self, VersionPolicyError> {
+        self.side_effects_cache_exclude =
+            if patterns.is_empty() { None } else { Some(create_package_version_policy(patterns)?) };
+        Ok(self)
+    }
+
+    /// Whether the build of the snapshot at `snapshot_key` may be
+    /// restored from, and saved to, the side-effects cache and shared
+    /// through a global-virtual-store slot. `false` for a package
+    /// `sideEffectsCache.exclude` names.
+    ///
+    /// A bare-name rule covers every resolution of the package, a git or
+    /// tarball URL included. A `name@version` rule names registry
+    /// versions only, from the default registry or a named one.
+    #[must_use]
+    pub fn caches_build(&self, snapshot_key: &PackageKey) -> bool {
+        let Some(exclude) = &self.side_effects_cache_exclude else {
+            return true;
+        };
+        match exclude.matches(&snapshot_key.name.to_string()) {
+            PolicyMatch::No => true,
+            PolicyMatch::AnyVersion => false,
+            PolicyMatch::ExactVersions(versions) => !snapshot_key.suffix
+                .version_semver()
+                .or_else(|| snapshot_key.suffix.registry_qualified().map(|(_, version)| version))
+                .is_some_and(|version| {
+                    versions
+                        .iter()
+                        .any(|exact| exact == &version.to_string())
+                }),
+        }
     }
 
     #[must_use]
@@ -100,13 +156,15 @@ impl AllowBuildPolicy {
         self
     }
 
-    /// Check whether a package is allowed to run build scripts.
+    /// Check whether a package is allowed to run build scripts. An
+    /// explicit `false` in `allowBuilds` outranks
+    /// `dangerouslyAllowAllBuilds`, so the two together allow every
+    /// build except the denied ones.
     #[must_use]
     pub fn check(&self, dep_path: &str) -> Option<bool> {
-        if self.dangerously_allow_all {
+        if self.dangerously_allow_all && !self.has_denials() {
             return Some(true);
         }
-
         let normalized_dep_path = normalize_build_dep_path(dep_path);
         let git_repo_key = git_repo_allow_build_key_from_dep_path(&normalized_dep_path);
         let git_repo_key = git_repo_key.as_deref();
@@ -114,6 +172,9 @@ impl AllowBuildPolicy {
         let name_at_version = format!("{name}@{version}");
         if self.denies(&normalized_dep_path, git_repo_key, (&name, &name_at_version)) {
             return Some(false);
+        }
+        if self.dangerously_allow_all {
+            return Some(true);
         }
         if self.allowed_dep_paths.contains(&normalized_dep_path)
             || git_repo_key.is_some_and(|key| self.allowed_git_repos.contains(key))
@@ -134,6 +195,12 @@ impl AllowBuildPolicy {
         }
 
         None
+    }
+
+    fn has_denials(&self) -> bool {
+        !(self.disallowed_dep_paths.is_empty()
+            && self.disallowed_git_repos.is_empty()
+            && self.expanded_disallowed.is_empty())
     }
 
     /// A denial by dep path, git repo, or package name outranks every
@@ -172,6 +239,49 @@ pub fn allow_build_key_from_ignored_build(dep_path: &str) -> String {
         Some((name, version)) if node_semver::Version::parse(version).is_ok() => name.to_string(),
         _ => pkg_id_with_patch_hash.to_string(),
     }
+}
+
+/// A short package label for prompts and listings, with the package's
+/// name for a registry package and the name plus its source for anything
+/// else: `(git)` for a git repository or a git host's tarball, `(tarball)`
+/// for another tarball, `(local)` for a `file:` / `link:` resolution.
+///
+/// The input is any dep path or build/permission key; peer and patch-hash
+/// suffixes are ignored. The approval key — a dep path for source
+/// packages — stays the key of every settings entry, so a label is only
+/// ever display text and cannot be fed back as a key.
+#[must_use]
+pub fn short_package_label(key: &str) -> String {
+    let pkg_id = get_pkg_id_with_patch_hash(key);
+    // A key with no name@version separator is a bare package name; with
+    // one, a version that parses as semver is a registry package and
+    // anything else a source. Git-host packages are tagged `(git)`
+    // however their dep path is built.
+    let (name, source) = match parse_dep_path_name_version(pkg_id) {
+        Some((name, version)) if node_semver::Version::parse(version).is_ok() => (name, None),
+        Some((name, version)) => (name, Some(source_tag(version))),
+        None => (pkg_id, None),
+    };
+    if is_git_hosted_dep_path(pkg_id) {
+        return format!("{name} (git)");
+    }
+    match source {
+        Some(tag) => format!("{name} ({tag})"),
+        None => name.to_string(),
+    }
+}
+
+/// The source tag of a version that is not a registry semver form and not
+/// git-hosted: `tarball` for a URL, including a local archive name; `local`
+/// for a directory a `file:` / `link:` spec resolves to.
+fn source_tag(version: &str) -> &'static str {
+    if version.starts_with("file:") || version.starts_with("link:") {
+        if version.ends_with(".tgz") || version.ends_with(".tar.gz") {
+            return "tarball";
+        }
+        return "local";
+    }
+    "tarball"
 }
 
 /// The package an `--allow-build` value or an `approve-builds` argument
@@ -230,6 +340,13 @@ impl<'c> BuildKeys<'c> {
             self.specs.push(spec);
         }
     }
+}
+
+/// Whether `dep_path` is a package installed from a git repository, by
+/// clone or as a git host's tarball.
+#[must_use]
+pub fn is_git_hosted_dep_path(dep_path: &str) -> bool {
+    git_repo_allow_build_key_from_dep_path(dep_path).is_some()
 }
 
 pub(crate) fn is_git_repo_allow_build_key(spec: &str) -> bool {
@@ -345,3 +462,6 @@ pub(crate) fn is_dep_path_allow_build_key(spec: &str) -> bool {
 pub(crate) fn is_source_like_dep_path_version(version: &str) -> bool {
     version.contains(':') || version.contains('/') || version.contains('#')
 }
+
+#[cfg(test)]
+mod tests;
